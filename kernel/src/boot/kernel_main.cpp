@@ -14,6 +14,7 @@
 #include <cosmos/keyboard.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
+#include <cosmos/stellar.hpp>
 
 extern "C" char __kernel_start[];
 extern "C" char __kernel_end[];
@@ -213,15 +214,49 @@ extern "C" NORETURN void kernel_main() {
     }
 
     if (virtioblk::init(g_hhdm_offset)) {
-        static u8 sector0[512];
-        if (virtioblk::read_sector(0, sector0)) {
-            fb::printf(0xC0FFC0, "[ok] virtio-blk: read sector 0 OK (%lu sectors total)\n",
-                       virtioblk::capacity_sectors());
-            serial::printf("[virtio-blk] sector 0, first 16 bytes:");
-            for (int i = 0; i < 16; ++i) serial::printf(" %x", sector0[i]);
-            serial::writeln("");
+        fb::printf(0xC0FFC0, "[ok] virtio-blk online (%lu sectors)\n", virtioblk::capacity_sectors());
+
+        stellar::init(g_hhdm_offset);
+        bool fs_ready = stellar::mount();
+        if (!fs_ready) fs_ready = stellar::format(virtioblk::capacity_sectors());
+
+        if (fs_ready) {
+            const char* msg = "Aphelion Stellar FS -- real file, real disk, real bytes.\n";
+            u64 msg_len = 0;
+            while (msg[msg_len]) ++msg_len;
+
+            u32 file = stellar::find(stellar::ROOT_STAR, "hello.txt");
+            if (file == stellar::INVALID_STAR)
+                file = stellar::create_file(stellar::ROOT_STAR, "hello.txt", msg, msg_len);
+
+            u32 subdir = stellar::find(stellar::ROOT_STAR, "sub");
+            if (subdir == stellar::INVALID_STAR)
+                subdir = stellar::create_constellation(stellar::ROOT_STAR, "sub");
+            const char* nested_msg = "nested constellation works\n";
+            u64 nested_len = 0;
+            while (nested_msg[nested_len]) ++nested_len;
+            u32 nested_file = stellar::find(subdir, "nested.txt");
+            if (nested_file == stellar::INVALID_STAR)
+                nested_file = stellar::create_file(subdir, "nested.txt", nested_msg, nested_len);
+            static u8 nested_readback[64];
+            u64 nested_n = stellar::read_file(nested_file, nested_readback, sizeof(nested_readback) - 1);
+            nested_readback[nested_n] = 0;
+            serial::printf("[stellar] /sub/nested.txt (%lu bytes): %s\n",
+                            nested_n, reinterpret_cast<const char*>(nested_readback));
+
+            static u8 readback[128];
+            u64 n = stellar::read_file(file, readback, sizeof(readback) - 1);
+            readback[n] = 0;
+
+            bool match = (n == msg_len);
+            for (u64 i = 0; match && i < n; ++i) match = (readback[i] == static_cast<u8>(msg[i]));
+
+            fb::printf(match ? 0xC0FFC0 : 0xE0D080,
+                       "[%s] Stellar FS: created /hello.txt, read %lu bytes back, %s\n",
+                       match ? "ok" : "--", n, match ? "matched exactly" : "MISMATCH");
+            serial::printf("[stellar] readback: %s\n", reinterpret_cast<const char*>(readback));
         } else {
-            fb::printf(0xE0D080, "[--] virtio-blk: device found but the read failed\n");
+            fb::printf(0xE0D080, "[--] Stellar FS: mount and format both failed\n");
         }
     } else {
         fb::printf(0xB0B0C0, "[--] No virtio-blk device on the PCI bus\n");

@@ -38,6 +38,8 @@ instead of quietly disappearing from the history.
   and threads that migrate cores on their own via a shared run queue
 - **A real block device driver** — virtio-blk over PCI, full modern
   virtio-pci transport, verified against actual disk data
+- **A real filesystem** — Stellar FS, a graph-based namespace on top of
+  virtio-blk, verified with real files that persist across reboots
 - **A real input device driver** — IOAPIC-routed PS/2 keyboard, verified
   by injecting keystrokes and reading them back out
 - **A framebuffer console** with its own embedded font — no VGA text mode
@@ -115,15 +117,31 @@ common-config/notify/device-config regions, the standard
 reset→ACKNOWLEDGE→DRIVER→FEATURES_OK→DRIVER_OK handshake negotiating only
 `VIRTIO_F_VERSION_1`, a single split virtqueue, synchronous polled requests.
 
-### Filesystem — "Stellar FS" *(designed, not yet implemented)*
+### Filesystem — "Stellar FS"
 
-Graph-based namespace instead of a strict tree — a `Star` (inode
-equivalent) is identified by a 128-bit ID in a B+tree catalog, not a fixed
-slot, so it can be pointed to by more than one `Constellation` (directory)
-natively, without special-casing hard links. Copy-on-write extents
-("stardust"), per-extent checksums, and O(1) snapshots (copy the catalog
-root pointer) fall out of the same design. The block device it was waiting
-on now exists — this is the actual next milestone.
+Graph-based namespace instead of a strict tree — a `Constellation`
+(directory) is just a `Star` whose data is a set of named edges, so nothing
+stops the same Star being pointed to from more than one Constellation, no
+hard-link special-casing required. `kernel/src/fs/stellar.cpp`.
+
+What v1 actually is, plainly: the Star Catalog is a flat, fixed-size array
+(star ID *is* the slot index) rather than the B+tree with independent
+128-bit IDs the original design calls for, and a Constellation's edge list
+lives in a single fixed sector (8 entries, not yet growable). Free space is
+a plain linear sector bitmap rather than reusing the Universe/Orbit buddy
+machinery for disk space too. Copy-on-write extents, per-extent checksums,
+and O(1) snapshots aren't built yet — they're the natural next layer once
+there's a growable catalog and directory structure under them. None of
+that is hidden in the code; it's the honest state of a first working slice,
+not a finished design pretending otherwise.
+
+What *is* real: format, mount, `create_file`/`create_constellation`,
+`find`, `list`, `read_file` all work end to end on top of virtio-blk, and
+it's been checked, not just trusted — booted against a fresh disk (format
+path), then rebooted against the *same* disk image (mount path) and
+confirmed the file written on the first boot was still there, byte-for-byte
+correct, after a full simulated power cycle. A file nested inside a
+Constellation two levels deep round-trips the same way.
 
 ### Hardware / interrupts
 
@@ -142,7 +160,7 @@ kernel/
     mm/         Universe (physical) + Constellation (virtual) memory
     sched/      Orbital scheduler + context switching
     drivers/    framebuffer, serial, PIT, PS/2 keyboard, virtio-blk
-    fs/         Stellar FS (in progress)
+    fs/         Stellar FS
   include/cosmos/   public headers for all of the above
   linker.ld
 Makefile
@@ -238,8 +256,10 @@ Kept here because they're the kind of thing worth not re-learning.
 
 ## Roadmap
 
-- Stellar FS on top of virtio-blk, now that there's a real device to read
-  and write
+- Grow Stellar FS toward the real design: a B+tree Star Catalog with
+  independent IDs instead of ID-as-slot-index, growable Constellation edge
+  lists instead of a fixed 8-entry sector, copy-on-write extents,
+  per-extent checksums, O(1) snapshots
 - Interrupt-driven virtio-blk completion instead of polling, and
   multi-request queueing instead of one synchronous request at a time
 - Shift/Ctrl/Alt tracking and MADT Interrupt Source Override parsing for
