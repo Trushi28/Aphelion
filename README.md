@@ -58,16 +58,14 @@ make iso            # fetch Limine if needed, build the kernel, build the ISO
 make run             # build + boot in QEMU with a display window
 make run-smp         # same, with 4 vCPUs
 make run-headless    # serial-only, no display — for scripted/automated runs
+make run-nodisk      # boot without a virtio-blk disk attached
 ```
 
-To exercise the virtio-blk driver, attach a disk:
-
-```sh
-qemu-img create -f raw disk.img 64M
-qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom build/aphelion.iso \
-  -drive file=disk.img,if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-  -serial stdio
-```
+`run`, `run-smp`, and `run-headless` all auto-create `disk.img` (a 64MB raw
+image, gitignored) on first use via `qemu-img` and attach it as a
+virtio-blk device — Stellar FS formats it on first boot and mounts the
+same filesystem on every boot after that, so whatever you create persists
+across runs. Delete `disk.img` to start over with a fresh filesystem.
 
 `build/aphelion.iso` also writes directly to a USB stick
 (`dd if=build/aphelion.iso of=/dev/sdX`) for real hardware — BIOS and UEFI
@@ -148,7 +146,11 @@ Constellation two levels deep round-trips the same way.
 x2APIC (MSR-based) with automatic fallback to xAPIC (MMIO) for CPUs or
 hypervisors without it. ACPI/MADT parsing for CPU + IOAPIC enumeration.
 IOAPIC-routed PS/2 keyboard on IRQ1 — the first real external device on a
-real IRQ line, no legacy PIC anywhere in the path.
+real IRQ line, no legacy PIC anywhere in the path. Shift is tracked (both
+left/right, unshifted and shifted tables for the full alphabet, digit row,
+and punctuation), along with left Ctrl and left Alt state — right Ctrl/Alt
+and anything else needing the E0 extended-scancode prefix (arrow keys
+included) aren't decoded yet.
 
 ## Project layout
 
@@ -262,8 +264,10 @@ Kept here because they're the kind of thing worth not re-learning.
   per-extent checksums, O(1) snapshots
 - Interrupt-driven virtio-blk completion instead of polling, and
   multi-request queueing instead of one synchronous request at a time
-- Shift/Ctrl/Alt tracking and MADT Interrupt Source Override parsing for
-  the keyboard driver
+- Extended (E0-prefixed) scancode handling for the keyboard driver — right
+  Ctrl/Alt, arrow keys, and everything else in that set — plus MADT
+  Interrupt Source Override parsing rather than assuming IRQ1 maps
+  straight to GSI1
 - Per-core run queues with work-stealing, instead of Orbital's current
   single shared queue
 - A Satellite exit/reap path — right now a thread whose entry function

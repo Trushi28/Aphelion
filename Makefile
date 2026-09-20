@@ -9,6 +9,8 @@ KDIR      := kernel
 BUILD     := build
 ISO_ROOT  := iso_root
 LIMINE    := limine
+DISK_IMG  := disk.img
+DISK_SIZE := 64M
 
 LIMINE_REPO   := https://github.com/limine-bootloader/limine.git
 LIMINE_BRANCH := v9.x-binary
@@ -32,7 +34,7 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
 
-.PHONY: all iso run run-smp run-headless clean distclean
+.PHONY: all iso run run-smp run-headless run-nodisk clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -65,14 +67,26 @@ iso: $(KERNEL_ELF) $(LIMINE)/limine.h
 		$(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 
-run: iso
+$(DISK_IMG):
+	qemu-img create -f raw $(DISK_IMG) $(DISK_SIZE)
+
+run: iso $(DISK_IMG)
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -no-reboot -no-shutdown
+
+run-smp: iso $(DISK_IMG)
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 4 -cdrom $(ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -no-reboot -no-shutdown
+
+run-headless: iso $(DISK_IMG)
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -display none -no-reboot -no-shutdown
+
+run-nodisk: iso
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown
-
-run-smp: iso
-	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 4 -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown
-
-run-headless: iso
-	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio -display none -no-reboot -no-shutdown
 
 clean:
 	rm -rf $(BUILD) $(ISO_ROOT)/boot/kernel.elf
