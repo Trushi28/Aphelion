@@ -106,6 +106,14 @@ Satellites migrate cores on their own as a natural consequence. That's a
 fine starting point, not yet core-affine; per-core queues with
 work-stealing is the natural next step, not a correctness gap.
 
+A Satellite that finishes — its entry function returns, or it calls
+`orbital::exit_current()` directly — gets moved onto a zombie list rather
+than staying scheduled, and its stack gets freed back to the Universe by
+whichever Sun's idle loop reaps it next. The zombie list is global, not
+per-core, so a Sun pinned by a CPU-bound Satellite that never yields
+doesn't block reaping — any *other* Sun that goes idle picks up the work,
+same shared-queue philosophy as everything else here.
+
 ### Storage — virtio-blk
 
 The first real block device, over PCI (legacy port-based config space
@@ -270,7 +278,3 @@ Kept here because they're the kind of thing worth not re-learning.
   straight to GSI1
 - Per-core run queues with work-stealing, instead of Orbital's current
   single shared queue
-- A Satellite exit/reap path — right now a thread whose entry function
-  returns just parks itself in a permanent yield loop rather than actually
-  freeing its stack, since doing that safely needs a reaper running on a
-  different stack than the one being freed
