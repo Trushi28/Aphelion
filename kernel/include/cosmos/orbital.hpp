@@ -28,6 +28,7 @@ void init_core();
 Satellite* spawn(const char* name, EntryFn entry, void* arg);
 
 void yield();
+NORETURN void exit_current();
 
 NORETURN void start_core();
 

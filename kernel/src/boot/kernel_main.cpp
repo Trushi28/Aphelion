@@ -98,8 +98,18 @@ static void demo_cooperative(void* arg) {
                         label, i, static_cast<int>(apic::id()));
         orbital::yield();
     }
-    serial::printf("[demo] %s done\n", label);
-    for (;;) orbital::yield();
+    serial::printf("[demo] %s done (returning -- implicit exit)\n", label);
+}
+
+static void demo_cooperative_explicit_exit(void* arg) {
+    const char* label = static_cast<const char*>(arg);
+    for (u32 i = 0; i < 8; ++i) {
+        serial::printf("[demo] %s (cooperative) round %u on core %d\n",
+                        label, i, static_cast<int>(apic::id()));
+        orbital::yield();
+    }
+    serial::printf("[demo] %s done (calling exit_current explicitly)\n", label);
+    orbital::exit_current();
 }
 
 static void demo_spinner(void* arg) {
@@ -288,7 +298,7 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0x8FD3FF, "\nOrbital scheduler: bringing up this core...\n");
     orbital::init_core();
     orbital::spawn("alpha", &demo_cooperative, const_cast<char*>("alpha"));
-    orbital::spawn("beta", &demo_cooperative, const_cast<char*>("beta"));
+    orbital::spawn("beta", &demo_cooperative_explicit_exit, const_cast<char*>("beta"));
     orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
     fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites spawned\n");
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");

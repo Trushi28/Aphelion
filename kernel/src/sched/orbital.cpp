@@ -21,6 +21,7 @@ static Satellite* g_current[256] = {};
 
 static Satellite* g_ring_head[NUM_RINGS] = {};
 static Satellite* g_ring_tail[NUM_RINGS] = {};
+static Satellite* g_zombies = nullptr;
 static cpu::Spinlock g_lock;
 
 static u32 ticks_for_ring(int ring) {
@@ -82,12 +83,32 @@ extern "C" void satellite_trampoline() {
     cpu::sti();
     self->entry(self->arg);
 
-    for (;;) yield();
+    exit_current();
+}
+
+static void reap_zombies() {
+    g_lock.lock();
+    Satellite* z = g_zombies;
+    g_zombies = nullptr;
+    g_lock.unlock();
+
+    while (z) {
+        Satellite* next_z = z->next;
+        serial::printf("[orbital] reaping satellite '%s' (freeing its stack)\n", z->name);
+        universe::free(reinterpret_cast<u64>(z->stack_base) - g_hhdm, STACK_ORDER);
+        g_lock.lock();
+        z->in_use = false;
+        g_lock.unlock();
+        z = next_z;
+    }
 }
 
 static void idle_entry(void*) {
     cpu::sti();
-    for (;;) cpu::halt();
+    for (;;) {
+        reap_zombies();
+        cpu::halt();
+    }
 }
 
 static void reschedule_locked(Satellite* old_to_enqueue) {
@@ -105,6 +126,21 @@ static void reschedule_locked(Satellite* old_to_enqueue) {
     g_current[me] = next;
     switch_context(&old->rsp, next->rsp);
     g_lock.unlock();
+}
+
+NORETURN void exit_current() {
+    cpu::cli();
+    u32 me = apic::id();
+    Satellite* cur = g_current[me];
+    if (cur == &g_idle[me]) {
+        cpu::sti();
+        for (;;) cpu::halt();
+    }
+    g_lock.lock();
+    cur->next = g_zombies;
+    g_zombies = cur;
+    reschedule_locked(nullptr);
+    cpu::hang();
 }
 
 static void timer_tick_handler(idt::Frame*) {
