@@ -27,9 +27,12 @@ u32 max_redirection_entries() {
     return ((read_reg(0x01) >> 16) & 0xFF) + 1;
 }
 
-void set_redirection(u32 gsi, u8 vector, u32 dest_apic_id, bool masked) {
+void set_redirection(u32 gsi, u8 vector, u32 dest_apic_id, bool masked,
+                      bool active_low, bool level_triggered) {
     u32 low = vector;
     if (masked) low |= (1u << 16);
+    if (active_low) low |= (1u << 13);
+    if (level_triggered) low |= (1u << 15);
     u32 high = (dest_apic_id & 0xFFu) << 24;
 
     write_reg(REDTBL_BASE + gsi * 2 + 1, high);

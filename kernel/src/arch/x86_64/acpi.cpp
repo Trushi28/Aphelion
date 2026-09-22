@@ -56,6 +56,14 @@ struct PACKED MadtLocalX2Apic {
     u32 acpi_processor_uid;
 };
 
+struct PACKED MadtIso {
+    MadtEntry hdr;
+    u8 bus;
+    u8 source_irq;
+    u32 gsi;
+    u16 flags;
+};
+
 static Info g_info;
 static u64 g_hhdm = 0;
 
@@ -96,6 +104,16 @@ static void parse_madt(SdtHeader* madt) {
                 g_info.ioapic_found = true;
                 break;
             }
+            case 2: {
+                auto* iso = reinterpret_cast<MadtIso*>(p);
+                if (g_info.iso_count < MAX_ISO) {
+                    g_info.iso[g_info.iso_count].source_irq = iso->source_irq;
+                    g_info.iso[g_info.iso_count].gsi = iso->gsi;
+                    g_info.iso[g_info.iso_count].flags = iso->flags;
+                    ++g_info.iso_count;
+                }
+                break;
+            }
             default: break;
         }
         p += e->length;
@@ -122,12 +140,25 @@ void init(u64 rsdp_phys, u64 hhdm_offset) {
         auto* hdr = phys<SdtHeader>(table_phys);
         if (sig_matches(hdr->sig, "APIC", 4)) {
             parse_madt(hdr);
-            serial::printf("[acpi] MADT: %u usable CPU(s), IOAPIC %s\n",
-                            g_info.cpu_count, g_info.ioapic_found ? "found" : "absent");
+            serial::printf("[acpi] MADT: %u usable CPU(s), IOAPIC %s, %u interrupt override(s)\n",
+                            g_info.cpu_count, g_info.ioapic_found ? "found" : "absent",
+                            g_info.iso_count);
         }
     }
 }
 
 const Info& info() { return g_info; }
+
+Redirection resolve_isa_irq(u8 isa_irq) {
+    for (u32 i = 0; i < g_info.iso_count; ++i) {
+        if (g_info.iso[i].source_irq == isa_irq) {
+            u16 flags = g_info.iso[i].flags;
+            u16 polarity = flags & 0x3;
+            u16 trigger = (flags >> 2) & 0x3;
+            return { g_info.iso[i].gsi, polarity == 3, trigger == 3 };
+        }
+    }
+    return { isa_irq, false, false };
+}
 
 }

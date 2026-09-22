@@ -216,9 +216,11 @@ extern "C" NORETURN void kernel_main() {
     if (acpi::info().ioapic_found) {
         ioapic::init(g_hhdm_offset, acpi::info().ioapic_base, acpi::info().ioapic_gsi_base);
         keyboard::init(VEC_KEYBOARD);
-        ioapic::set_redirection(1, VEC_KEYBOARD, apic::id(),   false);
-        fb::printf(0xC0FFC0, "[ok] IOAPIC online (%d redirection entries), PS/2 keyboard on IRQ1 -- try typing\n",
-                   static_cast<int>(ioapic::max_redirection_entries()));
+        acpi::Redirection kbd_irq = acpi::resolve_isa_irq(1);
+        ioapic::set_redirection(kbd_irq.gsi, VEC_KEYBOARD, apic::id(), false,
+                                 kbd_irq.active_low, kbd_irq.level_triggered);
+        fb::printf(0xC0FFC0, "[ok] IOAPIC online (%d redirection entries), PS/2 keyboard on IRQ1 -> GSI%u -- try typing\n",
+                   static_cast<int>(ioapic::max_redirection_entries()), kbd_irq.gsi);
     } else {
         fb::printf(0xE0D080, "[--] No IOAPIC reported; keyboard unavailable\n");
     }
