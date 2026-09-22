@@ -27,10 +27,38 @@ static char g_set1_to_ascii_shifted[128];
 static volatile bool g_shift = false;
 static volatile bool g_ctrl = false;
 static volatile bool g_alt = false;
+static volatile bool g_rctrl = false;
+static volatile bool g_ralt = false;
+static volatile bool g_extended = false;
 
 bool shift_down() { return g_shift; }
-bool ctrl_down() { return g_ctrl; }
-bool alt_down() { return g_alt; }
+bool ctrl_down() { return g_ctrl || g_rctrl; }
+bool alt_down() { return g_alt || g_ralt; }
+
+static void emit_char(char c) {
+    serial::putc(c);
+    if (fb::ready()) fb::putc(c, 0xE8E8E8, 0x0A0A14);
+}
+
+static void emit_seq(const char* s) {
+    while (*s) emit_char(*s++);
+}
+
+static const char* extended_sequence(u8 code) {
+    switch (code) {
+        case 0x48: return "\x1b[A";
+        case 0x50: return "\x1b[B";
+        case 0x4D: return "\x1b[C";
+        case 0x4B: return "\x1b[D";
+        case 0x47: return "\x1b[H";
+        case 0x4F: return "\x1b[F";
+        case 0x52: return "\x1b[2~";
+        case 0x53: return "\x1b[3~";
+        case 0x49: return "\x1b[5~";
+        case 0x51: return "\x1b[6~";
+        default: return nullptr;
+    }
+}
 
 static void fill_row(char* table, u8 start, const char* chars) {
     for (int i = 0; chars[i]; ++i) table[start + i] = chars[i];
@@ -64,8 +92,24 @@ static void build_scancode_tables() {
 static void keyboard_isr(idt::Frame*) {
     apic::eoi();
     u8 sc = cpu::in8(PORT_DATA);
+
+    if (sc == 0xE0) { g_extended = true; return; }
+
     bool release = sc & 0x80;
     u8 code = sc & 0x7F;
+    bool extended = g_extended;
+    g_extended = false;
+
+    if (extended) {
+        if (code == SC_LCTRL) { g_rctrl = !release; return; }
+        if (code == SC_LALT) { g_ralt = !release; return; }
+        if (release) return;
+        if (code == 0x1C) { emit_char('\n'); return; }
+        if (code == 0x35) { emit_char('/'); return; }
+        const char* seq = extended_sequence(code);
+        if (seq) emit_seq(seq);
+        return;
+    }
 
     if (code == SC_LSHIFT || code == SC_RSHIFT) { g_shift = !release; return; }
     if (code == SC_LCTRL) { g_ctrl = !release; return; }
@@ -75,8 +119,7 @@ static void keyboard_isr(idt::Frame*) {
 
     char c = (g_shift ? g_set1_to_ascii_shifted : g_set1_to_ascii)[code];
     if (!c) return;
-    serial::putc(c);
-    if (fb::ready()) fb::putc(c, 0xE8E8E8, 0x0A0A14);
+    emit_char(c);
 }
 
 void init(u8 vector) {
