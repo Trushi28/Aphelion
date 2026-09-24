@@ -17,6 +17,7 @@ void init();
 void set_handler(u8 vector, Handler h);
 
 constexpr u8 VEC_APIC_TIMER = 0x20;
+constexpr u8 VEC_VIRTIO_BLK = 0x22;
 constexpr u8 VEC_SPURIOUS   = 0xFF;
 
 }

@@ -267,6 +267,8 @@ extern "C" NORETURN void kernel_main() {
                        "[%s] Stellar FS: created /hello.txt, read %lu bytes back, %s\n",
                        match ? "ok" : "--", n, match ? "matched exactly" : "MISMATCH");
             serial::printf("[stellar] readback: %s\n", reinterpret_cast<const char*>(readback));
+            serial::printf("[virtio-blk] completion mode: %s, %u interrupt(s) delivered\n",
+                            virtioblk::using_msix() ? "MSI-X" : "polled", virtioblk::irq_count());
         } else {
             fb::printf(0xE0D080, "[--] Stellar FS: mount and format both failed\n");
         }
