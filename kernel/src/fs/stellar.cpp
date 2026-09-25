@@ -1,5 +1,5 @@
 #include <cosmos/stellar.hpp>
-#include <cosmos/virtio_blk.hpp>
+#include <cosmos/blockdev.hpp>
 #include <cosmos/pmm.hpp>
 #include <cosmos/serial.hpp>
 
@@ -73,19 +73,19 @@ static void* alloc_ram(u64 bytes) {
 
 static void flush_bitmap() {
     for (u64 i = 0; i < g_sb.bitmap_sectors; ++i)
-        virtioblk::write_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE);
+        blockdev::write_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE);
 }
 static void flush_catalog_entry(u32 id) {
     u32 per_sector = static_cast<u32>(SECTOR_SIZE / sizeof(StarEntry));
     u64 sector = g_sb.catalog_start + id / per_sector;
     StarEntry* base = g_catalog + (id / per_sector) * per_sector;
-    virtioblk::write_sector(sector, base);
+    blockdev::write_sector(sector, base);
 }
 static void flush_superblock() {
     u8 buf[SECTOR_SIZE];
     for (auto& b : buf) b = 0;
     __builtin_memcpy(buf, &g_sb, sizeof(g_sb));
-    virtioblk::write_sector(0, buf);
+    blockdev::write_sector(0, buf);
 }
 
 static u32 alloc_star() {
@@ -118,7 +118,7 @@ static u64 alloc_sectors(u64 count) {
 static bool add_edge(u32 dir_star, const char* name, u32 target) {
     if (dir_star == INVALID_STAR || g_catalog[dir_star].type != TYPE_CONSTELLATION) return false;
     u8 buf[SECTOR_SIZE];
-    if (!virtioblk::read_sector(g_catalog[dir_star].first_sector, buf)) return false;
+    if (!blockdev::read_sector(g_catalog[dir_star].first_sector, buf)) return false;
     DirEntry* entries = reinterpret_cast<DirEntry*>(buf);
     u32 count = static_cast<u32>(SECTOR_SIZE / sizeof(DirEntry));
     for (u32 i = 0; i < count; ++i) {
@@ -126,7 +126,7 @@ static bool add_edge(u32 dir_star, const char* name, u32 target) {
             entries[i].in_use = 1;
             entries[i].star = target;
             copy_name(entries[i].name, name);
-            return virtioblk::write_sector(g_catalog[dir_star].first_sector, buf);
+            return blockdev::write_sector(g_catalog[dir_star].first_sector, buf);
         }
     }
     return false;
@@ -150,7 +150,7 @@ bool format(u64 total_sectors) {
 
     flush_bitmap();
     for (u64 i = 0; i < g_sb.catalog_sectors; ++i)
-        virtioblk::write_sector(g_sb.catalog_start + i,
+        blockdev::write_sector(g_sb.catalog_start + i,
                                   reinterpret_cast<u8*>(g_catalog) + i * SECTOR_SIZE);
     flush_superblock();
 
@@ -166,7 +166,7 @@ bool format(u64 total_sectors) {
 
 bool mount() {
     u8 buf[SECTOR_SIZE];
-    if (!virtioblk::read_sector(0, buf)) return false;
+    if (!blockdev::read_sector(0, buf)) return false;
     Superblock sb;
     __builtin_memcpy(&sb, buf, sizeof(sb));
     if (sb.magic != MAGIC) {
@@ -177,9 +177,9 @@ bool mount() {
     g_bitmap = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors * SECTOR_SIZE));
     g_catalog = static_cast<StarEntry*>(alloc_ram(g_sb.catalog_sectors * SECTOR_SIZE));
     for (u64 i = 0; i < g_sb.bitmap_sectors; ++i)
-        virtioblk::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE);
+        blockdev::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE);
     for (u64 i = 0; i < g_sb.catalog_sectors; ++i)
-        virtioblk::read_sector(g_sb.catalog_start + i,
+        blockdev::read_sector(g_sb.catalog_start + i,
                                  reinterpret_cast<u8*>(g_catalog) + i * SECTOR_SIZE);
     g_mounted = true;
     serial::printf("[stellar] mounted: %lu sectors, %u catalog slots\n",
@@ -196,7 +196,7 @@ u32 create_constellation(u32 parent, const char* name) {
 
     u8 zero[SECTOR_SIZE];
     for (auto& b : zero) b = 0;
-    virtioblk::write_sector(start, zero);
+    blockdev::write_sector(start, zero);
 
     g_catalog[id].type = TYPE_CONSTELLATION;
     g_catalog[id].size_bytes = 0;
@@ -223,7 +223,7 @@ u32 create_file(u32 parent, const char* name, const void* data, u64 size) {
         u64 remaining = done < size ? size - done : 0;
         u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
         for (u64 b = 0; b < SECTOR_SIZE; ++b) buf[b] = (b < chunk) ? src[done + b] : 0;
-        if (!virtioblk::write_sector(start + i, buf)) return INVALID_STAR;
+        if (!blockdev::write_sector(start + i, buf)) return INVALID_STAR;
     }
 
     g_catalog[id].type = TYPE_FILE;
@@ -245,7 +245,7 @@ u64 read_file(u32 star, void* buf, u64 max_size) {
     u8 sector_buf[SECTOR_SIZE];
     u64 read_so_far = 0;
     for (u64 i = 0; i < g_catalog[star].sector_count && read_so_far < to_read; ++i) {
-        if (!virtioblk::read_sector(g_catalog[star].first_sector + i, sector_buf)) break;
+        if (!blockdev::read_sector(g_catalog[star].first_sector + i, sector_buf)) break;
         u64 chunk = to_read - read_so_far;
         if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
         for (u64 b = 0; b < chunk; ++b) dst[read_so_far + b] = sector_buf[b];
@@ -258,7 +258,7 @@ u32 find(u32 dir_star, const char* name) {
     if (!g_mounted || dir_star >= g_sb.catalog_capacity) return INVALID_STAR;
     if (g_catalog[dir_star].type != TYPE_CONSTELLATION) return INVALID_STAR;
     u8 buf[SECTOR_SIZE];
-    if (!virtioblk::read_sector(g_catalog[dir_star].first_sector, buf)) return INVALID_STAR;
+    if (!blockdev::read_sector(g_catalog[dir_star].first_sector, buf)) return INVALID_STAR;
     DirEntry* entries = reinterpret_cast<DirEntry*>(buf);
     u32 count = static_cast<u32>(SECTOR_SIZE / sizeof(DirEntry));
     for (u32 i = 0; i < count; ++i)
@@ -270,7 +270,7 @@ void list(u32 dir_star, ListCallback cb, void* ctx) {
     if (!g_mounted || dir_star >= g_sb.catalog_capacity) return;
     if (g_catalog[dir_star].type != TYPE_CONSTELLATION) return;
     u8 buf[SECTOR_SIZE];
-    if (!virtioblk::read_sector(g_catalog[dir_star].first_sector, buf)) return;
+    if (!blockdev::read_sector(g_catalog[dir_star].first_sector, buf)) return;
     DirEntry* entries = reinterpret_cast<DirEntry*>(buf);
     u32 count = static_cast<u32>(SECTOR_SIZE / sizeof(DirEntry));
     for (u32 i = 0; i < count; ++i)
