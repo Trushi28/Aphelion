@@ -14,6 +14,7 @@
 #include <cosmos/keyboard.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
+#include <cosmos/blockdev.hpp>
 #include <cosmos/stellar.hpp>
 
 extern "C" char __kernel_start[];
@@ -225,12 +226,14 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xE0D080, "[--] No IOAPIC reported; keyboard unavailable\n");
     }
 
-    if (virtioblk::init(g_hhdm_offset)) {
-        fb::printf(0xC0FFC0, "[ok] virtio-blk online (%lu sectors)\n", virtioblk::capacity_sectors());
+    virtioblk::init(g_hhdm_offset);
+    if (blockdev::present()) {
+        fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
+                   blockdev::active()->name(), blockdev::capacity_sectors());
 
         stellar::init(g_hhdm_offset);
         bool fs_ready = stellar::mount();
-        if (!fs_ready) fs_ready = stellar::format(virtioblk::capacity_sectors());
+        if (!fs_ready) fs_ready = stellar::format(blockdev::capacity_sectors());
 
         if (fs_ready) {
             const char* msg = "Aphelion Stellar FS -- real file, real disk, real bytes.\n";
@@ -273,7 +276,7 @@ extern "C" NORETURN void kernel_main() {
             fb::printf(0xE0D080, "[--] Stellar FS: mount and format both failed\n");
         }
     } else {
-        fb::printf(0xB0B0C0, "[--] No virtio-blk device on the PCI bus\n");
+        fb::printf(0xB0B0C0, "[--] No block device found\n");
     }
 
     universe::reclaim_bootloader_regions(entries, n_entries);

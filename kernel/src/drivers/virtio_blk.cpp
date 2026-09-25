@@ -1,4 +1,5 @@
 #include <cosmos/virtio_blk.hpp>
+#include <cosmos/blockdev.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/pmm.hpp>
 #include <cosmos/vmm.hpp>
@@ -124,6 +125,14 @@ static void completion_isr(idt::Frame*) {
     __atomic_fetch_add(&g_irq_count, 1, __ATOMIC_SEQ_CST);
 }
 
+struct HalDevice : blockdev::Device {
+    bool read_sector(u64 sector, void* buf512) override;
+    bool write_sector(u64 sector, const void* buf512) override;
+    u64 capacity_sectors() override { return virtioblk::capacity_sectors(); }
+    const char* name() override { return "virtio-blk"; }
+};
+static HalDevice g_hal;
+
 bool init(u64 hhdm_offset) {
     g_hhdm = hhdm_offset;
     g_found_flag = false;
@@ -241,6 +250,7 @@ bool init(u64 hhdm_offset) {
     serial::printf("[virtio-blk] ready, capacity=%lu sectors, completion mode=%s\n",
                     capacity_sectors(), g_msix_ready ? "MSI-X" : "polled");
     if (g_msix_ready) cpu::sti();
+    blockdev::register_device(&g_hal);
     return true;
 }
 
@@ -288,5 +298,8 @@ bool write_sector(u64 sector, const void* buf512) {
     for (int i = 0; i < 512; ++i) g_bounce[i] = static_cast<const u8*>(buf512)[i];
     return do_request(sector, true);
 }
+
+bool HalDevice::read_sector(u64 sector, void* buf512) { return virtioblk::read_sector(sector, buf512); }
+bool HalDevice::write_sector(u64 sector, const void* buf512) { return virtioblk::write_sector(sector, buf512); }
 
 }
