@@ -87,6 +87,15 @@ extern "C" void ap_entry(limine_smp_info* info) {
     orbital::start_core();
 }
 
+static u32 itoa_dec(u64 v, char* out) {
+    char tmp[20];
+    u32 len = 0;
+    if (v == 0) tmp[len++] = '0';
+    while (v) { tmp[len++] = static_cast<char>('0' + (v % 10)); v /= 10; }
+    for (u32 i = 0; i < len; ++i) out[i] = tmp[len - 1 - i];
+    return len;
+}
+
 static NORETURN void panic_no_framebuffer() {
     serial::writeln("[boot] FATAL: bootloader gave no framebuffer");
     cpu::hang();
@@ -240,17 +249,17 @@ extern "C" NORETURN void kernel_main() {
             u64 msg_len = 0;
             while (msg[msg_len]) ++msg_len;
 
-            u32 file = stellar::find(stellar::ROOT_STAR, "hello.txt");
+            u64 file = stellar::find(stellar::ROOT_STAR, "hello.txt");
             if (file == stellar::INVALID_STAR)
                 file = stellar::create_file(stellar::ROOT_STAR, "hello.txt", msg, msg_len);
 
-            u32 subdir = stellar::find(stellar::ROOT_STAR, "sub");
+            u64 subdir = stellar::find(stellar::ROOT_STAR, "sub");
             if (subdir == stellar::INVALID_STAR)
                 subdir = stellar::create_constellation(stellar::ROOT_STAR, "sub");
             const char* nested_msg = "nested constellation works\n";
             u64 nested_len = 0;
             while (nested_msg[nested_len]) ++nested_len;
-            u32 nested_file = stellar::find(subdir, "nested.txt");
+            u64 nested_file = stellar::find(subdir, "nested.txt");
             if (nested_file == stellar::INVALID_STAR)
                 nested_file = stellar::create_file(subdir, "nested.txt", nested_msg, nested_len);
             static u8 nested_readback[64];
@@ -272,6 +281,35 @@ extern "C" NORETURN void kernel_main() {
             serial::printf("[stellar] readback: %s\n", reinterpret_cast<const char*>(readback));
             serial::printf("[virtio-blk] completion mode: %s, %u interrupt(s) delivered\n",
                             virtioblk::using_msix() ? "MSI-X" : "polled", virtioblk::irq_count());
+
+            constexpr u64 STRESS_COUNT = 14;
+            static u64 stress_ids[STRESS_COUNT];
+            bool stress_create_ok = true;
+            for (u64 i = 0; i < STRESS_COUNT; ++i) {
+                char content[20];
+                u32 len = itoa_dec(i, content);
+                stress_ids[i] = stellar::create_file(stellar::INVALID_STAR, "", content, len);
+                if (stress_ids[i] == stellar::INVALID_STAR) stress_create_ok = false;
+            }
+
+            u64 stress_mismatches = 0;
+            for (u64 i = 0; i < STRESS_COUNT; ++i) {
+                char expect[20];
+                u32 elen = itoa_dec(i, expect);
+                u8 got[20];
+                u64 n = stellar::read_file(stress_ids[i], got, sizeof(got) - 1);
+                bool ok = (n == elen);
+                for (u64 j = 0; ok && j < n; ++j) ok = (got[j] == static_cast<u8>(expect[j]));
+                if (!ok) ++stress_mismatches;
+            }
+
+            bool stress_ok = stress_create_ok && (stress_mismatches == 0);
+            fb::printf(stress_ok ? 0xC0FFC0 : 0xE0D080,
+                       "[%s] Stellar FS B+tree stress: %lu stars created, %lu mismatch(es) on readback\n",
+                       stress_ok ? "ok" : "--", STRESS_COUNT, stress_mismatches);
+            serial::printf("[stellar] B+tree stress: %lu stars created (create_ok=%d), %lu mismatch(es), ids %lu..%lu\n",
+                            STRESS_COUNT, stress_create_ok ? 1 : 0, stress_mismatches,
+                            stress_ids[0], stress_ids[STRESS_COUNT - 1]);
         } else {
             fb::printf(0xE0D080, "[--] Stellar FS: mount and format both failed\n");
         }
