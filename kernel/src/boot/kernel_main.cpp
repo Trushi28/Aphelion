@@ -14,6 +14,7 @@
 #include <cosmos/keyboard.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
+#include <cosmos/ahci.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/stellar.hpp>
 
@@ -265,6 +266,7 @@ extern "C" NORETURN void kernel_main() {
     }
 
     virtioblk::init(g_hhdm_offset);
+    ahci::init(g_hhdm_offset);
     if (blockdev::present()) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
