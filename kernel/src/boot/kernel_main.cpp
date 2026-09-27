@@ -140,6 +140,31 @@ static void demo_spinner(void* arg) {
     }
 }
 
+constexpr u64 WORKER_COUNT = 8;
+static volatile u64 g_worker_cores_mask = 0;
+static volatile u32 g_workers_remaining = WORKER_COUNT;
+
+static void demo_worker(void* arg) {
+    u64 idx = reinterpret_cast<u64>(arg);
+    serial::printf("[demo] worker %lu started on core %d\n", idx, static_cast<int>(apic::id()));
+    for (u32 i = 0; i < 50000; ++i) {
+        if ((i & 0x7FF) == 0) orbital::yield();
+    }
+    u32 core = apic::id();
+    serial::printf("[demo] worker %lu finished on core %d\n", idx, static_cast<int>(core));
+    u32 bit = core < 64 ? core : 63;
+    __atomic_fetch_or(&g_worker_cores_mask, 1ull << bit, __ATOMIC_SEQ_CST);
+    if (__atomic_sub_fetch(&g_workers_remaining, 1u, __ATOMIC_SEQ_CST) == 0) {
+        u64 mask = g_worker_cores_mask;
+        u32 distinct = 0;
+        while (mask) { distinct += static_cast<u32>(mask & 1); mask >>= 1; }
+        bool ok = distinct > 1;
+        serial::printf("[orbital] work-stealing check: %lu worker(s) finished across %u distinct core(s) -> %s\n",
+                        WORKER_COUNT, distinct, ok ? "stealing confirmed" : "no migration observed");
+    }
+    orbital::exit_current();
+}
+
 extern "C" NORETURN void kernel_main() {
     serial::init();
     serial::writeln("\n=== Aphelion booting ===");
@@ -355,7 +380,10 @@ extern "C" NORETURN void kernel_main() {
     orbital::spawn("alpha", &demo_cooperative, const_cast<char*>("alpha"));
     orbital::spawn("beta", &demo_cooperative_explicit_exit, const_cast<char*>("beta"));
     orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
-    fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites spawned\n");
+    for (u64 i = 0; i < WORKER_COUNT; ++i)
+        orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
+    fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
+               WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");
 
     orbital::start_core();
