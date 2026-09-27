@@ -42,6 +42,15 @@ struct PACKED DirEntry {
 };
 static_assert(sizeof(DirEntry) == 64, "DirEntry must be 64 bytes");
 
+constexpr u32 DIR_ENTRIES_PER_SECTOR = (SECTOR_SIZE - 8) / sizeof(DirEntry);
+
+struct PACKED DirSector {
+    u64 next_sector;
+    DirEntry entries[DIR_ENTRIES_PER_SECTOR];
+    u8 padding[SECTOR_SIZE - 8 - DIR_ENTRIES_PER_SECTOR * sizeof(DirEntry)];
+};
+static_assert(sizeof(DirSector) == SECTOR_SIZE, "DirSector must fill one sector");
+
 struct PACKED LeafEntry {
     u64 star_id;
     StarEntry entry;
@@ -158,6 +167,25 @@ static bool btree_search(u64 node_sector, u64 key, StarEntry* out) {
     u32 i = 0;
     while (i < node->count && key >= node->key[i]) ++i;
     return btree_search(node->child[i], key, out);
+}
+
+static bool btree_update(u64 node_sector, u64 key, const StarEntry& value) {
+    u8 buf[SECTOR_SIZE];
+    if (!blockdev::read_sector(node_sector, buf)) return false;
+    if (buf[0]) {
+        auto* leaf = reinterpret_cast<LeafNode*>(buf);
+        for (u32 i = 0; i < leaf->count; ++i) {
+            if (leaf->entries[i].star_id == key) {
+                leaf->entries[i].entry = value;
+                return blockdev::write_sector(node_sector, buf);
+            }
+        }
+        return false;
+    }
+    auto* node = reinterpret_cast<InternalNode*>(buf);
+    u32 i = 0;
+    while (i < node->count && key >= node->key[i]) ++i;
+    return btree_update(node->child[i], key, value);
 }
 
 static bool btree_insert(u64 node_sector, u64 key, const StarEntry& value,
@@ -282,22 +310,46 @@ static bool catalog_find(u64 key, StarEntry* out) {
     return btree_search(g_sb.catalog_root, key, out);
 }
 
+static bool catalog_update(u64 key, const StarEntry& value) {
+    return btree_update(g_sb.catalog_root, key, value);
+}
+
 static bool add_edge(u64 dir_star, const char* name, u64 target) {
     StarEntry e;
     if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return false;
+
+    u64 sector = e.first_sector;
     u8 buf[SECTOR_SIZE];
-    if (!blockdev::read_sector(e.first_sector, buf)) return false;
-    DirEntry* entries = reinterpret_cast<DirEntry*>(buf);
-    u32 count = static_cast<u32>(SECTOR_SIZE / sizeof(DirEntry));
-    for (u32 i = 0; i < count; ++i) {
-        if (!entries[i].in_use) {
-            entries[i].in_use = 1;
-            entries[i].star = target;
-            copy_name(entries[i].name, name);
-            return blockdev::write_sector(e.first_sector, buf);
+    for (;;) {
+        if (!blockdev::read_sector(sector, buf)) return false;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
+            if (!ds->entries[i].in_use) {
+                ds->entries[i].in_use = 1;
+                ds->entries[i].star = target;
+                copy_name(ds->entries[i].name, name);
+                return blockdev::write_sector(sector, buf);
+            }
         }
+        if (ds->next_sector != 0) {
+            sector = ds->next_sector;
+            continue;
+        }
+
+        u64 new_sector = alloc_sectors(1);
+        if (new_sector == 0) return false;
+        u8 zero[SECTOR_SIZE];
+        for (auto& b : zero) b = 0;
+        blockdev::write_sector(new_sector, zero);
+
+        ds->next_sector = new_sector;
+        blockdev::write_sector(sector, buf);
+
+        e.sector_count += 1;
+        catalog_update(dir_star, e);
+
+        sector = new_sector;
     }
-    return false;
 }
 
 bool format(u64 total_sectors) {
@@ -330,8 +382,8 @@ bool format(u64 total_sectors) {
         serial::writeln("[stellar] format: root did not land at star 0");
         return false;
     }
-    serial::printf("[stellar] formatted: %lu sectors, B+tree catalog (leaf fanout %u, internal fanout %u)\n",
-                    total_sectors, LEAF_MAX, INTERNAL_MAX);
+    serial::printf("[stellar] formatted: %lu sectors, B+tree catalog (leaf fanout %u, internal fanout %u), directory fanout %u/sector\n",
+                    total_sectors, LEAF_MAX, INTERNAL_MAX, DIR_ENTRIES_PER_SECTOR);
     return true;
 }
 
@@ -426,12 +478,15 @@ u64 find(u64 dir_star, const char* name) {
     if (!g_mounted) return INVALID_STAR;
     StarEntry e;
     if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return INVALID_STAR;
+    u64 sector = e.first_sector;
     u8 buf[SECTOR_SIZE];
-    if (!blockdev::read_sector(e.first_sector, buf)) return INVALID_STAR;
-    DirEntry* entries = reinterpret_cast<DirEntry*>(buf);
-    u32 count = static_cast<u32>(SECTOR_SIZE / sizeof(DirEntry));
-    for (u32 i = 0; i < count; ++i)
-        if (entries[i].in_use && names_equal(entries[i].name, name)) return entries[i].star;
+    while (sector != 0) {
+        if (!blockdev::read_sector(sector, buf)) return INVALID_STAR;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i)
+            if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) return ds->entries[i].star;
+        sector = ds->next_sector;
+    }
     return INVALID_STAR;
 }
 
@@ -439,15 +494,18 @@ void list(u64 dir_star, ListCallback cb, void* ctx) {
     if (!g_mounted) return;
     StarEntry e;
     if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return;
+    u64 sector = e.first_sector;
     u8 buf[SECTOR_SIZE];
-    if (!blockdev::read_sector(e.first_sector, buf)) return;
-    DirEntry* entries = reinterpret_cast<DirEntry*>(buf);
-    u32 count = static_cast<u32>(SECTOR_SIZE / sizeof(DirEntry));
-    for (u32 i = 0; i < count; ++i) {
-        if (!entries[i].in_use) continue;
-        StarEntry child;
-        u32 type = catalog_find(entries[i].star, &child) ? child.type : TYPE_FREE;
-        cb(entries[i].name, entries[i].star, type, ctx);
+    while (sector != 0) {
+        if (!blockdev::read_sector(sector, buf)) return;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
+            if (!ds->entries[i].in_use) continue;
+            StarEntry child;
+            u32 type = catalog_find(ds->entries[i].star, &child) ? child.type : TYPE_FREE;
+            cb(ds->entries[i].name, ds->entries[i].star, type, ctx);
+        }
+        sector = ds->next_sector;
     }
 }
 

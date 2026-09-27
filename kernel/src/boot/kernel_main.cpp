@@ -96,6 +96,10 @@ static u32 itoa_dec(u64 v, char* out) {
     return len;
 }
 
+static void count_entry(const char*, u64, u32, void* ctx) {
+    ++(*static_cast<u64*>(ctx));
+}
+
 static NORETURN void panic_no_framebuffer() {
     serial::writeln("[boot] FATAL: bootloader gave no framebuffer");
     cpu::hang();
@@ -286,9 +290,12 @@ extern "C" NORETURN void kernel_main() {
             static u64 stress_ids[STRESS_COUNT];
             bool stress_create_ok = true;
             for (u64 i = 0; i < STRESS_COUNT; ++i) {
-                char content[20];
-                u32 len = itoa_dec(i, content);
-                stress_ids[i] = stellar::create_file(stellar::INVALID_STAR, "", content, len);
+                char digits[20];
+                u32 dlen = itoa_dec(i, digits);
+                char name[32] = "stress";
+                for (u32 j = 0; j < dlen; ++j) name[6 + j] = digits[j];
+                name[6 + dlen] = 0;
+                stress_ids[i] = stellar::create_file(stellar::ROOT_STAR, name, digits, dlen);
                 if (stress_ids[i] == stellar::INVALID_STAR) stress_create_ok = false;
             }
 
@@ -303,13 +310,16 @@ extern "C" NORETURN void kernel_main() {
                 if (!ok) ++stress_mismatches;
             }
 
-            bool stress_ok = stress_create_ok && (stress_mismatches == 0);
+            u64 dir_count = 0;
+            stellar::list(stellar::ROOT_STAR, &count_entry, &dir_count);
+            u64 expected_dir_count = STRESS_COUNT + 2;
+
+            bool stress_ok = stress_create_ok && (stress_mismatches == 0) && (dir_count >= expected_dir_count);
             fb::printf(stress_ok ? 0xC0FFC0 : 0xE0D080,
-                       "[%s] Stellar FS B+tree stress: %lu stars created, %lu mismatch(es) on readback\n",
-                       stress_ok ? "ok" : "--", STRESS_COUNT, stress_mismatches);
-            serial::printf("[stellar] B+tree stress: %lu stars created (create_ok=%d), %lu mismatch(es), ids %lu..%lu\n",
-                            STRESS_COUNT, stress_create_ok ? 1 : 0, stress_mismatches,
-                            stress_ids[0], stress_ids[STRESS_COUNT - 1]);
+                       "[%s] Stellar FS B+tree + growable directory stress: %lu stars, %lu mismatch(es), %lu dir entries enumerated\n",
+                       stress_ok ? "ok" : "--", STRESS_COUNT, stress_mismatches, dir_count);
+            serial::printf("[stellar] stress: %lu stars created (create_ok=%d), %lu mismatch(es), root dir enumerates %lu/%lu entries across its sector chain\n",
+                            STRESS_COUNT, stress_create_ok ? 1 : 0, stress_mismatches, dir_count, expected_dir_count);
         } else {
             fb::printf(0xE0D080, "[--] Stellar FS: mount and format both failed\n");
         }
