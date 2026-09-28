@@ -55,6 +55,9 @@ ALWAYS_INLINE u64 read_cr3() {
 ALWAYS_INLINE void write_cr3(u64 v) {
     asm volatile("mov %0, %%cr3" :: "r"(v) : "memory");
 }
+ALWAYS_INLINE void invlpg(u64 addr) {
+    asm volatile("invlpg (%0)" :: "r"(addr) : "memory");
+}
 
 ALWAYS_INLINE void set_gs_base(u64 v) { wrmsr(0xC0000101, v); }
 ALWAYS_INLINE u64  get_gs_base()      { return rdmsr(0xC0000101); }

@@ -254,6 +254,9 @@ extern "C" NORETURN void kernel_main() {
 
     constexpr u8 VEC_KEYBOARD = 0x21;
     if (acpi::info().ioapic_found) {
+        u64 ioapic_2m = acpi::info().ioapic_base & ~0x1FFFFFull;
+        constellation::map_2m(g_hhdm_offset + ioapic_2m, ioapic_2m,
+                               constellation::WRITABLE | constellation::NO_CACHE);
         ioapic::init(g_hhdm_offset, acpi::info().ioapic_base, acpi::info().ioapic_gsi_base);
         keyboard::init(VEC_KEYBOARD);
         acpi::Redirection kbd_irq = acpi::resolve_isa_irq(1);
@@ -375,7 +378,7 @@ extern "C" NORETURN void kernel_main() {
         }
         fb::printf(0xC0FFC0, "[ok] SMP: waking %lu additional core(s)...\n", total - 1);
 
-        for (u64 i = 0; i < 200000000ull; ++i) { asm volatile("" ::: "memory"); }
+        for (u64 i = 0; i < 300000000ull && g_cpus_online < total; ++i) asm volatile("pause" ::: "memory");
         fb::printf(0xC0FFC0, "[ok] SMP: %lu Sun(s) online in total\n", g_cpus_online);
     } else {
         fb::printf(0xB0B0C0, "[--] SMP: single core reported, nothing else to wake\n");

@@ -11,6 +11,7 @@ ISO_ROOT  := iso_root
 LIMINE    := limine
 DISK_IMG  := disk.img
 DISK_SIZE := 64M
+OVMF      ?= $(firstword $(wildcard /usr/share/edk2/x64/OVMF.4m.fd /usr/share/edk2/x64/OVMF.fd /usr/share/edk2/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd /usr/share/edk2-ovmf/x64/OVMF.fd /usr/share/qemu/OVMF.fd))
 
 LIMINE_REPO   := https://github.com/limine-bootloader/limine.git
 LIMINE_BRANCH := v9.x-binary
@@ -34,7 +35,7 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
 
-.PHONY: all iso run run-smp run-headless run-nodisk clean distclean
+.PHONY: all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-nodisk clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -82,6 +83,24 @@ run-smp: iso $(DISK_IMG)
 
 run-headless: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -display none -no-reboot -no-shutdown
+
+run-uefi: iso $(DISK_IMG)
+	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -bios $(OVMF) -cdrom $(ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -no-reboot -no-shutdown
+
+run-uefi-smp: iso $(DISK_IMG)
+	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 4 -bios $(OVMF) -cdrom $(ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -no-reboot -no-shutdown
+
+run-uefi-headless: iso $(DISK_IMG)
+	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -bios $(OVMF) -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
 		-serial stdio -display none -no-reboot -no-shutdown
 

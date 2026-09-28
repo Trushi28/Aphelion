@@ -17,6 +17,15 @@ static u64* new_table() {
     return v;
 }
 
+static void split_huge(u64* entry) {
+    u64 old = *entry;
+    u64 base = old & 0x000FFFFFFFE00000ull;
+    u64 flags = (old & 0xFFFull & ~HUGE_PAGE) | (old & NO_EXECUTE);
+    u64* pt = new_table();
+    for (u64 i = 0; i < 512; ++i) pt[i] = (base + i * 0x1000) | flags;
+    *entry = phys_of(pt) | PRESENT | WRITABLE;
+}
+
 void map_2m(u64 virt_addr, u64 phys_addr, u64 flags) {
     u64 pml4i = (virt_addr >> 39) & 0x1FF;
     u64 pdpti = (virt_addr >> 30) & 0x1FF;
@@ -31,6 +40,7 @@ void map_2m(u64 virt_addr, u64 phys_addr, u64 flags) {
     u64* pd = virt_of(pdpt[pdpti] & ~0xFFFull);
 
     pd[pdi] = (phys_addr & ~0x1FFFFFull) | flags | HUGE_PAGE | PRESENT;
+    cpu::invlpg(virt_addr);
 }
 
 void map_4k(u64 virt_addr, u64 phys_addr, u64 flags) {
@@ -49,9 +59,12 @@ void map_4k(u64 virt_addr, u64 phys_addr, u64 flags) {
 
     if (!(pd[pdi] & PRESENT))
         pd[pdi] = phys_of(new_table()) | PRESENT | WRITABLE;
+    else if (pd[pdi] & HUGE_PAGE)
+        split_huge(&pd[pdi]);
     u64* pt = virt_of(pd[pdi] & ~0xFFFull);
 
     pt[pti] = (phys_addr & ~0xFFFull) | flags | PRESENT;
+    cpu::invlpg(virt_addr);
 }
 
 void init(u64 hhdm_offset, u64 kernel_phys_base, u64 kernel_virt_base,
