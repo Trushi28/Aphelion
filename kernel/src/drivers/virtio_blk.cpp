@@ -249,7 +249,6 @@ bool init(u64 hhdm_offset) {
     g_present = true;
     serial::printf("[virtio-blk] ready, capacity=%lu sectors, completion mode=%s\n",
                     capacity_sectors(), g_msix_ready ? "MSI-X" : "polled");
-    if (g_msix_ready) cpu::sti();
     blockdev::register_device(&g_hal);
     return true;
 }
@@ -277,13 +276,16 @@ static bool do_request(u64 sector, bool write) {
     *notify = 0;
 
     u64 waits = 0;
+    u64 irq_flags = cpu::irq_save();
     while (g_used->idx == g_used_seen) {
-        if (g_msix_ready) cpu::halt(); else cpu::io_wait();
+        if (g_msix_ready) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
         if (++waits > 20000000ull) {
+            cpu::irq_restore(irq_flags);
             serial::writeln("[virtio-blk] request timed out");
             return false;
         }
     }
+    cpu::irq_restore(irq_flags);
     g_used_seen = g_used->idx;
 
     return *g_req_status == BLK_S_OK;

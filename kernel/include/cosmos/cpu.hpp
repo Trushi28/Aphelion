@@ -38,6 +38,15 @@ ALWAYS_INLINE void cpuid(u32 leaf, u32 subleaf, u32* a, u32* b, u32* c, u32* d) 
 ALWAYS_INLINE void cli() { asm volatile("cli"); }
 ALWAYS_INLINE void sti() { asm volatile("sti"); }
 ALWAYS_INLINE void halt() { asm volatile("hlt"); }
+ALWAYS_INLINE void sti_halt() { asm volatile("sti; hlt" ::: "memory"); }
+ALWAYS_INLINE u64 irq_save() {
+    u64 flags;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+ALWAYS_INLINE void irq_restore(u64 flags) {
+    if (flags & (1ull << 9)) asm volatile("sti" ::: "memory");
+}
 NORETURN ALWAYS_INLINE void hang() { for (;;) { cli(); halt(); } }
 
 ALWAYS_INLINE u64 read_cr3() {
