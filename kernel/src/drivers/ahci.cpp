@@ -5,6 +5,8 @@
 #include <cosmos/vmm.hpp>
 #include <cosmos/serial.hpp>
 #include <cosmos/cpu.hpp>
+#include <cosmos/idt.hpp>
+#include <cosmos/apic.hpp>
 
 namespace ahci {
 
@@ -26,6 +28,12 @@ constexpr u32 PORT_TFD_BSY = 1u << 7;
 constexpr u32 PORT_TFD_DRQ = 1u << 3;
 
 constexpr u32 PORT_IS_TFES = 1u << 30;
+
+constexpr u32 GHC_IE = 1u << 1;
+constexpr u32 PORT_IE_DHRE = 1u << 0;
+constexpr u32 PORT_IE_TFEE = 1u << 30;
+
+constexpr u8 CAP_ID_MSI = 0x05;
 
 constexpr u8 ATA_CMD_IDENTIFY = 0xEC;
 constexpr u8 ATA_CMD_READ_DMA_EXT = 0x25;
@@ -116,6 +124,10 @@ static HbaCmdHeader* g_cmd_list = nullptr;
 static HbaCmdTable* g_cmd_table = nullptr;
 static u8* g_bounce = nullptr;
 static u64 g_capacity_sectors = 0;
+static int g_port_index = -1;
+static bool g_msi_ready = false;
+static u32 g_irq_count = 0;
+static u32 g_is_latched = 0;
 
 static void map_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
@@ -147,6 +159,21 @@ static void scan_cb(const pci::Device& d, void*) {
 
 bool present() { return g_present; }
 u64 capacity_sectors() { return g_capacity_sectors; }
+bool using_msi() { return g_msi_ready; }
+u32 irq_count() { return __atomic_load_n(&g_irq_count, __ATOMIC_SEQ_CST); }
+
+static void completion_isr(idt::Frame*) {
+    apic::eoi();
+    u32 port_is = g_port->is;
+    g_port->is = port_is;
+    g_hba->is = 1u << g_port_index;
+    __atomic_fetch_or(&g_is_latched, port_is, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&g_irq_count, 1, __ATOMIC_SEQ_CST);
+}
+
+static bool task_file_error() {
+    return ((g_port->is | __atomic_load_n(&g_is_latched, __ATOMIC_SEQ_CST)) & PORT_IS_TFES) != 0;
+}
 
 static bool wait_not_busy(u64 spins_max) {
     u64 spins = 0;
@@ -161,6 +188,7 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
     if (!wait_not_busy(10000000ull)) return false;
 
     g_port->is = 0xFFFFFFFFu;
+    __atomic_store_n(&g_is_latched, 0u, __ATOMIC_SEQ_CST);
 
     HbaCmdHeader* hdr = &g_cmd_list[0];
     hdr->cfl_a_w_p = static_cast<u8>((sizeof(FisRegH2D) / 4) | (write ? (1u << 6) : 0));
@@ -192,16 +220,20 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
     g_port->ci = 1u;
 
     u64 spins = 0;
+    u64 irq_flags = cpu::irq_save();
+    bool ok = true;
     for (;;) {
         if (!(g_port->ci & 1u)) break;
-        if (g_port->is & PORT_IS_TFES) return false;
-        cpu::io_wait();
+        if (task_file_error()) { ok = false; break; }
+        if (g_msi_ready) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
         if (++spins > 20000000ull) {
             serial::writeln("[ahci] command timed out");
-            return false;
+            ok = false;
+            break;
         }
     }
-    return !(g_port->is & PORT_IS_TFES);
+    cpu::irq_restore(irq_flags);
+    return ok && !task_file_error();
 }
 
 static bool identify(u8* out512) {
@@ -254,6 +286,7 @@ static bool rebase_port() {
 
     g_port->serr = 0xFFFFFFFFu;
     g_port->is = 0xFFFFFFFFu;
+    g_port->ie = PORT_IE_DHRE | PORT_IE_TFEE;
 
     g_port->cmd |= PORT_CMD_FRE;
     g_port->cmd |= PORT_CMD_ST;
@@ -273,6 +306,30 @@ bool init(u64 hhdm_offset) {
 
     u16 cmd = pci::read16(g_found.addr, 0x04);
     pci::write16(g_found.addr, 0x04, cmd | 0x0006);
+
+    u16 status = pci::read16(g_found.addr, 0x06);
+    if (status & (1u << 4)) {
+        u8 cap_ptr = pci::read8(g_found.addr, 0x34);
+        while (cap_ptr) {
+            u8 cap_id = pci::read8(g_found.addr, cap_ptr);
+            u8 next = pci::read8(g_found.addr, static_cast<u8>(cap_ptr + 1));
+            if (cap_id == CAP_ID_MSI) {
+                u16 msg_ctrl = pci::read16(g_found.addr, static_cast<u8>(cap_ptr + 2));
+                bool addr64 = (msg_ctrl & (1u << 7)) != 0;
+                u32 addr_lo = 0xFEE00000u | (apic::id() << 12);
+                pci::write32(g_found.addr, static_cast<u8>(cap_ptr + 4), addr_lo);
+                u8 data_off = static_cast<u8>(cap_ptr + (addr64 ? 12 : 8));
+                if (addr64) pci::write32(g_found.addr, static_cast<u8>(cap_ptr + 8), 0);
+                pci::write16(g_found.addr, data_off, idt::VEC_AHCI);
+                msg_ctrl = static_cast<u16>((msg_ctrl & ~(0x7u << 4)) | 1u);
+                pci::write16(g_found.addr, static_cast<u8>(cap_ptr + 2), msg_ctrl);
+                idt::set_handler(idt::VEC_AHCI, &completion_isr);
+                g_msi_ready = true;
+                break;
+            }
+            cap_ptr = next;
+        }
+    }
 
     u64 abar_phys = pci::bar_address(g_found.addr, 5);
     map_region(abar_phys);
@@ -295,6 +352,7 @@ bool init(u64 hhdm_offset) {
         return false;
     }
     serial::printf("[ahci] using port %d\n", found_port);
+    g_port_index = found_port;
     g_port = reinterpret_cast<volatile HbaPort*>(
         reinterpret_cast<volatile u8*>(g_hba) + 0x100 + found_port * 0x80);
 
@@ -302,6 +360,8 @@ bool init(u64 hhdm_offset) {
         serial::writeln("[ahci] port rebase timed out");
         return false;
     }
+
+    if (g_msi_ready) g_hba->ghc |= GHC_IE;
 
     g_bounce = static_cast<u8*>(alloc_pages(512));
 
@@ -321,7 +381,8 @@ bool init(u64 hhdm_offset) {
     }
 
     g_present = true;
-    serial::printf("[ahci] ready, capacity=%lu sectors\n", g_capacity_sectors);
+    serial::printf("[ahci] ready, capacity=%lu sectors, completion mode=%s\n",
+                    g_capacity_sectors, g_msi_ready ? "MSI" : "polled");
     blockdev::register_device(&g_hal);
     return true;
 }

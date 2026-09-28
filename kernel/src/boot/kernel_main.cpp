@@ -310,8 +310,12 @@ extern "C" NORETURN void kernel_main() {
                        "[%s] Stellar FS: created /hello.txt, read %lu bytes back, %s\n",
                        match ? "ok" : "--", n, match ? "matched exactly" : "MISMATCH");
             serial::printf("[stellar] readback: %s\n", reinterpret_cast<const char*>(readback));
-            serial::printf("[virtio-blk] completion mode: %s, %u interrupt(s) delivered\n",
-                            virtioblk::using_msix() ? "MSI-X" : "polled", virtioblk::irq_count());
+            if (virtioblk::present())
+                serial::printf("[virtio-blk] completion mode: %s, %u interrupt(s) delivered\n",
+                                virtioblk::using_msix() ? "MSI-X" : "polled", virtioblk::irq_count());
+            if (ahci::present())
+                serial::printf("[ahci] completion mode: %s, %u interrupt(s) delivered\n",
+                                ahci::using_msi() ? "MSI" : "polled", ahci::irq_count());
 
             constexpr u64 STRESS_COUNT = 14;
             static u64 stress_ids[STRESS_COUNT];
