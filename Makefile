@@ -35,7 +35,7 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
 
-.PHONY: all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-nodisk clean distclean
+.PHONY: all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -103,6 +103,26 @@ run-uefi-headless: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -bios $(OVMF) -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
 		-serial stdio -display none -no-reboot -no-shutdown
+
+SMP        ?= 1
+QEMU_Q35    = qemu-system-x86_64 -M q35 -cpu max -m 256M -smp $(SMP)
+DRIVE_AHCI  = -drive file=$(DISK_IMG),if=none,id=ahd0,format=raw -device ide-hd,drive=ahd0,bus=ide.0
+DRIVE_NVME  = -drive file=$(DISK_IMG),if=none,id=nvm0,format=raw -device nvme,drive=nvm0,serial=aphelion0
+QEMU_TAIL   = -serial stdio -no-reboot -no-shutdown
+
+run-ahci: iso $(DISK_IMG)
+	$(QEMU_Q35) -cdrom $(ISO) $(DRIVE_AHCI) $(QEMU_TAIL)
+
+run-uefi-ahci: iso $(DISK_IMG)
+	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
+	$(QEMU_Q35) -bios $(OVMF) -cdrom $(ISO) $(DRIVE_AHCI) $(QEMU_TAIL)
+
+run-nvme: iso $(DISK_IMG)
+	$(QEMU_Q35) -cdrom $(ISO) $(DRIVE_NVME) $(QEMU_TAIL)
+
+run-uefi-nvme: iso $(DISK_IMG)
+	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
+	$(QEMU_Q35) -bios $(OVMF) -cdrom $(ISO) $(DRIVE_NVME) $(QEMU_TAIL)
 
 run-nodisk: iso
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown

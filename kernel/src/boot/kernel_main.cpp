@@ -15,6 +15,7 @@
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
 #include <cosmos/ahci.hpp>
+#include <cosmos/nvme.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/stellar.hpp>
 
@@ -270,6 +271,7 @@ extern "C" NORETURN void kernel_main() {
 
     virtioblk::init(g_hhdm_offset);
     ahci::init(g_hhdm_offset);
+    nvme::init(g_hhdm_offset);
     if (blockdev::present()) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
@@ -319,6 +321,9 @@ extern "C" NORETURN void kernel_main() {
             if (ahci::present())
                 serial::printf("[ahci] completion mode: %s, %u interrupt(s) delivered\n",
                                 ahci::using_msi() ? "MSI" : "polled", ahci::irq_count());
+            if (nvme::present())
+                serial::printf("[nvme] completion mode: %s, %u interrupt(s) delivered\n",
+                                nvme::completion_mode(), nvme::irq_count());
 
             constexpr u64 STRESS_COUNT = 14;
             static u64 stress_ids[STRESS_COUNT];
