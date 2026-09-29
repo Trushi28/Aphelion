@@ -23,4 +23,8 @@ u64 find(u64 dir_star, const char* name);
 using ListCallback = void (*)(const char* name, u64 star, u32 type, void* ctx);
 void list(u64 dir_star, ListCallback cb, void* ctx);
 
+u64 write_file(u64 star, const void* data, u64 size);
+u64 snapshot(u64 star);
+bool verify_file(u64 star);
+
 }

@@ -42,7 +42,8 @@ constexpr u32 CNS_NAMESPACE = 0x00;
 constexpr u32 CNS_CONTROLLER = 0x01;
 constexpr u32 CNS_ACTIVE_LIST = 0x02;
 
-constexpr u16 MAX_DEPTH = 64;
+constexpr u16 ADMIN_DEPTH = 8;
+constexpr u32 MAX_INFLIGHT = 16;
 constexpr u64 MAP_BYTES = 0x10000;
 constexpr u64 SPINS_PER_HALF_SECOND = 500000;
 constexpr u64 COMMAND_SPINS = 20000000;
@@ -74,6 +75,7 @@ struct Queue {
     volatile Cqe* cq;
     volatile u32* sq_doorbell;
     volatile u32* cq_doorbell;
+    u16 depth;
     u16 sq_tail;
     u16 cq_head;
     u16 phase;
@@ -87,12 +89,16 @@ static pci::Address g_addr{};
 static volatile u8* g_regs = nullptr;
 static u32 g_stride = 4;
 static u16 g_depth = 0;
+static u32 g_io_max_inflight = 1;
 
 static Queue g_admin{};
 static Queue g_io{};
 
 static u8* g_ident = nullptr;
-static u8* g_bounce = nullptr;
+static u8* g_admin_bounce = nullptr;
+static u8* g_io_bounce_pool = nullptr;
+static bool g_slot_done[MAX_INFLIGHT];
+static u16 g_slot_status[MAX_INFLIGHT];
 
 static u32 g_nsid = 1;
 static u32 g_lba_shift = 9;
@@ -135,6 +141,7 @@ static void* alloc_pages(u64 bytes) {
     return v;
 }
 static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
+static u8* io_bounce_for(u32 slot) { return g_io_bounce_pool + static_cast<u64>(slot) * 4096; }
 
 static void scan_cb(const pci::Device& d, void*) {
     if (g_found_flag) return;
@@ -175,7 +182,7 @@ static bool execute(Queue& q, Sqe& cmd) {
     cmd.cdw0 = (cmd.cdw0 & 0xFFFFu) | (static_cast<u32>(cid) << 16);
 
     q.sq[q.sq_tail] = cmd;
-    q.sq_tail = static_cast<u16>((q.sq_tail + 1) % g_depth);
+    q.sq_tail = static_cast<u16>((q.sq_tail + 1) % q.depth);
     __sync_synchronize();
     *q.sq_doorbell = q.sq_tail;
 
@@ -193,7 +200,7 @@ static bool execute(Queue& q, Sqe& cmd) {
     __sync_synchronize();
     u16 status = q.cq[q.cq_head].status;
     u16 got_cid = q.cq[q.cq_head].cid;
-    q.cq_head = static_cast<u16>((q.cq_head + 1) % g_depth);
+    q.cq_head = static_cast<u16>((q.cq_head + 1) % q.depth);
     if (q.cq_head == 0) q.phase = static_cast<u16>(q.phase ^ 1u);
     *q.cq_doorbell = q.cq_head;
     cpu::irq_restore(irq_flags);
@@ -222,22 +229,75 @@ static bool identify(u32 cns, u32 nsid) {
     return admin(ADMIN_IDENTIFY, nsid, virt_to_phys(g_ident), cns, 0);
 }
 
-static bool transfer(u64 lba, bool write) {
+static void submit_io(u32 slot, u64 lba, bool write) {
+    u16 cid = static_cast<u16>(slot + 1);
+    Sqe& cmd = g_io.sq[g_io.sq_tail];
+    cmd = Sqe{};
+    cmd.cdw0 = static_cast<u32>((write ? IO_WRITE : IO_READ) | (static_cast<u32>(cid) << 16));
+    cmd.nsid = g_nsid;
+    cmd.prp1 = virt_to_phys(io_bounce_for(slot));
+    cmd.cdw10 = static_cast<u32>(lba);
+    cmd.cdw11 = static_cast<u32>(lba >> 32);
+    g_slot_done[slot] = false;
+    g_io.sq_tail = static_cast<u16>((g_io.sq_tail + 1) % g_io.depth);
+}
+
+static void ring_io_sq_doorbell() { *g_io.sq_doorbell = g_io.sq_tail; }
+
+static bool drain_io(u32 pending) {
+    u64 waits = 0;
+    u64 irq_flags = cpu::irq_save();
+    while (pending > 0) {
+        if ((g_io.cq[g_io.cq_head].status & 1u) != g_io.phase) {
+            if (g_use_irq) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
+            if (++waits > COMMAND_SPINS) {
+                cpu::irq_restore(irq_flags);
+                serial::writeln("[nvme] I/O batch timed out");
+                return false;
+            }
+            continue;
+        }
+        u16 cid = g_io.cq[g_io.cq_head].cid;
+        u16 status = g_io.cq[g_io.cq_head].status;
+        u32 slot = static_cast<u32>(cid) - 1;
+        if (slot < MAX_INFLIGHT && !g_slot_done[slot]) {
+            g_slot_done[slot] = true;
+            g_slot_status[slot] = static_cast<u16>(status >> 1);
+            --pending;
+        }
+        g_io.cq_head = static_cast<u16>((g_io.cq_head + 1) % g_io.depth);
+        if (g_io.cq_head == 0) g_io.phase = static_cast<u16>(g_io.phase ^ 1u);
+    }
+    *g_io.cq_doorbell = g_io.cq_head;
+    cpu::irq_restore(irq_flags);
+    return true;
+}
+
+static bool run_io_batch(u64 start_lba, u32 n, bool write) {
+    for (u32 i = 0; i < n; ++i) submit_io(i, start_lba + i, write);
+    ring_io_sq_doorbell();
+    if (!drain_io(n)) return false;
+    bool ok = true;
+    for (u32 i = 0; i < n; ++i) ok = ok && (g_slot_status[i] == 0);
+    return ok;
+}
+
+static bool rmw_transfer(u64 lba, bool write) {
     Sqe cmd{};
     cmd.cdw0 = write ? IO_WRITE : IO_READ;
     cmd.nsid = g_nsid;
-    cmd.prp1 = virt_to_phys(g_bounce);
+    cmd.prp1 = virt_to_phys(g_admin_bounce);
     cmd.cdw10 = static_cast<u32>(lba);
     cmd.cdw11 = static_cast<u32>(lba >> 32);
-    cmd.cdw12 = 0;
     return execute(g_io, cmd);
 }
 
-static void setup_queue(Queue& q, u32 qid, void* sq, void* cq) {
+static void setup_queue(Queue& q, u32 qid, void* sq, void* cq, u16 depth) {
     q.sq = static_cast<Sqe*>(sq);
     q.cq = static_cast<volatile Cqe*>(cq);
     q.sq_doorbell = reinterpret_cast<volatile u32*>(g_regs + REG_DOORBELL + (2 * qid) * g_stride);
     q.cq_doorbell = reinterpret_cast<volatile u32*>(g_regs + REG_DOORBELL + (2 * qid + 1) * g_stride);
+    q.depth = depth;
     q.sq_tail = 0;
     q.cq_head = 0;
     q.phase = 1;
@@ -323,8 +383,10 @@ static void log_controller(u32 vs) {
 }
 
 struct HalDevice : blockdev::Device {
-    bool read_sector(u64 sector, void* buf512) override { return nvme::read_sector(sector, buf512); }
-    bool write_sector(u64 sector, const void* buf512) override { return nvme::write_sector(sector, buf512); }
+    bool read_sector(u64 sector, void* buf512) override;
+    bool write_sector(u64 sector, const void* buf512) override;
+    bool read_sectors(u64 start_sector, u64 count, void* buf) override;
+    bool write_sectors(u64 start_sector, u64 count, const void* buf) override;
     u64 capacity_sectors() override { return nvme::capacity_sectors(); }
     const char* name() override { return "nvme"; }
 };
@@ -382,8 +444,10 @@ bool init(u64 hhdm_offset) {
         serial::writeln("[nvme] doorbell stride exceeds the mapped register window");
         return false;
     }
-    g_depth = (mqes + 1 < MAX_DEPTH) ? static_cast<u16>(mqes + 1) : MAX_DEPTH;
-    if (g_depth < 2) {
+    u16 admin_depth = (mqes + 1 < ADMIN_DEPTH) ? static_cast<u16>(mqes + 1) : ADMIN_DEPTH;
+    u16 io_depth = (mqes + 1 < MAX_INFLIGHT + 1) ? static_cast<u16>(mqes + 1) : static_cast<u16>(MAX_INFLIGHT + 1);
+    g_depth = io_depth;
+    if (admin_depth < 2 || io_depth < 2) {
         serial::writeln("[nvme] controller queue size too small");
         return false;
     }
@@ -400,12 +464,15 @@ bool init(u64 hhdm_offset) {
     void* isq = alloc_pages(universe::PAGE_SIZE);
     void* icq = alloc_pages(universe::PAGE_SIZE);
     g_ident = static_cast<u8*>(alloc_pages(4096));
-    g_bounce = static_cast<u8*>(alloc_pages(4096));
+    g_admin_bounce = static_cast<u8*>(alloc_pages(4096));
+    g_io_bounce_pool = static_cast<u8*>(alloc_pages(4096ull * MAX_INFLIGHT));
+    for (auto& d : g_slot_done) d = false;
+    for (auto& s : g_slot_status) s = 0;
 
-    setup_queue(g_admin, 0, asq, acq);
-    setup_queue(g_io, 1, isq, icq);
+    setup_queue(g_admin, 0, asq, acq, admin_depth);
+    setup_queue(g_io, 1, isq, icq, io_depth);
 
-    wreg32(REG_AQA, ((g_depth - 1u) << 16) | (g_depth - 1u));
+    wreg32(REG_AQA, ((static_cast<u32>(admin_depth) - 1u) << 16) | (static_cast<u32>(admin_depth) - 1u));
     wreg64(REG_ASQ, virt_to_phys(asq));
     wreg64(REG_ACQ, virt_to_phys(acq));
     wreg32(REG_CC, CC_EN | CC_IOSQES | CC_IOCQES);
@@ -428,9 +495,9 @@ bool init(u64 hhdm_offset) {
     if (!armed && msi_cap) enable_msi(msi_cap);
 
     u32 cq_flags = (g_mode == IrqMode::Polled) ? 0x1u : 0x3u;
-    if (!admin(ADMIN_CREATE_CQ, 0, virt_to_phys(icq), ((g_depth - 1u) << 16) | 1u, cq_flags))
+    if (!admin(ADMIN_CREATE_CQ, 0, virt_to_phys(icq), (static_cast<u32>(io_depth - 1u) << 16) | 1u, cq_flags))
         return fail("create I/O completion queue");
-    if (!admin(ADMIN_CREATE_SQ, 0, virt_to_phys(isq), ((g_depth - 1u) << 16) | 1u, (1u << 16) | 1u))
+    if (!admin(ADMIN_CREATE_SQ, 0, virt_to_phys(isq), (static_cast<u32>(io_depth - 1u) << 16) | 1u, (1u << 16) | 1u))
         return fail("create I/O submission queue");
 
     if (!identify(CNS_CONTROLLER, 0)) return fail("identify controller");
@@ -466,6 +533,8 @@ bool init(u64 hhdm_offset) {
     g_nsid = nsid;
     g_lba_shift = lbads;
     g_capacity_sectors = (nsze << lbads) >> 9;
+    g_io_max_inflight = io_depth > 1 ? static_cast<u32>(io_depth - 1) : 1;
+    if (g_io_max_inflight > MAX_INFLIGHT) g_io_max_inflight = MAX_INFLIGHT;
     serial::printf("[nvme] namespace %u: %lu LBAs of %u bytes\n", nsid, nsze, 1u << lbads);
 
     if (g_mode != IrqMode::Polled) {
@@ -474,32 +543,75 @@ bool init(u64 hhdm_offset) {
     }
 
     g_present = true;
-    serial::printf("[nvme] ready, capacity=%lu sectors, completion mode=%s\n",
-                    g_capacity_sectors, completion_mode());
+    serial::printf("[nvme] ready, capacity=%lu sectors, completion mode=%s, %u request(s) in flight\n",
+                    g_capacity_sectors, completion_mode(), g_io_max_inflight);
     blockdev::register_device(&g_hal);
     return true;
 }
 
-bool read_sector(u64 sector, void* buf512) {
-    if (!g_present || sector >= g_capacity_sectors) return false;
-    u64 byte = sector << 9;
-    u64 lba = byte >> g_lba_shift;
-    u64 off = byte & ((1ull << g_lba_shift) - 1);
-    if (!transfer(lba, false)) return false;
-    u8* dst = static_cast<u8*>(buf512);
-    for (u64 i = 0; i < 512; ++i) dst[i] = g_bounce[off + i];
+bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
+    if (!g_present || start_sector + count > g_capacity_sectors) return false;
+    u8* dst = static_cast<u8*>(buf);
+    if (g_lba_shift != 9) {
+        for (u64 i = 0; i < count; ++i) if (!read_sector(start_sector + i, dst + i * 512)) return false;
+        return true;
+    }
+    while (count > 0) {
+        u32 batch = static_cast<u32>(count < g_io_max_inflight ? count : g_io_max_inflight);
+        if (!run_io_batch(start_sector, batch, false)) return false;
+        for (u32 i = 0; i < batch; ++i)
+            for (int b = 0; b < 512; ++b) dst[static_cast<u64>(i) * 512 + b] = io_bounce_for(i)[b];
+        dst += static_cast<u64>(batch) * 512;
+        start_sector += batch;
+        count -= batch;
+    }
     return true;
 }
 
-bool write_sector(u64 sector, const void* buf512) {
+bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
+    if (!g_present || start_sector + count > g_capacity_sectors) return false;
+    const u8* src = static_cast<const u8*>(buf);
+    if (g_lba_shift != 9) {
+        for (u64 i = 0; i < count; ++i) if (!write_sector(start_sector + i, src + i * 512)) return false;
+        return true;
+    }
+    while (count > 0) {
+        u32 batch = static_cast<u32>(count < g_io_max_inflight ? count : g_io_max_inflight);
+        for (u32 i = 0; i < batch; ++i)
+            for (int b = 0; b < 512; ++b) io_bounce_for(i)[b] = src[static_cast<u64>(i) * 512 + b];
+        if (!run_io_batch(start_sector, batch, true)) return false;
+        src += static_cast<u64>(batch) * 512;
+        start_sector += batch;
+        count -= batch;
+    }
+    return true;
+}
+
+bool HalDevice::read_sector(u64 sector, void* buf512) {
     if (!g_present || sector >= g_capacity_sectors) return false;
+    if (g_lba_shift == 9) return read_sectors(sector, 1, buf512);
     u64 byte = sector << 9;
     u64 lba = byte >> g_lba_shift;
     u64 off = byte & ((1ull << g_lba_shift) - 1);
-    if (g_lba_shift > 9 && !transfer(lba, false)) return false;
-    const u8* src = static_cast<const u8*>(buf512);
-    for (u64 i = 0; i < 512; ++i) g_bounce[off + i] = src[i];
-    return transfer(lba, true);
+    if (!rmw_transfer(lba, false)) return false;
+    u8* dst = static_cast<u8*>(buf512);
+    for (u64 i = 0; i < 512; ++i) dst[i] = g_admin_bounce[off + i];
+    return true;
 }
+
+bool HalDevice::write_sector(u64 sector, const void* buf512) {
+    if (!g_present || sector >= g_capacity_sectors) return false;
+    if (g_lba_shift == 9) return write_sectors(sector, 1, buf512);
+    u64 byte = sector << 9;
+    u64 lba = byte >> g_lba_shift;
+    u64 off = byte & ((1ull << g_lba_shift) - 1);
+    if (!rmw_transfer(lba, false)) return false;
+    const u8* src = static_cast<const u8*>(buf512);
+    for (u64 i = 0; i < 512; ++i) g_admin_bounce[off + i] = src[i];
+    return rmw_transfer(lba, true);
+}
+
+bool read_sector(u64 sector, void* buf512) { return g_hal.read_sector(sector, buf512); }
+bool write_sector(u64 sector, const void* buf512) { return g_hal.write_sector(sector, buf512); }
 
 }

@@ -276,6 +276,25 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
 
+        u64 total_sectors = blockdev::capacity_sectors();
+        if (total_sectors > 64) {
+            constexpr u64 SCRATCH_COUNT = 32;
+            u64 scratch_start = total_sectors - SCRATCH_COUNT;
+            static u8 scratch_write[SCRATCH_COUNT * 512];
+            static u8 scratch_read[SCRATCH_COUNT * 512];
+            for (u64 i = 0; i < sizeof(scratch_write); ++i)
+                scratch_write[i] = static_cast<u8>((i * 2654435761u) >> 24);
+            bool batch_write_ok = blockdev::write_sectors(scratch_start, SCRATCH_COUNT, scratch_write);
+            bool batch_read_ok = blockdev::read_sectors(scratch_start, SCRATCH_COUNT, scratch_read);
+            bool batch_match = batch_write_ok && batch_read_ok;
+            for (u64 i = 0; batch_match && i < sizeof(scratch_write); ++i)
+                batch_match = (scratch_write[i] == scratch_read[i]);
+            fb::printf(batch_match ? 0xC0FFC0 : 0xE0D080,
+                       "[%s] %s multi-request queueing: %lu sectors written+read in one batch, %s\n",
+                       batch_match ? "ok" : "--", blockdev::active()->name(), SCRATCH_COUNT,
+                       batch_match ? "byte-for-byte match" : "MISMATCH");
+        }
+
         stellar::init(g_hhdm_offset);
         bool fs_ready = stellar::mount();
         if (!fs_ready) fs_ready = stellar::format(blockdev::capacity_sectors());
@@ -324,6 +343,38 @@ extern "C" NORETURN void kernel_main() {
             if (nvme::present())
                 serial::printf("[nvme] completion mode: %s, %u interrupt(s) delivered\n",
                                 nvme::completion_mode(), nvme::irq_count());
+
+            const char* rewritten_msg = "Aphelion Stellar FS -- rewritten after snapshot.\n";
+            u64 rewritten_len = 0;
+            while (rewritten_msg[rewritten_len]) ++rewritten_len;
+
+            bool cow_pre_ok = stellar::verify_file(file);
+            u64 snap_id = stellar::snapshot(file);
+            u64 rewritten_star = stellar::write_file(file, rewritten_msg, rewritten_len);
+            bool cow_write_ok = (rewritten_star == file) && stellar::verify_file(file);
+            bool cow_snap_ok = (snap_id != stellar::INVALID_STAR) && stellar::verify_file(snap_id);
+
+            static u8 snap_readback[128];
+            u64 snap_n = stellar::read_file(snap_id, snap_readback, sizeof(snap_readback) - 1);
+            snap_readback[snap_n] = 0;
+            bool snap_content_ok = (snap_n == msg_len);
+            for (u64 i = 0; snap_content_ok && i < snap_n; ++i)
+                snap_content_ok = (snap_readback[i] == static_cast<u8>(msg[i]));
+
+            static u8 new_readback[128];
+            u64 new_n = stellar::read_file(file, new_readback, sizeof(new_readback) - 1);
+            new_readback[new_n] = 0;
+            bool new_content_ok = (new_n == rewritten_len);
+            for (u64 i = 0; new_content_ok && i < new_n; ++i)
+                new_content_ok = (new_readback[i] == static_cast<u8>(rewritten_msg[i]));
+
+            bool cow_ok = cow_pre_ok && cow_write_ok && cow_snap_ok && snap_content_ok && new_content_ok;
+            fb::printf(cow_ok ? 0xC0FFC0 : 0xE0D080,
+                       "[%s] Stellar FS COW: snapshot star %lu keeps the pre-write bytes, live star %lu carries the rewrite, both checksums verify\n",
+                       cow_ok ? "ok" : "--", snap_id, file);
+            serial::printf("[stellar] cow: snapshot readback \"%s\" (%lu bytes), live readback \"%s\" (%lu bytes)\n",
+                            reinterpret_cast<const char*>(snap_readback), snap_n,
+                            reinterpret_cast<const char*>(new_readback), new_n);
 
             constexpr u64 STRESS_COUNT = 14;
             static u64 stress_ids[STRESS_COUNT];

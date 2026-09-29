@@ -7,7 +7,7 @@ namespace stellar {
 
 constexpr u64 SECTOR_SIZE = 512;
 constexpr u64 MAGIC = 0x5AE1157A6111A2C5ull;
-constexpr u32 VERSION = 2;
+constexpr u32 VERSION = 3;
 constexpr u32 NAME_LEN = 52;
 constexpr u32 LEAF_MAX = 6;
 constexpr u32 INTERNAL_MAX = 30;
@@ -20,6 +20,7 @@ struct PACKED Superblock {
     u64 bitmap_start;
     u64 bitmap_sectors;
     u64 catalog_root;
+    u64 extent_root;
     u64 next_star_id;
     u32 reserved0;
     u32 reserved1;
@@ -31,7 +32,8 @@ struct PACKED StarEntry {
     u64 size_bytes;
     u64 first_sector;
     u64 sector_count;
-    u8 padding[32];
+    u32 checksum;
+    u8 padding[28];
 };
 static_assert(sizeof(StarEntry) == 64, "StarEntry must be 64 bytes");
 
@@ -82,6 +84,26 @@ static u64 g_hhdm = 0;
 static bool g_mounted = false;
 static Superblock g_sb{};
 static u8* g_bitmap = nullptr;
+
+static u32 g_crc32_table[256];
+static bool g_crc32_ready = false;
+
+static void crc32_init() {
+    for (u32 i = 0; i < 256; ++i) {
+        u32 c = i;
+        for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        g_crc32_table[i] = c;
+    }
+    g_crc32_ready = true;
+}
+static u32 crc32_update(u32 crc, const u8* data, u64 len) {
+    if (!g_crc32_ready) crc32_init();
+    for (u64 i = 0; i < len; ++i) crc = g_crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+static u32 crc32_full(const u8* data, u64 len) {
+    return crc32_update(0xFFFFFFFFu, data, len) ^ 0xFFFFFFFFu;
+}
 
 static void copy_name(char* dst, const char* src) {
     u32 i = 0;
@@ -139,6 +161,12 @@ static u64 alloc_sectors(u64 count) {
         }
     }
     return 0;
+}
+
+static void free_sectors(u64 first, u64 count) {
+    for (u64 j = first; j < first + count; ++j)
+        g_bitmap[j / 8] &= static_cast<u8>(~(1u << (j % 8)));
+    flush_bitmap();
 }
 
 static u64 alloc_node_sector() { return alloc_sectors(1); }
@@ -286,32 +314,61 @@ static bool btree_insert(u64 node_sector, u64 key, const StarEntry& value,
     return true;
 }
 
-static void catalog_insert(u64 key, const StarEntry& value) {
+static void tree_insert(u64* root, u64 key, const StarEntry& value) {
     u64 promoted_key = 0, new_right = 0;
-    if (!btree_insert(g_sb.catalog_root, key, value, &promoted_key, &new_right)) return;
+    if (!btree_insert(*root, key, value, &promoted_key, &new_right)) return;
 
     u8 buf[SECTOR_SIZE];
     for (auto& b : buf) b = 0;
-    auto* root = reinterpret_cast<InternalNode*>(buf);
-    root->is_leaf = 0;
-    root->count = 1;
-    root->key[0] = promoted_key;
-    root->child[0] = g_sb.catalog_root;
-    root->child[1] = new_right;
+    auto* root_node = reinterpret_cast<InternalNode*>(buf);
+    root_node->is_leaf = 0;
+    root_node->count = 1;
+    root_node->key[0] = promoted_key;
+    root_node->child[0] = *root;
+    root_node->child[1] = new_right;
 
     u64 new_root_sector = alloc_node_sector();
     blockdev::write_sector(new_root_sector, buf);
 
-    g_sb.catalog_root = new_root_sector;
+    *root = new_root_sector;
     flush_superblock();
 }
 
-static bool catalog_find(u64 key, StarEntry* out) {
-    return btree_search(g_sb.catalog_root, key, out);
+static void catalog_insert(u64 key, const StarEntry& value) { tree_insert(&g_sb.catalog_root, key, value); }
+static bool catalog_find(u64 key, StarEntry* out) { return btree_search(g_sb.catalog_root, key, out); }
+static bool catalog_update(u64 key, const StarEntry& value) { return btree_update(g_sb.catalog_root, key, value); }
+
+static u32 extent_refcount(u64 first_sector) {
+    StarEntry tmp;
+    if (!btree_search(g_sb.extent_root, first_sector, &tmp)) return 1;
+    return static_cast<u32>(tmp.size_bytes);
+}
+static void extent_set_refcount(u64 first_sector, u32 rc) {
+    StarEntry tmp{};
+    tmp.size_bytes = rc;
+    if (!btree_update(g_sb.extent_root, first_sector, tmp))
+        tree_insert(&g_sb.extent_root, first_sector, tmp);
+}
+static void release_extent(u64 first_sector, u64 sector_count) {
+    u32 rc = extent_refcount(first_sector);
+    if (rc <= 1) {
+        free_sectors(first_sector, sector_count);
+        return;
+    }
+    extent_set_refcount(first_sector, rc - 1);
 }
 
-static bool catalog_update(u64 key, const StarEntry& value) {
-    return btree_update(g_sb.catalog_root, key, value);
+static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
+    const u8* src = static_cast<const u8*>(data);
+    u8 buf[SECTOR_SIZE];
+    for (u64 i = 0; i < nsec; ++i) {
+        u64 done = i * SECTOR_SIZE;
+        u64 remaining = done < size ? size - done : 0;
+        u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
+        for (u64 b = 0; b < SECTOR_SIZE; ++b) buf[b] = (b < chunk) ? src[done + b] : 0;
+        if (!blockdev::write_sector(start + i, buf)) return false;
+    }
+    return true;
 }
 
 static bool add_edge(u64 dir_star, const char* name, u64 target) {
@@ -362,17 +419,21 @@ bool format(u64 total_sectors) {
     if (g_sb.bitmap_sectors == 0) g_sb.bitmap_sectors = 1;
     g_sb.next_star_id = 0;
     g_sb.catalog_root = 0;
+    g_sb.extent_root = 0;
 
     g_bitmap = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors * SECTOR_SIZE));
     g_mounted = true;
 
-    u64 root_node_sector = alloc_sectors(1);
-    if (root_node_sector == 0) return false;
+    u64 catalog_root_sector = alloc_sectors(1);
+    u64 extent_root_sector = alloc_sectors(1);
+    if (catalog_root_sector == 0 || extent_root_sector == 0) return false;
     u8 buf[SECTOR_SIZE];
     for (auto& b : buf) b = 0;
     reinterpret_cast<LeafNode*>(buf)->is_leaf = 1;
-    blockdev::write_sector(root_node_sector, buf);
-    g_sb.catalog_root = root_node_sector;
+    blockdev::write_sector(catalog_root_sector, buf);
+    blockdev::write_sector(extent_root_sector, buf);
+    g_sb.catalog_root = catalog_root_sector;
+    g_sb.extent_root = extent_root_sector;
 
     flush_bitmap();
     flush_superblock();
@@ -433,26 +494,81 @@ u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
     u64 nsec = size == 0 ? 1 : (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
     u64 start = alloc_sectors(nsec);
     if (start == 0) return INVALID_STAR;
-
-    const u8* src = static_cast<const u8*>(data);
-    u8 buf[SECTOR_SIZE];
-    for (u64 i = 0; i < nsec; ++i) {
-        u64 done = i * SECTOR_SIZE;
-        u64 remaining = done < size ? size - done : 0;
-        u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
-        for (u64 b = 0; b < SECTOR_SIZE; ++b) buf[b] = (b < chunk) ? src[done + b] : 0;
-        if (!blockdev::write_sector(start + i, buf)) return INVALID_STAR;
-    }
+    if (!write_extent(start, nsec, data, size)) return INVALID_STAR;
 
     StarEntry entry{};
     entry.type = TYPE_FILE;
     entry.size_bytes = size;
     entry.first_sector = start;
     entry.sector_count = nsec;
+    entry.checksum = crc32_full(static_cast<const u8*>(data), size);
     catalog_insert(id, entry);
 
     if (parent != INVALID_STAR) add_edge(parent, name, id);
     return id;
+}
+
+u64 write_file(u64 star, const void* data, u64 size) {
+    if (!g_mounted) return INVALID_STAR;
+    StarEntry old_e;
+    if (!catalog_find(star, &old_e) || old_e.type != TYPE_FILE) return INVALID_STAR;
+
+    u64 nsec = size == 0 ? 1 : (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    u64 start = alloc_sectors(nsec);
+    if (start == 0) return INVALID_STAR;
+    if (!write_extent(start, nsec, data, size)) return INVALID_STAR;
+
+    StarEntry new_e{};
+    new_e.type = TYPE_FILE;
+    new_e.size_bytes = size;
+    new_e.first_sector = start;
+    new_e.sector_count = nsec;
+    new_e.checksum = crc32_full(static_cast<const u8*>(data), size);
+
+    if (!catalog_update(star, new_e)) return INVALID_STAR;
+    release_extent(old_e.first_sector, old_e.sector_count);
+    return star;
+}
+
+u64 snapshot(u64 star) {
+    if (!g_mounted) return INVALID_STAR;
+    StarEntry e;
+    if (!catalog_find(star, &e)) return INVALID_STAR;
+    if (e.type != TYPE_FILE) {
+        serial::writeln("[stellar] snapshot: only files are snapshottable, not constellations");
+        return INVALID_STAR;
+    }
+
+    u32 rc = extent_refcount(e.first_sector);
+    extent_set_refcount(e.first_sector, rc + 1);
+
+    u64 new_id = alloc_star_id();
+    catalog_insert(new_id, e);
+    return new_id;
+}
+
+bool verify_file(u64 star) {
+    if (!g_mounted) return false;
+    StarEntry e;
+    if (!catalog_find(star, &e) || e.type != TYPE_FILE) return false;
+
+    u32 crc = 0xFFFFFFFFu;
+    u8 buf[SECTOR_SIZE];
+    u64 remaining = e.size_bytes;
+    for (u64 i = 0; i < e.sector_count && remaining > 0; ++i) {
+        if (!blockdev::read_sector(e.first_sector + i, buf)) return false;
+        u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
+        crc = crc32_update(crc, buf, chunk);
+        remaining -= chunk;
+    }
+    crc ^= 0xFFFFFFFFu;
+
+    if (crc != e.checksum) {
+        serial::printf("[stellar] checksum mismatch on star %lu: stored %x computed %x\n",
+                        star, e.checksum, crc);
+        return false;
+    }
+    return true;
 }
 
 u64 read_file(u64 star, void* buf, u64 max_size) {

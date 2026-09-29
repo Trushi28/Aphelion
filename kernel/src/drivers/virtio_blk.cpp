@@ -29,7 +29,8 @@ constexpr u8 STATUS_FAILED = 128;
 
 constexpr u32 FEATURE_VERSION_1 = 1u << (32 - 32);
 
-constexpr int QSIZE = 8;
+constexpr u32 MAX_INFLIGHT = 16;
+constexpr int QSIZE = MAX_INFLIGHT * 3;
 
 constexpr u32 BLK_T_IN = 0;
 constexpr u32 BLK_T_OUT = 1;
@@ -74,10 +75,14 @@ static VringDesc* g_desc = nullptr;
 static VringAvail* g_avail = nullptr;
 static VringUsed* g_used = nullptr;
 static u16 g_used_seen = 0;
+static u16 g_negotiated_qsize = 0;
+static u32 g_max_inflight = 1;
 
-static BlkReqHeader* g_req_hdr = nullptr;
-static u8* g_req_status = nullptr;
-static u8* g_bounce = nullptr;
+static BlkReqHeader* g_hdrs = nullptr;
+static u8* g_status_arr = nullptr;
+static u8* g_bounce_pool = nullptr;
+static bool g_slot_done[MAX_INFLIGHT];
+static bool g_slot_ok[MAX_INFLIGHT];
 
 static volatile u32* g_msix_table = nullptr;
 static bool g_msix_ready = false;
@@ -99,6 +104,7 @@ static void* alloc_pages(u64 bytes) {
     return v;
 }
 static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
+static u8* bounce_for(u32 slot) { return g_bounce_pool + static_cast<u64>(slot) * 512; }
 
 static pci::Device g_found{};
 static bool g_found_flag = false;
@@ -125,9 +131,64 @@ static void completion_isr(idt::Frame*) {
     __atomic_fetch_add(&g_irq_count, 1, __ATOMIC_SEQ_CST);
 }
 
+static void notify_device() {
+    volatile u16* notify = reinterpret_cast<volatile u16*>(
+        g_notify_base + static_cast<u64>(g_queue_notify_off) * g_notify_multiplier);
+    *notify = 0;
+}
+
+static void submit(u32 slot, u64 sector, bool write) {
+    g_hdrs[slot].type = write ? BLK_T_OUT : BLK_T_IN;
+    g_hdrs[slot].reserved = 0;
+    g_hdrs[slot].sector = sector;
+    g_status_arr[slot] = 0xFF;
+    g_slot_done[slot] = false;
+
+    u16 base = static_cast<u16>(slot * 3);
+    g_desc[base + 0] = { virt_to_phys(&g_hdrs[slot]), sizeof(BlkReqHeader), DESC_F_NEXT, static_cast<u16>(base + 1) };
+    g_desc[base + 1] = { virt_to_phys(bounce_for(slot)), 512,
+                          static_cast<u16>(DESC_F_NEXT | (write ? 0 : DESC_F_WRITE)), static_cast<u16>(base + 2) };
+    g_desc[base + 2] = { virt_to_phys(&g_status_arr[slot]), 1, DESC_F_WRITE, 0 };
+
+    u16 ring_slot = g_avail->idx % g_negotiated_qsize;
+    g_avail->ring[ring_slot] = base;
+    __sync_synchronize();
+    g_avail->idx = static_cast<u16>(g_avail->idx + 1);
+    __sync_synchronize();
+}
+
+static bool drain(u32 pending) {
+    u64 waits = 0;
+    u64 irq_flags = cpu::irq_save();
+    while (pending > 0) {
+        if (g_used->idx == g_used_seen) {
+            if (g_msix_ready) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
+            if (++waits > 20000000ull) {
+                cpu::irq_restore(irq_flags);
+                serial::writeln("[virtio-blk] request batch timed out");
+                return false;
+            }
+            continue;
+        }
+        u16 idx = g_used_seen % g_negotiated_qsize;
+        u32 head = g_used->ring[idx].id;
+        u32 slot = head / 3;
+        if (slot < MAX_INFLIGHT && !g_slot_done[slot]) {
+            g_slot_done[slot] = true;
+            g_slot_ok[slot] = g_status_arr[slot] == BLK_S_OK;
+            --pending;
+        }
+        g_used_seen = static_cast<u16>(g_used_seen + 1);
+    }
+    cpu::irq_restore(irq_flags);
+    return true;
+}
+
 struct HalDevice : blockdev::Device {
     bool read_sector(u64 sector, void* buf512) override;
     bool write_sector(u64 sector, const void* buf512) override;
+    bool read_sectors(u64 start_sector, u64 count, void* buf) override;
+    bool write_sectors(u64 start_sector, u64 count, const void* buf) override;
     u64 capacity_sectors() override { return virtioblk::capacity_sectors(); }
     const char* name() override { return "virtio-blk"; }
 };
@@ -221,7 +282,11 @@ bool init(u64 hhdm_offset) {
     g_common->queue_select = 0;
     u16 max_qsize = g_common->queue_size;
     u16 qsize = (max_qsize < QSIZE) ? max_qsize : QSIZE;
-    if (qsize == 0) { serial::writeln("[virtio-blk] queue 0 unavailable"); return false; }
+    if (qsize < 3) { serial::writeln("[virtio-blk] queue 0 too small"); return false; }
+    g_negotiated_qsize = qsize;
+    g_max_inflight = qsize / 3;
+    if (g_max_inflight > MAX_INFLIGHT) g_max_inflight = MAX_INFLIGHT;
+    if (g_max_inflight < 1) g_max_inflight = 1;
 
     g_desc = static_cast<VringDesc*>(alloc_pages(sizeof(VringDesc) * QSIZE));
     g_avail = static_cast<VringAvail*>(alloc_pages(sizeof(VringAvail)));
@@ -242,66 +307,62 @@ bool init(u64 hhdm_offset) {
 
     g_common->device_status |= STATUS_DRIVER_OK;
 
-    g_req_hdr = static_cast<BlkReqHeader*>(alloc_pages(sizeof(BlkReqHeader)));
-    g_req_status = static_cast<u8*>(alloc_pages(1));
-    g_bounce = static_cast<u8*>(alloc_pages(512));
+    g_hdrs = static_cast<BlkReqHeader*>(alloc_pages(sizeof(BlkReqHeader) * MAX_INFLIGHT));
+    g_status_arr = static_cast<u8*>(alloc_pages(MAX_INFLIGHT));
+    g_bounce_pool = static_cast<u8*>(alloc_pages(512ull * MAX_INFLIGHT));
+    for (auto& d : g_slot_done) d = false;
+    for (auto& o : g_slot_ok) o = false;
 
     g_present = true;
-    serial::printf("[virtio-blk] ready, capacity=%lu sectors, completion mode=%s\n",
-                    capacity_sectors(), g_msix_ready ? "MSI-X" : "polled");
+    serial::printf("[virtio-blk] ready, capacity=%lu sectors, completion mode=%s, %u request(s) in flight\n",
+                    capacity_sectors(), g_msix_ready ? "MSI-X" : "polled", g_max_inflight);
     blockdev::register_device(&g_hal);
     return true;
 }
 
-static bool do_request(u64 sector, bool write) {
+static bool run_batch(u64 start_sector, u64 count, bool write) {
     if (!g_present) return false;
-
-    g_req_hdr->type = write ? BLK_T_OUT : BLK_T_IN;
-    g_req_hdr->reserved = 0;
-    g_req_hdr->sector = sector;
-    *g_req_status = 0xFF;
-
-    g_desc[0] = { virt_to_phys(g_req_hdr), sizeof(BlkReqHeader), DESC_F_NEXT, 1 };
-    g_desc[1] = { virt_to_phys(g_bounce), 512, static_cast<u16>(DESC_F_NEXT | (write ? 0 : DESC_F_WRITE)), 2 };
-    g_desc[2] = { virt_to_phys(g_req_status), 1, DESC_F_WRITE, 0 };
-
-    u16 slot = g_avail->idx % QSIZE;
-    g_avail->ring[slot] = 0;
-    __sync_synchronize();
-    g_avail->idx = static_cast<u16>(g_avail->idx + 1);
-    __sync_synchronize();
-
-    volatile u16* notify = reinterpret_cast<volatile u16*>(
-        g_notify_base + static_cast<u64>(g_queue_notify_off) * g_notify_multiplier);
-    *notify = 0;
-
-    u64 waits = 0;
-    u64 irq_flags = cpu::irq_save();
-    while (g_used->idx == g_used_seen) {
-        if (g_msix_ready) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
-        if (++waits > 20000000ull) {
-            cpu::irq_restore(irq_flags);
-            serial::writeln("[virtio-blk] request timed out");
-            return false;
-        }
-    }
-    cpu::irq_restore(irq_flags);
-    g_used_seen = g_used->idx;
-
-    return *g_req_status == BLK_S_OK;
+    u32 n = static_cast<u32>(count);
+    for (u32 i = 0; i < n; ++i) submit(i, start_sector + i, write);
+    notify_device();
+    if (!drain(n)) return false;
+    bool ok = true;
+    for (u32 i = 0; i < n; ++i) ok = ok && g_slot_ok[i];
+    return ok;
 }
 
-bool read_sector(u64 sector, void* buf512) {
-    if (!do_request(sector, false)) return false;
-    for (int i = 0; i < 512; ++i) static_cast<u8*>(buf512)[i] = g_bounce[i];
+bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
+    u8* dst = static_cast<u8*>(buf);
+    while (count > 0) {
+        u64 batch = count < g_max_inflight ? count : g_max_inflight;
+        if (!run_batch(start_sector, batch, false)) return false;
+        for (u64 i = 0; i < batch; ++i)
+            for (int b = 0; b < 512; ++b) dst[i * 512 + b] = bounce_for(static_cast<u32>(i))[b];
+        dst += batch * 512;
+        start_sector += batch;
+        count -= batch;
+    }
     return true;
 }
-bool write_sector(u64 sector, const void* buf512) {
-    for (int i = 0; i < 512; ++i) g_bounce[i] = static_cast<const u8*>(buf512)[i];
-    return do_request(sector, true);
+
+bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
+    const u8* src = static_cast<const u8*>(buf);
+    while (count > 0) {
+        u64 batch = count < g_max_inflight ? count : g_max_inflight;
+        for (u64 i = 0; i < batch; ++i)
+            for (int b = 0; b < 512; ++b) bounce_for(static_cast<u32>(i))[b] = src[i * 512 + b];
+        if (!run_batch(start_sector, batch, true)) return false;
+        src += batch * 512;
+        start_sector += batch;
+        count -= batch;
+    }
+    return true;
 }
 
-bool HalDevice::read_sector(u64 sector, void* buf512) { return virtioblk::read_sector(sector, buf512); }
-bool HalDevice::write_sector(u64 sector, const void* buf512) { return virtioblk::write_sector(sector, buf512); }
+bool HalDevice::read_sector(u64 sector, void* buf512) { return read_sectors(sector, 1, buf512); }
+bool HalDevice::write_sector(u64 sector, const void* buf512) { return write_sectors(sector, 1, buf512); }
+
+bool read_sector(u64 sector, void* buf512) { return g_hal.read_sector(sector, buf512); }
+bool write_sector(u64 sector, const void* buf512) { return g_hal.write_sector(sector, buf512); }
 
 }
