@@ -376,6 +376,20 @@ extern "C" NORETURN void kernel_main() {
                             reinterpret_cast<const char*>(snap_readback), snap_n,
                             reinterpret_cast<const char*>(new_readback), new_n);
 
+            constexpr u64 BULK_BYTES = 8192;
+            static u8 bulk_write[BULK_BYTES];
+            static u8 bulk_read[BULK_BYTES];
+            for (u64 i = 0; i < BULK_BYTES; ++i) bulk_write[i] = static_cast<u8>((i * 40503u) >> 8);
+            u64 bulk = stellar::find(stellar::ROOT_STAR, "bulk.bin");
+            if (bulk == stellar::INVALID_STAR)
+                bulk = stellar::create_file(stellar::ROOT_STAR, "bulk.bin", bulk_write, BULK_BYTES);
+            u64 bulk_n = stellar::read_file(bulk, bulk_read, BULK_BYTES);
+            bool bulk_ok = (bulk_n == BULK_BYTES) && stellar::verify_file(bulk);
+            for (u64 i = 0; bulk_ok && i < BULK_BYTES; ++i) bulk_ok = (bulk_read[i] == bulk_write[i]);
+            fb::printf(bulk_ok ? 0xC0FFC0 : 0xE0D080,
+                       "[%s] Stellar FS bulk I/O: /bulk.bin %lu bytes through the batched block path, checksum verified, %s\n",
+                       bulk_ok ? "ok" : "--", bulk_n, bulk_ok ? "byte-for-byte match" : "MISMATCH");
+
             constexpr u64 STRESS_COUNT = 14;
             static u64 stress_ids[STRESS_COUNT];
             bool stress_create_ok = true;

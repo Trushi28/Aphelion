@@ -359,6 +359,7 @@ static void release_extent(u64 first_sector, u64 sector_count) {
 }
 
 static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
+    if (size != 0 && size == nsec * SECTOR_SIZE && blockdev::write_sectors(start, nsec, data)) return true;
     const u8* src = static_cast<const u8*>(data);
     u8 buf[SECTOR_SIZE];
     for (u64 i = 0; i < nsec; ++i) {
@@ -578,6 +579,9 @@ u64 read_file(u64 star, void* buf, u64 max_size) {
     u64 size = e.size_bytes;
     u64 to_read = size < max_size ? size : max_size;
     u8* dst = static_cast<u8*>(buf);
+    if (e.sector_count > 1 && max_size >= e.sector_count * SECTOR_SIZE &&
+        blockdev::read_sectors(e.first_sector, e.sector_count, dst))
+        return to_read;
     u8 sector_buf[SECTOR_SIZE];
     u64 read_so_far = 0;
     for (u64 i = 0; i < e.sector_count && read_so_far < to_read; ++i) {

@@ -31,13 +31,20 @@ constexpr u32 PORT_IS_TFES = 1u << 30;
 
 constexpr u32 GHC_IE = 1u << 1;
 constexpr u32 PORT_IE_DHRE = 1u << 0;
+constexpr u32 PORT_IE_SDBE = 1u << 3;
 constexpr u32 PORT_IE_TFEE = 1u << 30;
+
+constexpr u32 HBA_CAP_SNCQ = 1u << 30;
+constexpr u32 MAX_INFLIGHT = 16;
+constexpr u64 CMD_TABLE_STRIDE = 256;
 
 constexpr u8 CAP_ID_MSI = 0x05;
 
 constexpr u8 ATA_CMD_IDENTIFY = 0xEC;
 constexpr u8 ATA_CMD_READ_DMA_EXT = 0x25;
 constexpr u8 ATA_CMD_WRITE_DMA_EXT = 0x35;
+constexpr u8 ATA_CMD_READ_FPDMA = 0x60;
+constexpr u8 ATA_CMD_WRITE_FPDMA = 0x61;
 
 struct PACKED HbaPort {
     u32 clb;
@@ -121,8 +128,11 @@ static bool g_present = false;
 static volatile HbaMem* g_hba = nullptr;
 static volatile HbaPort* g_port = nullptr;
 static HbaCmdHeader* g_cmd_list = nullptr;
-static HbaCmdTable* g_cmd_table = nullptr;
+static u8* g_cmd_table = nullptr;
 static u8* g_bounce = nullptr;
+static u8* g_bounce_pool = nullptr;
+static bool g_ncq_ready = false;
+static u32 g_max_inflight = 1;
 static u64 g_capacity_sectors = 0;
 static int g_port_index = -1;
 static bool g_msi_ready = false;
@@ -145,6 +155,10 @@ static void* alloc_pages(u64 bytes) {
     return v;
 }
 static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
+static HbaCmdTable* table_for(u32 slot) {
+    return reinterpret_cast<HbaCmdTable*>(g_cmd_table + static_cast<u64>(slot) * CMD_TABLE_STRIDE);
+}
+static u8* bounce_for(u32 slot) { return g_bounce_pool + static_cast<u64>(slot) * 512; }
 
 static pci::Device g_found{};
 static bool g_found_flag = false;
@@ -196,7 +210,7 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
     hdr->prdtl = 1;
     hdr->prdbc = 0;
 
-    HbaCmdTable* tbl = &g_cmd_table[0];
+    HbaCmdTable* tbl = table_for(0);
     for (auto& b : tbl->cfis) b = 0;
 
     tbl->prdt_entry[0].dba = static_cast<u32>(virt_to_phys(buf));
@@ -236,6 +250,88 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
     return ok && !task_file_error();
 }
 
+static bool recover_port() {
+    g_port->cmd &= ~PORT_CMD_ST;
+    u64 spins = 0;
+    while (g_port->cmd & PORT_CMD_CR) {
+        cpu::io_wait();
+        if (++spins > 1000000ull) return false;
+    }
+    g_port->serr = 0xFFFFFFFFu;
+    g_port->is = 0xFFFFFFFFu;
+    __atomic_store_n(&g_is_latched, 0u, __ATOMIC_SEQ_CST);
+    g_port->cmd |= PORT_CMD_ST;
+    return true;
+}
+
+static void submit_ncq(u32 slot, u64 lba, bool write) {
+    HbaCmdHeader* hdr = &g_cmd_list[slot];
+    hdr->cfl_a_w_p = static_cast<u8>((sizeof(FisRegH2D) / 4) | (write ? (1u << 6) : 0));
+    hdr->r_b_c_pmp = 0;
+    hdr->prdtl = 1;
+    hdr->prdbc = 0;
+
+    HbaCmdTable* tbl = table_for(slot);
+    for (auto& b : tbl->cfis) b = 0;
+
+    u64 buf_phys = virt_to_phys(bounce_for(slot));
+    tbl->prdt_entry[0].dba = static_cast<u32>(buf_phys);
+    tbl->prdt_entry[0].dbau = static_cast<u32>(buf_phys >> 32);
+    tbl->prdt_entry[0].dbc_i = (512u - 1) | (1u << 31);
+
+    auto* fis = reinterpret_cast<FisRegH2D*>(tbl->cfis);
+    fis->fis_type = 0x27;
+    fis->pmport_c = 1u << 7;
+    fis->command = write ? ATA_CMD_WRITE_FPDMA : ATA_CMD_READ_FPDMA;
+    fis->featurel = 1;
+    fis->lba0 = static_cast<u8>(lba);
+    fis->lba1 = static_cast<u8>(lba >> 8);
+    fis->lba2 = static_cast<u8>(lba >> 16);
+    fis->device = 1u << 6;
+    fis->lba3 = static_cast<u8>(lba >> 24);
+    fis->lba4 = static_cast<u8>(lba >> 32);
+    fis->lba5 = static_cast<u8>(lba >> 40);
+    fis->featureh = 0;
+    fis->countl = static_cast<u8>(slot << 3);
+    fis->counth = 0;
+}
+
+static bool run_ncq_batch(u64 start_sector, u32 n, bool write) {
+    if (!wait_not_busy(10000000ull)) return false;
+
+    g_port->is = 0xFFFFFFFFu;
+    __atomic_store_n(&g_is_latched, 0u, __ATOMIC_SEQ_CST);
+
+    u32 mask = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    for (u32 i = 0; i < n; ++i) submit_ncq(i, start_sector + i, write);
+
+    __sync_synchronize();
+    g_port->sact = mask;
+    __sync_synchronize();
+    g_port->ci = mask;
+
+    u64 spins = 0;
+    u64 irq_flags = cpu::irq_save();
+    bool ok = true;
+    for (;;) {
+        if (!((g_port->sact | g_port->ci) & mask)) break;
+        if (task_file_error()) { ok = false; break; }
+        if (g_msi_ready) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
+        if (++spins > 20000000ull) {
+            serial::writeln("[ahci] NCQ batch timed out");
+            ok = false;
+            break;
+        }
+    }
+    cpu::irq_restore(irq_flags);
+
+    if (!ok || task_file_error()) {
+        recover_port();
+        return false;
+    }
+    return true;
+}
+
 static bool identify(u8* out512) {
     return run_command(ATA_CMD_IDENTIFY, 0, 1, out512, false);
 }
@@ -255,6 +351,44 @@ bool write_sector(u64 sector, const void* buf512) {
 struct HalDevice : blockdev::Device {
     bool read_sector(u64 sector, void* buf512) override { return ahci::read_sector(sector, buf512); }
     bool write_sector(u64 sector, const void* buf512) override { return ahci::write_sector(sector, buf512); }
+    bool read_sectors(u64 start_sector, u64 count, void* buf) override {
+        if (!g_present || start_sector + count > g_capacity_sectors) return false;
+        u8* dst = static_cast<u8*>(buf);
+        if (!g_ncq_ready) {
+            for (u64 i = 0; i < count; ++i)
+                if (!ahci::read_sector(start_sector + i, dst + i * 512)) return false;
+            return true;
+        }
+        while (count > 0) {
+            u32 batch = static_cast<u32>(count < g_max_inflight ? count : g_max_inflight);
+            if (!run_ncq_batch(start_sector, batch, false)) return false;
+            for (u32 i = 0; i < batch; ++i)
+                for (int b = 0; b < 512; ++b) dst[static_cast<u64>(i) * 512 + b] = bounce_for(i)[b];
+            dst += static_cast<u64>(batch) * 512;
+            start_sector += batch;
+            count -= batch;
+        }
+        return true;
+    }
+    bool write_sectors(u64 start_sector, u64 count, const void* buf) override {
+        if (!g_present || start_sector + count > g_capacity_sectors) return false;
+        const u8* src = static_cast<const u8*>(buf);
+        if (!g_ncq_ready) {
+            for (u64 i = 0; i < count; ++i)
+                if (!ahci::write_sector(start_sector + i, src + i * 512)) return false;
+            return true;
+        }
+        while (count > 0) {
+            u32 batch = static_cast<u32>(count < g_max_inflight ? count : g_max_inflight);
+            for (u32 i = 0; i < batch; ++i)
+                for (int b = 0; b < 512; ++b) bounce_for(i)[b] = src[static_cast<u64>(i) * 512 + b];
+            if (!run_ncq_batch(start_sector, batch, true)) return false;
+            src += static_cast<u64>(batch) * 512;
+            start_sector += batch;
+            count -= batch;
+        }
+        return true;
+    }
     u64 capacity_sectors() override { return ahci::capacity_sectors(); }
     const char* name() override { return "ahci"; }
 };
@@ -270,7 +404,7 @@ static bool rebase_port() {
 
     g_cmd_list = static_cast<HbaCmdHeader*>(alloc_pages(1024));
     void* fis_base = alloc_pages(256);
-    g_cmd_table = static_cast<HbaCmdTable*>(alloc_pages(sizeof(HbaCmdTable)));
+    g_cmd_table = static_cast<u8*>(alloc_pages(CMD_TABLE_STRIDE * MAX_INFLIGHT));
 
     u64 clb_phys = virt_to_phys(g_cmd_list);
     g_port->clb = static_cast<u32>(clb_phys);
@@ -280,13 +414,15 @@ static bool rebase_port() {
     g_port->fb = static_cast<u32>(fb_phys);
     g_port->fbu = static_cast<u32>(fb_phys >> 32);
 
-    u64 ctba_phys = virt_to_phys(g_cmd_table);
-    g_cmd_list[0].ctba = static_cast<u32>(ctba_phys);
-    g_cmd_list[0].ctbau = static_cast<u32>(ctba_phys >> 32);
+    for (u32 slot = 0; slot < MAX_INFLIGHT; ++slot) {
+        u64 ctba_phys = virt_to_phys(table_for(slot));
+        g_cmd_list[slot].ctba = static_cast<u32>(ctba_phys);
+        g_cmd_list[slot].ctbau = static_cast<u32>(ctba_phys >> 32);
+    }
 
     g_port->serr = 0xFFFFFFFFu;
     g_port->is = 0xFFFFFFFFu;
-    g_port->ie = PORT_IE_DHRE | PORT_IE_TFEE;
+    g_port->ie = PORT_IE_DHRE | PORT_IE_SDBE | PORT_IE_TFEE;
 
     g_port->cmd |= PORT_CMD_FRE;
     g_port->cmd |= PORT_CMD_ST;
@@ -364,6 +500,7 @@ bool init(u64 hhdm_offset) {
     if (g_msi_ready) g_hba->ghc |= GHC_IE;
 
     g_bounce = static_cast<u8*>(alloc_pages(512));
+    g_bounce_pool = static_cast<u8*>(alloc_pages(512ull * MAX_INFLIGHT));
 
     u8 id_buf[512];
     if (!identify(id_buf)) {
@@ -380,9 +517,18 @@ bool init(u64 hhdm_offset) {
         g_capacity_sectors = words[60] | (static_cast<u64>(words[61]) << 16);
     }
 
+    bool hba_ncq = (g_hba->cap & HBA_CAP_SNCQ) != 0;
+    bool dev_ncq = (words[76] & (1u << 8)) != 0;
+    u32 dev_depth = static_cast<u32>(words[75] & 0x1F) + 1;
+    if (hba_ncq && dev_ncq) {
+        g_max_inflight = dev_depth < MAX_INFLIGHT ? dev_depth : MAX_INFLIGHT;
+        g_ncq_ready = g_max_inflight > 1;
+    }
+
     g_present = true;
-    serial::printf("[ahci] ready, capacity=%lu sectors, completion mode=%s\n",
-                    g_capacity_sectors, g_msi_ready ? "MSI" : "polled");
+    serial::printf("[ahci] ready, capacity=%lu sectors, completion mode=%s, %u request(s) in flight (%s)\n",
+                    g_capacity_sectors, g_msi_ready ? "MSI" : "polled",
+                    g_ncq_ready ? g_max_inflight : 1u, g_ncq_ready ? "NCQ" : "single-command");
     blockdev::register_device(&g_hal);
     return true;
 }
