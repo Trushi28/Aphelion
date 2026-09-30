@@ -102,6 +102,23 @@ static void count_entry(const char*, u64, u32, void* ctx) {
     ++(*static_cast<u64*>(ctx));
 }
 
+static u64 cstr_len(const char* s) {
+    u64 n = 0;
+    while (s[n]) ++n;
+    return n;
+}
+
+static bool file_equals(u64 star, const char* expect) {
+    static u8 tmp[256];
+    u64 want = cstr_len(expect);
+    if (star == stellar::INVALID_STAR || want >= sizeof(tmp)) return false;
+    u64 got = stellar::read_file(star, tmp, sizeof(tmp));
+    if (got != want) return false;
+    for (u64 i = 0; i < got; ++i)
+        if (tmp[i] != static_cast<u8>(expect[i])) return false;
+    return true;
+}
+
 static NORETURN void panic_no_framebuffer() {
     serial::writeln("[boot] FATAL: bootloader gave no framebuffer");
     cpu::hang();
@@ -375,6 +392,32 @@ extern "C" NORETURN void kernel_main() {
             serial::printf("[stellar] cow: snapshot readback \"%s\" (%lu bytes), live readback \"%s\" (%lu bytes)\n",
                             reinterpret_cast<const char*>(snap_readback), snap_n,
                             reinterpret_cast<const char*>(new_readback), new_n);
+
+            u64 live = stellar::create_constellation(stellar::INVALID_STAR, "");
+            u64 live_a = stellar::create_file(live, "a.txt", "one\n", 4);
+            u64 live_sub = stellar::create_constellation(live, "sub");
+            stellar::create_file(live_sub, "n.txt", "nested\n", 7);
+
+            u64 snap_dir = stellar::snapshot(live);
+
+            stellar::write_file(live_a, "two two\n", 8);
+            stellar::create_file(live, "b.txt", "new\n", 4);
+
+            u64 snap_a = stellar::find(snap_dir, "a.txt");
+            u64 snap_sub = stellar::find(snap_dir, "sub");
+            u64 snap_nested = stellar::find(snap_sub, "n.txt");
+            bool tree_ok = snap_dir != stellar::INVALID_STAR && snap_dir != live &&
+                           snap_sub != stellar::INVALID_STAR && snap_sub != live_sub &&
+                           file_equals(snap_a, "one\n") && stellar::verify_file(snap_a) &&
+                           file_equals(live_a, "two two\n") && stellar::verify_file(live_a) &&
+                           file_equals(snap_nested, "nested\n") && stellar::verify_file(snap_nested) &&
+                           stellar::find(snap_dir, "b.txt") == stellar::INVALID_STAR &&
+                           stellar::find(live, "b.txt") != stellar::INVALID_STAR &&
+                           stellar::link(live, "snap", snap_dir) &&
+                           stellar::find(live, "snap") == snap_dir;
+            fb::printf(tree_ok ? 0xC0FFC0 : 0xE0D080,
+                       "[%s] Stellar FS tree snapshot: star %lu froze a.txt + sub/n.txt while live star %lu diverged (rewrite + new file), %s\n",
+                       tree_ok ? "ok" : "--", snap_dir, live, tree_ok ? "isolation confirmed" : "FAILED");
 
             constexpr u64 BULK_BYTES = 8192;
             static u8 bulk_write[BULK_BYTES];

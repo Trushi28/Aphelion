@@ -11,6 +11,7 @@ constexpr u32 VERSION = 3;
 constexpr u32 NAME_LEN = 52;
 constexpr u32 LEAF_MAX = 6;
 constexpr u32 INTERNAL_MAX = 30;
+constexpr u32 SNAPSHOT_MAX_DEPTH = 8;
 
 struct PACKED Superblock {
     u64 magic;
@@ -531,21 +532,54 @@ u64 write_file(u64 star, const void* data, u64 size) {
     return star;
 }
 
-u64 snapshot(u64 star) {
-    if (!g_mounted) return INVALID_STAR;
-    StarEntry e;
-    if (!catalog_find(star, &e)) return INVALID_STAR;
-    if (e.type != TYPE_FILE) {
-        serial::writeln("[stellar] snapshot: only files are snapshottable, not constellations");
-        return INVALID_STAR;
-    }
-
+static u64 snapshot_file(const StarEntry& e) {
     u32 rc = extent_refcount(e.first_sector);
     extent_set_refcount(e.first_sector, rc + 1);
 
     u64 new_id = alloc_star_id();
     catalog_insert(new_id, e);
     return new_id;
+}
+
+static u64 snapshot_tree(u64 star, u32 depth) {
+    if (depth > SNAPSHOT_MAX_DEPTH) {
+        serial::writeln("[stellar] snapshot: namespace too deep or cyclic");
+        return INVALID_STAR;
+    }
+    StarEntry e;
+    if (!catalog_find(star, &e)) return INVALID_STAR;
+    if (e.type == TYPE_FILE) return snapshot_file(e);
+    if (e.type != TYPE_CONSTELLATION) return INVALID_STAR;
+
+    u64 new_dir = create_constellation(INVALID_STAR, "");
+    if (new_dir == INVALID_STAR) return INVALID_STAR;
+
+    u64 sector = e.first_sector;
+    u8 buf[SECTOR_SIZE];
+    while (sector != 0) {
+        if (!blockdev::read_sector(sector, buf)) return INVALID_STAR;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
+            if (!ds->entries[i].in_use) continue;
+            u64 child = snapshot_tree(ds->entries[i].star, depth + 1);
+            if (child == INVALID_STAR) return INVALID_STAR;
+            if (!add_edge(new_dir, ds->entries[i].name, child)) return INVALID_STAR;
+        }
+        sector = ds->next_sector;
+    }
+    return new_dir;
+}
+
+u64 snapshot(u64 star) {
+    if (!g_mounted) return INVALID_STAR;
+    return snapshot_tree(star, 0);
+}
+
+bool link(u64 dir_star, const char* name, u64 target) {
+    if (!g_mounted) return false;
+    StarEntry e;
+    if (!catalog_find(target, &e)) return false;
+    return add_edge(dir_star, name, target);
 }
 
 bool verify_file(u64 star) {
