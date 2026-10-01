@@ -108,11 +108,11 @@ static u64 cstr_len(const char* s) {
     return n;
 }
 
-static bool file_equals(u64 star, const char* expect) {
+static bool file_equals(u64 star, const char* expect, u64 snap = stellar::LIVE) {
     static u8 tmp[256];
     u64 want = cstr_len(expect);
     if (star == stellar::INVALID_STAR || want >= sizeof(tmp)) return false;
-    u64 got = stellar::read_file(star, tmp, sizeof(tmp));
+    u64 got = stellar::read_file(star, tmp, sizeof(tmp), snap);
     if (got != want) return false;
     for (u64 i = 0; i < got; ++i)
         if (tmp[i] != static_cast<u8>(expect[i])) return false;
@@ -314,6 +314,7 @@ extern "C" NORETURN void kernel_main() {
 
         stellar::init(g_hhdm_offset);
         bool fs_ready = stellar::mount();
+        bool fresh_fs = !fs_ready;
         if (!fs_ready) fs_ready = stellar::format(blockdev::capacity_sectors());
 
         if (fs_ready) {
@@ -361,63 +362,61 @@ extern "C" NORETURN void kernel_main() {
                 serial::printf("[nvme] completion mode: %s, %u interrupt(s) delivered\n",
                                 nvme::completion_mode(), nvme::irq_count());
 
-            const char* rewritten_msg = "Aphelion Stellar FS -- rewritten after snapshot.\n";
-            u64 rewritten_len = 0;
-            while (rewritten_msg[rewritten_len]) ++rewritten_len;
+            if (fresh_fs) {
+                const char* rewritten_msg = "Aphelion Stellar FS -- rewritten after snapshot.\n";
+                u64 rewritten_len = cstr_len(rewritten_msg);
 
-            bool cow_pre_ok = stellar::verify_file(file);
-            u64 snap_id = stellar::snapshot(file);
-            u64 rewritten_star = stellar::write_file(file, rewritten_msg, rewritten_len);
-            bool cow_write_ok = (rewritten_star == file) && stellar::verify_file(file);
-            bool cow_snap_ok = (snap_id != stellar::INVALID_STAR) && stellar::verify_file(snap_id);
+                bool cow_pre_ok = stellar::verify_file(file);
+                stellar::IoStats io_before = stellar::io_stats();
+                u64 snap = stellar::snapshot();
+                stellar::IoStats io_after = stellar::io_stats();
+                u64 snap_writes = io_after.writes - io_before.writes;
+                u64 snap_reads = io_after.reads - io_before.reads;
 
-            static u8 snap_readback[128];
-            u64 snap_n = stellar::read_file(snap_id, snap_readback, sizeof(snap_readback) - 1);
-            snap_readback[snap_n] = 0;
-            bool snap_content_ok = (snap_n == msg_len);
-            for (u64 i = 0; snap_content_ok && i < snap_n; ++i)
-                snap_content_ok = (snap_readback[i] == static_cast<u8>(msg[i]));
+                u64 rewritten_star = stellar::write_file(file, rewritten_msg, rewritten_len);
+                bool cow_write_ok = (rewritten_star == file) && stellar::verify_file(file);
+                bool cow_snap_ok = (snap != stellar::INVALID_STAR) && stellar::verify_file(file, snap);
+                bool snap_content_ok = file_equals(file, msg, snap);
+                bool new_content_ok = file_equals(file, rewritten_msg);
+                bool cow_ok = cow_pre_ok && cow_write_ok && cow_snap_ok && snap_content_ok && new_content_ok;
+                fb::printf(cow_ok ? 0xC0FFC0 : 0xE0D080,
+                           "[%s] Stellar FS COW: snapshot %lu keeps the pre-write bytes, live view carries the rewrite, both checksums verify\n",
+                           cow_ok ? "ok" : "--", snap);
 
-            static u8 new_readback[128];
-            u64 new_n = stellar::read_file(file, new_readback, sizeof(new_readback) - 1);
-            new_readback[new_n] = 0;
-            bool new_content_ok = (new_n == rewritten_len);
-            for (u64 i = 0; new_content_ok && i < new_n; ++i)
-                new_content_ok = (new_readback[i] == static_cast<u8>(rewritten_msg[i]));
+                u64 live = stellar::create_constellation(stellar::ROOT_STAR, "tree");
+                u64 live_a = stellar::create_file(live, "a.txt", "one\n", 4);
+                u64 live_sub = stellar::create_constellation(live, "sub");
+                u64 live_n = stellar::create_file(live_sub, "n.txt", "nested\n", 7);
 
-            bool cow_ok = cow_pre_ok && cow_write_ok && cow_snap_ok && snap_content_ok && new_content_ok;
-            fb::printf(cow_ok ? 0xC0FFC0 : 0xE0D080,
-                       "[%s] Stellar FS COW: snapshot star %lu keeps the pre-write bytes, live star %lu carries the rewrite, both checksums verify\n",
-                       cow_ok ? "ok" : "--", snap_id, file);
-            serial::printf("[stellar] cow: snapshot readback \"%s\" (%lu bytes), live readback \"%s\" (%lu bytes)\n",
-                            reinterpret_cast<const char*>(snap_readback), snap_n,
-                            reinterpret_cast<const char*>(new_readback), new_n);
+                io_before = stellar::io_stats();
+                u64 tree_snap = stellar::snapshot();
+                io_after = stellar::io_stats();
+                bool o1_ok = (io_after.writes - io_before.writes == 1) && (io_after.reads - io_before.reads == 0) &&
+                             snap_writes == 1 && snap_reads == 0;
 
-            u64 live = stellar::create_constellation(stellar::INVALID_STAR, "");
-            u64 live_a = stellar::create_file(live, "a.txt", "one\n", 4);
-            u64 live_sub = stellar::create_constellation(live, "sub");
-            stellar::create_file(live_sub, "n.txt", "nested\n", 7);
+                stellar::write_file(live_a, "two two\n", 8);
+                u64 live_b = stellar::create_file(live, "b.txt", "new\n", 4);
 
-            u64 snap_dir = stellar::snapshot(live);
-
-            stellar::write_file(live_a, "two two\n", 8);
-            stellar::create_file(live, "b.txt", "new\n", 4);
-
-            u64 snap_a = stellar::find(snap_dir, "a.txt");
-            u64 snap_sub = stellar::find(snap_dir, "sub");
-            u64 snap_nested = stellar::find(snap_sub, "n.txt");
-            bool tree_ok = snap_dir != stellar::INVALID_STAR && snap_dir != live &&
-                           snap_sub != stellar::INVALID_STAR && snap_sub != live_sub &&
-                           file_equals(snap_a, "one\n") && stellar::verify_file(snap_a) &&
-                           file_equals(live_a, "two two\n") && stellar::verify_file(live_a) &&
-                           file_equals(snap_nested, "nested\n") && stellar::verify_file(snap_nested) &&
-                           stellar::find(snap_dir, "b.txt") == stellar::INVALID_STAR &&
-                           stellar::find(live, "b.txt") != stellar::INVALID_STAR &&
-                           stellar::link(live, "snap", snap_dir) &&
-                           stellar::find(live, "snap") == snap_dir;
-            fb::printf(tree_ok ? 0xC0FFC0 : 0xE0D080,
-                       "[%s] Stellar FS tree snapshot: star %lu froze a.txt + sub/n.txt while live star %lu diverged (rewrite + new file), %s\n",
-                       tree_ok ? "ok" : "--", snap_dir, live, tree_ok ? "isolation confirmed" : "FAILED");
+                bool tree_ok = tree_snap != stellar::INVALID_STAR &&
+                               stellar::find(live, "a.txt", tree_snap) == live_a &&
+                               file_equals(live_a, "one\n", tree_snap) && stellar::verify_file(live_a, tree_snap) &&
+                               file_equals(live_a, "two two\n") && stellar::verify_file(live_a) &&
+                               stellar::find(live, "sub", tree_snap) == live_sub &&
+                               file_equals(live_n, "nested\n", tree_snap) &&
+                               stellar::find(live, "b.txt", tree_snap) == stellar::INVALID_STAR &&
+                               stellar::find(live, "b.txt") == live_b;
+                fb::printf(tree_ok ? 0xC0FFC0 : 0xE0D080,
+                           "[%s] Stellar FS tree snapshot %lu froze a.txt + sub/n.txt while the live tree diverged (rewrite + new file), %s\n",
+                           tree_ok ? "ok" : "--", tree_snap, tree_ok ? "isolation confirmed" : "FAILED");
+                fb::printf(o1_ok ? 0xC0FFC0 : 0xE0D080,
+                           "[%s] Stellar FS snapshot cost: %lu sector write(s), %lu read(s) -- independent of tree size\n",
+                           o1_ok ? "ok" : "--", io_after.writes - io_before.writes, io_after.reads - io_before.reads);
+                serial::printf("[stellar] snapshots: %u in table, snapshot() cost %lu write(s) + %lu read(s) each (O(1), epoch-based)\n",
+                                stellar::snapshot_count(), io_after.writes - io_before.writes, io_after.reads - io_before.reads);
+            } else {
+                serial::printf("[stellar] snapshot self-tests skipped on a mounted disk (%u/%u snapshot slots in use); delete disk.img to rerun them\n",
+                                stellar::snapshot_count(), stellar::SNAPSHOT_MAX);
+            }
 
             constexpr u64 BULK_BYTES = 8192;
             static u8 bulk_write[BULK_BYTES];
@@ -442,7 +441,9 @@ extern "C" NORETURN void kernel_main() {
                 char name[32] = "stress";
                 for (u32 j = 0; j < dlen; ++j) name[6 + j] = digits[j];
                 name[6 + dlen] = 0;
-                stress_ids[i] = stellar::create_file(stellar::ROOT_STAR, name, digits, dlen);
+                stress_ids[i] = stellar::find(stellar::ROOT_STAR, name);
+                if (stress_ids[i] == stellar::INVALID_STAR)
+                    stress_ids[i] = stellar::create_file(stellar::ROOT_STAR, name, digits, dlen);
                 if (stress_ids[i] == stellar::INVALID_STAR) stress_create_ok = false;
             }
 
@@ -459,9 +460,9 @@ extern "C" NORETURN void kernel_main() {
 
             u64 dir_count = 0;
             stellar::list(stellar::ROOT_STAR, &count_entry, &dir_count);
-            u64 expected_dir_count = STRESS_COUNT + 2;
+            u64 expected_dir_count = STRESS_COUNT + 4;
 
-            bool stress_ok = stress_create_ok && (stress_mismatches == 0) && (dir_count >= expected_dir_count);
+            bool stress_ok = stress_create_ok && (stress_mismatches == 0) && (dir_count == expected_dir_count);
             fb::printf(stress_ok ? 0xC0FFC0 : 0xE0D080,
                        "[%s] Stellar FS B+tree + growable directory stress: %lu stars, %lu mismatch(es), %lu dir entries enumerated\n",
                        stress_ok ? "ok" : "--", STRESS_COUNT, stress_mismatches, dir_count);
