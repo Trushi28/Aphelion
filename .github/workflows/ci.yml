@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential nasm xorriso mtools qemu-system-x86 qemu-utils
+
+      - name: Build
+        run: make iso
+
+      - name: Filesystem tests
+        run: make test-stellar
+
+      - name: Boot on NVMe, 1 core
+        run: tools/ci-boot.sh nvme 1
+
+      - name: Boot on NVMe, 4 cores
+        run: tools/ci-boot.sh nvme 4
+
+      - name: Boot on AHCI
+        run: tools/ci-boot.sh ahci 1
+
+      - name: Boot on virtio-blk
+        run: tools/ci-boot.sh virtio 1
