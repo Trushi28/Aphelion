@@ -5,7 +5,7 @@ edge sectors (7 per sector, unbounded), so one star can be linked from several d
 with no hard-link special case.
 
 ```text
-sector 0          superblock: magic, version 4, catalog root, next star id, epoch, snapshot table
+sector 0          superblock: magic, version 5, catalog root, next star id, epoch, snapshot table
 sectors 1..n      free-sector bitmap
 sectors n+1..     B+tree nodes (1 sector each), directory sectors, file extents
 ```
@@ -45,6 +45,20 @@ ID (`stellar::LIVE` = 0 is the default), and star IDs are stable across views.
   copies that directory's sector chain: O(directory size), the same order as the linear scan every
   directory operation already does.
 
+### Deletion and reclamation
+
+Each catalog entry carries a link count. `unlink(dir, name)` removes one edge; the star dies when
+its last edge goes, and a non-empty directory is refused. A dead star's extents are returned
+immediately if they were born in the current epoch, because no snapshot can reference them.
+Anything older stays allocated for the snapshots that may still use it.
+
+`delete_snapshot(id)` tombstones a slot in the snapshot table, and the next `snapshot()` reuses it.
+Space is reclaimed by `gc()`, a stop-the-world mark and sweep: it marks the metadata region plus
+every catalog node, directory chain and file extent reachable from the live root and from each
+remaining snapshot root, then rewrites the free bitmap to match. Nothing reachable can be freed,
+and sectors leaked by failed operations are recovered as a side effect. It is O(filesystem size)
+and needs one bit of RAM per sector.
+
 ### I/O efficiency
 
 Three things were making the filesystem slow, all fixed: the whole free bitmap was rewritten on
@@ -73,13 +87,16 @@ Stated plainly:
 - **Not crash-consistent.** Data is written before the superblock, but nodes modified in place
   within an epoch are not atomic, there is no journal, and no block-device FLUSH is issued. The
   persistence checked so far is a clean QEMU reboot, not a pulled plug.
-- **No deletion** of files, directories or snapshots, so blocks retained by snapshots are never
-  reclaimed. The snapshot table holds 24.
+- **gc() is stop-the-world**, O(filesystem size), and not SMP-safe: Stellar has no locking and is
+  only called from the boot core. Space held by older epochs only comes back via `delete_snapshot`
+  and `gc()`.
+- Dead stars keep a 40-byte catalog entry and their IDs are never reused; the B+tree has no delete.
+- A deleted snapshot's ID can be handed out again by a later `snapshot()`. The snapshot table holds 24.
 - Snapshots are **whole-filesystem**, not per-subtree.
 - Directory lookup is a linear scan of the sector chain.
 - Free space is a linear bitmap, not the Universe/Orbit buddy machinery.
 - Per-file CRC32 only; no per-extent or per-node checksums.
-- Bumping the superblock version reformats an existing disk on next boot (v3 images aren't migrated).
+- Bumping the superblock version reformats an existing disk on next boot (v3 and v4 images aren't migrated).
 - The boot self-tests that take snapshots are skipped on a mounted disk to avoid exhausting the table.
 
 ---

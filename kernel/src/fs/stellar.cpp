@@ -7,7 +7,7 @@ namespace stellar {
 
 constexpr u64 SECTOR_SIZE = 512;
 constexpr u64 MAGIC = 0x5AE1157A6111A2C5ull;
-constexpr u32 VERSION = 4;
+constexpr u32 VERSION = 5;
 constexpr u32 NAME_LEN = 52;
 constexpr u32 LEAF_MAX = 10;
 constexpr u32 INTERNAL_MAX = 30;
@@ -41,7 +41,7 @@ struct PACKED StarEntry {
     u64 first_sector;
     u64 gen;
     u32 sector_count;
-    u32 reserved;
+    u32 nlink;
 };
 static_assert(sizeof(StarEntry) == 40, "StarEntry must be 40 bytes");
 
@@ -295,7 +295,7 @@ static bool view_root(u64 snap, u64* root) {
     if (snap == LIVE) { *root = g_sb.catalog_root; return true; }
     if (snap > g_sb.snap_count) return false;
     *root = g_sb.snaps[snap - 1].catalog_root;
-    return true;
+    return *root != 0;
 }
 
 static bool bt_search(u64 root, u64 key, StarEntry* out) {
@@ -659,6 +659,7 @@ u64 create_constellation(u64 parent, const char* name) {
     entry.first_sector = start;
     entry.sector_count = 1;
     entry.gen = g_sb.epoch;
+    entry.nlink = 1;
     if (!catalog_upsert(id, entry)) return INVALID_STAR;
 
     if (parent != INVALID_STAR && !add_edge(parent, name, id)) return INVALID_STAR;
@@ -680,6 +681,7 @@ u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
     entry.first_sector = start;
     entry.sector_count = static_cast<u32>(nsec);
     entry.gen = g_sb.epoch;
+    entry.nlink = 1;
     entry.checksum = crc32_full(static_cast<const u8*>(data), size);
     if (!catalog_upsert(id, entry)) return INVALID_STAR;
 
@@ -704,6 +706,7 @@ u64 write_file(u64 star, const void* data, u64 size) {
     new_e.first_sector = start;
     new_e.sector_count = static_cast<u32>(nsec);
     new_e.gen = g_sb.epoch;
+    new_e.nlink = old_e.nlink;
     new_e.checksum = crc32_full(static_cast<const u8*>(data), size);
 
     if (!catalog_upsert(star, new_e)) return INVALID_STAR;
@@ -712,22 +715,218 @@ u64 write_file(u64 star, const void* data, u64 size) {
 }
 
 u64 snapshot() {
-    if (!g_mounted || g_sb.snap_count >= SNAPSHOT_MAX) return INVALID_STAR;
+    if (!g_mounted) return INVALID_STAR;
+    u32 slot = g_sb.snap_count;
+    for (u32 i = 0; i < g_sb.snap_count; ++i) {
+        if (g_sb.snaps[i].catalog_root == 0) { slot = i; break; }
+    }
+    if (slot >= SNAPSHOT_MAX) return INVALID_STAR;
     Txn txn;
-    g_sb.snaps[g_sb.snap_count].catalog_root = g_sb.catalog_root;
-    g_sb.snaps[g_sb.snap_count].epoch = g_sb.epoch;
-    ++g_sb.snap_count;
+    g_sb.snaps[slot].catalog_root = g_sb.catalog_root;
+    g_sb.snaps[slot].epoch = g_sb.epoch;
+    if (slot == g_sb.snap_count) ++g_sb.snap_count;
     ++g_sb.epoch;
     g_sb_dirty = true;
-    return g_sb.snap_count;
+    return static_cast<u64>(slot) + 1;
 }
 
 bool link(u64 dir_star, const char* name, u64 target) {
-    if (!g_mounted) return false;
+    if (!g_mounted || dir_star == target) return false;
     Txn txn;
     StarEntry e;
+    if (!catalog_find(target, &e) || e.type == TYPE_FREE) return false;
+    if (!add_edge(dir_star, name, target)) return false;
     if (!catalog_find(target, &e)) return false;
-    return add_edge(dir_star, name, target);
+    ++e.nlink;
+    return catalog_upsert(target, e);
+}
+
+u32 live_snapshot_count() {
+    u32 n = 0;
+    for (u32 i = 0; i < g_sb.snap_count; ++i)
+        if (g_sb.snaps[i].catalog_root != 0) ++n;
+    return n;
+}
+
+bool delete_snapshot(u64 snap) {
+    if (!g_mounted || snap == LIVE || snap > g_sb.snap_count) return false;
+    if (g_sb.snaps[snap - 1].catalog_root == 0) return false;
+    Txn txn;
+    g_sb.snaps[snap - 1].catalog_root = 0;
+    g_sb.snaps[snap - 1].epoch = 0;
+    while (g_sb.snap_count > 0 && g_sb.snaps[g_sb.snap_count - 1].catalog_root == 0)
+        --g_sb.snap_count;
+    g_sb_dirty = true;
+    return true;
+}
+
+static bool dir_is_empty(const StarEntry& d) {
+    u64 sector = d.first_sector;
+    u8 buf[SECTOR_SIZE];
+    while (sector != 0) {
+        if (!rd(sector, buf)) return false;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i)
+            if (ds->entries[i].in_use) return false;
+        sector = ds->next_sector;
+    }
+    return true;
+}
+
+static bool remove_edge(u64 dir_star, const char* name, u64* target_out) {
+    StarEntry e;
+    if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return false;
+    if (!dir_make_current(e, dir_star)) return false;
+
+    u64 sector = e.first_sector;
+    u8 buf[SECTOR_SIZE];
+    while (sector != 0) {
+        if (!rd(sector, buf)) return false;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
+            if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) {
+                *target_out = ds->entries[i].star;
+                ds->entries[i].in_use = 0;
+                ds->entries[i].star = 0;
+                ds->entries[i].name[0] = 0;
+                return wr(sector, buf);
+            }
+        }
+        sector = ds->next_sector;
+    }
+    return false;
+}
+
+static void release_current_epoch(const StarEntry& t) {
+    if (t.type == TYPE_FILE) {
+        if (t.gen == g_sb.epoch) release_sectors(t.first_sector, t.sector_count);
+        return;
+    }
+    u64 sector = t.first_sector;
+    u8 buf[SECTOR_SIZE];
+    while (sector != 0) {
+        if (!rd(sector, buf)) return;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        u64 next = ds->next_sector;
+        if (ds->gen == g_sb.epoch) release_sectors(sector, 1);
+        sector = next;
+    }
+}
+
+bool unlink(u64 dir_star, const char* name) {
+    if (!g_mounted) return false;
+    Txn txn;
+    u64 target = find(dir_star, name);
+    if (target == INVALID_STAR || target == ROOT_STAR) return false;
+
+    StarEntry t;
+    if (!catalog_find(target, &t)) return false;
+    if (t.type == TYPE_CONSTELLATION && !dir_is_empty(t)) return false;
+
+    u64 removed = INVALID_STAR;
+    if (!remove_edge(dir_star, name, &removed) || removed != target) return false;
+
+    if (!catalog_find(target, &t)) return false;
+    if (t.nlink > 1) {
+        --t.nlink;
+        return catalog_upsert(target, t);
+    }
+    release_current_epoch(t);
+    t.type = TYPE_FREE;
+    t.nlink = 0;
+    t.size_bytes = 0;
+    t.first_sector = 0;
+    t.sector_count = 0;
+    t.checksum = 0;
+    return catalog_upsert(target, t);
+}
+
+static u8* g_mark = nullptr;
+
+static bool mk_test(u64 s) { return ((g_mark[s / 8] >> (s % 8)) & 1u) != 0; }
+static void mk_set(u64 s) { g_mark[s / 8] |= static_cast<u8>(1u << (s % 8)); }
+static void mk_range(u64 first, u64 count) {
+    for (u64 s = first; s < first + count && s < g_sb.total_sectors; ++s) mk_set(s);
+}
+
+static void free_ram(void* p, u64 bytes) {
+    int order = 0;
+    while ((universe::PAGE_SIZE << order) < bytes) ++order;
+    universe::free(reinterpret_cast<u64>(p) - g_hhdm, order);
+}
+
+static bool mark_dir_chain(u64 sector) {
+    u8 buf[SECTOR_SIZE];
+    while (sector != 0 && sector < g_sb.total_sectors && !mk_test(sector)) {
+        mk_set(sector);
+        if (!rd(sector, buf)) return false;
+        sector = reinterpret_cast<DirSector*>(buf)->next_sector;
+    }
+    return true;
+}
+
+static bool mark_tree(u64 sector, u32 depth) {
+    if (depth > 12 || sector == 0 || sector >= g_sb.total_sectors) return false;
+    if (mk_test(sector)) return true;
+    mk_set(sector);
+
+    u8 buf[SECTOR_SIZE];
+    if (!rd(sector, buf)) return false;
+
+    if (buf[0]) {
+        auto* leaf = reinterpret_cast<LeafNode*>(buf);
+        u32 n = leaf->count;
+        if (n > LEAF_MAX) n = LEAF_MAX;
+        for (u32 i = 0; i < n; ++i) {
+            StarEntry e = leaf->entries[i].entry;
+            if (e.type == TYPE_FILE) mk_range(e.first_sector, e.sector_count);
+            else if (e.type == TYPE_CONSTELLATION && !mark_dir_chain(e.first_sector)) return false;
+        }
+        return true;
+    }
+
+    auto* node = reinterpret_cast<InternalNode*>(buf);
+    u32 n = node->count;
+    if (n > INTERNAL_MAX) n = INTERNAL_MAX;
+    for (u32 i = 0; i <= n; ++i)
+        if (!mark_tree(node->child[i], depth + 1)) return false;
+    return true;
+}
+
+u64 gc() {
+    if (!g_mounted) return INVALID_STAR;
+    Txn txn;
+    u64 bm_bytes = g_sb.bitmap_sectors * SECTOR_SIZE;
+    u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
+    g_mark = static_cast<u8*>(alloc_ram(bm_bytes));
+    mk_range(0, data_start);
+
+    bool ok = mark_tree(g_sb.catalog_root, 0);
+    for (u32 i = 0; ok && i < g_sb.snap_count; ++i)
+        if (g_sb.snaps[i].catalog_root != 0) ok = mark_tree(g_sb.snaps[i].catalog_root, 0);
+
+    u64 freed = INVALID_STAR;
+    if (ok) {
+        freed = 0;
+        for (u64 s = data_start; s < g_sb.total_sectors; ++s) {
+            bool used = ((g_bitmap[s / 8] >> (s % 8)) & 1u) != 0;
+            if (used && !mk_test(s)) ++freed;
+        }
+        for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
+            u8* cur = g_bitmap + i * SECTOR_SIZE;
+            const u8* want = g_mark + i * SECTOR_SIZE;
+            if (__builtin_memcmp(cur, want, SECTOR_SIZE) == 0) continue;
+            __builtin_memcpy(cur, want, SECTOR_SIZE);
+            g_bm_dirty[i] = 1;
+            if (i < g_bm_lo) g_bm_lo = i;
+            if (i > g_bm_hi) g_bm_hi = i;
+        }
+        g_alloc_hint = data_start;
+    }
+
+    free_ram(g_mark, bm_bytes);
+    g_mark = nullptr;
+    return freed;
 }
 
 bool verify_file(u64 star, u64 snap) {

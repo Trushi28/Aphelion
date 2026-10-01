@@ -201,6 +201,110 @@ int main() {
     CHECK(last == stellar::SNAPSHOT_MAX, "reach snapshot limit");
     CHECK(stellar::snapshot() == stellar::INVALID_STAR, "limit enforced");
 
+    fresh_fs();
+    {
+        static u8 blob[5000];
+        static u8 sink[8192];
+        for (u64 i = 0; i < sizeof(blob); ++i) blob[i] = static_cast<u8>(i * 7 + 3);
+
+        u64 tmp = stellar::create_file(stellar::ROOT_STAR, "tmp.bin", blob, sizeof(blob));
+        CHECK(tmp != stellar::INVALID_STAR, "create tmp.bin");
+        u64 after_create = stellar::free_space_sectors();
+        CHECK(stellar::unlink(stellar::ROOT_STAR, "tmp.bin"), "unlink in-epoch file");
+        u64 after_unlink = stellar::free_space_sectors();
+        printf("in-epoch unlink: free sectors %lu -> %lu\n", after_create, after_unlink);
+        CHECK(after_unlink >= after_create + 10, "in-epoch unlink returns its extent immediately");
+        CHECK(stellar::find(stellar::ROOT_STAR, "tmp.bin") == stellar::INVALID_STAR, "unlinked name is gone");
+        CHECK(stellar::read_file(tmp, sink, sizeof(sink)) == 0, "dead star reads nothing");
+        CHECK(!stellar::unlink(stellar::ROOT_STAR, "tmp.bin"), "second unlink fails");
+        CHECK(!stellar::unlink(stellar::ROOT_STAR, "missing"), "unlink of a missing name fails");
+
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "d");
+        make(d, "inner", "x");
+        CHECK(!stellar::unlink(stellar::ROOT_STAR, "d"), "non-empty directory is refused");
+        CHECK(stellar::unlink(d, "inner"), "unlink file inside directory");
+        CHECK(stellar::unlink(stellar::ROOT_STAR, "d"), "empty directory is removed");
+        CHECK(stellar::find(stellar::ROOT_STAR, "d") == stellar::INVALID_STAR, "directory name is gone");
+
+        u64 d1 = stellar::create_constellation(stellar::ROOT_STAR, "l1");
+        u64 d2 = stellar::create_constellation(stellar::ROOT_STAR, "l2");
+        u64 shared = make(d1, "s", "shared\n");
+        CHECK(stellar::link(d2, "alias", shared), "second link");
+        CHECK(stellar::write_file(shared, "v2\n", 3) == shared, "rewrite a linked file");
+        CHECK(stellar::unlink(d1, "s"), "drop first link");
+        CHECK(eq(shared, "v2\n") && stellar::find(d2, "alias") == shared, "second link keeps the file alive");
+        CHECK(stellar::unlink(d2, "alias"), "drop last link");
+        CHECK(stellar::read_file(shared, sink, sizeof(sink)) == 0, "last unlink kills the star");
+    }
+
+    fresh_fs();
+    {
+        static u8 blob[4096];
+        static u8 sink[8192];
+        for (u64 i = 0; i < sizeof(blob); ++i) blob[i] = static_cast<u8>(i * 13 + 5);
+
+        u64 keep = make(stellar::ROOT_STAR, "keep", "k\n");
+        u64 big = stellar::create_file(stellar::ROOT_STAR, "big", blob, sizeof(blob));
+        u64 s = stellar::snapshot();
+        CHECK(s == 1, "snapshot id");
+        CHECK(stellar::unlink(stellar::ROOT_STAR, "big"), "unlink after snapshot");
+        CHECK(stellar::find(stellar::ROOT_STAR, "big") == stellar::INVALID_STAR, "live view lost the name");
+        CHECK(stellar::find(stellar::ROOT_STAR, "big", s) == big, "snapshot still names the file");
+
+        CHECK(stellar::gc() != stellar::INVALID_STAR, "gc with a snapshot alive");
+        CHECK(stellar::read_file(big, sink, sizeof(sink), s) == sizeof(blob) && stellar::verify_file(big, s),
+              "gc keeps every extent a snapshot references");
+
+        u64 before = stellar::free_space_sectors();
+        CHECK(stellar::delete_snapshot(s), "delete snapshot");
+        CHECK(!stellar::delete_snapshot(s), "deleting twice fails");
+        CHECK(stellar::find(stellar::ROOT_STAR, "big", s) == stellar::INVALID_STAR, "deleted snapshot is not addressable");
+        u64 freed = stellar::gc();
+        printf("gc after snapshot delete: freed %lu sectors\n", freed);
+        CHECK(freed != stellar::INVALID_STAR && freed >= 8, "gc reclaims what only the snapshot held");
+        CHECK(stellar::free_space_sectors() == before + freed, "bitmap matches the sweep");
+        CHECK(stellar::gc() == 0, "second gc is a no-op");
+        CHECK(eq(keep, "k\n") && stellar::verify_file(keep), "live data intact after gc");
+
+        for (u64 i = 0; i < 200; ++i) {
+            char nm[32]; name_of(nm, "g", i);
+            CHECK(stellar::create_file(stellar::ROOT_STAR, nm, nm, strlen(nm)) != stellar::INVALID_STAR, "create after gc");
+        }
+        for (u64 i = 0; i < 200; ++i) {
+            char nm[32]; name_of(nm, "g", i);
+            CHECK(eq(stellar::find(stellar::ROOT_STAR, nm), nm), "no overlap after gc");
+        }
+        CHECK(eq(keep, "k\n"), "old file survives reuse of reclaimed sectors");
+
+        u64 free_end = stellar::free_space_sectors();
+        CHECK(stellar::mount(), "remount after gc");
+        CHECK(stellar::free_space_sectors() == free_end, "swept bitmap persisted");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "keep"), "k\n"), "keep persisted");
+    }
+
+    fresh_fs();
+    {
+        u64 a1 = stellar::snapshot();
+        u64 a2 = stellar::snapshot();
+        u64 a3 = stellar::snapshot();
+        CHECK(a1 == 1 && a2 == 2 && a3 == 3, "snapshot ids");
+        CHECK(stellar::delete_snapshot(a2), "delete middle snapshot");
+        CHECK(!stellar::delete_snapshot(a2), "delete twice fails");
+        CHECK(stellar::live_snapshot_count() == 2 && stellar::snapshot_count() == 3, "tombstone is counted");
+        CHECK(stellar::snapshot() == 2, "freed slot is reused");
+        CHECK(stellar::delete_snapshot(a3) && stellar::delete_snapshot(2), "delete the tail");
+        CHECK(stellar::snapshot_count() == 1 && stellar::live_snapshot_count() == 1, "table shrinks");
+        CHECK(!stellar::delete_snapshot(stellar::LIVE) && !stellar::delete_snapshot(99), "invalid ids refused");
+    }
+
+    fresh_fs();
+    {
+        for (u32 i = 0; i < stellar::SNAPSHOT_MAX; ++i) stellar::snapshot();
+        CHECK(stellar::snapshot() == stellar::INVALID_STAR, "table full");
+        CHECK(stellar::delete_snapshot(5), "free one slot");
+        CHECK(stellar::snapshot() == 5, "full table recovers after a delete");
+    }
+
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
