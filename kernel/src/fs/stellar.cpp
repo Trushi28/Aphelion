@@ -11,7 +11,7 @@ constexpr u32 VERSION = 5;
 constexpr u32 NAME_LEN = 52;
 constexpr u32 LEAF_MAX = 10;
 constexpr u32 INTERNAL_MAX = 30;
-constexpr u32 CACHE_SLOTS = 64;
+constexpr u32 CACHE_SLOTS = 256;
 
 struct PACKED SnapRec {
     u64 catalog_root;
@@ -114,24 +114,46 @@ static u64 g_alloc_hint = 0;
 static CacheSlot g_cache[CACHE_SLOTS];
 static u64 g_io_reads = 0, g_io_writes = 0, g_cache_hits = 0;
 
-static u32 g_crc32_table[256];
+static u32 g_crc32_table[8][256];
 static bool g_crc32_ready = false;
 
 static void crc32_init() {
     for (u32 i = 0; i < 256; ++i) {
         u32 c = i;
         for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        g_crc32_table[i] = c;
+        g_crc32_table[0][i] = c;
+    }
+    for (u32 i = 0; i < 256; ++i) {
+        for (u32 k = 1; k < 8; ++k) {
+            u32 prev = g_crc32_table[k - 1][i];
+            g_crc32_table[k][i] = (prev >> 8) ^ g_crc32_table[0][prev & 0xFF];
+        }
     }
     g_crc32_ready = true;
 }
 static u32 crc32_update(u32 crc, const u8* data, u64 len) {
     if (!g_crc32_ready) crc32_init();
-    for (u64 i = 0; i < len; ++i) crc = g_crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    while (len >= 8) {
+        u32 a = crc ^ (static_cast<u32>(data[0]) | (static_cast<u32>(data[1]) << 8) |
+                       (static_cast<u32>(data[2]) << 16) | (static_cast<u32>(data[3]) << 24));
+        u32 b = static_cast<u32>(data[4]) | (static_cast<u32>(data[5]) << 8) |
+                (static_cast<u32>(data[6]) << 16) | (static_cast<u32>(data[7]) << 24);
+        crc = g_crc32_table[7][a & 0xFF] ^ g_crc32_table[6][(a >> 8) & 0xFF] ^
+              g_crc32_table[5][(a >> 16) & 0xFF] ^ g_crc32_table[4][a >> 24] ^
+              g_crc32_table[3][b & 0xFF] ^ g_crc32_table[2][(b >> 8) & 0xFF] ^
+              g_crc32_table[1][(b >> 16) & 0xFF] ^ g_crc32_table[0][b >> 24];
+        data += 8;
+        len -= 8;
+    }
+    for (u64 i = 0; i < len; ++i) crc = g_crc32_table[0][(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     return crc;
 }
 static u32 crc32_full(const u8* data, u64 len) {
     return crc32_update(0xFFFFFFFFu, data, len) ^ 0xFFFFFFFFu;
+}
+
+u32 crc32(const void* data, u64 len) {
+    return crc32_full(static_cast<const u8*>(data), len);
 }
 
 static void copy_name(char* dst, const char* src) {
@@ -237,14 +259,32 @@ static void commit() {
     }
 }
 
+static u32 g_txn_depth = 0;
+
 struct Txn {
-    ~Txn() { commit(); }
+    Txn() { ++g_txn_depth; }
+    ~Txn() { if (--g_txn_depth == 0) commit(); }
 };
+
+void begin_batch() { ++g_txn_depth; }
+
+bool end_batch() {
+    if (g_txn_depth == 0) return false;
+    if (--g_txn_depth == 0) commit();
+    return true;
+}
 
 static u64 find_run(u64 from, u64 to, u64 count) {
     u64 run = 0, run_start = 0;
     for (u64 s = from; s < to;) {
         if ((s & 7) == 0 && g_bitmap[s / 8] == 0xFF) { run = 0; s += 8; continue; }
+        if ((s & 7) == 0 && s + 8 <= to && g_bitmap[s / 8] == 0x00) {
+            if (run == 0) run_start = s;
+            run += 8;
+            if (run >= count) return run_start;
+            s += 8;
+            continue;
+        }
         if (!(g_bitmap[s / 8] & (1u << (s % 8)))) {
             if (run == 0) run_start = s;
             if (++run == count) return run_start;
@@ -476,15 +516,16 @@ static bool catalog_upsert(u64 key, const StarEntry& value) {
 static bool catalog_find(u64 key, StarEntry* out) { return bt_search(g_sb.catalog_root, key, out); }
 
 static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
-    if (size != 0 && size == nsec * SECTOR_SIZE &&
-        blockdev::write_sectors(start, nsec, data)) {
-        g_io_writes += nsec;
-        cache_drop(start, nsec);
-        return true;
-    }
     const u8* src = static_cast<const u8*>(data);
+    u64 full = size / SECTOR_SIZE;
+    if (full > 0 && blockdev::write_sectors(start, full, src)) {
+        g_io_writes += full;
+        cache_drop(start, full);
+    } else {
+        full = 0;
+    }
     u8 buf[SECTOR_SIZE];
-    for (u64 i = 0; i < nsec; ++i) {
+    for (u64 i = full; i < nsec; ++i) {
         u64 done = i * SECTOR_SIZE;
         u64 remaining = done < size ? size - done : 0;
         u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
@@ -495,6 +536,13 @@ static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
 }
 
 static bool dir_make_current(StarEntry& e, u64 dir_star) {
+    {
+        u8 head[SECTOR_SIZE];
+        if (e.first_sector != 0) {
+            if (!rd(e.first_sector, head)) return false;
+            if (reinterpret_cast<DirSector*>(head)->gen == g_sb.epoch) return true;
+        }
+    }
     u8 prev[SECTOR_SIZE];
     u64 prev_sector = 0;
     bool prev_dirty = false;
@@ -531,12 +579,25 @@ static bool dir_make_current(StarEntry& e, u64 dir_star) {
     return true;
 }
 
+static u64 g_hint_dir = INVALID_STAR;
+static u64 g_hint_sector = 0;
+static u64 g_hint_epoch = 0;
+
+static void reset_runtime_state() {
+    g_hint_dir = INVALID_STAR;
+    g_hint_sector = 0;
+    g_hint_epoch = 0;
+    g_txn_depth = 0;
+}
+
 static bool add_edge(u64 dir_star, const char* name, u64 target) {
     StarEntry e;
     if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return false;
     if (!dir_make_current(e, dir_star)) return false;
 
     u64 sector = e.first_sector;
+    if (g_hint_dir == dir_star && g_hint_epoch == g_sb.epoch && g_hint_sector != 0)
+        sector = g_hint_sector;
     u8 buf[SECTOR_SIZE];
     for (;;) {
         if (!rd(sector, buf)) return false;
@@ -546,7 +607,11 @@ static bool add_edge(u64 dir_star, const char* name, u64 target) {
                 ds->entries[i].in_use = 1;
                 ds->entries[i].star = target;
                 copy_name(ds->entries[i].name, name);
-                return wr(sector, buf);
+                if (!wr(sector, buf)) return false;
+                g_hint_dir = dir_star;
+                g_hint_sector = sector;
+                g_hint_epoch = g_sb.epoch;
+                return true;
             }
         }
         if (ds->next_sector != 0) {
@@ -592,6 +657,7 @@ bool format(u64 total_sectors) {
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     g_sb_dirty = true;
     g_mounted = true;
+    reset_runtime_state();
 
     u64 root_sector = alloc_sectors(1);
     if (root_sector == 0) return false;
@@ -637,6 +703,7 @@ bool mount() {
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     g_sb_dirty = false;
     g_mounted = true;
+    reset_runtime_state();
     serial::printf("[stellar] mounted: %lu sectors, catalog root at sector %lu, epoch %lu, %u snapshot(s), next star id %lu\n",
                     g_sb.total_sectors, g_sb.catalog_root, g_sb.epoch, g_sb.snap_count, g_sb.next_star_id);
     return true;
@@ -785,6 +852,7 @@ static bool remove_edge(u64 dir_star, const char* name, u64* target_out) {
         auto* ds = reinterpret_cast<DirSector*>(buf);
         for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
             if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) {
+                g_hint_dir = INVALID_STAR;
                 *target_out = ds->entries[i].star;
                 ds->entries[i].in_use = 0;
                 ds->entries[i].star = 0;
@@ -936,15 +1004,23 @@ bool verify_file(u64 star, u64 snap) {
     StarEntry e;
     if (!bt_search(root, star, &e) || e.type != TYPE_FILE) return false;
 
+    constexpr u64 CHUNK = 16;
+    static u8* scratch = nullptr;
+    if (!scratch) scratch = static_cast<u8*>(alloc_ram(CHUNK * SECTOR_SIZE));
+
     u32 crc = 0xFFFFFFFFu;
-    u8 buf[SECTOR_SIZE];
     u64 remaining = e.size_bytes;
-    for (u64 i = 0; i < e.sector_count && remaining > 0; ++i) {
-        ++g_io_reads;
-        if (!blockdev::read_sector(e.first_sector + i, buf)) return false;
-        u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
-        crc = crc32_update(crc, buf, chunk);
-        remaining -= chunk;
+    u64 sec = 0;
+    while (remaining > 0 && sec < e.sector_count) {
+        u64 n = e.sector_count - sec;
+        if (n > CHUNK) n = CHUNK;
+        g_io_reads += n;
+        if (!blockdev::read_sectors(e.first_sector + sec, n, scratch)) return false;
+        u64 bytes = n * SECTOR_SIZE;
+        if (bytes > remaining) bytes = remaining;
+        crc = crc32_update(crc, scratch, bytes);
+        remaining -= bytes;
+        sec += n;
     }
     crc ^= 0xFFFFFFFFu;
 
@@ -965,14 +1041,14 @@ u64 read_file(u64 star, void* buf, u64 max_size, u64 snap) {
     u64 size = e.size_bytes;
     u64 to_read = size < max_size ? size : max_size;
     u8* dst = static_cast<u8*>(buf);
-    if (e.sector_count > 1 && max_size >= static_cast<u64>(e.sector_count) * SECTOR_SIZE &&
-        blockdev::read_sectors(e.first_sector, e.sector_count, dst)) {
-        g_io_reads += e.sector_count;
-        return to_read;
+    u64 read_so_far = 0;
+    u64 full = to_read / SECTOR_SIZE;
+    if (full >= 2 && blockdev::read_sectors(e.first_sector, full, dst)) {
+        g_io_reads += full;
+        read_so_far = full * SECTOR_SIZE;
     }
     u8 sector_buf[SECTOR_SIZE];
-    u64 read_so_far = 0;
-    for (u64 i = 0; i < e.sector_count && read_so_far < to_read; ++i) {
+    for (u64 i = read_so_far / SECTOR_SIZE; i < e.sector_count && read_so_far < to_read; ++i) {
         if (!rd(e.first_sector + i, sector_buf)) break;
         u64 chunk = to_read - read_so_far;
         if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;

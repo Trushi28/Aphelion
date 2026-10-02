@@ -305,6 +305,115 @@ int main() {
         CHECK(stellar::snapshot() == 5, "full table recovers after a delete");
     }
 
+    {
+        auto crc_ref = [](const u8* d, u64 n) {
+            u32 c = 0xFFFFFFFFu;
+            for (u64 i = 0; i < n; ++i) {
+                c ^= d[i];
+                for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            return c ^ 0xFFFFFFFFu;
+        };
+        CHECK(stellar::crc32("123456789", 9) == 0xCBF43926u, "crc32 known answer");
+        static u8 data[600];
+        for (u64 i = 0; i < sizeof(data); ++i) data[i] = static_cast<u8>((i * 2654435761u) >> 13);
+        bool ok = true;
+        for (u64 off = 0; off < 8; ++off)
+            for (u64 n = 0; n <= 300; ++n)
+                ok = ok && stellar::crc32(data + off, n) == crc_ref(data + off, n);
+        CHECK(ok, "slice-by-8 matches the bitwise reference at every length and alignment");
+    }
+
+    fresh_fs();
+    {
+        static u8 in[70000], out[70000];
+        for (u64 i = 0; i < sizeof(in); ++i) in[i] = static_cast<u8>((i * 40503u) >> 7);
+        const u64 sizes[] = {0, 1, 511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097, 5000, 8192, 8193, 70000};
+        u64 idx = 0;
+        for (u64 sz : sizes) {
+            char nm[32]; name_of(nm, "rt", idx++);
+            u64 st = stellar::create_file(stellar::ROOT_STAR, nm, in, sz);
+            CHECK(st != stellar::INVALID_STAR, "round trip create");
+            for (u64 i = 0; i < sizeof(out); ++i) out[i] = 0xEE;
+            u64 got = stellar::read_file(st, out, sz);
+            bool same = got == sz;
+            for (u64 i = 0; same && i < sz; ++i) same = out[i] == in[i];
+            CHECK(same, "exact-size read");
+            bool guard = true;
+            for (u64 i = sz; i < sz + 16 && i < sizeof(out); ++i) guard = guard && out[i] == 0xEE;
+            CHECK(guard, "read never writes past the requested size");
+            CHECK(stellar::verify_file(st), "checksum verifies");
+            for (u64 i = 0; i < sizeof(out); ++i) out[i] = 0;
+            got = stellar::read_file(st, out, sizeof(out));
+            same = got == sz;
+            for (u64 i = 0; same && i < sz; ++i) same = out[i] == in[i];
+            CHECK(same, "oversized-buffer read");
+        }
+    }
+
+    fresh_fs();
+    {
+        auto a = stellar::io_stats();
+        for (u64 i = 0; i < 300; ++i) {
+            char nm[32]; name_of(nm, "m", i);
+            make(stellar::ROOT_STAR, nm, nm);
+        }
+        auto b = stellar::io_stats();
+        u64 lookups = (b.reads - a.reads) + (b.cache_hits - a.cache_hits);
+        printf("300 creates in one directory: %lu sector lookups (%.1f per create)\n", lookups, (double)lookups / 300.0);
+        CHECK(lookups <= 300 * 20, "directory append cost does not grow with directory size");
+    }
+
+    fresh_fs();
+    {
+        u64 live = 0;
+        for (u64 i = 0; i < 30; ++i) { char nm[32]; name_of(nm, "h", i); make(stellar::ROOT_STAR, nm, nm); ++live; }
+        stellar::snapshot();
+        for (u64 i = 30; i < 60; ++i) { char nm[32]; name_of(nm, "h", i); make(stellar::ROOT_STAR, nm, nm); ++live; }
+        for (u64 i = 0; i < 60; i += 3) {
+            char nm[32]; name_of(nm, "h", i);
+            CHECK(stellar::unlink(stellar::ROOT_STAR, nm), "unlink before refill");
+            --live;
+        }
+        for (u64 i = 100; i < 130; ++i) { char nm[32]; name_of(nm, "h", i); make(stellar::ROOT_STAR, nm, nm); ++live; }
+        CHECK(count_dir(stellar::ROOT_STAR) == live, "directory count after epoch change, unlinks and refill");
+        bool all = true;
+        for (u64 i = 0; i < 130; ++i) {
+            if (i >= 60 && i < 100) continue;
+            char nm[32]; name_of(nm, "h", i);
+            u64 st = stellar::find(stellar::ROOT_STAR, nm);
+            bool should_exist = i >= 100 || (i % 3) != 0;
+            all = all && (should_exist ? eq(st, nm) : st == stellar::INVALID_STAR);
+        }
+        CHECK(all, "append hint stays correct across snapshot and unlink");
+    }
+
+    {
+        auto count_writes = [](bool batched) {
+            fresh_fs();
+            auto a = stellar::io_stats();
+            if (batched) stellar::begin_batch();
+            for (u64 i = 0; i < 100; ++i) {
+                char nm[32]; name_of(nm, "b", i);
+                make(stellar::ROOT_STAR, nm, nm);
+            }
+            if (batched) CHECK(stellar::end_batch(), "end batch");
+            return stellar::io_stats().writes - a.writes;
+        };
+        u64 plain = count_writes(false);
+        u64 grouped = count_writes(true);
+        printf("100 creates: %lu sector writes unbatched, %lu in one batch\n", plain, grouped);
+        CHECK(grouped < plain, "batching saves superblock and bitmap writes");
+        CHECK(stellar::mount(), "remount after batch");
+        bool all = true;
+        for (u64 i = 0; i < 100; ++i) {
+            char nm[32]; name_of(nm, "b", i);
+            all = all && eq(stellar::find(stellar::ROOT_STAR, nm), nm);
+        }
+        CHECK(all, "batched creates persisted");
+        CHECK(!stellar::end_batch(), "unbalanced end_batch is refused");
+    }
+
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -64,8 +64,8 @@ and needs one bit of RAM per sector.
 Three things were making the filesystem slow, all fixed: the whole free bitmap was rewritten on
 *every* allocation; there was no sector cache, so every B+tree level was a disk round trip; and the
 superblock was written for every new star ID. Now only dirty bitmap sectors are written, once per
-operation; a 64-slot write-through cache (32 KiB) serves repeat reads; allocation is next-fit with
-whole-byte skipping.
+operation; a 256-slot write-through cache (128 KiB) serves repeat reads; allocation is next-fit with
+whole-byte skipping in both directions.
 
 Measured with the host-side harness (131072-sector disk), old implementation vs new in the same harness:
 
@@ -75,6 +75,20 @@ Measured with the host-side harness (131072-sector disk), old implementation vs 
 | Snapshot of a ~120-entry tree | 3,999 writes, 2,742 reads | **1 write, 0 reads** |
 | Snapshot of a 700+ entry tree with a 5-deep subtree | recursive copy, grows with size | **1 write, 0 reads** |
 | NVMe interrupts during boot self-tests | 271 | **16** |
+
+### Second pass
+
+- **Directory appends are O(1).** A directory whose head sector is current has a current chain, so
+  `dir_make_current` checks one sector instead of walking the chain, and `add_edge` resumes from the
+  last sector it filled instead of the head. `unlink` drops that hint.
+- **Extents move in batches.** Writes send every whole sector in one batched request and only the
+  padded tail sector singly. `read_file` and `verify_file` batch the same way, and a read no longer
+  needs an output buffer rounded up to a sector.
+- **Group commit.** `begin_batch()` / `end_batch()` hold the bitmap and superblock writes until the
+  outermost batch ends. Data and catalog nodes are still written through immediately, so a crash
+  inside a batch loses more than a crash between single operations.
+- **CRC32 is slice-by-8**, checked against the bitwise reference at every length and alignment.
+- **The cache is 256 slots**, so B+tree interior nodes survive a directory walk.
 
 ---
 

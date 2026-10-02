@@ -36,6 +36,9 @@ bool unlink(u64 dir_star, const char* name);
 bool delete_snapshot(u64 snap);
 u32 live_snapshot_count();
 u64 gc();
+void begin_batch();
+bool end_batch();
+u32 crc32(const void* data, u64 len);
 bool verify_file(u64 star, u64 snap = LIVE);
 
 IoStats io_stats();
