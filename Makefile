@@ -71,6 +71,10 @@ iso: $(KERNEL_ELF) $(LIMINE)/limine.h
 $(DISK_IMG):
 	qemu-img create -f raw $(DISK_IMG) $(DISK_SIZE)
 
+.PHONY: reset-disk
+reset-disk:
+	rm -f $(DISK_IMG)
+
 run: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \

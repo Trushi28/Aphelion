@@ -33,3 +33,11 @@ jobs:
 
       - name: Boot on virtio-blk
         run: tools/ci-boot.sh virtio 1
+
+      - name: Upload boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-logs
+          path: build/ci-logs
+          if-no-files-found: ignore

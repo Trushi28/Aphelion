@@ -70,6 +70,8 @@ extern "C" void isr_dispatch(Frame* f) {
 
 void set_handler(u8 vector, Handler h) { g_handlers[vector] = h; }
 
+static void spurious_handler(Frame*) {}
+
 static void load_idtr() {
     Descriptor desc{ sizeof(g_idt) - 1, reinterpret_cast<u64>(g_idt) };
     asm volatile("lidt %0" :: "m"(desc));
@@ -81,6 +83,7 @@ void init() {
     built = true;
 
     for (auto& h : g_handlers) h = nullptr;
+    g_handlers[VEC_SPURIOUS] = &spurious_handler;
     for (auto& g : g_idt) __builtin_memset(&g, 0, sizeof(g));
 
     constexpr u8 TYPE_INTR64 = 0x8E;

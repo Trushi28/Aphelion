@@ -59,6 +59,8 @@ static volatile u64 g_cpus_online = 0;
 static volatile u64 g_next_core_idx = 1;
 static u64 g_hhdm_offset = 0;
 
+static constexpr const char* HELLO_REWRITTEN = "Aphelion Stellar FS -- rewritten after snapshot.\n";
+
 static u32 init_gdt_idt(bool is_bsp) {
     static u8 df_stack[8][4096] __attribute__((aligned(16)));
     static u8 nmi_stack[8][4096] __attribute__((aligned(16)));
@@ -310,6 +312,7 @@ extern "C" NORETURN void kernel_main() {
                        "[%s] %s multi-request queueing: %lu sectors written+read in one batch, %s\n",
                        batch_match ? "ok" : "--", blockdev::active()->name(), SCRATCH_COUNT,
                        batch_match ? "byte-for-byte match" : "MISMATCH");
+            serial::printf("[selftest] multi-request queueing: %s\n", batch_match ? "ok" : "MISMATCH");
         }
 
         stellar::init(g_hhdm_offset);
@@ -345,13 +348,13 @@ extern "C" NORETURN void kernel_main() {
             u64 n = stellar::read_file(file, readback, sizeof(readback) - 1);
             readback[n] = 0;
 
-            bool match = (n == msg_len);
-            for (u64 i = 0; match && i < n; ++i) match = (readback[i] == static_cast<u8>(msg[i]));
+            bool match = file_equals(file, msg) || file_equals(file, HELLO_REWRITTEN);
 
             fb::printf(match ? 0xC0FFC0 : 0xE0D080,
-                       "[%s] Stellar FS: created /hello.txt, read %lu bytes back, %s\n",
-                       match ? "ok" : "--", n, match ? "matched exactly" : "MISMATCH");
+                       "[%s] Stellar FS: %s /hello.txt, read %lu bytes back, %s\n",
+                       match ? "ok" : "--", fresh_fs ? "created" : "found", n, match ? "matched exactly" : "MISMATCH");
             serial::printf("[stellar] readback: %s\n", reinterpret_cast<const char*>(readback));
+            serial::printf("[selftest] hello.txt: %s\n", match ? "ok" : "MISMATCH");
             if (virtioblk::present())
                 serial::printf("[virtio-blk] completion mode: %s, %u interrupt(s) delivered\n",
                                 virtioblk::using_msix() ? "MSI-X" : "polled", virtioblk::irq_count());
@@ -363,7 +366,7 @@ extern "C" NORETURN void kernel_main() {
                                 nvme::completion_mode(), nvme::irq_count());
 
             if (fresh_fs) {
-                const char* rewritten_msg = "Aphelion Stellar FS -- rewritten after snapshot.\n";
+                const char* rewritten_msg = HELLO_REWRITTEN;
                 u64 rewritten_len = cstr_len(rewritten_msg);
 
                 bool cow_pre_ok = stellar::verify_file(file);
@@ -413,6 +416,7 @@ extern "C" NORETURN void kernel_main() {
                            o1_ok ? "ok" : "--", io_after.writes - io_before.writes, io_after.reads - io_before.reads);
                 serial::printf("[stellar] snapshots: %u in table, snapshot() cost %lu write(s) + %lu read(s) each (O(1), epoch-based)\n",
                                 stellar::snapshot_count(), io_after.writes - io_before.writes, io_after.reads - io_before.reads);
+                serial::printf("[selftest] COW and tree snapshots: %s\n", (cow_ok && tree_ok && o1_ok) ? "ok" : "MISMATCH");
             } else {
                 serial::printf("[stellar] snapshot self-tests skipped on a mounted disk (%u/%u snapshot slots in use); delete disk.img to rerun them\n",
                                 stellar::snapshot_count(), stellar::SNAPSHOT_MAX);
@@ -431,6 +435,7 @@ extern "C" NORETURN void kernel_main() {
             fb::printf(bulk_ok ? 0xC0FFC0 : 0xE0D080,
                        "[%s] Stellar FS bulk I/O: /bulk.bin %lu bytes through the batched block path, checksum verified, %s\n",
                        bulk_ok ? "ok" : "--", bulk_n, bulk_ok ? "byte-for-byte match" : "MISMATCH");
+            serial::printf("[selftest] bulk I/O: %s\n", bulk_ok ? "ok" : "MISMATCH");
 
             constexpr u64 STRESS_COUNT = 14;
             static u64 stress_ids[STRESS_COUNT];

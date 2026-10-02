@@ -83,9 +83,12 @@ make run-nvme       # boot with an NVMe disk (SMP=4 for multi-core)
 make run-ahci       # boot with an AHCI/SATA disk
 make run-headless   # serial output only
 make test-stellar   # run the filesystem tests on the host, without QEMU
+make reset-disk     # delete disk.img so the next run formats a fresh filesystem
 ```
 
-The first run creates `disk.img`, a 64 MB raw disk. Delete it to start with a fresh filesystem.
+The first run creates `disk.img`, a 64 MB raw disk. The filesystem on it is independent of the
+block driver, so switching between virtio-blk, AHCI and NVMe keeps the same files. Run
+`make reset-disk` to start with a fresh filesystem.
 The ISO can also be written to a USB stick to boot real hardware:
 
 ```sh
