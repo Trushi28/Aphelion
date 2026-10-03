@@ -151,7 +151,7 @@ static void* alloc_pages(u64 bytes) {
     while ((universe::PAGE_SIZE << order) < bytes) ++order;
     u64 phys = universe::alloc(order);
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    for (u64 i = 0; i < (universe::PAGE_SIZE << order); ++i) reinterpret_cast<u8*>(v)[i] = 0;
+    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
     return v;
 }
 static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
@@ -231,6 +231,7 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
     fis->countl = static_cast<u8>(count);
     fis->counth = static_cast<u8>(count >> 8);
 
+    __sync_synchronize();
     g_port->ci = 1u;
 
     u64 spins = 0;
@@ -246,6 +247,7 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
             break;
         }
     }
+    __sync_synchronize();
     cpu::irq_restore(irq_flags);
     return ok && !task_file_error();
 }
@@ -323,6 +325,7 @@ static bool run_ncq_batch(u64 start_sector, u32 n, bool write) {
             break;
         }
     }
+    __sync_synchronize();
     cpu::irq_restore(irq_flags);
 
     if (!ok || task_file_error()) {
@@ -339,12 +342,12 @@ static bool identify(u8* out512) {
 bool read_sector(u64 sector, void* buf512) {
     if (!g_present) return false;
     if (!run_command(ATA_CMD_READ_DMA_EXT, sector, 1, g_bounce, false)) return false;
-    for (int i = 0; i < 512; ++i) static_cast<u8*>(buf512)[i] = g_bounce[i];
+    __builtin_memcpy(buf512, g_bounce, 512);
     return true;
 }
 bool write_sector(u64 sector, const void* buf512) {
     if (!g_present) return false;
-    for (int i = 0; i < 512; ++i) g_bounce[i] = static_cast<const u8*>(buf512)[i];
+    __builtin_memcpy(g_bounce, buf512, 512);
     return run_command(ATA_CMD_WRITE_DMA_EXT, sector, 1, g_bounce, true);
 }
 
@@ -363,7 +366,7 @@ struct HalDevice : blockdev::Device {
             u32 batch = static_cast<u32>(count < g_max_inflight ? count : g_max_inflight);
             if (!run_ncq_batch(start_sector, batch, false)) return false;
             for (u32 i = 0; i < batch; ++i)
-                for (int b = 0; b < 512; ++b) dst[static_cast<u64>(i) * 512 + b] = bounce_for(i)[b];
+                __builtin_memcpy(dst + static_cast<u64>(i) * 512, bounce_for(i), 512);
             dst += static_cast<u64>(batch) * 512;
             start_sector += batch;
             count -= batch;
@@ -381,7 +384,7 @@ struct HalDevice : blockdev::Device {
         while (count > 0) {
             u32 batch = static_cast<u32>(count < g_max_inflight ? count : g_max_inflight);
             for (u32 i = 0; i < batch; ++i)
-                for (int b = 0; b < 512; ++b) bounce_for(i)[b] = src[static_cast<u64>(i) * 512 + b];
+                __builtin_memcpy(bounce_for(i), src + static_cast<u64>(i) * 512, 512);
             if (!run_ncq_batch(start_sector, batch, true)) return false;
             src += static_cast<u64>(batch) * 512;
             start_sector += batch;
@@ -424,6 +427,7 @@ static bool rebase_port() {
     g_port->is = 0xFFFFFFFFu;
     g_port->ie = PORT_IE_DHRE | PORT_IE_SDBE | PORT_IE_TFEE;
 
+    __sync_synchronize();
     g_port->cmd |= PORT_CMD_FRE;
     g_port->cmd |= PORT_CMD_ST;
     return true;

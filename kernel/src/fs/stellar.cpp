@@ -180,8 +180,7 @@ static void* alloc_ram(u64 bytes) {
     while ((universe::PAGE_SIZE << order) < bytes) ++order;
     u64 phys = universe::alloc(order);
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    u8* b = static_cast<u8*>(v);
-    for (u64 i = 0; i < (universe::PAGE_SIZE << order); ++i) b[i] = 0;
+    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
     return v;
 }
 

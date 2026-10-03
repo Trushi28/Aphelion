@@ -100,7 +100,7 @@ static void* alloc_pages(u64 bytes) {
     while ((universe::PAGE_SIZE << order) < bytes) ++order;
     u64 phys = universe::alloc(order);
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    for (u64 i = 0; i < (universe::PAGE_SIZE << order); ++i) reinterpret_cast<u8*>(v)[i] = 0;
+    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
     return v;
 }
 static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
@@ -157,11 +157,13 @@ static void submit(u32 slot, u64 sector, bool write) {
     __sync_synchronize();
 }
 
+static u16 used_idx() { return reinterpret_cast<volatile VringUsed*>(g_used)->idx; }
+
 static bool drain(u32 pending) {
     u64 waits = 0;
     u64 irq_flags = cpu::irq_save();
     while (pending > 0) {
-        if (g_used->idx == g_used_seen) {
+        if (used_idx() == g_used_seen) {
             if (g_msix_ready) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
             if (++waits > 20000000ull) {
                 cpu::irq_restore(irq_flags);
@@ -170,6 +172,7 @@ static bool drain(u32 pending) {
             }
             continue;
         }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         u16 idx = g_used_seen % g_negotiated_qsize;
         u32 head = g_used->ring[idx].id;
         u32 slot = head / 3;
@@ -337,7 +340,7 @@ bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
         u64 batch = count < g_max_inflight ? count : g_max_inflight;
         if (!run_batch(start_sector, batch, false)) return false;
         for (u64 i = 0; i < batch; ++i)
-            for (int b = 0; b < 512; ++b) dst[i * 512 + b] = bounce_for(static_cast<u32>(i))[b];
+            __builtin_memcpy(dst + i * 512, bounce_for(static_cast<u32>(i)), 512);
         dst += batch * 512;
         start_sector += batch;
         count -= batch;
@@ -350,7 +353,7 @@ bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
     while (count > 0) {
         u64 batch = count < g_max_inflight ? count : g_max_inflight;
         for (u64 i = 0; i < batch; ++i)
-            for (int b = 0; b < 512; ++b) bounce_for(static_cast<u32>(i))[b] = src[i * 512 + b];
+            __builtin_memcpy(bounce_for(static_cast<u32>(i)), src + i * 512, 512);
         if (!run_batch(start_sector, batch, true)) return false;
         src += batch * 512;
         start_sector += batch;

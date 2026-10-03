@@ -16,12 +16,17 @@ OVMF      ?= $(firstword $(wildcard /usr/share/edk2/x64/OVMF.4m.fd /usr/share/ed
 LIMINE_REPO   := https://github.com/limine-bootloader/limine.git
 LIMINE_BRANCH := v9.x-binary
 
-CXXFLAGS := -std=c++20 -Wall -Wextra \
+OPT ?= -O2
+
+CXXFLAGS := -std=c++20 $(OPT) -Wall -Wextra \
+            -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
             -ffreestanding -fno-stack-protector -fno-stack-check \
             -fno-lto -fno-pic -fno-pie -fno-exceptions -fno-rtti \
             -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
             -mcmodel=kernel -m64 -Wa,--noexecstack \
             -I$(KDIR)/include -I$(LIMINE)
+
+FLAGS_STAMP := $(BUILD)/.cxxflags
 
 ASMFLAGS := -f elf64
 
@@ -43,7 +48,14 @@ $(LIMINE)/limine.h:
 	git clone $(LIMINE_REPO) --branch=$(LIMINE_BRANCH) --depth=1 $(LIMINE)
 	$(MAKE) -C $(LIMINE)
 
-$(BUILD)/%.o: %.cpp $(LIMINE)/limine.h
+.PHONY: FORCE
+FORCE:
+
+$(FLAGS_STAMP): FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(CXXFLAGS)' | cmp -s - $@ || echo '$(CXXFLAGS)' > $@
+
+$(BUILD)/%.o: %.cpp $(LIMINE)/limine.h $(FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

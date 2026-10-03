@@ -137,7 +137,7 @@ static void* alloc_pages(u64 bytes) {
     while ((universe::PAGE_SIZE << order) < bytes) ++order;
     u64 phys = universe::alloc(order);
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    for (u64 i = 0; i < (universe::PAGE_SIZE << order); ++i) reinterpret_cast<u8*>(v)[i] = 0;
+    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
     return v;
 }
 static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
@@ -242,7 +242,10 @@ static void submit_io(u32 slot, u64 lba, bool write) {
     g_io.sq_tail = static_cast<u16>((g_io.sq_tail + 1) % g_io.depth);
 }
 
-static void ring_io_sq_doorbell() { *g_io.sq_doorbell = g_io.sq_tail; }
+static void ring_io_sq_doorbell() {
+    __sync_synchronize();
+    *g_io.sq_doorbell = g_io.sq_tail;
+}
 
 static bool drain_io(u32 pending) {
     u64 waits = 0;
@@ -268,6 +271,7 @@ static bool drain_io(u32 pending) {
         g_io.cq_head = static_cast<u16>((g_io.cq_head + 1) % g_io.depth);
         if (g_io.cq_head == 0) g_io.phase = static_cast<u16>(g_io.phase ^ 1u);
     }
+    __sync_synchronize();
     *g_io.cq_doorbell = g_io.cq_head;
     cpu::irq_restore(irq_flags);
     return true;
@@ -560,7 +564,7 @@ bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
         u32 batch = static_cast<u32>(count < g_io_max_inflight ? count : g_io_max_inflight);
         if (!run_io_batch(start_sector, batch, false)) return false;
         for (u32 i = 0; i < batch; ++i)
-            for (int b = 0; b < 512; ++b) dst[static_cast<u64>(i) * 512 + b] = io_bounce_for(i)[b];
+            __builtin_memcpy(dst + static_cast<u64>(i) * 512, io_bounce_for(i), 512);
         dst += static_cast<u64>(batch) * 512;
         start_sector += batch;
         count -= batch;
@@ -578,7 +582,7 @@ bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
     while (count > 0) {
         u32 batch = static_cast<u32>(count < g_io_max_inflight ? count : g_io_max_inflight);
         for (u32 i = 0; i < batch; ++i)
-            for (int b = 0; b < 512; ++b) io_bounce_for(i)[b] = src[static_cast<u64>(i) * 512 + b];
+            __builtin_memcpy(io_bounce_for(i), src + static_cast<u64>(i) * 512, 512);
         if (!run_io_batch(start_sector, batch, true)) return false;
         src += static_cast<u64>(batch) * 512;
         start_sector += batch;
@@ -595,7 +599,7 @@ bool HalDevice::read_sector(u64 sector, void* buf512) {
     u64 off = byte & ((1ull << g_lba_shift) - 1);
     if (!rmw_transfer(lba, false)) return false;
     u8* dst = static_cast<u8*>(buf512);
-    for (u64 i = 0; i < 512; ++i) dst[i] = g_admin_bounce[off + i];
+    __builtin_memcpy(dst, g_admin_bounce + off, 512);
     return true;
 }
 
@@ -607,7 +611,7 @@ bool HalDevice::write_sector(u64 sector, const void* buf512) {
     u64 off = byte & ((1ull << g_lba_shift) - 1);
     if (!rmw_transfer(lba, false)) return false;
     const u8* src = static_cast<const u8*>(buf512);
-    for (u64 i = 0; i < 512; ++i) g_admin_bounce[off + i] = src[i];
+    __builtin_memcpy(g_admin_bounce + off, src, 512);
     return rmw_transfer(lba, true);
 }
 

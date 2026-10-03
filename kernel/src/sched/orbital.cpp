@@ -86,6 +86,7 @@ static void build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     s->in_use = true;
 
     u64* sp = reinterpret_cast<u64*>(stack_virt + s->stack_size);
+    *(--sp) = 0;
     *(--sp) = reinterpret_cast<u64>(trampoline);
     *(--sp) = 0;
     *(--sp) = 0;

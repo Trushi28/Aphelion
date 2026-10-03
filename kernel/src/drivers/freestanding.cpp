@@ -1,23 +1,28 @@
 #include <cosmos/types.hpp>
 
 extern "C" void* memset(void* dst, int v, usize n) {
-    auto* d = static_cast<u8*>(dst);
-    for (usize i = 0; i < n; ++i) d[i] = static_cast<u8>(v);
+    void* d = dst;
+    asm volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(static_cast<u8>(v)) : "memory");
     return dst;
 }
 
 extern "C" void* memcpy(void* dst, const void* src, usize n) {
-    auto* d = static_cast<u8*>(dst);
-    auto* s = static_cast<const u8*>(src);
-    for (usize i = 0; i < n; ++i) d[i] = s[i];
+    void* d = dst;
+    const void* s = src;
+    asm volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) :: "memory");
     return dst;
 }
 
 extern "C" void* memmove(void* dst, const void* src, usize n) {
     auto* d = static_cast<u8*>(dst);
     auto* s = static_cast<const u8*>(src);
-    if (d < s) { for (usize i = 0; i < n; ++i) d[i] = s[i]; }
-    else       { for (usize i = n; i-- > 0;)   d[i] = s[i]; }
+    if (d < s) {
+        void* dd = d;
+        const void* ss = s;
+        asm volatile("rep movsb" : "+D"(dd), "+S"(ss), "+c"(n) :: "memory");
+    } else {
+        for (usize i = n; i-- > 0;) d[i] = s[i];
+    }
     return dst;
 }
 

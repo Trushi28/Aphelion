@@ -20,48 +20,54 @@ void init(const Info& info) {
     g_ready = true;
 }
 
+static u32 pack(u32 rgb) {
+    u32 r = (rgb >> 16) & 0xFF;
+    u32 g = (rgb >> 8) & 0xFF;
+    u32 b = rgb & 0xFF;
+    return (r << g_info.red_shift) | (g << g_info.green_shift) | (b << g_info.blue_shift);
+}
+
+static volatile u32* row_ptr(u64 y, u64 x) {
+    return reinterpret_cast<volatile u32*>(g_info.base + y * g_info.pitch + x * (g_info.bpp / 8));
+}
+
 void put_pixel(u64 x, u64 y, u32 rgb) {
     if (x >= g_info.width || y >= g_info.height) return;
-    u8 r = static_cast<u8>((rgb >> 16) & 0xFF);
-    u8 g = static_cast<u8>((rgb >> 8) & 0xFF);
-    u8 b = static_cast<u8>(rgb & 0xFF);
-    u32 packed = (static_cast<u32>(r) << g_info.red_shift) |
-                 (static_cast<u32>(g) << g_info.green_shift) |
-                 (static_cast<u32>(b) << g_info.blue_shift);
-    auto* px = reinterpret_cast<volatile u32*>(g_info.base + y * g_info.pitch + x * (g_info.bpp / 8));
-    *px = packed;
+    *row_ptr(y, x) = pack(rgb);
+}
+
+static void fill_rows(u64 first, u64 count, u32 packed) {
+    for (u64 y = first; y < first + count && y < g_info.height; ++y) {
+        void* d = const_cast<u32*>(row_ptr(y, 0));
+        u64 n = g_info.width;
+        asm volatile("rep stosl" : "+D"(d), "+c"(n) : "a"(packed) : "memory");
+    }
 }
 
 void clear(u32 rgb) {
-    for (u64 y = 0; y < g_info.height; ++y)
-        for (u64 x = 0; x < g_info.width; ++x)
-            put_pixel(x, y, rgb);
+    fill_rows(0, g_info.height, pack(rgb));
     g_col = g_row = 0;
 }
 
 static void scroll(u32 bg) {
-
-    u64 row_bytes = GLYPH_H * g_info.pitch;
-    for (u64 y = 0; y < g_info.height - GLYPH_H; ++y) {
-        auto* dst = g_info.base + y * g_info.pitch;
-        auto* src = g_info.base + (y + GLYPH_H) * g_info.pitch;
-        for (u64 i = 0; i < g_info.pitch; ++i) dst[i] = src[i];
+    u64 keep = g_info.height - GLYPH_H;
+    for (u64 y = 0; y < keep; ++y) {
+        void* d = const_cast<u32*>(row_ptr(y, 0));
+        const void* s = const_cast<u32*>(row_ptr(y + GLYPH_H, 0));
+        u64 n = g_info.width;
+        asm volatile("rep movsl" : "+D"(d), "+S"(s), "+c"(n) :: "memory");
     }
-    (void)row_bytes;
-    for (u64 y = g_info.height - GLYPH_H; y < g_info.height; ++y)
-        for (u64 x = 0; x < g_info.width; ++x)
-            put_pixel(x, y, bg);
+    fill_rows(keep, GLYPH_H, pack(bg));
 }
 
 static void draw_glyph(char c, u64 col, u64 row, u32 fg, u32 bg) {
     const u8* rows = font8x8::glyphs[static_cast<u8>(c) & 0x7F];
     u64 ox = col * GLYPH_W, oy = row * GLYPH_H;
+    u32 pf = pack(fg), pb = pack(bg);
     for (u64 gy = 0; gy < GLYPH_H; ++gy) {
+        volatile u32* line = row_ptr(oy + gy, ox);
         u8 bits = rows[gy];
-        for (u64 gx = 0; gx < GLYPH_W; ++gx) {
-            bool on = (bits >> gx) & 1;
-            put_pixel(ox + gx, oy + gy, on ? fg : bg);
-        }
+        for (u64 gx = 0; gx < GLYPH_W; ++gx) line[gx] = ((bits >> gx) & 1) ? pf : pb;
     }
 }
 

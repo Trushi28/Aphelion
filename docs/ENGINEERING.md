@@ -1,6 +1,6 @@
 # Engineering notes
 
-Thirteen real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Fourteen real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 Kept here because they're the kind of thing worth not re-learning.
 
@@ -69,3 +69,16 @@ Kept here because they're the kind of thing worth not re-learning.
     making the catalog and directories epoch-versioned copy-on-write, so a
     snapshot is just a saved root pointer. The boot self-test now asserts the
     cost is exactly 1 write.
+14. **The kernel was built at `-O0`, and turning on `-O2` exposed five latent
+    hazards that `-O0` had been hiding.** Port I/O, `cli`/`sti`/`hlt` and
+    `wrmsr` inline asm had no memory clobber, so a polled completion loop
+    could legally be compiled to read a DMA-written ring once. Descriptors
+    written with ordinary stores before a volatile doorbell write had no fence,
+    and volatile only orders against other volatile accesses. The freestanding
+    `memset`/`memcpy` loops get recognised as `memset`/`memcpy` and call
+    themselves; they are now `rep stosb`/`rep movsb`, with
+    `-fno-tree-loop-distribute-patterns` for the loops that remain. Byte
+    buffers cast to B+tree nodes and ACPI tables need `-fno-strict-aliasing`.
+    New kernel threads entered at `rsp % 16 == 0` where the ABI wants 8.
+    Separately, the framebuffer scroll copied volatile bytes one at a time,
+    which no optimisation level can batch; it now moves whole rows.

@@ -4,16 +4,16 @@
 namespace cpu {
 
 ALWAYS_INLINE void out8(u16 port, u8 val) {
-    asm volatile("outb %0, %1" :: "a"(val), "Nd"(port));
+    asm volatile("outb %0, %1" :: "a"(val), "Nd"(port) : "memory");
 }
 ALWAYS_INLINE u8 in8(u16 port) {
-    u8 v; asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v;
+    u8 v; asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port) : "memory"); return v;
 }
 ALWAYS_INLINE void out32(u16 port, u32 val) {
-    asm volatile("outl %0, %1" :: "a"(val), "Nd"(port));
+    asm volatile("outl %0, %1" :: "a"(val), "Nd"(port) : "memory");
 }
 ALWAYS_INLINE u32 in32(u16 port) {
-    u32 v; asm volatile("inl %1, %0" : "=a"(v) : "Nd"(port)); return v;
+    u32 v; asm volatile("inl %1, %0" : "=a"(v) : "Nd"(port) : "memory"); return v;
 }
 
 ALWAYS_INLINE void io_wait() { out8(0x80, 0); }
@@ -26,7 +26,7 @@ ALWAYS_INLINE u64 rdmsr(u32 msr) {
 ALWAYS_INLINE void wrmsr(u32 msr, u64 val) {
     u32 lo = static_cast<u32>(val);
     u32 hi = static_cast<u32>(val >> 32);
-    asm volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(msr));
+    asm volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(msr) : "memory");
 }
 
 ALWAYS_INLINE void cpuid(u32 leaf, u32 subleaf, u32* a, u32* b, u32* c, u32* d) {
@@ -35,9 +35,9 @@ ALWAYS_INLINE void cpuid(u32 leaf, u32 subleaf, u32* a, u32* b, u32* c, u32* d) 
                  : "a"(leaf), "c"(subleaf));
 }
 
-ALWAYS_INLINE void cli() { asm volatile("cli"); }
-ALWAYS_INLINE void sti() { asm volatile("sti"); }
-ALWAYS_INLINE void halt() { asm volatile("hlt"); }
+ALWAYS_INLINE void cli() { asm volatile("cli" ::: "memory"); }
+ALWAYS_INLINE void sti() { asm volatile("sti" ::: "memory"); }
+ALWAYS_INLINE void halt() { asm volatile("hlt" ::: "memory"); }
 ALWAYS_INLINE void sti_halt() { asm volatile("sti; hlt" ::: "memory"); }
 ALWAYS_INLINE u64 irq_save() {
     u64 flags;
