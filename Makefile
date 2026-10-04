@@ -24,7 +24,7 @@ CXXFLAGS := -std=c++20 $(OPT) -Wall -Wextra \
             -fno-lto -fno-pic -fno-pie -fno-exceptions -fno-rtti \
             -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
             -mcmodel=kernel -m64 -Wa,--noexecstack \
-            -I$(KDIR)/include -I$(LIMINE)
+            -MMD -MP -I$(KDIR)/include -I$(LIMINE)
 
 FLAGS_STAMP := $(BUILD)/.cxxflags
 
@@ -62,6 +62,8 @@ $(BUILD)/%.o: %.cpp $(LIMINE)/limine.h $(FLAGS_STAMP)
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(ASM) $(ASMFLAGS) $< -o $@
+
+-include $(OBJECTS:.o=.d)
 
 $(KERNEL_ELF): $(OBJECTS) $(KDIR)/linker.ld
 	$(LD) $(LDFLAGS) $(OBJECTS) -o $@
