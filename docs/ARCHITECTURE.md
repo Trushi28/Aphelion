@@ -78,6 +78,13 @@ registers.
 All three wait with `cli` / check / `sti; hlt` (no lost-wakeup window) and fall back to
 polling if no interrupt arrives.
 
+### Locking
+
+`orbital::Mutex` is recursive and owned by the Satellite. A contended waiter calls `yield_contended()`, which
+puts it in the lowest ring: plain `yield()` promotes a Satellite, so waiters used to climb above the lock holder
+and starve it (see [Engineering notes](ENGINEERING.md), item 20). Stellar has one mutex and each block driver has
+its own around every request, always acquired in that order. There is no sleeping lock or wait queue yet.
+
 ### Hardware and interrupts
 
 x2APIC with xAPIC fallback. ACPI/MADT parsing for CPUs, IOAPIC and Interrupt Source

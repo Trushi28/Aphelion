@@ -1,6 +1,6 @@
 # Engineering notes
 
-Fourteen real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Twenty-two real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 Kept here because they're the kind of thing worth not re-learning.
 
@@ -82,3 +82,34 @@ Kept here because they're the kind of thing worth not re-learning.
     New kernel threads entered at `rsp % 16 == 0` where the ABI wants 8.
     Separately, the framebuffer scroll copied volatile bytes one at a time,
     which no optimisation level can batch; it now moves whole rows.
+15. **The Makefile tracked no header dependencies.** Objects depended only on their `.cpp`, so editing a header
+    left stale objects behind. Adding a virtual to `blockdev::Device` shifts the vtable and would have made
+    untouched drivers call the wrong slot. Fixed with `-MMD -MP`.
+16. **A name was truncated on create and compared in full on lookup.** `copy_name` cut at 51 characters while
+    `find` compared the whole string, so a long name could be created and never found; nothing stopped the
+    same name being created twice, and `link` accepted directories, which makes cycles. Names are validated,
+    duplicates refused, and only files can be hard linked. The stress test never saw any of it because it only
+    ever made valid, unique names.
+17. **`mount()` trusted the superblock.** A `snap_count` above 24 read past the snapshot array and a wrong
+    `bitmap_sectors` sized the in-RAM bitmap from untrusted input. Found by corrupting each field of sector 0 in
+    the host harness; all 16 corruptions mounted before.
+18. **Write errors were swallowed.** `commit()` returned `void` and ignored `raw_wr`, so a failed bitmap or
+    superblock write still reported success. `unlink` also freed a file's extents before the catalog update that
+    kills the star, so a failed update left a live star pointing at free sectors. Found by failing the disk
+    after every possible number of writes for each operation.
+19. **Stellar and all three drivers shared global state with no locking.** Two Satellites in the cache,
+    bitmap, queue tails or bounce buffers corrupted them. Reproduced with Satellites hammering the filesystem
+    and the block layer on 4 cores before any lock existed, then verified fixed with the same tests.
+20. **A mutex built on `yield()` livelocked.** `yield()` promotes the caller one ring, so a waiter spinning on
+    a lock climbed to ring 0 and kept out-ranking the preempted holder in a lower ring. On one core the
+    holder never ran again: virtio persisted boots hung about once in every two or three. Found by sampling the
+    stuck CPU through the QEMU monitor and dumping the mutex owner and its ring; fixed by sinking waiters to
+    the lowest ring.
+21. **The "work stealing confirmed" check was a timing race.** It asked which core eight fixed-length workers
+    finished on, which depends on whether an idle core gets scheduled before the boot core finishes. On a
+    one-CPU host, where QEMU's four vCPUs share a core, the untouched code confirmed in 2 of 10 boots. Workers now
+    run until they have observed more than one core (with a cap), so the test waits for the event.
+22. **A recoverable allocation failure leaked into an error code.** When the directory index could not be
+    allocated the code correctly fell back to scanning, but the allocator had already recorded `NoMemory` as the
+    first error, so a duplicate create reported `NoMemory` instead of `Exists`. Found only by a test that
+    starves the index of memory; the index and filter now allocate quietly.
