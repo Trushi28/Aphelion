@@ -120,6 +120,63 @@ struct Guard {
     ~Guard() { g_lock.unlock(); }
 };
 
+static Status g_err = Status::Ok;
+static u32 g_api_depth = 0;
+
+static bool fail(Status s) {
+    if (g_err == Status::Ok) g_err = s;
+    return false;
+}
+static u64 fail_id(Status s) {
+    fail(s);
+    return INVALID_STAR;
+}
+
+struct Api {
+    Status* why;
+    explicit Api(Status* w) : why(w) {
+        g_lock.lock();
+        if (g_api_depth++ == 0) g_err = Status::Ok;
+    }
+    ~Api() {
+        --g_api_depth;
+        g_lock.unlock();
+    }
+    void report(bool good) {
+        if (why) *why = good ? Status::Ok : (g_err != Status::Ok ? g_err : Status::Internal);
+    }
+    bool ok(bool v) { report(v); return v; }
+    u64 val(u64 v) { report(v != INVALID_STAR); return v; }
+};
+
+const char* status_name(Status s) {
+    switch (s) {
+        case Status::Ok: return "ok";
+        case Status::NotMounted: return "not mounted";
+        case Status::NotFormatted: return "not formatted";
+        case Status::InvalidArgument: return "invalid argument";
+        case Status::InvalidName: return "invalid name";
+        case Status::NotFound: return "not found";
+        case Status::Exists: return "already exists";
+        case Status::NotADirectory: return "not a directory";
+        case Status::IsADirectory: return "is a directory";
+        case Status::NotEmpty: return "directory not empty";
+        case Status::NoSpace: return "no space left on device";
+        case Status::NoMemory: return "out of memory";
+        case Status::Io: return "I/O error";
+        case Status::Checksum: return "checksum mismatch";
+        case Status::Corrupt: return "corrupt metadata";
+        case Status::Busy: return "busy (batch open)";
+        case Status::NoSuchSnapshot: return "no such snapshot";
+        case Status::TooManySnapshots: return "snapshot table full";
+        case Status::Internal: return "internal error";
+    }
+    return "unknown";
+}
+
+static void idx_drop_all();
+static void bloom_drop_all();
+
 static CacheSlot g_cache[CACHE_SLOTS];
 static u64 g_io_reads = 0, g_io_writes = 0, g_cache_hits = 0;
 
@@ -200,12 +257,19 @@ u32 snapshot_count() { Guard guard; return g_sb.snap_count; }
 static void* alloc_ram(u64 bytes) {
     int order = 0;
     while ((universe::PAGE_SIZE << order) < bytes) ++order;
-    if (order > universe::MAX_ORDER) return nullptr;
+    if (order > universe::MAX_ORDER) { fail(Status::NoMemory); return nullptr; }
     u64 phys = universe::alloc(order);
-    if (phys == 0) return nullptr;
+    if (phys == 0) { fail(Status::NoMemory); return nullptr; }
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
     __builtin_memset(v, 0, universe::PAGE_SIZE << order);
     return v;
+}
+
+static void* alloc_ram_soft(u64 bytes) {
+    Status saved = g_err;
+    void* p = alloc_ram(bytes);
+    if (!p) g_err = saved;
+    return p;
 }
 
 static void free_ram(void* p, u64 bytes) {
@@ -221,6 +285,8 @@ static u8* g_verify_scratch = nullptr;
 
 static void release_runtime() {
     g_mounted = false;
+    idx_drop_all();
+    bloom_drop_all();
     free_ram(g_bitmap, g_bitmap_bytes);
     free_ram(g_bm_dirty, g_bitmap_bytes / SECTOR_SIZE);
     free_ram(g_verify_scratch, VERIFY_CHUNK * SECTOR_SIZE);
@@ -247,7 +313,8 @@ static bool alloc_runtime(u64 bitmap_sectors) {
 
 static bool raw_wr(u64 sector, const void* buf) {
     ++g_io_writes;
-    return blockdev::write_sector(sector, buf);
+    if (!blockdev::write_sector(sector, buf)) return fail(Status::Io);
+    return true;
 }
 
 static bool rd(u64 sector, void* out) {
@@ -258,7 +325,7 @@ static bool rd(u64 sector, void* out) {
         return true;
     }
     ++g_io_reads;
-    if (!blockdev::read_sector(sector, c.data)) { c.valid = false; return false; }
+    if (!blockdev::read_sector(sector, c.data)) { c.valid = false; return fail(Status::Io); }
     c.sector = sector;
     c.valid = true;
     __builtin_memcpy(out, c.data, SECTOR_SIZE);
@@ -270,7 +337,7 @@ static bool wr(u64 sector, const void* in) {
     ++g_io_writes;
     if (!blockdev::write_sector(sector, in)) {
         if (c.valid && c.sector == sector) c.valid = false;
-        return false;
+        return fail(Status::Io);
     }
     c.sector = sector;
     c.valid = true;
@@ -345,11 +412,15 @@ void begin_batch() {
     ++g_txn_depth;
 }
 
-bool end_batch() {
-    if (g_txn_depth == 0 || !g_lock.held_by_me()) return false;
+bool end_batch(Status* why) {
+    if (g_txn_depth == 0 || !g_lock.held_by_me()) {
+        if (why) *why = Status::InvalidArgument;
+        return false;
+    }
     bool ok = true;
     if (--g_txn_depth == 0) ok = commit();
     g_lock.unlock();
+    if (why) *why = ok ? Status::Ok : Status::Io;
     return ok;
 }
 
@@ -384,7 +455,7 @@ static u64 alloc_sectors(u64 count) {
         if (end > g_sb.total_sectors) end = g_sb.total_sectors;
         r = find_run(data_start, end, count);
     }
-    if (!r) return 0;
+    if (!r) { fail(Status::NoSpace); return 0; }
     for (u64 j = r; j < r + count; ++j) bm_set(j, true);
     g_alloc_hint = r + count;
     return r;
@@ -413,9 +484,10 @@ static u64 alloc_star_id() {
 
 static bool view_root(u64 snap, u64* root) {
     if (snap == LIVE) { *root = g_sb.catalog_root; return true; }
-    if (snap > g_sb.snap_count) return false;
+    if (snap > g_sb.snap_count) return fail(Status::NoSuchSnapshot);
     *root = g_sb.snaps[snap - 1].catalog_root;
-    return *root != 0;
+    if (*root == 0) return fail(Status::NoSuchSnapshot);
+    return true;
 }
 
 static bool bt_search(u64 root, u64 key, StarEntry* out) {
@@ -612,12 +684,268 @@ static int dir_lookup(const StarEntry& d, const char* name, u64* star) {
     return 0;
 }
 
+static u64 g_hash_mask = ~0ull;
+
+static u64 hash_name(const char* n) {
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < NAME_LEN && n[i]; ++i) {
+        h ^= static_cast<u8>(n[i]);
+        h *= 0x100000001b3ull;
+    }
+    h ^= h >> 32;
+    h *= 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+    return h & g_hash_mask;
+}
+
+static LookupStats g_ls{};
+static u64 g_clock = 0;
+
+constexpr u32 IDX_SLOTS = 4;
+constexpr u32 IDX_FREE_MAX = 32;
+constexpr u32 IDX_MIN_CAP = 64;
+
+struct IdxEntry { u64 hash; u64 star; u64 sector; u32 slot; u32 state; };
+struct FreeSlot { u64 sector; u32 slot; u32 pad; };
+struct DirIndex {
+    bool valid;
+    u64 dir, head, stamp, tail;
+    IdxEntry* tab;
+    u32 cap, count, tombs, nfree;
+    FreeSlot freed[IDX_FREE_MAX];
+};
+static DirIndex g_idx[IDX_SLOTS];
+
+static void idx_release(DirIndex& ix) {
+    if (ix.tab) free_ram(ix.tab, static_cast<u64>(ix.cap) * sizeof(IdxEntry));
+    ix = DirIndex{};
+}
+static void idx_drop_all() { for (auto& ix : g_idx) idx_release(ix); }
+static void idx_drop(u64 dir) { for (auto& ix : g_idx) if (ix.valid && ix.dir == dir) idx_release(ix); }
+
+static void idx_put_raw(DirIndex& ix, u64 hash, u64 star, u64 sector, u32 slot) {
+    u32 i = static_cast<u32>(hash) & (ix.cap - 1);
+    while (ix.tab[i].state == 1) i = (i + 1) & (ix.cap - 1);
+    if (ix.tab[i].state == 2) --ix.tombs;
+    ix.tab[i] = { hash, star, sector, slot, 1 };
+    ++ix.count;
+}
+
+static bool idx_resize(DirIndex& ix, u32 new_cap) {
+    auto* t = static_cast<IdxEntry*>(alloc_ram_soft(static_cast<u64>(new_cap) * sizeof(IdxEntry)));
+    if (!t) return false;
+    IdxEntry* old = ix.tab;
+    u32 old_cap = ix.cap;
+    if (new_cap > ix.cap) ++g_ls.index_grows;
+    ix.tab = t;
+    ix.cap = new_cap;
+    ix.count = 0;
+    ix.tombs = 0;
+    for (u32 i = 0; i < old_cap; ++i)
+        if (old[i].state == 1) idx_put_raw(ix, old[i].hash, old[i].star, old[i].sector, old[i].slot);
+    if (old) free_ram(old, static_cast<u64>(old_cap) * sizeof(IdxEntry));
+    return true;
+}
+
+static bool idx_room(DirIndex& ix) {
+    if ((static_cast<u64>(ix.count) + ix.tombs + 1) * 4 <= static_cast<u64>(ix.cap) * 3) return true;
+    u32 want = ix.cap;
+    if ((static_cast<u64>(ix.count) + 1) * 2 > want) want *= 2;
+    return idx_resize(ix, want);
+}
+
+static bool idx_insert(DirIndex& ix, const char* name, u64 star, u64 sector, u32 slot) {
+    if (!idx_room(ix)) return false;
+    idx_put_raw(ix, hash_name(name), star, sector, slot);
+    return true;
+}
+
+static void idx_erase(DirIndex& ix, const char* name, u64 sector, u32 slot) {
+    u64 h = hash_name(name);
+    u32 i = static_cast<u32>(h) & (ix.cap - 1);
+    for (u32 n = 0; n < ix.cap; ++n, i = (i + 1) & (ix.cap - 1)) {
+        IdxEntry& e = ix.tab[i];
+        if (e.state == 0) return;
+        if (e.state == 1 && e.hash == h && e.sector == sector && e.slot == slot) {
+            e.state = 2;
+            --ix.count;
+            ++ix.tombs;
+            return;
+        }
+    }
+}
+
+static int idx_find(DirIndex& ix, const char* name, u64* star, u64* sector, u32* slot) {
+    u64 h = hash_name(name);
+    u32 i = static_cast<u32>(h) & (ix.cap - 1);
+    for (u32 n = 0; n < ix.cap; ++n, i = (i + 1) & (ix.cap - 1)) {
+        IdxEntry& e = ix.tab[i];
+        if (e.state == 0) return 0;
+        if (e.state != 1 || e.hash != h) continue;
+        u8 buf[SECTOR_SIZE];
+        if (!rd(e.sector, buf)) return -1;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        if (e.slot < DIR_ENTRIES_PER_SECTOR && ds->entries[e.slot].in_use &&
+            names_equal(ds->entries[e.slot].name, name)) {
+            *star = ds->entries[e.slot].star;
+            *sector = e.sector;
+            *slot = e.slot;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static DirIndex* idx_build(u64 dir_star, const StarEntry& e) {
+    DirIndex* v = nullptr;
+    for (auto& ix : g_idx) if (!ix.valid) { v = &ix; break; }
+    if (!v) {
+        v = &g_idx[0];
+        for (auto& ix : g_idx) if (ix.stamp < v->stamp) v = &ix;
+    }
+    idx_release(*v);
+    u64 est = static_cast<u64>(e.sector_count) * DIR_ENTRIES_PER_SECTOR * 2;
+    u32 want = IDX_MIN_CAP;
+    while (want < est && want < (1u << 20)) want <<= 1;
+    auto* t = static_cast<IdxEntry*>(alloc_ram_soft(static_cast<u64>(want) * sizeof(IdxEntry)));
+    if (!t) return nullptr;
+    v->tab = t;
+    v->cap = want;
+    v->dir = dir_star;
+    v->head = e.first_sector;
+
+    u64 sector = e.first_sector;
+    u8 buf[SECTOR_SIZE];
+    for (u64 hops = 0; sector != 0; ++hops) {
+        if (hops > (1ull << 24) || !rd(sector, buf)) {
+            if (hops > (1ull << 24)) fail(Status::Corrupt);
+            idx_release(*v);
+            return nullptr;
+        }
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
+            if (ds->entries[i].in_use) {
+                if (!idx_insert(*v, ds->entries[i].name, ds->entries[i].star, sector, i)) {
+                    idx_release(*v);
+                    return nullptr;
+                }
+            } else if (v->nfree < IDX_FREE_MAX) {
+                v->freed[v->nfree++] = { sector, i, 0 };
+            }
+        }
+        v->tail = sector;
+        sector = ds->next_sector;
+    }
+    v->valid = true;
+    v->stamp = ++g_clock;
+    ++g_ls.index_builds;
+    return v;
+}
+
+static DirIndex* idx_get(u64 dir_star, const StarEntry& e) {
+    for (auto& ix : g_idx) {
+        if (!ix.valid || ix.dir != dir_star) continue;
+        if (ix.head == e.first_sector) { ix.stamp = ++g_clock; return &ix; }
+        idx_release(ix);
+        break;
+    }
+    return idx_build(dir_star, e);
+}
+
+constexpr u32 BLOOM_SLOTS = 8;
+constexpr u64 BLOOM_BITS_PER_ENTRY = 16;
+constexpr u64 BLOOM_MAX_BITS = 1ull << 23;
+
+struct Bloom { bool valid; u64 root, dir, stamp, nbits; u8* bits; };
+static Bloom g_bloom[BLOOM_SLOTS];
+
+static void bloom_release(Bloom& b) {
+    if (b.bits) free_ram(b.bits, b.nbits / 8);
+    b = Bloom{};
+}
+static void bloom_drop_all() { for (auto& b : g_bloom) bloom_release(b); }
+
+static void bloom_positions(u64 h, u64 nbits, u64* p) {
+    u64 step = ((h >> 32) ^ (h << 7)) | 1;
+    for (u32 i = 0; i < 4; ++i) p[i] = (h + i * step) & (nbits - 1);
+}
+static void bloom_add(Bloom& b, u64 h) {
+    u64 p[4];
+    bloom_positions(h, b.nbits, p);
+    for (u32 i = 0; i < 4; ++i) b.bits[p[i] / 8] |= static_cast<u8>(1u << (p[i] % 8));
+}
+static bool bloom_maybe(const Bloom& b, u64 h) {
+    u64 p[4];
+    bloom_positions(h, b.nbits, p);
+    for (u32 i = 0; i < 4; ++i)
+        if (!(b.bits[p[i] / 8] & (1u << (p[i] % 8)))) return false;
+    return true;
+}
+
+static Bloom* bloom_get(u64 root, u64 dir, const StarEntry& e) {
+    for (auto& b : g_bloom)
+        if (b.valid && b.root == root && b.dir == dir) { b.stamp = ++g_clock; return &b; }
+    Bloom* v = nullptr;
+    for (auto& b : g_bloom) if (!b.valid) { v = &b; break; }
+    if (!v) {
+        v = &g_bloom[0];
+        for (auto& b : g_bloom) if (b.stamp < v->stamp) v = &b;
+    }
+    bloom_release(*v);
+    u64 entries = static_cast<u64>(e.sector_count) * DIR_ENTRIES_PER_SECTOR;
+    u64 nbits = 256;
+    while (nbits < entries * BLOOM_BITS_PER_ENTRY && nbits < BLOOM_MAX_BITS) nbits <<= 1;
+    u8* bits = static_cast<u8*>(alloc_ram_soft(nbits / 8));
+    if (!bits) return nullptr;
+    v->bits = bits;
+    v->nbits = nbits;
+    u64 sector = e.first_sector;
+    u8 buf[SECTOR_SIZE];
+    for (u64 hops = 0; sector != 0; ++hops) {
+        if (hops > (1ull << 24) || !rd(sector, buf)) { bloom_release(*v); return nullptr; }
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i)
+            if (ds->entries[i].in_use) bloom_add(*v, hash_name(ds->entries[i].name));
+        sector = ds->next_sector;
+    }
+    v->root = root;
+    v->dir = dir;
+    v->valid = true;
+    v->stamp = ++g_clock;
+    ++g_ls.bloom_builds;
+    return v;
+}
+
+static int snapshot_lookup(u64 root, u64 dir_star, const StarEntry& e, const char* name, u64* star) {
+    Bloom* b = bloom_get(root, dir_star, e);
+    if (b) {
+        if (!bloom_maybe(*b, hash_name(name))) { ++g_ls.bloom_rejects; return 0; }
+        ++g_ls.bloom_passes;
+    }
+    ++g_ls.scan_lookups;
+    int r = dir_lookup(e, name, star);
+    if (r == 0 && b) ++g_ls.bloom_false_positives;
+    return r;
+}
+
+static int live_lookup(u64 dir_star, const StarEntry& d, const char* name, u64* star) {
+    DirIndex* ix = idx_get(dir_star, d);
+    if (!ix) { ++g_ls.scan_lookups; return dir_lookup(d, name, star); }
+    ++g_ls.index_lookups;
+    u64 sector; u32 slot;
+    return idx_find(*ix, name, star, &sector, &slot);
+}
+
 static bool can_add(u64 parent, const char* name) {
-    if (!valid_name(name)) return false;
+    if (!valid_name(name)) return fail(Status::InvalidName);
     StarEntry d;
-    if (!catalog_find(parent, &d) || d.type != TYPE_CONSTELLATION) return false;
+    if (!catalog_find(parent, &d)) return fail(Status::NotFound);
+    if (d.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
     u64 existing;
-    return dir_lookup(d, name, &existing) == 0;
+    int r = live_lookup(parent, d, name, &existing);
+    if (r < 0) return false;
+    if (r == 1) return fail(Status::Exists);
+    return true;
 }
 
 static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
@@ -689,16 +1017,15 @@ static u64 g_hint_sector = 0;
 static u64 g_hint_epoch = 0;
 
 static void reset_runtime_state() {
+    idx_drop_all();
+    bloom_drop_all();
     g_hint_dir = INVALID_STAR;
     g_hint_sector = 0;
     g_hint_epoch = 0;
     g_txn_depth = 0;
 }
 
-static bool add_edge(u64 dir_star, const char* name, u64 target) {
-    StarEntry e;
-    if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return false;
-    if (!dir_make_current(e, dir_star)) return false;
+static bool add_edge_scan(u64 dir_star, const char* name, u64 target, StarEntry& e) {
 
     u64 sector = e.first_sector;
     if (g_hint_dir == dir_star && g_hint_epoch == g_sb.epoch && g_hint_sector != 0)
@@ -740,6 +1067,58 @@ static bool add_edge(u64 dir_star, const char* name, u64 target) {
     }
 }
 
+static bool add_edge(u64 dir_star, const char* name, u64 target) {
+    StarEntry e;
+    if (!catalog_find(dir_star, &e)) return fail(Status::NotFound);
+    if (e.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
+    if (!dir_make_current(e, dir_star)) return false;
+    DirIndex* ix = idx_get(dir_star, e);
+    if (!ix) return add_edge_scan(dir_star, name, target, e);
+    g_hint_dir = INVALID_STAR;
+
+    u8 buf[SECTOR_SIZE];
+    u64 sector = 0;
+    u32 slot = 0;
+    bool placed = false;
+    while (ix->nfree > 0 && !placed) {
+        FreeSlot f = ix->freed[--ix->nfree];
+        if (!rd(f.sector, buf)) { idx_release(*ix); return false; }
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        if (f.slot < DIR_ENTRIES_PER_SECTOR && !ds->entries[f.slot].in_use) { sector = f.sector; slot = f.slot; placed = true; }
+    }
+    if (!placed) {
+        if (!rd(ix->tail, buf)) { idx_release(*ix); return false; }
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        if (ds->next_sector != 0) { idx_release(*ix); return add_edge_scan(dir_star, name, target, e); }
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR && !placed; ++i)
+            if (!ds->entries[i].in_use) { sector = ix->tail; slot = i; placed = true; }
+        if (!placed) {
+            u64 ns = alloc_sectors(1);
+            if (ns == 0) return false;
+            u8 zero[SECTOR_SIZE];
+            for (auto& b : zero) b = 0;
+            reinterpret_cast<DirSector*>(zero)->gen = g_sb.epoch;
+            if (!wr(ns, zero)) return false;
+            ds->next_sector = ns;
+            if (!wr(ix->tail, buf)) { idx_release(*ix); return false; }
+            e.sector_count += 1;
+            if (!catalog_upsert(dir_star, e)) { idx_release(*ix); return false; }
+            ix->tail = ns;
+            sector = ns;
+            slot = 0;
+            placed = true;
+        }
+    }
+    if (!rd(sector, buf)) { idx_release(*ix); return false; }
+    auto* ds = reinterpret_cast<DirSector*>(buf);
+    ds->entries[slot].in_use = 1;
+    ds->entries[slot].star = target;
+    copy_name(ds->entries[slot].name, name);
+    if (!wr(sector, buf)) { idx_release(*ix); return false; }
+    if (!idx_insert(*ix, ds->entries[slot].name, target, sector, slot)) idx_release(*ix);
+    return true;
+}
+
 static u64 bitmap_sectors_for(u64 total_sectors) {
     u64 n = (total_sectors / 8 + SECTOR_SIZE - 1) / SECTOR_SIZE;
     return n == 0 ? 1 : n;
@@ -763,10 +1142,9 @@ static const char* superblock_problem(const Superblock& sb, u64 device_sectors) 
     return nullptr;
 }
 
-bool format(u64 total_sectors) {
-    Guard guard;
-    if (g_txn_depth != 0) return false;
-    if (total_sectors < MIN_SECTORS || total_sectors > blockdev::capacity_sectors()) return false;
+static bool format_impl(u64 total_sectors) {
+    if (g_txn_depth != 0) return fail(Status::Busy);
+    if (total_sectors < MIN_SECTORS || total_sectors > blockdev::capacity_sectors()) return fail(Status::InvalidArgument);
     for (auto& c : g_cache) c.valid = false;
     g_sb = Superblock{};
     g_sb.magic = MAGIC;
@@ -814,24 +1192,28 @@ bool format(u64 total_sectors) {
     return true;
 }
 
-bool mount() {
-    Guard guard;
-    if (g_txn_depth != 0) return false;
+bool format(u64 total_sectors, Status* why) {
+    Api api(why);
+    return api.ok(format_impl(total_sectors));
+}
+
+static bool mount_impl() {
+    if (g_txn_depth != 0) return fail(Status::Busy);
     g_mounted = false;
     u8 buf[SECTOR_SIZE];
     for (auto& c : g_cache) c.valid = false;
-    if (!blockdev::read_sector(0, buf)) return false;
+    if (!blockdev::read_sector(0, buf)) return fail(Status::Io);
     ++g_io_reads;
     Superblock sb;
     __builtin_memcpy(&sb, buf, sizeof(sb));
     if (sb.magic != MAGIC || sb.version != VERSION) {
         serial::writeln("[stellar] mount: bad magic or version, not formatted");
-        return false;
+        return fail(Status::NotFormatted);
     }
     const char* problem = superblock_problem(sb, blockdev::capacity_sectors());
     if (problem) {
         serial::printf("[stellar] mount: superblock rejected, %s\n", problem);
-        return false;
+        return fail(Status::Corrupt);
     }
     g_sb = sb;
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
@@ -840,7 +1222,7 @@ bool mount() {
         if (!blockdev::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE)) {
             serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + i);
             release_runtime();
-            return false;
+            return fail(Status::Io);
         }
     }
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
@@ -852,9 +1234,13 @@ bool mount() {
     return true;
 }
 
-u64 create_constellation(u64 parent, const char* name) {
-    Guard guard;
-    if (!g_mounted) return INVALID_STAR;
+bool mount(Status* why) {
+    Api api(why);
+    return api.ok(mount_impl());
+}
+
+static u64 create_constellation_impl(u64 parent, const char* name) {
+    if (!g_mounted) return fail_id(Status::NotMounted);
     Txn txn;
     if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
     u64 id = alloc_star_id();
@@ -878,9 +1264,13 @@ u64 create_constellation(u64 parent, const char* name) {
     return txn.finish(true) ? id : INVALID_STAR;
 }
 
-u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
-    Guard guard;
-    if (!g_mounted) return INVALID_STAR;
+u64 create_constellation(u64 parent, const char* name, Status* why) {
+    Api api(why);
+    return api.val(create_constellation_impl(parent, name));
+}
+
+static u64 create_file_impl(u64 parent, const char* name, const void* data, u64 size) {
+    if (!g_mounted) return fail_id(Status::NotMounted);
     Txn txn;
     if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
     u64 id = alloc_star_id();
@@ -903,12 +1293,18 @@ u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
     return txn.finish(true) ? id : INVALID_STAR;
 }
 
-u64 write_file(u64 star, const void* data, u64 size) {
-    Guard guard;
-    if (!g_mounted) return INVALID_STAR;
+u64 create_file(u64 parent, const char* name, const void* data, u64 size, Status* why) {
+    Api api(why);
+    return api.val(create_file_impl(parent, name, data, size));
+}
+
+static u64 write_file_impl(u64 star, const void* data, u64 size) {
+    if (!g_mounted) return fail_id(Status::NotMounted);
     Txn txn;
     StarEntry old_e;
-    if (!catalog_find(star, &old_e) || old_e.type != TYPE_FILE) return INVALID_STAR;
+    if (!catalog_find(star, &old_e)) return fail_id(Status::NotFound);
+    if (old_e.type == TYPE_CONSTELLATION) return fail_id(Status::IsADirectory);
+    if (old_e.type != TYPE_FILE) return fail_id(Status::NotFound);
 
     u64 nsec = size == 0 ? 1 : (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
     u64 start = alloc_sectors(nsec);
@@ -929,14 +1325,18 @@ u64 write_file(u64 star, const void* data, u64 size) {
     return txn.finish(true) ? star : INVALID_STAR;
 }
 
-u64 snapshot() {
-    Guard guard;
-    if (!g_mounted) return INVALID_STAR;
+u64 write_file(u64 star, const void* data, u64 size, Status* why) {
+    Api api(why);
+    return api.val(write_file_impl(star, data, size));
+}
+
+static u64 snapshot_impl() {
+    if (!g_mounted) return fail_id(Status::NotMounted);
     u32 slot = g_sb.snap_count;
     for (u32 i = 0; i < g_sb.snap_count; ++i) {
         if (g_sb.snaps[i].catalog_root == 0) { slot = i; break; }
     }
-    if (slot >= SNAPSHOT_MAX) return INVALID_STAR;
+    if (slot >= SNAPSHOT_MAX) return fail_id(Status::TooManySnapshots);
     Txn txn;
     g_sb.snaps[slot].catalog_root = g_sb.catalog_root;
     g_sb.snaps[slot].epoch = g_sb.epoch;
@@ -946,17 +1346,28 @@ u64 snapshot() {
     return txn.finish(true) ? static_cast<u64>(slot) + 1 : INVALID_STAR;
 }
 
-bool link(u64 dir_star, const char* name, u64 target) {
-    Guard guard;
-    if (!g_mounted || dir_star == target) return false;
+u64 snapshot(Status* why) {
+    Api api(why);
+    return api.val(snapshot_impl());
+}
+
+static bool link_impl(u64 dir_star, const char* name, u64 target) {
+    if (!g_mounted) return fail(Status::NotMounted);
+    if (dir_star == target) return fail(Status::InvalidArgument);
     Txn txn;
     StarEntry e;
-    if (!catalog_find(target, &e) || e.type != TYPE_FILE) return false;
+    if (!catalog_find(target, &e) || e.type == TYPE_FREE) return fail(Status::NotFound);
+    if (e.type != TYPE_FILE) return fail(Status::IsADirectory);
     if (!can_add(dir_star, name)) return false;
     if (!add_edge(dir_star, name, target)) return false;
     if (!catalog_find(target, &e)) return false;
     ++e.nlink;
     return txn.finish(catalog_upsert(target, e));
+}
+
+bool link(u64 dir_star, const char* name, u64 target, Status* why) {
+    Api api(why);
+    return api.ok(link_impl(dir_star, name, target));
 }
 
 u32 live_snapshot_count() {
@@ -967,17 +1378,24 @@ u32 live_snapshot_count() {
     return n;
 }
 
-bool delete_snapshot(u64 snap) {
-    Guard guard;
-    if (!g_mounted || snap == LIVE || snap > g_sb.snap_count) return false;
-    if (g_sb.snaps[snap - 1].catalog_root == 0) return false;
+static bool delete_snapshot_impl(u64 snap) {
+    if (!g_mounted) return fail(Status::NotMounted);
+    if (snap == LIVE) return fail(Status::InvalidArgument);
+    if (snap > g_sb.snap_count) return fail(Status::NoSuchSnapshot);
+    if (g_sb.snaps[snap - 1].catalog_root == 0) return fail(Status::NoSuchSnapshot);
     Txn txn;
+    bloom_drop_all();
     g_sb.snaps[snap - 1].catalog_root = 0;
     g_sb.snaps[snap - 1].epoch = 0;
     while (g_sb.snap_count > 0 && g_sb.snaps[g_sb.snap_count - 1].catalog_root == 0)
         --g_sb.snap_count;
     g_sb_dirty = true;
     return txn.finish(true);
+}
+
+bool delete_snapshot(u64 snap, Status* why) {
+    Api api(why);
+    return api.ok(delete_snapshot_impl(snap));
 }
 
 static bool dir_is_empty(const StarEntry& d) {
@@ -993,10 +1411,7 @@ static bool dir_is_empty(const StarEntry& d) {
     return true;
 }
 
-static bool remove_edge(u64 dir_star, const char* name, u64* target_out) {
-    StarEntry e;
-    if (!catalog_find(dir_star, &e) || e.type != TYPE_CONSTELLATION) return false;
-    if (!dir_make_current(e, dir_star)) return false;
+static bool remove_edge_scan(const char* name, u64* target_out, StarEntry& e) {
 
     u64 sector = e.first_sector;
     u8 buf[SECTOR_SIZE];
@@ -1018,6 +1433,33 @@ static bool remove_edge(u64 dir_star, const char* name, u64* target_out) {
     return false;
 }
 
+static bool remove_edge(u64 dir_star, const char* name, u64* target_out) {
+    StarEntry e;
+    if (!catalog_find(dir_star, &e)) return fail(Status::NotFound);
+    if (e.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
+    if (!dir_make_current(e, dir_star)) return false;
+    DirIndex* ix = idx_get(dir_star, e);
+    if (!ix) return remove_edge_scan(name, target_out, e);
+
+    u64 star, sector;
+    u32 slot;
+    int r = idx_find(*ix, name, &star, &sector, &slot);
+    if (r < 0) { idx_release(*ix); return false; }
+    if (r == 0) return fail(Status::NotFound);
+    u8 buf[SECTOR_SIZE];
+    if (!rd(sector, buf)) { idx_release(*ix); return false; }
+    auto* ds = reinterpret_cast<DirSector*>(buf);
+    ds->entries[slot].in_use = 0;
+    ds->entries[slot].star = 0;
+    ds->entries[slot].name[0] = 0;
+    if (!wr(sector, buf)) { idx_release(*ix); return false; }
+    g_hint_dir = INVALID_STAR;
+    idx_erase(*ix, name, sector, slot);
+    if (ix->nfree < IDX_FREE_MAX) ix->freed[ix->nfree++] = { sector, slot, 0 };
+    *target_out = star;
+    return true;
+}
+
 static void release_current_epoch(const StarEntry& t) {
     if (t.type == TYPE_FILE) {
         if (t.gen == g_sb.epoch) release_sectors(t.first_sector, t.sector_count);
@@ -1034,21 +1476,21 @@ static void release_current_epoch(const StarEntry& t) {
     }
 }
 
-bool unlink(u64 dir_star, const char* name) {
-    Guard guard;
-    if (!g_mounted) return false;
+static bool unlink_impl(u64 dir_star, const char* name) {
+    if (!g_mounted) return fail(Status::NotMounted);
     Txn txn;
     u64 target = find(dir_star, name);
-    if (target == INVALID_STAR || target == ROOT_STAR) return false;
+    if (target == INVALID_STAR) return false;
+    if (target == ROOT_STAR) return fail(Status::InvalidArgument);
 
     StarEntry t;
-    if (!catalog_find(target, &t)) return false;
-    if (t.type == TYPE_CONSTELLATION && !dir_is_empty(t)) return false;
+    if (!catalog_find(target, &t)) return fail(Status::NotFound);
+    if (t.type == TYPE_CONSTELLATION && !dir_is_empty(t)) return fail(Status::NotEmpty);
 
     u64 removed = INVALID_STAR;
     if (!remove_edge(dir_star, name, &removed) || removed != target) return false;
 
-    if (!catalog_find(target, &t)) return false;
+    if (!catalog_find(target, &t)) return fail(Status::NotFound);
     if (t.nlink > 1) {
         --t.nlink;
         return txn.finish(catalog_upsert(target, t));
@@ -1061,8 +1503,14 @@ bool unlink(u64 dir_star, const char* name) {
     dead.sector_count = 0;
     dead.checksum = 0;
     if (!catalog_upsert(target, dead)) return false;
+    if (t.type == TYPE_CONSTELLATION) idx_drop(target);
     release_current_epoch(t);
     return txn.finish(true);
+}
+
+bool unlink(u64 dir_star, const char* name, Status* why) {
+    Api api(why);
+    return api.ok(unlink_impl(dir_star, name));
 }
 
 static u8* g_mark = nullptr;
@@ -1111,9 +1559,8 @@ static bool mark_tree(u64 sector, u32 depth) {
     return true;
 }
 
-u64 gc() {
-    Guard guard;
-    if (!g_mounted) return INVALID_STAR;
+static u64 gc_impl() {
+    if (!g_mounted) return fail_id(Status::NotMounted);
     Txn txn;
     u64 bm_bytes = g_sb.bitmap_sectors * SECTOR_SIZE;
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
@@ -1146,17 +1593,23 @@ u64 gc() {
 
     free_ram(g_mark, bm_bytes);
     g_mark = nullptr;
-    if (freed == INVALID_STAR) return INVALID_STAR;
+    if (freed == INVALID_STAR) return fail_id(Status::Corrupt);
     return txn.finish(true) ? freed : INVALID_STAR;
 }
 
-bool verify_file(u64 star, u64 snap) {
-    Guard guard;
-    if (!g_mounted) return false;
+u64 gc(Status* why) {
+    Api api(why);
+    return api.val(gc_impl());
+}
+
+static bool verify_file_impl(u64 star, u64 snap) {
+    if (!g_mounted) return fail(Status::NotMounted);
     u64 root;
     if (!view_root(snap, &root)) return false;
     StarEntry e;
-    if (!bt_search(root, star, &e) || e.type != TYPE_FILE) return false;
+    if (!bt_search(root, star, &e)) return fail(Status::NotFound);
+    if (e.type == TYPE_CONSTELLATION) return fail(Status::IsADirectory);
+    if (e.type != TYPE_FILE) return fail(Status::NotFound);
 
     constexpr u64 CHUNK = VERIFY_CHUNK;
     if (!g_verify_scratch) g_verify_scratch = static_cast<u8*>(alloc_ram(CHUNK * SECTOR_SIZE));
@@ -1182,18 +1635,24 @@ bool verify_file(u64 star, u64 snap) {
     if (crc != e.checksum) {
         serial::printf("[stellar] checksum mismatch on star %lu: stored %x computed %x\n",
                         star, e.checksum, crc);
-        return false;
+        return fail(Status::Checksum);
     }
     return true;
 }
 
-u64 read_file(u64 star, void* buf, u64 max_size, u64 snap) {
-    Guard guard;
-    if (!g_mounted) return 0;
+bool verify_file(u64 star, u64 snap, Status* why) {
+    Api api(why);
+    return api.ok(verify_file_impl(star, snap));
+}
+
+static u64 read_file_impl(u64 star, void* buf, u64 max_size, u64 snap) {
+    if (!g_mounted) { fail(Status::NotMounted); return READ_ERROR; }
     u64 root;
-    if (!view_root(snap, &root)) return 0;
+    if (!view_root(snap, &root)) return READ_ERROR;
     StarEntry e;
-    if (!bt_search(root, star, &e) || e.type != TYPE_FILE) return 0;
+    if (!bt_search(root, star, &e)) { fail(Status::NotFound); return READ_ERROR; }
+    if (e.type == TYPE_CONSTELLATION) { fail(Status::IsADirectory); return READ_ERROR; }
+    if (e.type != TYPE_FILE) { fail(Status::NotFound); return READ_ERROR; }
     u64 size = e.size_bytes;
     u64 to_read = size < max_size ? size : max_size;
     u8* dst = static_cast<u8*>(buf);
@@ -1211,31 +1670,48 @@ u64 read_file(u64 star, void* buf, u64 max_size, u64 snap) {
         for (u64 b = 0; b < chunk; ++b) dst[read_so_far + b] = sector_buf[b];
         read_so_far += chunk;
     }
+    if (read_so_far < to_read) return READ_ERROR;
     if (read_so_far == size && crc32_full(dst, size) != e.checksum) {
         serial::printf("[stellar] checksum mismatch reading star %lu, refusing the data\n", star);
-        return 0;
+        fail(Status::Checksum);
+        return READ_ERROR;
     }
     return read_so_far;
 }
 
-u64 find(u64 dir_star, const char* name, u64 snap) {
-    Guard guard;
-    if (!g_mounted) return INVALID_STAR;
+u64 read_file(u64 star, void* buf, u64 max_size, u64 snap, Status* why) {
+    Api api(why);
+    return api.val(read_file_impl(star, buf, max_size, snap));
+}
+
+static u64 find_impl(u64 dir_star, const char* name, u64 snap) {
+    if (!g_mounted) return fail_id(Status::NotMounted);
+    if (!valid_name(name)) return fail_id(Status::InvalidName);
     u64 root;
     if (!view_root(snap, &root)) return INVALID_STAR;
     StarEntry e;
-    if (!bt_search(root, dir_star, &e) || e.type != TYPE_CONSTELLATION) return INVALID_STAR;
-    u64 star;
-    return dir_lookup(e, name, &star) == 1 ? star : INVALID_STAR;
+    if (!bt_search(root, dir_star, &e)) return fail_id(Status::NotFound);
+    if (e.type != TYPE_CONSTELLATION) return fail_id(Status::NotADirectory);
+    u64 star = INVALID_STAR;
+    int r = snap == LIVE ? live_lookup(dir_star, e, name, &star)
+                         : snapshot_lookup(root, dir_star, e, name, &star);
+    if (r < 0) return INVALID_STAR;
+    if (r == 0) return fail_id(Status::NotFound);
+    return star;
 }
 
-void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
-    Guard guard;
-    if (!g_mounted) return;
+u64 find(u64 dir_star, const char* name, u64 snap, Status* why) {
+    Api api(why);
+    return api.val(find_impl(dir_star, name, snap));
+}
+
+static void list_impl(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
+    if (!g_mounted) { fail(Status::NotMounted); return; }
     u64 root;
     if (!view_root(snap, &root)) return;
     StarEntry e;
-    if (!bt_search(root, dir_star, &e) || e.type != TYPE_CONSTELLATION) return;
+    if (!bt_search(root, dir_star, &e)) { fail(Status::NotFound); return; }
+    if (e.type != TYPE_CONSTELLATION) { fail(Status::NotADirectory); return; }
     u64 sector = e.first_sector;
     u8 buf[SECTOR_SIZE];
     while (sector != 0) {
@@ -1249,6 +1725,85 @@ void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
         }
         sector = ds->next_sector;
     }
+}
+
+void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap, Status* why) {
+    Api api(why);
+    list_impl(dir_star, cb, ctx, snap);
+    api.report(g_err == Status::Ok);
+}
+
+static u64 resolve_n(const char* path, u64 len, u64 snap) {
+    if (!g_mounted) return fail_id(Status::NotMounted);
+    if (!path || len == 0 || path[0] != '/') return fail_id(Status::InvalidName);
+    u64 cur = ROOT_STAR;
+    u64 i = 0;
+    bool trailing = false;
+    while (i < len) {
+        while (i < len && path[i] == '/') { ++i; trailing = true; }
+        if (i >= len) break;
+        trailing = false;
+        char comp[NAME_LEN];
+        u32 n = 0;
+        while (i < len && path[i] != '/') {
+            if (n >= NAME_LEN - 1) return fail_id(Status::InvalidName);
+            comp[n++] = path[i++];
+        }
+        comp[n] = 0;
+        if (!valid_name(comp)) return fail_id(Status::InvalidName);
+        u64 next = find_impl(cur, comp, snap);
+        if (next == INVALID_STAR) return INVALID_STAR;
+        cur = next;
+    }
+    if (trailing && cur != ROOT_STAR) {
+        u64 root;
+        StarEntry e;
+        if (!view_root(snap, &root)) return INVALID_STAR;
+        if (!bt_search(root, cur, &e)) return fail_id(Status::NotFound);
+        if (e.type != TYPE_CONSTELLATION) return fail_id(Status::NotADirectory);
+    }
+    return cur;
+}
+
+u64 resolve(const char* path, u64 snap, Status* why) {
+    Api api(why);
+    u64 len = path ? strlen(path) : 0;
+    return api.val(resolve_n(path, len, snap));
+}
+
+static u64 resolve_parent_impl(const char* path, char* leaf, u64 leaf_size, u64 snap) {
+    if (!path || !leaf || path[0] != '/') return fail_id(Status::InvalidName);
+    u64 len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') --len;
+    u64 slash = len;
+    while (slash > 0 && path[slash - 1] != '/') --slash;
+    u64 leaf_len = len - slash;
+    if (leaf_len == 0 || leaf_len >= NAME_LEN || leaf_len >= leaf_size) return fail_id(Status::InvalidName);
+    char comp[NAME_LEN];
+    for (u64 k = 0; k < leaf_len; ++k) comp[k] = path[slash + k];
+    comp[leaf_len] = 0;
+    if (!valid_name(comp)) return fail_id(Status::InvalidName);
+    u64 parent = resolve_n(path, slash, snap);
+    if (parent == INVALID_STAR) return INVALID_STAR;
+    for (u64 k = 0; k <= leaf_len; ++k) leaf[k] = comp[k];
+    return parent;
+}
+
+u64 resolve_parent(const char* path, char* leaf, u64 leaf_size, u64 snap, Status* why) {
+    Api api(why);
+    return api.val(resolve_parent_impl(path, leaf, leaf_size, snap));
+}
+
+LookupStats lookup_stats() {
+    Guard guard;
+    return g_ls;
+}
+
+void test_set_hash_mask(u64 mask) {
+    Guard guard;
+    idx_drop_all();
+    bloom_drop_all();
+    g_hash_mask = mask ? mask : ~0ull;
 }
 
 }

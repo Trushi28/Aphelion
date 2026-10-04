@@ -469,12 +469,34 @@ extern "C" NORETURN void kernel_main() {
                 nested_file = stellar::create_file(subdir, "nested.txt", nested_msg, nested_len);
             static u8 nested_readback[64];
             u64 nested_n = stellar::read_file(nested_file, nested_readback, sizeof(nested_readback) - 1);
+            if (nested_n == stellar::READ_ERROR) nested_n = 0;
             nested_readback[nested_n] = 0;
             serial::printf("[stellar] /sub/nested.txt (%lu bytes): %s\n",
                             nested_n, reinterpret_cast<const char*>(nested_readback));
 
+            {
+                using stellar::Status;
+                Status st = Status::Internal;
+                u8 probe[16];
+                bool resolve_ok = stellar::resolve("/sub/nested.txt", stellar::LIVE, &st) == nested_file && st == Status::Ok;
+                bool missing_ok = stellar::find(stellar::ROOT_STAR, "no-such-file", stellar::LIVE, &st) == stellar::INVALID_STAR &&
+                                  st == Status::NotFound;
+                bool dup_ok = stellar::create_file(stellar::ROOT_STAR, "hello.txt", "x", 1, &st) == stellar::INVALID_STAR &&
+                              st == Status::Exists;
+                bool name_ok = stellar::create_file(stellar::ROOT_STAR, "bad/name", "x", 1, &st) == stellar::INVALID_STAR &&
+                               st == Status::InvalidName;
+                bool dir_ok = stellar::read_file(subdir, probe, sizeof(probe), stellar::LIVE, &st) == stellar::READ_ERROR &&
+                              st == Status::IsADirectory;
+                bool api_ok = resolve_ok && missing_ok && dup_ok && name_ok && dir_ok;
+                fb::printf(api_ok ? 0xC0FFC0 : 0xE0D080,
+                           "[%s] Stellar FS API: path resolution, duplicate/invalid-name/not-found/is-a-directory status codes, %s\n",
+                           api_ok ? "ok" : "--", api_ok ? "all as expected" : "MISMATCH");
+                serial::printf("[selftest] stellar api: %s\n", api_ok ? "ok" : "MISMATCH");
+            }
+
             static u8 readback[128];
             u64 n = stellar::read_file(file, readback, sizeof(readback) - 1);
+            if (n == stellar::READ_ERROR) n = 0;
             readback[n] = 0;
 
             bool match = file_equals(file, msg) || file_equals(file, HELLO_REWRITTEN);

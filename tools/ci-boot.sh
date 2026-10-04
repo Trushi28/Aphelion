@@ -65,6 +65,7 @@ check_common() {
     grep -q '\[selftest\] hello.txt: ok' "$LOG.clean" || fail "hello.txt self-test did not pass"
     grep -q '\[selftest\] multi-request queueing: ok' "$LOG.clean" || fail "multi-request queueing self-test did not pass"
     grep -q '\[selftest\] bulk I/O: ok' "$LOG.clean" || fail "bulk I/O self-test did not pass"
+    grep -q '\[selftest\] stellar api: ok' "$LOG.clean" || fail "filesystem API self-test did not pass"
     grep -q 'stress: 14 stars created (create_ok=1), 0 mismatch(es)' "$LOG.clean" || fail "filesystem stress test failed"
     grep -q '\[smp-fs\] FAIL' "$LOG.clean" && fail "concurrent filesystem stress reported a failure"
     grep -q '\[selftest\] smp-fs: ok' "$LOG.clean" || fail "concurrent filesystem stress did not pass"

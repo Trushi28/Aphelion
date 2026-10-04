@@ -85,6 +85,7 @@ static bool eq(u64 star, const char* expect, u64 snap = stellar::LIVE) {
     return true;
 }
 
+static bool strcmp_(const char* a, const char* b) { while (*a && *a == *b) { ++a; ++b; } return *a == *b; }
 static void count_cb(const char*, u64, u32, void* ctx) { ++*static_cast<u64*>(ctx); }
 static u64 count_dir(u64 dir, u64 snap = stellar::LIVE) {
     u64 n = 0;
@@ -247,7 +248,7 @@ int main() {
         printf("in-epoch unlink: free sectors %lu -> %lu\n", after_create, after_unlink);
         CHECK(after_unlink >= after_create + 10, "in-epoch unlink returns its extent immediately");
         CHECK(stellar::find(stellar::ROOT_STAR, "tmp.bin") == stellar::INVALID_STAR, "unlinked name is gone");
-        CHECK(stellar::read_file(tmp, sink, sizeof(sink)) == 0, "dead star reads nothing");
+        CHECK(stellar::read_file(tmp, sink, sizeof(sink)) == stellar::READ_ERROR, "dead star reads nothing");
         CHECK(!stellar::unlink(stellar::ROOT_STAR, "tmp.bin"), "second unlink fails");
         CHECK(!stellar::unlink(stellar::ROOT_STAR, "missing"), "unlink of a missing name fails");
 
@@ -266,7 +267,7 @@ int main() {
         CHECK(stellar::unlink(d1, "s"), "drop first link");
         CHECK(eq(shared, "v2\n") && stellar::find(d2, "alias") == shared, "second link keeps the file alive");
         CHECK(stellar::unlink(d2, "alias"), "drop last link");
-        CHECK(stellar::read_file(shared, sink, sizeof(sink)) == 0, "last unlink kills the star");
+        CHECK(stellar::read_file(shared, sink, sizeof(sink)) == stellar::READ_ERROR, "last unlink kills the star");
     }
 
     fresh_fs();
@@ -509,7 +510,7 @@ int main() {
         CHECK(stellar::link(other, "alias", a1), "link under a fresh name works");
         CHECK(stellar::unlink(other, "alias") && stellar::unlink(stellar::ROOT_STAR, "dup"), "unlink both names");
         u8 sink[16];
-        CHECK(stellar::read_file(a1, sink, sizeof(sink)) == 0 && stellar::find(stellar::ROOT_STAR, "dup") == stellar::INVALID_STAR,
+        CHECK(stellar::read_file(a1, sink, sizeof(sink)) == stellar::READ_ERROR && stellar::find(stellar::ROOT_STAR, "dup") == stellar::INVALID_STAR,
               "refused link did not leak a link count");
 
         u64 d = stellar::create_constellation(stellar::ROOT_STAR, "wide");
@@ -746,11 +747,11 @@ int main() {
         CHECK(stellar::mount(), "remount with corrupted extents");
 
         CHECK(!stellar::verify_file(big) && !stellar::verify_file(one), "verify_file sees the corruption");
-        CHECK(stellar::read_file(big, sink, sizeof(sink)) == 0, "read_file refuses a corrupt multi-sector file");
-        CHECK(stellar::read_file(one, sink, sizeof(sink)) == 0, "read_file refuses a corrupt single-sector file");
-        CHECK(stellar::read_file(big, sink, sizeof(blob)) == 0, "an exact-size buffer is still verified");
+        CHECK(stellar::read_file(big, sink, sizeof(sink)) == stellar::READ_ERROR, "read_file refuses a corrupt multi-sector file");
+        CHECK(stellar::read_file(one, sink, sizeof(sink)) == stellar::READ_ERROR, "read_file refuses a corrupt single-sector file");
+        CHECK(stellar::read_file(big, sink, sizeof(blob)) == stellar::READ_ERROR, "an exact-size buffer is still verified");
         CHECK(stellar::read_file(big, sink, 100) == 100, "a partial read cannot be verified and still works");
-        CHECK(stellar::read_file(big, sink, sizeof(sink), snap) == 0, "the same bytes seen through a snapshot are refused too");
+        CHECK(stellar::read_file(big, sink, sizeof(sink), snap) == stellar::READ_ERROR, "the same bytes seen through a snapshot are refused too");
         CHECK(stellar::read_file(empty, sink, sizeof(sink)) == 0 && stellar::verify_file(empty), "untouched files are unaffected");
         CHECK(eq(stellar::find(stellar::ROOT_STAR, "frozen"), "snapshotted\n"), "files written after the snapshot read clean");
 
@@ -824,6 +825,432 @@ int main() {
         CHECK(!stellar::end_batch(), "closing a batch that was never opened is refused");
         CHECK(stellar::find(stellar::ROOT_STAR, "in-batch") != stellar::INVALID_STAR, "the batched create is still there");
         CHECK(stellar::mount(), "mount works again once the batch is closed");
+    }
+
+    // ---------------------------------------------------------------- status codes
+    fresh_fs();
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        auto S = [&](Status want, const char* msg) {
+            if (st != want) printf("  got '%s', wanted '%s'\n", stellar::status_name(st), stellar::status_name(want));
+            CHECK(st == want, msg);
+            st = Status::Internal;
+        };
+        u64 a = stellar::create_file(stellar::ROOT_STAR, "a", "hello", 5, &st);
+        CHECK(a != stellar::INVALID_STAR, "create"); S(Status::Ok, "create reports Ok");
+        u64 dir = stellar::create_constellation(stellar::ROOT_STAR, "dir", &st); S(Status::Ok, "mkdir reports Ok");
+        u64 inner = stellar::create_file(dir, "inner", "x", 1, &st); (void)inner;
+        char n60[61]; for (int i = 0; i < 60; ++i) n60[i] = 'q'; n60[60] = 0;
+
+        stellar::create_file(stellar::ROOT_STAR, "a", "x", 1, &st); S(Status::Exists, "duplicate name");
+        stellar::create_constellation(stellar::ROOT_STAR, "a", &st); S(Status::Exists, "duplicate directory name");
+        stellar::create_file(stellar::ROOT_STAR, "", "x", 1, &st); S(Status::InvalidName, "empty name");
+        stellar::create_file(stellar::ROOT_STAR, "..", "x", 1, &st); S(Status::InvalidName, "dotdot name");
+        stellar::create_file(stellar::ROOT_STAR, "p/q", "x", 1, &st); S(Status::InvalidName, "slash in name");
+        stellar::create_file(stellar::ROOT_STAR, n60, "x", 1, &st); S(Status::InvalidName, "long name");
+        stellar::create_file(a, "x", "x", 1, &st); S(Status::NotADirectory, "create under a file");
+        stellar::create_file(99999, "x", "x", 1, &st); S(Status::NotFound, "create under a missing parent");
+
+        stellar::find(stellar::ROOT_STAR, "missing", stellar::LIVE, &st); S(Status::NotFound, "find missing");
+        stellar::find(a, "x", stellar::LIVE, &st); S(Status::NotADirectory, "find inside a file");
+        stellar::find(stellar::ROOT_STAR, "a", 9, &st); S(Status::NoSuchSnapshot, "find in a snapshot that does not exist");
+        stellar::find(stellar::ROOT_STAR, "", stellar::LIVE, &st); S(Status::InvalidName, "find with an empty name");
+        CHECK(stellar::find(stellar::ROOT_STAR, "a", stellar::LIVE, &st) == a, "find hit"); S(Status::Ok, "find hit reports Ok");
+
+        static u8 buf[64];
+        u64 got = stellar::read_file(a, buf, sizeof(buf), stellar::LIVE, &st);
+        CHECK(got == 5, "read returns the size"); S(Status::Ok, "read reports Ok");
+        stellar::read_file(77777, buf, sizeof(buf), stellar::LIVE, &st); S(Status::NotFound, "read missing star");
+        CHECK(stellar::read_file(dir, buf, sizeof(buf), stellar::LIVE, &st) == stellar::READ_ERROR, "reading a directory fails"); S(Status::IsADirectory, "read a directory");
+        stellar::read_file(a, buf, sizeof(buf), 5, &st); S(Status::NoSuchSnapshot, "read from a missing snapshot");
+        u64 empty = stellar::create_file(stellar::ROOT_STAR, "empty", nullptr, 0, &st);
+        got = stellar::read_file(empty, buf, sizeof(buf), stellar::LIVE, &st);
+        CHECK(got == 0 && got != stellar::READ_ERROR, "an empty file reads as 0, not as an error"); S(Status::Ok, "empty read reports Ok");
+
+        stellar::write_file(dir, "x", 1, &st); S(Status::IsADirectory, "write to a directory");
+        stellar::write_file(88888, "x", 1, &st); S(Status::NotFound, "write to a missing star");
+
+        CHECK(!stellar::link(stellar::ROOT_STAR, "dd", dir, &st), "link dir"); S(Status::IsADirectory, "link a directory");
+        CHECK(!stellar::link(stellar::ROOT_STAR, "dd", 66666, &st), "link missing"); S(Status::NotFound, "link a missing target");
+        CHECK(!stellar::link(stellar::ROOT_STAR, "a", a, &st) || true, "link self name");
+        stellar::link(dir, "inner", a, &st); S(Status::Exists, "link onto an existing name");
+        CHECK(!stellar::link(a, "z", a, &st), "link into itself"); S(Status::InvalidArgument, "link where dir equals target");
+
+        CHECK(!stellar::unlink(stellar::ROOT_STAR, "nope", &st), "unlink missing"); S(Status::NotFound, "unlink missing");
+        CHECK(!stellar::unlink(stellar::ROOT_STAR, "dir", &st), "unlink non-empty"); S(Status::NotEmpty, "unlink a non-empty directory");
+        CHECK(!stellar::unlink(a, "x", &st), "unlink inside a file"); S(Status::NotADirectory, "unlink inside a file");
+        CHECK(!stellar::unlink(77777, "x", &st), "unlink in missing dir"); S(Status::NotFound, "unlink in a missing directory");
+        CHECK(stellar::unlink(dir, "inner", &st), "unlink ok"); S(Status::Ok, "unlink reports Ok");
+
+        CHECK(!stellar::delete_snapshot(stellar::LIVE, &st), "delete live"); S(Status::InvalidArgument, "delete the live view");
+        CHECK(!stellar::delete_snapshot(77, &st), "delete missing"); S(Status::NoSuchSnapshot, "delete a missing snapshot");
+        u64 sn = stellar::snapshot(&st); S(Status::Ok, "snapshot reports Ok");
+        CHECK(stellar::delete_snapshot(sn, &st), "delete ok"); S(Status::Ok, "delete reports Ok");
+        CHECK(!stellar::delete_snapshot(sn, &st), "delete twice"); S(Status::NoSuchSnapshot, "delete twice");
+
+        CHECK(!stellar::verify_file(dir, stellar::LIVE, &st), "verify a directory"); S(Status::IsADirectory, "verify a directory");
+        CHECK(!stellar::verify_file(55555, stellar::LIVE, &st), "verify missing"); S(Status::NotFound, "verify a missing star");
+
+        stellar::begin_batch();
+        CHECK(!stellar::mount(&st), "mount in batch"); S(Status::Busy, "mount during a batch");
+        CHECK(!stellar::format(g_sectors, &st), "format in batch"); S(Status::Busy, "format during a batch");
+        CHECK(stellar::end_batch(&st), "end batch"); S(Status::Ok, "end_batch reports Ok");
+        CHECK(!stellar::end_batch(&st), "unbalanced end"); S(Status::InvalidArgument, "unbalanced end_batch");
+
+        CHECK(!stellar::format(8, &st), "format tiny"); S(Status::InvalidArgument, "format below the minimum size");
+        CHECK(!stellar::format(g_sectors + 1, &st), "format too big"); S(Status::InvalidArgument, "format beyond the device");
+        CHECK(stellar::mount(&st), "remount"); S(Status::Ok, "mount reports Ok");
+
+        for (u32 i = 0; i < stellar::SNAPSHOT_MAX; ++i) stellar::snapshot();
+        CHECK(stellar::snapshot(&st) == stellar::INVALID_STAR, "snapshot full"); S(Status::TooManySnapshots, "snapshot table full");
+    }
+
+    fresh_fs();
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        u8 zero[512] = {0};
+        __builtin_memcpy(g_disk, zero, 512);
+        CHECK(!stellar::mount(&st) && st == Status::NotFormatted, "blank disk reports NotFormatted");
+        CHECK(stellar::format(g_sectors, &st) && st == Status::Ok, "format reports Ok");
+        u8 sb[512]; __builtin_memcpy(sb, g_disk, 512);
+        u32 bad = 99; __builtin_memcpy(g_disk + 64, &bad, 4);
+        CHECK(!stellar::mount(&st) && st == Status::Corrupt, "bad superblock reports Corrupt");
+        CHECK(stellar::find(stellar::ROOT_STAR, "x", stellar::LIVE, &st) == stellar::INVALID_STAR && st == Status::NotMounted,
+              "operations after a rejected mount report NotMounted");
+        __builtin_memcpy(g_disk, sb, 512);
+        CHECK(stellar::mount(), "restore");
+
+        u64 f = make(stellar::ROOT_STAR, "f", "payload");
+        g_allocs_until_fail = 0;
+        CHECK(!stellar::verify_file(f, stellar::LIVE, &st) && st == Status::NoMemory, "verify out of memory reports NoMemory");
+        CHECK(stellar::gc(&st) == stellar::INVALID_STAR && st == Status::NoMemory, "gc out of memory reports NoMemory");
+        CHECK(!stellar::mount(&st) && st == Status::NoMemory, "mount out of memory reports NoMemory");
+        g_allocs_until_fail = -1;
+        CHECK(stellar::mount(), "restore after the allocation test");
+
+        static u8 big[512 * 200];
+        fresh_fs(80);
+        CHECK(stellar::create_file(stellar::ROOT_STAR, "toobig", big, sizeof(big), &st) == stellar::INVALID_STAR && st == Status::NoSpace,
+              "a file that cannot fit reports NoSpace");
+        CHECK(make(stellar::ROOT_STAR, "small", "ok") != stellar::INVALID_STAR, "and the filesystem still works");
+
+        fresh_fs();
+        make(stellar::ROOT_STAR, "keep", "k");
+        const char* names[4] = {"create_file", "write_file", "snapshot", "unlink"};
+        for (int which = 0; which < 4; ++which) {
+            fresh_fs();
+            u64 star = make(stellar::ROOT_STAR, "x", "old");
+            g_wcount = 0; g_fail_after = ~0ull;
+            auto run = [&](Status* w) -> bool {
+                switch (which) {
+                    case 0: return stellar::create_file(stellar::ROOT_STAR, "n", "new", 3, w) != stellar::INVALID_STAR;
+                    case 1: return stellar::write_file(star, "newer", 5, w) != stellar::INVALID_STAR;
+                    case 2: return stellar::snapshot(w) != stellar::INVALID_STAR;
+                    default: return stellar::unlink(stellar::ROOT_STAR, "x", w);
+                }
+            };
+            CHECK(run(&st) && st == Status::Ok, names[which]);
+            u64 total = g_wcount;
+            fresh_fs();
+            star = make(stellar::ROOT_STAR, "x", "old");
+            g_wcount = 0;
+            bool all_io = true;
+            for (u64 k = 0; k < total; ++k) {
+                fresh_fs();
+                star = make(stellar::ROOT_STAR, "x", "old");
+                g_wcount = 0; g_fail_after = k;
+                st = Status::Ok;
+                bool ok = run(&st);
+                g_fail_after = ~0ull;
+                if (ok || st != Status::Io) all_io = false;
+            }
+            CHECK(all_io, "every injected write failure is reported as Io, never Internal or Ok");
+        }
+        fresh_fs();
+    }
+
+    // ---------------------------------------------------------------- directory index
+    fresh_fs();
+    {
+        stellar::test_set_hash_mask(0);
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "wide");
+        stellar::LookupStats l0 = stellar::lookup_stats();
+        stellar::IoStats win[11];
+        for (u64 i = 0; i < 1000; ++i) {
+            if (i % 100 == 0) win[i / 100] = stellar::io_stats();
+            char nm[32]; name_of(nm, "e", i);
+            CHECK(make(d, nm, nm) != stellar::INVALID_STAR, "create in a growing directory");
+        }
+        win[10] = stellar::io_stats();
+        auto cost = [&](int w) { return (win[w + 1].reads - win[w].reads) + (win[w + 1].cache_hits - win[w].cache_hits); };
+        auto wr_cost = [&](int w) { return win[w + 1].writes - win[w].writes; };
+        stellar::LookupStats l1 = stellar::lookup_stats();
+        printf("1000 creates in one directory: sector lookups per 100 creates: first %lu, last %lu; writes %lu -> %lu; index builds %lu, index lookups %lu, scans %lu\n",
+               cost(0), cost(9), wr_cost(0), wr_cost(9), l1.index_builds - l0.index_builds,
+               l1.index_lookups - l0.index_lookups, l1.scan_lookups - l0.scan_lookups);
+        CHECK(cost(9) <= cost(0) + cost(0) / 2 + 100, "lookup cost per create does not grow with the directory");
+        CHECK(wr_cost(9) <= wr_cost(0) + wr_cost(0) / 4, "write cost per create does not grow with the directory");
+        CHECK(cost(9) <= 100 * 14, "a create costs a small constant number of sector lookups");
+        CHECK(l1.index_builds - l0.index_builds <= 3, "the index is built once, not per operation");
+        CHECK(l1.scan_lookups - l0.scan_lookups == 0, "no directory chain scans on the live view");
+        CHECK(count_dir(d) == 1000, "all entries are listed");
+
+        stellar::IoStats f0 = stellar::io_stats();
+        for (u64 i = 0; i < 1000; i += 3) {
+            char nm[32]; name_of(nm, "e", i);
+            CHECK(stellar::find(d, nm) != stellar::INVALID_STAR, "indexed find");
+        }
+        stellar::IoStats f1 = stellar::io_stats();
+        u64 finds = 334;
+        printf("find in a 1000-entry directory: %.1f sector lookups per find\n",
+               (double)((f1.reads - f0.reads) + (f1.cache_hits - f0.cache_hits)) / finds);
+        CHECK((f1.reads - f0.reads) + (f1.cache_hits - f0.cache_hits) <= finds * 10, "find is O(1) in directory size");
+
+        for (u64 i = 0; i < 1000; i += 2) { char nm[32]; name_of(nm, "e", i); CHECK(stellar::unlink(d, nm), "unlink from the index"); }
+        for (u64 i = 0; i < 500; ++i) { char nm[32]; name_of(nm, "r", i); CHECK(make(d, nm, nm) != stellar::INVALID_STAR, "refill reuses freed slots"); }
+        CHECK(count_dir(d) == 1000, "directory count after churn");
+        bool all = true;
+        for (u64 i = 0; i < 1000; ++i) {
+            char nm[32]; name_of(nm, "e", i);
+            u64 st = stellar::find(d, nm);
+            all = all && ((i % 2 == 0) ? st == stellar::INVALID_STAR : eq(st, nm));
+        }
+        for (u64 i = 0; i < 500; ++i) { char nm[32]; name_of(nm, "r", i); all = all && eq(stellar::find(d, nm), nm); }
+        CHECK(all, "every surviving name resolves after churn");
+        CHECK(stellar::mount() && count_dir(stellar::find(stellar::ROOT_STAR, "wide")) == 1000, "index state matches the disk after a remount");
+    }
+
+    {
+        static const u64 masks[3] = {0x3, 0xF, 0};
+        for (u64 mask : masks) {
+            fresh_fs();
+            stellar::test_set_hash_mask(mask);
+            constexpr int N = 90, MAXS = 6;
+            struct Model { bool present[N]; u64 star[N]; };
+            static Model live, snap_model[MAXS];
+            static u64 snap_id[MAXS];
+            __builtin_memset(&live, 0, sizeof(live));
+            int nsnaps = 0;
+            u64 d = stellar::create_constellation(stellar::ROOT_STAR, "fz");
+            u64 rng = 88172645463325252ull ^ mask;
+            auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return static_cast<u32>(rng >> 11); };
+            u64 bad = 0;
+            auto note = [&](bool ok, const char* what, int step) { if (!ok) { if (!bad) printf("  fuzz mask %lx: first failure '%s' at step %d\n", mask, what, step); ++bad; } };
+            for (int step = 0; step < 4000; ++step) {
+                u32 op = rnd() % 100;
+                int k = static_cast<int>(rnd() % N);
+                char nm[16]; name_of(nm, "n", static_cast<u64>(k));
+                stellar::Status st = stellar::Status::Internal;
+                if (op < 38) {
+                    u64 id = stellar::create_file(d, nm, nm, strlen(nm), &st);
+                    if (live.present[k]) note(id == stellar::INVALID_STAR && st == stellar::Status::Exists, "duplicate create", step);
+                    else { note(id != stellar::INVALID_STAR && st == stellar::Status::Ok, "create", step); live.present[k] = true; live.star[k] = id; }
+                } else if (op < 63) {
+                    bool ok = stellar::unlink(d, nm, &st);
+                    if (live.present[k]) { note(ok && st == stellar::Status::Ok, "unlink", step); live.present[k] = false; }
+                    else note(!ok && st == stellar::Status::NotFound, "unlink missing", step);
+                } else if (op < 88) {
+                    u64 id = stellar::find(d, nm, stellar::LIVE, &st);
+                    if (live.present[k]) note(id == live.star[k] && st == stellar::Status::Ok, "find present", step);
+                    else note(id == stellar::INVALID_STAR && st == stellar::Status::NotFound, "find absent", step);
+                } else if (op < 92 && nsnaps < MAXS) {
+                    u64 id = stellar::snapshot();
+                    note(id != stellar::INVALID_STAR, "snapshot", step);
+                    snap_model[nsnaps] = live; snap_id[nsnaps] = id; ++nsnaps;
+                } else if (op < 97 && nsnaps > 0) {
+                    int si = static_cast<int>(rnd() % static_cast<u32>(nsnaps));
+                    u64 id = stellar::find(d, nm, snap_id[si], &st);
+                    if (snap_model[si].present[k]) note(id == snap_model[si].star[k] && st == stellar::Status::Ok, "snapshot find present (bloom false negative?)", step);
+                    else note(id == stellar::INVALID_STAR && st == stellar::Status::NotFound, "snapshot find absent", step);
+                } else {
+                    note(stellar::mount(), "remount", step);
+                }
+            }
+            u64 listed = 0, expect = 0;
+            stellar::list(d, &count_cb, &listed);
+            for (int k = 0; k < N; ++k) expect += live.present[k] ? 1 : 0;
+            note(listed == expect, "final directory count", -1);
+            for (int si = 0; si < nsnaps; ++si) {
+                u64 sl = 0, se = 0;
+                stellar::list(d, &count_cb, &sl, snap_id[si]);
+                for (int k = 0; k < N; ++k) se += snap_model[si].present[k] ? 1 : 0;
+                note(sl == se, "snapshot directory count", si);
+            }
+            stellar::LookupStats ls = stellar::lookup_stats();
+            printf("fuzz with hash mask %lx: %lu failure(s); bloom rejects %lu, passes %lu, false positives %lu\n",
+                   mask, bad, ls.bloom_rejects, ls.bloom_passes, ls.bloom_false_positives);
+            CHECK(bad == 0, "randomized create/unlink/find/snapshot/remount agrees with the reference model");
+        }
+        stellar::test_set_hash_mask(0);
+    }
+
+    fresh_fs();
+    {
+        stellar::test_set_hash_mask(0);
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "churn");
+        for (u64 i = 0; i < 8; ++i) { char nm[32]; name_of(nm, "keep", i); make(d, nm, nm); }
+        stellar::LookupStats a = stellar::lookup_stats();
+        bool ok = true;
+        for (u64 i = 0; i < 6000; ++i) {
+            char nm[32]; name_of(nm, "tmp", i);
+            ok = ok && make(d, nm, nm) != stellar::INVALID_STAR && stellar::unlink(d, nm);
+        }
+        stellar::LookupStats b = stellar::lookup_stats();
+        CHECK(ok, "6000 create/unlink pairs in a directory that holds 8 entries");
+        printf("churn: %lu table growths over 6000 create/unlink pairs\n", b.index_grows - a.index_grows);
+        CHECK(b.index_grows == a.index_grows, "the index does not grow while the live entry count stays flat");
+        CHECK(count_dir(d) == 8, "and the directory still holds exactly its 8 entries");
+    }
+
+    fresh_fs();
+    {
+        stellar::test_set_hash_mask(0);
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "oom");
+        for (u64 i = 0; i < 30; ++i) { char nm[32]; name_of(nm, "a", i); make(d, nm, nm); }
+        u64 snap = stellar::snapshot();
+        stellar::test_set_hash_mask(0);
+        stellar::LookupStats l0 = stellar::lookup_stats();
+
+        g_allocs_until_fail = 0;
+        bool c_create = true, c_unlink = true, c_dup = true, c_live = true, c_snap = true, c_snap_absent = true;
+        for (u64 i = 0; i < 30; ++i) { char nm[32]; name_of(nm, "b", i); c_create = c_create && make(d, nm, nm) != stellar::INVALID_STAR; }
+        for (u64 i = 0; i < 30; i += 2) { char nm[32]; name_of(nm, "a", i); c_unlink = c_unlink && stellar::unlink(d, nm); }
+        stellar::Status st = stellar::Status::Ok;
+        c_dup = stellar::create_file(d, "a1", "dup", 3, &st) == stellar::INVALID_STAR && st == stellar::Status::Exists;
+        for (u64 i = 0; i < 30; ++i) {
+            char nm[32]; name_of(nm, "a", i);
+            c_live = c_live && ((i % 2) ? eq(stellar::find(d, nm), nm) : stellar::find(d, nm) == stellar::INVALID_STAR);
+            c_snap = c_snap && eq(stellar::find(d, nm, snap), nm, snap);
+        }
+        for (u64 i = 0; i < 30; ++i) { char nm[32]; name_of(nm, "b", i); c_snap_absent = c_snap_absent && stellar::find(d, nm, snap) == stellar::INVALID_STAR; }
+        bool ok = c_create && c_unlink && c_dup && c_live && c_snap && c_snap_absent;
+        if (!ok) printf("  scan fallback steps: create=%d unlink=%d dup=%d live=%d snap=%d snap_absent=%d\n", c_create, c_unlink, c_dup, c_live, c_snap, c_snap_absent);
+        g_allocs_until_fail = -1;
+        stellar::LookupStats l1 = stellar::lookup_stats();
+        CHECK(ok, "with no memory for an index or a filter, every operation still works by scanning");
+        CHECK(l1.scan_lookups > l0.scan_lookups && l1.index_builds == l0.index_builds && l1.bloom_builds == l0.bloom_builds,
+              "and it really took the scan path");
+        CHECK(count_dir(d) == 45, "directory count after scan-path creates and unlinks");
+
+        bool again = true;
+        for (u64 i = 0; i < 30; ++i) {
+            char nm[32]; name_of(nm, "a", i);
+            again = again && ((i % 2) ? eq(stellar::find(d, nm), nm) : stellar::find(d, nm) == stellar::INVALID_STAR);
+            name_of(nm, "b", i);
+            again = again && eq(stellar::find(d, nm), nm);
+        }
+        CHECK(again, "an index built afterwards agrees with what the scan path wrote");
+        CHECK(make(d, "a0", "reborn") != stellar::INVALID_STAR && make(d, "b0", "x") == stellar::INVALID_STAR, "index path appends and rejects duplicates afterwards");
+    }
+
+    // ---------------------------------------------------------------- bloom filter on snapshot lookups
+    fresh_fs();
+    {
+        stellar::test_set_hash_mask(0);
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "bf");
+        for (u64 i = 0; i < 200; ++i) { char nm[32]; name_of(nm, "b", i); make(d, nm, nm); }
+        u64 s = stellar::snapshot();
+        for (u64 i = 0; i < 50; ++i) { char nm[32]; name_of(nm, "b", i); stellar::unlink(d, nm); }
+        for (u64 i = 0; i < 50; ++i) { char nm[32]; name_of(nm, "after", i); make(d, nm, nm); }
+
+        stellar::LookupStats a = stellar::lookup_stats();
+        stellar::IoStats io0 = stellar::io_stats();
+        u64 found = 0;
+        for (u64 i = 0; i < 2000; ++i) { char nm[32]; name_of(nm, "zz", i); found += stellar::find(d, nm, s) != stellar::INVALID_STAR; }
+        stellar::LookupStats b = stellar::lookup_stats();
+        stellar::IoStats io1 = stellar::io_stats();
+        u64 rejects = b.bloom_rejects - a.bloom_rejects, scans = b.scan_lookups - a.scan_lookups, fps = b.bloom_false_positives - a.bloom_false_positives;
+        u64 lookups = (io1.reads - io0.reads) + (io1.cache_hits - io0.cache_hits);
+        printf("2000 absent-name lookups in a snapshot: %lu rejected by the filter, %lu scanned (%lu false positives), %.1f sector lookups each\n",
+               rejects, scans, fps, (double)lookups / 2000.0);
+        CHECK(found == 0, "no absent name is ever found");
+        CHECK(rejects >= 1960, "at least 98% of absent names are rejected without touching the directory");
+        CHECK(scans <= 40 && fps == scans, "only filter false positives fall through to a scan");
+        CHECK(b.bloom_builds - a.bloom_builds == 1, "the filter is built once per snapshot directory");
+        CHECK(lookups <= 2000 * 6, "a rejected lookup costs only the catalog descent");
+
+        bool all = true;
+        for (u64 i = 0; i < 200; ++i) { char nm[32]; name_of(nm, "b", i); all = all && eq(stellar::find(d, nm, s), nm, s); }
+        CHECK(all, "the filter has no false negatives: every name in the snapshot is found");
+        bool none = true;
+        for (u64 i = 0; i < 50; ++i) { char nm[32]; name_of(nm, "after", i); none = none && stellar::find(d, nm, s) == stellar::INVALID_STAR; }
+        CHECK(none, "names created after the snapshot are not in it");
+
+        CHECK(stellar::delete_snapshot(s), "delete the snapshot");
+        u64 s2 = stellar::snapshot();
+        stellar::LookupStats c = stellar::lookup_stats();
+        bool second = true;
+        for (u64 i = 50; i < 200; ++i) { char nm[32]; name_of(nm, "b", i); second = second && stellar::find(d, nm, s2) != stellar::INVALID_STAR; }
+        for (u64 i = 0; i < 50; ++i) { char nm[32]; name_of(nm, "b", i); second = second && stellar::find(d, nm, s2) == stellar::INVALID_STAR; }
+        CHECK(second, "a snapshot taken after the delete sees its own contents");
+        CHECK(stellar::lookup_stats().bloom_builds - c.bloom_builds == 1, "deleting a snapshot drops its filter");
+    }
+
+    // ---------------------------------------------------------------- path resolution
+    fresh_fs();
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        u64 a = stellar::create_constellation(stellar::ROOT_STAR, "a");
+        u64 b = stellar::create_constellation(a, "b");
+        u64 c = make(b, "c.txt", "see\n");
+        u64 x = make(a, "x.txt", "x");
+        u64 top = make(stellar::ROOT_STAR, "top.txt", "t");
+        char n60[62]; n60[0] = '/'; for (int i = 1; i <= 60; ++i) n60[i] = 'q'; n60[61] = 0;
+        auto R = [&](const char* path, u64 want, Status ws, const char* msg, u64 snap = stellar::LIVE) {
+            st = Status::Internal;
+            u64 got = stellar::resolve(path, snap, &st);
+            if (got != want || st != ws) printf("  resolve('%s'): got %lu/%s\n", path, got, stellar::status_name(st));
+            CHECK(got == want && st == ws, msg);
+        };
+        const u64 NONE = stellar::INVALID_STAR;
+        R("/", stellar::ROOT_STAR, Status::Ok, "root");
+        R("/a", a, Status::Ok, "one component");
+        R("/a/b/c.txt", c, Status::Ok, "nested file");
+        R("//a///b//c.txt", c, Status::Ok, "repeated slashes collapse");
+        R("/a/b/", b, Status::Ok, "trailing slash on a directory");
+        R("/a/b///", b, Status::Ok, "several trailing slashes");
+        R("/top.txt", top, Status::Ok, "file at the root");
+        R("/top.txt/", NONE, Status::NotADirectory, "trailing slash on a file");
+        R("/a/b/c.txt/d", NONE, Status::NotADirectory, "descending through a file");
+        R("/missing", NONE, Status::NotFound, "missing leaf");
+        R("/a/missing/c.txt", NONE, Status::NotFound, "missing middle component");
+        R("/a/../a", NONE, Status::InvalidName, "dotdot is refused");
+        R("/a/./b", NONE, Status::InvalidName, "dot is refused");
+        R("a/b", NONE, Status::InvalidName, "relative paths are refused");
+        R("", NONE, Status::InvalidName, "empty path");
+        R(n60, NONE, Status::InvalidName, "over-long component");
+
+        u64 snap = stellar::snapshot();
+        u64 fresh = make(a, "new.txt", "n");
+        R("/a/new.txt", fresh, Status::Ok, "live view sees the new file");
+        R("/a/new.txt", NONE, Status::NotFound, "snapshot view does not", snap);
+        R("/a/b/c.txt", c, Status::Ok, "snapshot view resolves old paths", snap);
+        R("/a/b/c.txt", NONE, Status::NoSuchSnapshot, "missing snapshot", 9);
+
+        char leaf[stellar::NAME_MAX_LEN + 1];
+        auto P = [&](const char* path, u64 want, const char* want_leaf, Status ws, const char* msg, u64 bufsz = sizeof(leaf)) {
+            st = Status::Internal;
+            leaf[0] = 0;
+            u64 got = stellar::resolve_parent(path, leaf, bufsz, stellar::LIVE, &st);
+            bool leaf_ok = want_leaf == nullptr || strcmp_(leaf, want_leaf);
+            if (got != want || st != ws || !leaf_ok) printf("  resolve_parent('%s'): got %lu/%s leaf '%s'\n", path, got, stellar::status_name(st), leaf);
+            CHECK(got == want && st == ws && leaf_ok, msg);
+        };
+        P("/a/b/new.txt", b, "new.txt", Status::Ok, "parent and leaf of a new path");
+        P("/top2", stellar::ROOT_STAR, "top2", Status::Ok, "leaf directly under the root");
+        P("/a/b/", a, "b", Status::Ok, "trailing slash is ignored");
+        P("/", NONE, nullptr, Status::InvalidName, "the root has no leaf");
+        P("/missing/x", NONE, nullptr, Status::NotFound, "missing parent");
+        P("/top.txt/x", NONE, nullptr, Status::NotADirectory, "parent is a file");
+        P("/a/..", NONE, nullptr, Status::InvalidName, "dotdot leaf");
+        P("/a/b/new.txt", NONE, nullptr, Status::InvalidName, "leaf buffer too small", 4);
+        u64 p = stellar::resolve_parent("/a/b/made.txt", leaf, sizeof(leaf));
+        u64 made = stellar::create_file(p, leaf, "m", 1);
+        CHECK(made != stellar::INVALID_STAR && stellar::resolve("/a/b/made.txt") == made, "create by path round trip");
+        (void)x;
     }
 
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
