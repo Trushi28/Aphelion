@@ -1182,6 +1182,10 @@ u64 read_file(u64 star, void* buf, u64 max_size, u64 snap) {
         for (u64 b = 0; b < chunk; ++b) dst[read_so_far + b] = sector_buf[b];
         read_so_far += chunk;
     }
+    if (read_so_far == size && crc32_full(dst, size) != e.checksum) {
+        serial::printf("[stellar] checksum mismatch reading star %lu, refusing the data\n", star);
+        return 0;
+    }
     return read_so_far;
 }
 

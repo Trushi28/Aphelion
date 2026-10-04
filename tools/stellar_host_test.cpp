@@ -706,6 +706,53 @@ int main() {
         CHECK(stellar::format(g_sectors), "format works once the disk is back");
     }
 
+    fresh_fs();
+    {
+        static u8 blob[5000], sink[8192];
+        for (u64 i = 0; i < sizeof(blob); ++i) blob[i] = static_cast<u8>(i * 17 + 1);
+        u64 big = stellar::create_file(stellar::ROOT_STAR, "big", blob, sizeof(blob));
+        u64 one = make(stellar::ROOT_STAR, "one", "tiny file\n");
+        u64 empty = stellar::create_file(stellar::ROOT_STAR, "empty", nullptr, 0);
+        u64 snap = stellar::snapshot();
+        u64 frozen = make(stellar::ROOT_STAR, "frozen", "snapshotted\n");
+        (void)frozen;
+
+        CHECK(stellar::mount(), "remount to clear the sector cache");
+
+        CHECK(stellar::read_file(big, sink, sizeof(sink)) == sizeof(blob), "clean multi-sector read");
+        CHECK(stellar::read_file(one, sink, sizeof(sink)) == 10, "clean single-sector read");
+        CHECK(stellar::read_file(empty, sink, sizeof(sink)) == 0 && stellar::verify_file(empty), "empty file reads clean");
+
+        u64 big_first = 0, one_first = 0;
+        for (u64 sec = 40; sec < g_sectors && (!big_first || !one_first); ++sec) {
+            if (!big_first && __builtin_memcmp(g_disk + sec * 512, blob, 512) == 0) big_first = sec;
+            if (!one_first && __builtin_memcmp(g_disk + sec * 512, "tiny file\n", 10) == 0) one_first = sec;
+        }
+        CHECK(big_first && one_first, "locate the extents on the disk");
+
+        g_disk[(big_first + 2) * 512 + 7] ^= 0x40;
+        g_disk[one_first * 512 + 4] ^= 0x01;
+        CHECK(stellar::mount(), "remount with corrupted extents");
+
+        CHECK(!stellar::verify_file(big) && !stellar::verify_file(one), "verify_file sees the corruption");
+        CHECK(stellar::read_file(big, sink, sizeof(sink)) == 0, "read_file refuses a corrupt multi-sector file");
+        CHECK(stellar::read_file(one, sink, sizeof(sink)) == 0, "read_file refuses a corrupt single-sector file");
+        CHECK(stellar::read_file(big, sink, sizeof(blob)) == 0, "an exact-size buffer is still verified");
+        CHECK(stellar::read_file(big, sink, 100) == 100, "a partial read cannot be verified and still works");
+        CHECK(stellar::read_file(big, sink, sizeof(sink), snap) == 0, "the same bytes seen through a snapshot are refused too");
+        CHECK(stellar::read_file(empty, sink, sizeof(sink)) == 0 && stellar::verify_file(empty), "untouched files are unaffected");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "frozen"), "snapshotted\n"), "files written after the snapshot read clean");
+
+        g_disk[(big_first + 2) * 512 + 7] ^= 0x40;
+        g_disk[one_first * 512 + 4] ^= 0x01;
+        CHECK(stellar::mount(), "remount after repairing the bytes");
+        CHECK(stellar::read_file(big, sink, sizeof(sink)) == sizeof(blob) && stellar::verify_file(big), "repaired file reads again");
+        bool same = true;
+        for (u64 i = 0; i < sizeof(blob); ++i) same = same && sink[i] == blob[i];
+        CHECK(same, "and returns the original bytes");
+        CHECK(eq(one, "tiny file\n"), "repaired small file reads again");
+    }
+
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
