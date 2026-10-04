@@ -291,38 +291,52 @@ static void bm_set(u64 s, bool used) {
     if (idx > g_bm_hi) g_bm_hi = idx;
 }
 
-static void commit() {
-    if (!g_mounted) return;
+static bool commit() {
+    if (!g_mounted) return true;
+    bool ok = true;
     if (g_bm_lo <= g_bm_hi) {
+        bool all = true;
         for (u64 i = g_bm_lo; i <= g_bm_hi; ++i) {
             if (!g_bm_dirty[i]) continue;
-            raw_wr(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE);
-            g_bm_dirty[i] = 0;
+            if (raw_wr(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE)) g_bm_dirty[i] = 0;
+            else all = false;
         }
-        g_bm_lo = ~0ull;
-        g_bm_hi = 0;
+        if (all) {
+            g_bm_lo = ~0ull;
+            g_bm_hi = 0;
+        } else {
+            ok = false;
+        }
     }
-    if (g_sb_dirty) {
+    if (g_sb_dirty && ok) {
         u8 buf[SECTOR_SIZE];
         for (auto& b : buf) b = 0;
         __builtin_memcpy(buf, &g_sb, sizeof(g_sb));
-        raw_wr(0, buf);
-        g_sb_dirty = false;
+        if (raw_wr(0, buf)) g_sb_dirty = false;
+        else ok = false;
     }
+    return ok;
 }
 
 static u32 g_txn_depth = 0;
 
 struct Txn {
+    bool finished = false;
     Txn() { ++g_txn_depth; }
-    ~Txn() { if (--g_txn_depth == 0) commit(); }
+    ~Txn() { if (!finished && --g_txn_depth == 0) commit(); }
+
+    bool finish(bool ok) {
+        finished = true;
+        if (--g_txn_depth != 0) return ok;
+        return commit() && ok;
+    }
 };
 
 void begin_batch() { ++g_txn_depth; }
 
 bool end_batch() {
     if (g_txn_depth == 0) return false;
-    if (--g_txn_depth == 0) commit();
+    if (--g_txn_depth == 0) return commit();
     return true;
 }
 
@@ -759,19 +773,24 @@ bool format(u64 total_sectors) {
     reset_runtime_state();
 
     u64 root_sector = alloc_sectors(1);
-    if (root_sector == 0) return false;
+    if (root_sector == 0) { release_runtime(); return false; }
     u8 buf[SECTOR_SIZE];
     for (auto& b : buf) b = 0;
     auto* leaf = reinterpret_cast<LeafNode*>(buf);
     leaf->is_leaf = 1;
     leaf->gen = g_sb.epoch;
-    if (!wr(root_sector, buf)) return false;
+    if (!wr(root_sector, buf)) { release_runtime(); return false; }
     g_sb.catalog_root = root_sector;
-    commit();
+    if (!commit()) {
+        serial::writeln("[stellar] format: could not write the initial metadata");
+        release_runtime();
+        return false;
+    }
 
     u64 root = create_constellation(INVALID_STAR, "");
     if (root != ROOT_STAR) {
         serial::writeln("[stellar] format: root did not land at star 0");
+        release_runtime();
         return false;
     }
     serial::printf("[stellar] formatted: %lu sectors, COW B+tree catalog (leaf fanout %u, internal fanout %u), directory fanout %u/sector, O(1) epoch snapshots (max %u)\n",
@@ -837,7 +856,7 @@ u64 create_constellation(u64 parent, const char* name) {
     if (!catalog_upsert(id, entry)) return INVALID_STAR;
 
     if (parent != INVALID_STAR && !add_edge(parent, name, id)) return INVALID_STAR;
-    return id;
+    return txn.finish(true) ? id : INVALID_STAR;
 }
 
 u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
@@ -861,7 +880,7 @@ u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
     if (!catalog_upsert(id, entry)) return INVALID_STAR;
 
     if (parent != INVALID_STAR && !add_edge(parent, name, id)) return INVALID_STAR;
-    return id;
+    return txn.finish(true) ? id : INVALID_STAR;
 }
 
 u64 write_file(u64 star, const void* data, u64 size) {
@@ -886,7 +905,7 @@ u64 write_file(u64 star, const void* data, u64 size) {
 
     if (!catalog_upsert(star, new_e)) return INVALID_STAR;
     if (old_e.gen == g_sb.epoch) release_sectors(old_e.first_sector, old_e.sector_count);
-    return star;
+    return txn.finish(true) ? star : INVALID_STAR;
 }
 
 u64 snapshot() {
@@ -902,7 +921,7 @@ u64 snapshot() {
     if (slot == g_sb.snap_count) ++g_sb.snap_count;
     ++g_sb.epoch;
     g_sb_dirty = true;
-    return static_cast<u64>(slot) + 1;
+    return txn.finish(true) ? static_cast<u64>(slot) + 1 : INVALID_STAR;
 }
 
 bool link(u64 dir_star, const char* name, u64 target) {
@@ -914,7 +933,7 @@ bool link(u64 dir_star, const char* name, u64 target) {
     if (!add_edge(dir_star, name, target)) return false;
     if (!catalog_find(target, &e)) return false;
     ++e.nlink;
-    return catalog_upsert(target, e);
+    return txn.finish(catalog_upsert(target, e));
 }
 
 u32 live_snapshot_count() {
@@ -933,7 +952,7 @@ bool delete_snapshot(u64 snap) {
     while (g_sb.snap_count > 0 && g_sb.snaps[g_sb.snap_count - 1].catalog_root == 0)
         --g_sb.snap_count;
     g_sb_dirty = true;
-    return true;
+    return txn.finish(true);
 }
 
 static bool dir_is_empty(const StarEntry& d) {
@@ -1006,16 +1025,18 @@ bool unlink(u64 dir_star, const char* name) {
     if (!catalog_find(target, &t)) return false;
     if (t.nlink > 1) {
         --t.nlink;
-        return catalog_upsert(target, t);
+        return txn.finish(catalog_upsert(target, t));
     }
+    StarEntry dead = t;
+    dead.type = TYPE_FREE;
+    dead.nlink = 0;
+    dead.size_bytes = 0;
+    dead.first_sector = 0;
+    dead.sector_count = 0;
+    dead.checksum = 0;
+    if (!catalog_upsert(target, dead)) return false;
     release_current_epoch(t);
-    t.type = TYPE_FREE;
-    t.nlink = 0;
-    t.size_bytes = 0;
-    t.first_sector = 0;
-    t.sector_count = 0;
-    t.checksum = 0;
-    return catalog_upsert(target, t);
+    return txn.finish(true);
 }
 
 static u8* g_mark = nullptr;
@@ -1098,7 +1119,8 @@ u64 gc() {
 
     free_ram(g_mark, bm_bytes);
     g_mark = nullptr;
-    return freed;
+    if (freed == INVALID_STAR) return INVALID_STAR;
+    return txn.finish(true) ? freed : INVALID_STAR;
 }
 
 bool verify_file(u64 star, u64 snap) {

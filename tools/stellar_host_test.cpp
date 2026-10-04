@@ -16,11 +16,26 @@ void free(void*);
 static u8* g_disk;
 static u64 g_sectors;
 
+static u64 g_wcount = 0;
+static u64 g_fail_after = ~0ull;
+
 namespace blockdev {
 bool read_sector(u64 s, void* b) { if (s >= g_sectors) return false; __builtin_memcpy(b, g_disk + s * 512, 512); return true; }
-bool write_sector(u64 s, const void* b) { if (s >= g_sectors) return false; __builtin_memcpy(g_disk + s * 512, b, 512); return true; }
+bool write_sector(u64 s, const void* b) {
+    if (s >= g_sectors || g_wcount >= g_fail_after) return false;
+    ++g_wcount;
+    __builtin_memcpy(g_disk + s * 512, b, 512);
+    return true;
+}
 bool read_sectors(u64 s, u64 n, void* b) { if (s + n > g_sectors) return false; __builtin_memcpy(b, g_disk + s * 512, n * 512); return true; }
-bool write_sectors(u64 s, u64 n, const void* b) { if (s + n > g_sectors) return false; __builtin_memcpy(g_disk + s * 512, b, n * 512); return true; }
+bool write_sectors(u64 s, u64 n, const void* b) {
+    if (s + n > g_sectors) return false;
+    u64 ok_n = n;
+    if (g_wcount + n > g_fail_after) ok_n = g_fail_after > g_wcount ? g_fail_after - g_wcount : 0;
+    __builtin_memcpy(g_disk + s * 512, b, ok_n * 512);
+    g_wcount += ok_n;
+    return ok_n == n;
+}
 u64 capacity_sectors() { return g_sectors; }
 }
 
@@ -598,6 +613,97 @@ int main() {
         CHECK(!stellar::verify_file(stellar::find(stellar::ROOT_STAR, "keep")), "verify_file fails when it cannot allocate scratch");
         g_allocs_until_fail = -1;
         CHECK(stellar::verify_file(stellar::find(stellar::ROOT_STAR, "keep")), "verify_file works again once RAM is back");
+    }
+
+    {
+        static u64 st_file, st_dir, st_snap;
+        static u8 payload[3000];
+        for (u64 i = 0; i < sizeof(payload); ++i) payload[i] = static_cast<u8>(i * 31 + 7);
+        struct Op { const char* name; void (*setup)(); bool (*run)(); };
+        auto plain = [] {};
+        const Op ops[] = {
+            {"create_file", +plain, [] { return stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)) != stellar::INVALID_STAR; }},
+            {"create_constellation", +plain, [] { return stellar::create_constellation(stellar::ROOT_STAR, "d") != stellar::INVALID_STAR; }},
+            {"write_file", [] { st_file = make(stellar::ROOT_STAR, "f", "old"); },
+                           [] { return stellar::write_file(st_file, payload, sizeof(payload)) != stellar::INVALID_STAR; }},
+            {"snapshot", +plain, [] { return stellar::snapshot() != stellar::INVALID_STAR; }},
+            {"link", [] { st_file = make(stellar::ROOT_STAR, "f", "x"); st_dir = stellar::create_constellation(stellar::ROOT_STAR, "d"); },
+                     [] { return stellar::link(st_dir, "alias", st_file); }},
+            {"unlink", [] { st_file = make(stellar::ROOT_STAR, "f", "x"); st_snap = stellar::snapshot(); (void)st_snap; },
+                       [] { return stellar::unlink(stellar::ROOT_STAR, "f"); }},
+            {"unlink (frees extents)", [] { st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)); },
+                       [] { return stellar::unlink(stellar::ROOT_STAR, "f"); }},
+            {"delete_snapshot", [] { st_snap = stellar::snapshot(); }, [] { return stellar::delete_snapshot(st_snap); }},
+            {"gc", [] {
+                        st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload));
+                        st_snap = stellar::snapshot();
+                        stellar::unlink(stellar::ROOT_STAR, "f");
+                        stellar::delete_snapshot(st_snap);
+                    },
+                    [] { return stellar::gc() != stellar::INVALID_STAR; }},
+            {"batch of creates", +plain, [] {
+                        stellar::begin_batch();
+                        bool ok = true;
+                        for (int i = 0; i < 5; ++i) {
+                            char nm[16]; name_of(nm, "b", static_cast<u64>(i));
+                            ok = (make(stellar::ROOT_STAR, nm, nm) != stellar::INVALID_STAR) && ok;
+                        }
+                        return stellar::end_batch() && ok;
+                    }},
+        };
+        for (const Op& op : ops) {
+            fresh_fs();
+            op.setup();
+            g_wcount = 0;
+            bool clean = op.run();
+            u64 total = g_wcount;
+            CHECK(clean, op.name);
+            u64 missed = 0, first_missed = ~0ull;
+            for (u64 k = 0; k < total; ++k) {
+                fresh_fs();
+                op.setup();
+                g_wcount = 0;
+                g_fail_after = k;
+                bool ok = op.run();
+                g_fail_after = ~0ull;
+                if (ok) { ++missed; if (first_missed == ~0ull) first_missed = k; }
+            }
+            if (missed) printf("  %s: %lu of %lu injected write failures went unreported (first at write %lu)\n",
+                               op.name, missed, total, first_missed);
+            CHECK(missed == 0, "a failed disk write must fail the operation");
+        }
+        g_fail_after = ~0ull;
+        fresh_fs();
+    }
+
+    fresh_fs();
+    {
+        g_wcount = 0;
+        u64 probe = make(stellar::ROOT_STAR, "probe", "p");
+        u64 w = g_wcount;
+        CHECK(probe != stellar::INVALID_STAR && w >= 2, "measure a create's writes");
+
+        g_wcount = 0;
+        g_fail_after = w - 1;
+        u64 lost = make(stellar::ROOT_STAR, "lost", "doomed");
+        g_fail_after = ~0ull;
+        CHECK(lost == stellar::INVALID_STAR, "create reports the failed superblock write");
+
+        u64 after = make(stellar::ROOT_STAR, "after", "survives");
+        CHECK(after != stellar::INVALID_STAR, "the next create succeeds on a healthy disk");
+        CHECK(stellar::mount(), "remount after a failed commit");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "after"), "survives"), "later data persisted");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "probe"), "p"), "earlier data persisted");
+        u64 free_now = stellar::free_space_sectors();
+        CHECK(stellar::gc() != stellar::INVALID_STAR, "gc runs after the failed commit");
+        CHECK(stellar::free_space_sectors() >= free_now, "gc never loses space it should return");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "after"), "survives"), "data intact after gc");
+
+        g_fail_after = 0;
+        CHECK(!stellar::format(g_sectors), "format fails when the disk is dead");
+        g_fail_after = ~0ull;
+        CHECK(stellar::find(stellar::ROOT_STAR, "probe") == stellar::INVALID_STAR, "a failed format leaves the filesystem unmounted");
+        CHECK(stellar::format(g_sectors), "format works once the disk is back");
     }
 
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
