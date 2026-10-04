@@ -192,10 +192,49 @@ u32 snapshot_count() { return g_sb.snap_count; }
 static void* alloc_ram(u64 bytes) {
     int order = 0;
     while ((universe::PAGE_SIZE << order) < bytes) ++order;
+    if (order > universe::MAX_ORDER) return nullptr;
     u64 phys = universe::alloc(order);
+    if (phys == 0) return nullptr;
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
     __builtin_memset(v, 0, universe::PAGE_SIZE << order);
     return v;
+}
+
+static void free_ram(void* p, u64 bytes) {
+    if (!p) return;
+    int order = 0;
+    while ((universe::PAGE_SIZE << order) < bytes) ++order;
+    universe::free(reinterpret_cast<u64>(p) - g_hhdm, order);
+}
+
+constexpr u64 VERIFY_CHUNK = 16;
+static u64 g_bitmap_bytes = 0;
+static u8* g_verify_scratch = nullptr;
+
+static void release_runtime() {
+    g_mounted = false;
+    free_ram(g_bitmap, g_bitmap_bytes);
+    free_ram(g_bm_dirty, g_bitmap_bytes / SECTOR_SIZE);
+    free_ram(g_verify_scratch, VERIFY_CHUNK * SECTOR_SIZE);
+    g_bitmap = nullptr;
+    g_bm_dirty = nullptr;
+    g_verify_scratch = nullptr;
+    g_bitmap_bytes = 0;
+    g_bm_lo = ~0ull;
+    g_bm_hi = 0;
+}
+
+static bool alloc_runtime(u64 bitmap_sectors) {
+    release_runtime();
+    g_bitmap_bytes = bitmap_sectors * SECTOR_SIZE;
+    g_bitmap = static_cast<u8*>(alloc_ram(g_bitmap_bytes));
+    g_bm_dirty = static_cast<u8*>(alloc_ram(bitmap_sectors));
+    if (!g_bitmap || !g_bm_dirty) {
+        release_runtime();
+        serial::writeln("[stellar] out of memory for the free-space bitmap");
+        return false;
+    }
+    return true;
 }
 
 static bool raw_wr(u64 sector, const void* buf) {
@@ -710,8 +749,7 @@ bool format(u64 total_sectors) {
     g_sb.epoch = 1;
     g_sb.snap_count = 0;
 
-    g_bitmap = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors * SECTOR_SIZE));
-    g_bm_dirty = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors));
+    if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
     for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) g_bm_dirty[i] = 1;
     g_bm_lo = 0;
     g_bm_hi = g_sb.bitmap_sectors - 1;
@@ -759,14 +797,12 @@ bool mount() {
         return false;
     }
     g_sb = sb;
-    g_bitmap = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors * SECTOR_SIZE));
-    g_bm_dirty = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors));
-    g_bm_lo = ~0ull;
-    g_bm_hi = 0;
+    if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
     for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
         ++g_io_reads;
         if (!blockdev::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE)) {
             serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + i);
+            release_runtime();
             return false;
         }
     }
@@ -990,12 +1026,6 @@ static void mk_range(u64 first, u64 count) {
     for (u64 s = first; s < first + count && s < g_sb.total_sectors; ++s) mk_set(s);
 }
 
-static void free_ram(void* p, u64 bytes) {
-    int order = 0;
-    while ((universe::PAGE_SIZE << order) < bytes) ++order;
-    universe::free(reinterpret_cast<u64>(p) - g_hhdm, order);
-}
-
 static bool mark_dir_chain(u64 sector) {
     u8 buf[SECTOR_SIZE];
     while (sector != 0 && sector < g_sb.total_sectors && !mk_test(sector)) {
@@ -1040,6 +1070,7 @@ u64 gc() {
     u64 bm_bytes = g_sb.bitmap_sectors * SECTOR_SIZE;
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
     g_mark = static_cast<u8*>(alloc_ram(bm_bytes));
+    if (!g_mark) return INVALID_STAR;
     mk_range(0, data_start);
 
     bool ok = mark_tree(g_sb.catalog_root, 0);
@@ -1077,9 +1108,10 @@ bool verify_file(u64 star, u64 snap) {
     StarEntry e;
     if (!bt_search(root, star, &e) || e.type != TYPE_FILE) return false;
 
-    constexpr u64 CHUNK = 16;
-    static u8* scratch = nullptr;
-    if (!scratch) scratch = static_cast<u8*>(alloc_ram(CHUNK * SECTOR_SIZE));
+    constexpr u64 CHUNK = VERIFY_CHUNK;
+    if (!g_verify_scratch) g_verify_scratch = static_cast<u8*>(alloc_ram(CHUNK * SECTOR_SIZE));
+    if (!g_verify_scratch) return false;
+    u8* scratch = g_verify_scratch;
 
     u32 crc = 0xFFFFFFFFu;
     u64 remaining = e.size_bytes;

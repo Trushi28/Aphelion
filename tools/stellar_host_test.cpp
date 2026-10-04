@@ -24,8 +24,12 @@ bool write_sectors(u64 s, u64 n, const void* b) { if (s + n > g_sectors) return 
 u64 capacity_sectors() { return g_sectors; }
 }
 
+static long g_allocs_until_fail = -1;
+
 namespace universe {
 u64 alloc(int order) {
+    if (g_allocs_until_fail == 0) return 0;
+    if (g_allocs_until_fail > 0) --g_allocs_until_fail;
     unsigned long bytes = PAGE_SIZE << order;
     return reinterpret_cast<u64>(aligned_alloc(4096, bytes));
 }
@@ -561,6 +565,39 @@ int main() {
         __builtin_memcpy(&root_copy, g_disk + 40, 8);
         for (u32 i = 0; i < 24; ++i) __builtin_memcpy(g_disk + 72 + 16 * i, &root_copy, 8);
         CHECK(stellar::mount(), "a full snapshot table with valid roots still mounts");
+    }
+
+    fresh_fs();
+    {
+        u64 keep = make(stellar::ROOT_STAR, "keep", "kept\n");
+        CHECK(keep != stellar::INVALID_STAR, "seed file");
+
+        for (long n = 0; n < 2; ++n) {
+            g_allocs_until_fail = n;
+            CHECK(!stellar::format(g_sectors), "format fails cleanly when RAM runs out");
+            g_allocs_until_fail = -1;
+        }
+        CHECK(stellar::format(g_sectors), "format works again once RAM is back");
+        keep = make(stellar::ROOT_STAR, "keep", "kept\n");
+
+        for (long n = 0; n < 2; ++n) {
+            g_allocs_until_fail = n;
+            CHECK(!stellar::mount(), "mount fails cleanly when RAM runs out");
+            CHECK(stellar::find(stellar::ROOT_STAR, "keep") == stellar::INVALID_STAR, "and stays unmounted");
+            g_allocs_until_fail = -1;
+        }
+        CHECK(stellar::mount() && eq(stellar::find(stellar::ROOT_STAR, "keep"), "kept\n"), "mount works again once RAM is back");
+
+        g_allocs_until_fail = 0;
+        CHECK(stellar::gc() == stellar::INVALID_STAR, "gc reports failure when it cannot allocate its mark bitmap");
+        g_allocs_until_fail = -1;
+        CHECK(stellar::gc() != stellar::INVALID_STAR, "gc works again once RAM is back");
+
+        CHECK(stellar::mount(), "remount to drop the verify scratch buffer");
+        g_allocs_until_fail = 0;
+        CHECK(!stellar::verify_file(stellar::find(stellar::ROOT_STAR, "keep")), "verify_file fails when it cannot allocate scratch");
+        g_allocs_until_fail = -1;
+        CHECK(stellar::verify_file(stellar::find(stellar::ROOT_STAR, "keep")), "verify_file works again once RAM is back");
     }
 
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
