@@ -12,6 +12,7 @@ constexpr u32 NAME_LEN = 52;
 constexpr u32 LEAF_MAX = 10;
 constexpr u32 INTERNAL_MAX = 30;
 constexpr u32 CACHE_SLOTS = 256;
+constexpr u64 MIN_SECTORS = 64;
 
 struct PACKED SnapRec {
     u64 catalog_root;
@@ -672,7 +673,31 @@ static bool add_edge(u64 dir_star, const char* name, u64 target) {
     }
 }
 
+static u64 bitmap_sectors_for(u64 total_sectors) {
+    u64 n = (total_sectors / 8 + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    return n == 0 ? 1 : n;
+}
+
+static const char* superblock_problem(const Superblock& sb, u64 device_sectors) {
+    if (sb.sector_size != SECTOR_SIZE) return "sector size is not 512";
+    if (sb.total_sectors < MIN_SECTORS) return "filesystem is too small";
+    if (sb.total_sectors > device_sectors) return "filesystem is larger than the device";
+    if (sb.bitmap_start != 1) return "bitmap does not start at sector 1";
+    if (sb.bitmap_sectors != bitmap_sectors_for(sb.total_sectors)) return "bitmap size does not match the disk size";
+    u64 data_start = sb.bitmap_start + sb.bitmap_sectors;
+    if (data_start >= sb.total_sectors) return "no data area";
+    if (sb.epoch == 0) return "epoch is zero";
+    if (sb.snap_count > SNAPSHOT_MAX) return "snapshot count exceeds the table";
+    if (sb.catalog_root < data_start || sb.catalog_root >= sb.total_sectors) return "catalog root is outside the data area";
+    for (u32 i = 0; i < sb.snap_count; ++i) {
+        u64 root = sb.snaps[i].catalog_root;
+        if (root != 0 && (root < data_start || root >= sb.total_sectors)) return "snapshot root is outside the data area";
+    }
+    return nullptr;
+}
+
 bool format(u64 total_sectors) {
+    if (total_sectors < MIN_SECTORS || total_sectors > blockdev::capacity_sectors()) return false;
     for (auto& c : g_cache) c.valid = false;
     g_sb = Superblock{};
     g_sb.magic = MAGIC;
@@ -680,8 +705,7 @@ bool format(u64 total_sectors) {
     g_sb.sector_size = SECTOR_SIZE;
     g_sb.total_sectors = total_sectors;
     g_sb.bitmap_start = 1;
-    g_sb.bitmap_sectors = (total_sectors / 8 + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    if (g_sb.bitmap_sectors == 0) g_sb.bitmap_sectors = 1;
+    g_sb.bitmap_sectors = bitmap_sectors_for(total_sectors);
     g_sb.next_star_id = 0;
     g_sb.epoch = 1;
     g_sb.snap_count = 0;
@@ -718,6 +742,7 @@ bool format(u64 total_sectors) {
 }
 
 bool mount() {
+    g_mounted = false;
     u8 buf[SECTOR_SIZE];
     for (auto& c : g_cache) c.valid = false;
     if (!blockdev::read_sector(0, buf)) return false;
@@ -728,14 +753,22 @@ bool mount() {
         serial::writeln("[stellar] mount: bad magic or version, not formatted");
         return false;
     }
+    const char* problem = superblock_problem(sb, blockdev::capacity_sectors());
+    if (problem) {
+        serial::printf("[stellar] mount: superblock rejected, %s\n", problem);
+        return false;
+    }
     g_sb = sb;
     g_bitmap = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors * SECTOR_SIZE));
     g_bm_dirty = static_cast<u8*>(alloc_ram(g_sb.bitmap_sectors));
     g_bm_lo = ~0ull;
     g_bm_hi = 0;
     for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
-        blockdev::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE);
         ++g_io_reads;
+        if (!blockdev::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE)) {
+            serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + i);
+            return false;
+        }
     }
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     g_sb_dirty = false;

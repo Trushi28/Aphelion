@@ -10,6 +10,7 @@ int vprintf(const char*, __builtin_va_list);
 int puts(const char*);
 void* aligned_alloc(unsigned long, unsigned long);
 void* calloc(unsigned long, unsigned long);
+void free(void*);
 }
 
 static u8* g_disk;
@@ -73,8 +74,9 @@ static void name_of(char* out, const char* prefix, u64 i) {
 
 static u64 make(u64 dir, const char* n, const char* c) { return stellar::create_file(dir, n, c, strlen(c)); }
 
-static void fresh_fs() {
-    g_sectors = 131072;
+static void fresh_fs(u64 sectors = 131072) {
+    free(g_disk);
+    g_sectors = sectors;
     g_disk = static_cast<u8*>(calloc(g_sectors, 512));
     stellar::init(0);
     CHECK(!stellar::mount(), "blank disk must not mount");
@@ -507,6 +509,58 @@ int main() {
         CHECK(stellar::link(d2, "f2", f) && eq(stellar::find(d2, "f2"), "file"), "file hard links still work");
         CHECK(stellar::unlink(d1, "f") && stellar::unlink(d2, "f2"), "both file links drop");
         CHECK(stellar::unlink(stellar::ROOT_STAR, "ld"), "directory removes cleanly, so its link count was untouched");
+    }
+
+    fresh_fs();
+    {
+        u64 keep = make(stellar::ROOT_STAR, "keep", "data");
+        CHECK(keep != stellar::INVALID_STAR, "seed file for mount tests");
+        u8 good[512];
+        __builtin_memcpy(good, g_disk, 512);
+
+        struct Poke { u64 off; u64 val; int bytes; };
+        struct Case { const char* name; Poke a; Poke b; };
+        const u64 total = g_sectors;
+        const Case cases[] = {
+            {"sector size is not 512", {12, 1024, 4}, {0, 0, 0}},
+            {"total sectors larger than the device", {16, total + 1, 8}, {0, 0, 0}},
+            {"total sectors zero", {16, 0, 8}, {0, 0, 0}},
+            {"total sectors tiny", {16, 4, 8}, {0, 0, 0}},
+            {"bitmap does not start at sector 1", {24, 2, 8}, {0, 0, 0}},
+            {"bitmap sector count too large", {32, 9999, 8}, {0, 0, 0}},
+            {"bitmap sector count zero", {32, 0, 8}, {0, 0, 0}},
+            {"bitmap sector count off by one", {32, 33, 8}, {0, 0, 0}},
+            {"catalog root zero", {40, 0, 8}, {0, 0, 0}},
+            {"catalog root inside the bitmap", {40, 1, 8}, {0, 0, 0}},
+            {"catalog root past the end", {40, total, 8}, {0, 0, 0}},
+            {"epoch zero", {56, 0, 8}, {0, 0, 0}},
+            {"snapshot count over the table", {64, 25, 4}, {0, 0, 0}},
+            {"snapshot count huge", {64, 0xFFFFFFFFu, 4}, {0, 0, 0}},
+            {"snapshot root past the end", {64, 1, 4}, {72, total + 5, 8}},
+            {"snapshot root inside the bitmap", {64, 1, 4}, {72, 3, 8}},
+        };
+        for (const Case& c : cases) {
+            __builtin_memcpy(g_disk, good, 512);
+            const Poke pokes[2] = {c.a, c.b};
+            for (const Poke& p : pokes) {
+                if (!p.bytes) continue;
+                __builtin_memcpy(g_disk + p.off, &p.val, p.bytes);
+            }
+            CHECK(!stellar::mount(), c.name);
+            CHECK(stellar::find(stellar::ROOT_STAR, "keep") == stellar::INVALID_STAR, "a rejected mount leaves the filesystem unmounted");
+            CHECK(stellar::create_file(stellar::ROOT_STAR, "x", "x", 1) == stellar::INVALID_STAR, "writes fail after a rejected mount");
+        }
+        __builtin_memcpy(g_disk, good, 512);
+        CHECK(stellar::mount(), "the untouched superblock still mounts");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "keep"), "data"), "and the data is intact");
+
+        __builtin_memcpy(g_disk, good, 512);
+        u32 snaps = 24;
+        __builtin_memcpy(g_disk + 64, &snaps, 4);
+        u64 root_copy;
+        __builtin_memcpy(&root_copy, g_disk + 40, 8);
+        for (u32 i = 0; i < 24; ++i) __builtin_memcpy(g_disk + 72 + 16 * i, &root_copy, 8);
+        CHECK(stellar::mount(), "a full snapshot table with valid roots still mounts");
     }
 
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
