@@ -162,26 +162,41 @@ static void demo_spinner(void* arg) {
 }
 
 constexpr u64 WORKER_COUNT = 8;
-constexpr u32 WORKER_ITERATIONS = 40000000;
+constexpr u64 WORKER_ITERATIONS_SINGLE = 50000;
+constexpr u64 WORKER_ITERATIONS_MIN = 2000000;
+constexpr u64 WORKER_ITERATIONS_CAP = 600000000;
 static volatile u64 g_worker_cores_mask = 0;
 static volatile u32 g_workers_remaining = WORKER_COUNT;
+
+static u32 popcount64(u64 m) {
+    u32 n = 0;
+    while (m) { n += static_cast<u32>(m & 1); m >>= 1; }
+    return n;
+}
+
+static void note_core(u32 core) {
+    __atomic_fetch_or(&g_worker_cores_mask, 1ull << (core < 64 ? core : 63), __ATOMIC_SEQ_CST);
+}
 
 static void demo_worker(void* arg) {
     u64 idx = reinterpret_cast<u64>(arg);
     serial::printf("[demo] worker %lu started on core %d\n", idx, static_cast<int>(apic::id()));
-    for (u32 i = 0; i < WORKER_ITERATIONS; ++i) {
-        if ((i & 0x7FF) == 0) orbital::yield();
+    const bool expect_migration = g_cpus_online > 1;
+    const u64 cap = expect_migration ? WORKER_ITERATIONS_CAP : WORKER_ITERATIONS_SINGLE;
+    for (u64 i = 0; i < cap; ++i) {
+        if ((i & 0x7FF) == 0) {
+            note_core(apic::id());
+            if (expect_migration && i >= WORKER_ITERATIONS_MIN && popcount64(g_worker_cores_mask) > 1) break;
+            orbital::yield();
+        }
     }
     u32 core = apic::id();
+    note_core(core);
     serial::printf("[demo] worker %lu finished on core %d\n", idx, static_cast<int>(core));
-    u32 bit = core < 64 ? core : 63;
-    __atomic_fetch_or(&g_worker_cores_mask, 1ull << bit, __ATOMIC_SEQ_CST);
     if (__atomic_sub_fetch(&g_workers_remaining, 1u, __ATOMIC_SEQ_CST) == 0) {
-        u64 mask = g_worker_cores_mask;
-        u32 distinct = 0;
-        while (mask) { distinct += static_cast<u32>(mask & 1); mask >>= 1; }
+        u32 distinct = popcount64(g_worker_cores_mask);
         bool ok = distinct > 1;
-        serial::printf("[orbital] work-stealing check: %lu worker(s) finished across %u distinct core(s) -> %s\n",
+        serial::printf("[orbital] work-stealing check: %lu worker(s) ran across %u distinct core(s) -> %s\n",
                         WORKER_COUNT, distinct, ok ? "stealing confirmed" : "no migration observed");
     }
     orbital::exit_current();
@@ -251,6 +266,52 @@ static void demo_fs_stress(void* arg) {
         if ((j % 5) == 0) orbital::yield();
     }
     if (__atomic_sub_fetch(&g_fs_stress_remaining, 1u, __ATOMIC_SEQ_CST) == 0) fs_stress_finish();
+    orbital::exit_current();
+}
+
+constexpr u64 BD_WORKERS = 4;
+constexpr u64 BD_SECTORS = 4;
+constexpr u32 BD_ROUNDS = 40;
+static bool g_bd_enabled = false;
+static u64 g_bd_base = 0;
+static volatile u32 g_bd_remaining = BD_WORKERS;
+static volatile u32 g_bd_errors = 0;
+
+static void bd_fail(const char* why, u64 w, u32 round) {
+    __atomic_fetch_add(&g_bd_errors, 1u, __ATOMIC_SEQ_CST);
+    serial::printf("[smp-blockdev] FAIL: %s (worker %lu, round %u)\n", why, w, round);
+}
+
+static void demo_blockdev_stress(void* arg) {
+    u64 w = reinterpret_cast<u64>(arg);
+    u8 out[BD_SECTORS * 512];
+    u8 in[BD_SECTORS * 512];
+    u64 start = g_bd_base + w * BD_SECTORS;
+    for (u32 round = 0; round < BD_ROUNDS; ++round) {
+        for (u64 i = 0; i < sizeof(out); ++i)
+            out[i] = static_cast<u8>(((i * 2654435761u) >> 24) ^ (w * 37) ^ (round * 11));
+        if (!blockdev::write_sectors(start, BD_SECTORS, out)) { bd_fail("batched write failed", w, round); continue; }
+        for (u64 i = 0; i < sizeof(in); ++i) in[i] = 0xA5;
+        if (!blockdev::read_sectors(start, BD_SECTORS, in)) { bd_fail("batched read failed", w, round); continue; }
+        bool same = true;
+        for (u64 i = 0; same && i < sizeof(in); ++i) same = in[i] == out[i];
+        if (!same) bd_fail("batched readback mismatch", w, round);
+
+        u8 one_out[512], one_in[512];
+        for (u64 i = 0; i < 512; ++i) one_out[i] = static_cast<u8>(i + w * 53 + round * 7);
+        u64 sec = start + (round % BD_SECTORS);
+        if (!blockdev::write_sector(sec, one_out) || !blockdev::read_sector(sec, one_in)) { bd_fail("single sector I/O failed", w, round); continue; }
+        same = true;
+        for (u64 i = 0; same && i < 512; ++i) same = one_in[i] == one_out[i];
+        if (!same) bd_fail("single sector mismatch", w, round);
+        if ((round % 8) == 0) orbital::yield();
+    }
+    if (__atomic_sub_fetch(&g_bd_remaining, 1u, __ATOMIC_SEQ_CST) == 0) {
+        u32 errors = g_bd_errors;
+        serial::printf("[smp-blockdev] %lu workers ran %u rounds of batched and single-sector I/O on private regions: %u error(s)\n",
+                        BD_WORKERS, BD_ROUNDS, errors);
+        serial::printf("[selftest] smp-blockdev: %s\n", errors == 0 ? "ok" : "MISMATCH");
+    }
     orbital::exit_current();
 }
 
@@ -584,6 +645,12 @@ extern "C" NORETURN void kernel_main() {
     orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
     for (u64 i = 0; i < WORKER_COUNT; ++i)
         orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
+    if (blockdev::present() && blockdev::capacity_sectors() > 256) {
+        g_bd_base = blockdev::capacity_sectors() - 64;
+        g_bd_enabled = true;
+        for (u64 i = 0; i < BD_WORKERS; ++i)
+            orbital::spawn("bd-stress", &demo_blockdev_stress, reinterpret_cast<void*>(i));
+    }
     if (g_fs_stress_enabled) {
         for (u64 i = 0; i < FS_STRESS_WORKERS; ++i)
             orbital::spawn("fs-stress", &demo_fs_stress, reinterpret_cast<void*>(i));
