@@ -7,6 +7,7 @@
 #include <cosmos/cpu.hpp>
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
+#include <cosmos/orbital.hpp>
 
 namespace ahci {
 
@@ -138,6 +139,13 @@ static int g_port_index = -1;
 static bool g_msi_ready = false;
 static u32 g_irq_count = 0;
 static u32 g_is_latched = 0;
+
+static orbital::Mutex g_dev_lock;
+
+struct DevGuard {
+    DevGuard() { g_dev_lock.lock(); }
+    ~DevGuard() { g_dev_lock.unlock(); }
+};
 
 static void map_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
@@ -340,12 +348,14 @@ static bool identify(u8* out512) {
 }
 
 bool read_sector(u64 sector, void* buf512) {
+    DevGuard guard;
     if (!g_present) return false;
     if (!run_command(ATA_CMD_READ_DMA_EXT, sector, 1, g_bounce, false)) return false;
     __builtin_memcpy(buf512, g_bounce, 512);
     return true;
 }
 bool write_sector(u64 sector, const void* buf512) {
+    DevGuard guard;
     if (!g_present) return false;
     __builtin_memcpy(g_bounce, buf512, 512);
     return run_command(ATA_CMD_WRITE_DMA_EXT, sector, 1, g_bounce, true);
@@ -355,6 +365,7 @@ struct HalDevice : blockdev::Device {
     bool read_sector(u64 sector, void* buf512) override { return ahci::read_sector(sector, buf512); }
     bool write_sector(u64 sector, const void* buf512) override { return ahci::write_sector(sector, buf512); }
     bool read_sectors(u64 start_sector, u64 count, void* buf) override {
+        DevGuard guard;
         if (!g_present || start_sector + count > g_capacity_sectors) return false;
         u8* dst = static_cast<u8*>(buf);
         if (!g_ncq_ready) {
@@ -374,6 +385,7 @@ struct HalDevice : blockdev::Device {
         return true;
     }
     bool write_sectors(u64 start_sector, u64 count, const void* buf) override {
+        DevGuard guard;
         if (!g_present || start_sector + count > g_capacity_sectors) return false;
         const u8* src = static_cast<const u8*>(buf);
         if (!g_ncq_ready) {

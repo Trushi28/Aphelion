@@ -162,13 +162,14 @@ static void demo_spinner(void* arg) {
 }
 
 constexpr u64 WORKER_COUNT = 8;
+constexpr u32 WORKER_ITERATIONS = 40000000;
 static volatile u64 g_worker_cores_mask = 0;
 static volatile u32 g_workers_remaining = WORKER_COUNT;
 
 static void demo_worker(void* arg) {
     u64 idx = reinterpret_cast<u64>(arg);
     serial::printf("[demo] worker %lu started on core %d\n", idx, static_cast<int>(apic::id()));
-    for (u32 i = 0; i < 50000; ++i) {
+    for (u32 i = 0; i < WORKER_ITERATIONS; ++i) {
         if ((i & 0x7FF) == 0) orbital::yield();
     }
     u32 core = apic::id();

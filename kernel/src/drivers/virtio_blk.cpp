@@ -7,6 +7,7 @@
 #include <cosmos/cpu.hpp>
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
+#include <cosmos/orbital.hpp>
 
 namespace virtioblk {
 
@@ -87,6 +88,13 @@ static bool g_slot_ok[MAX_INFLIGHT];
 static volatile u32* g_msix_table = nullptr;
 static bool g_msix_ready = false;
 static u32 g_irq_count = 0;
+
+static orbital::Mutex g_dev_lock;
+
+struct DevGuard {
+    DevGuard() { g_dev_lock.lock(); }
+    ~DevGuard() { g_dev_lock.unlock(); }
+};
 
 static void map_bar_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
@@ -335,6 +343,7 @@ static bool run_batch(u64 start_sector, u64 count, bool write) {
 }
 
 bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
+    DevGuard guard;
     u8* dst = static_cast<u8*>(buf);
     while (count > 0) {
         u64 batch = count < g_max_inflight ? count : g_max_inflight;
@@ -349,6 +358,7 @@ bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
 }
 
 bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
+    DevGuard guard;
     const u8* src = static_cast<const u8*>(buf);
     while (count > 0) {
         u64 batch = count < g_max_inflight ? count : g_max_inflight;
@@ -362,8 +372,8 @@ bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
     return true;
 }
 
-bool HalDevice::read_sector(u64 sector, void* buf512) { return read_sectors(sector, 1, buf512); }
-bool HalDevice::write_sector(u64 sector, const void* buf512) { return write_sectors(sector, 1, buf512); }
+bool HalDevice::read_sector(u64 sector, void* buf512) { DevGuard guard; return read_sectors(sector, 1, buf512); }
+bool HalDevice::write_sector(u64 sector, const void* buf512) { DevGuard guard; return write_sectors(sector, 1, buf512); }
 
 bool read_sector(u64 sector, void* buf512) { return g_hal.read_sector(sector, buf512); }
 bool write_sector(u64 sector, const void* buf512) { return g_hal.write_sector(sector, buf512); }

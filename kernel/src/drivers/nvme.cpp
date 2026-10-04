@@ -7,6 +7,7 @@
 #include <cosmos/cpu.hpp>
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
+#include <cosmos/orbital.hpp>
 
 namespace nvme {
 
@@ -124,6 +125,13 @@ static inline void wreg64(u32 off, u64 v) {
 
 static u32 rd32(const u8* p) { u32 v; __builtin_memcpy(&v, p, sizeof(v)); return v; }
 static u64 rd64(const u8* p) { u64 v; __builtin_memcpy(&v, p, sizeof(v)); return v; }
+
+static orbital::Mutex g_dev_lock;
+
+struct DevGuard {
+    DevGuard() { g_dev_lock.lock(); }
+    ~DevGuard() { g_dev_lock.unlock(); }
+};
 
 static void map_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
@@ -554,6 +562,7 @@ bool init(u64 hhdm_offset) {
 }
 
 bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
+    DevGuard guard;
     if (!g_present || start_sector + count > g_capacity_sectors) return false;
     u8* dst = static_cast<u8*>(buf);
     if (g_lba_shift != 9) {
@@ -573,6 +582,7 @@ bool HalDevice::read_sectors(u64 start_sector, u64 count, void* buf) {
 }
 
 bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
+    DevGuard guard;
     if (!g_present || start_sector + count > g_capacity_sectors) return false;
     const u8* src = static_cast<const u8*>(buf);
     if (g_lba_shift != 9) {
@@ -592,6 +602,7 @@ bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
 }
 
 bool HalDevice::read_sector(u64 sector, void* buf512) {
+    DevGuard guard;
     if (!g_present || sector >= g_capacity_sectors) return false;
     if (g_lba_shift == 9) return read_sectors(sector, 1, buf512);
     u64 byte = sector << 9;
@@ -604,6 +615,7 @@ bool HalDevice::read_sector(u64 sector, void* buf512) {
 }
 
 bool HalDevice::write_sector(u64 sector, const void* buf512) {
+    DevGuard guard;
     if (!g_present || sector >= g_capacity_sectors) return false;
     if (g_lba_shift == 9) return write_sectors(sector, 1, buf512);
     u64 byte = sector << 9;
