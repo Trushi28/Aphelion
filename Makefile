@@ -147,7 +147,7 @@ run-nodisk: iso
 
 test-stellar:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp -o $(BUILD)/stellar_host_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp -o $(BUILD)/stellar_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/stellar_host_test
 
 clean:

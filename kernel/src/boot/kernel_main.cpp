@@ -111,7 +111,7 @@ static u64 cstr_len(const char* s) {
 }
 
 static bool file_equals(u64 star, const char* expect, u64 snap = stellar::LIVE) {
-    static u8 tmp[256];
+    u8 tmp[256];
     u64 want = cstr_len(expect);
     if (star == stellar::INVALID_STAR || want >= sizeof(tmp)) return false;
     u64 got = stellar::read_file(star, tmp, sizeof(tmp), snap);
@@ -183,6 +183,73 @@ static void demo_worker(void* arg) {
         serial::printf("[orbital] work-stealing check: %lu worker(s) finished across %u distinct core(s) -> %s\n",
                         WORKER_COUNT, distinct, ok ? "stealing confirmed" : "no migration observed");
     }
+    orbital::exit_current();
+}
+
+constexpr u64 FS_STRESS_WORKERS = 4;
+constexpr u64 FS_STRESS_FILES = 25;
+static bool g_fs_stress_enabled = false;
+static u64 g_fs_stress_dir = stellar::INVALID_STAR;
+static volatile u32 g_fs_stress_remaining = FS_STRESS_WORKERS;
+static volatile u32 g_fs_stress_errors = 0;
+
+static void fs_stress_name(char* out, u64 w, u64 j) {
+    u32 n = 0;
+    out[n++] = 's';
+    n += itoa_dec(w, out + n);
+    out[n++] = '_';
+    n += itoa_dec(j, out + n);
+    out[n] = 0;
+}
+
+static void fs_stress_fail(const char* why, u64 w, u64 j) {
+    __atomic_fetch_add(&g_fs_stress_errors, 1u, __ATOMIC_SEQ_CST);
+    serial::printf("[smp-fs] FAIL: %s (worker %lu, file %lu)\n", why, w, j);
+}
+
+static void fs_stress_finish() {
+    u64 total = FS_STRESS_WORKERS * FS_STRESS_FILES;
+    u64 listed = 0;
+    stellar::list(g_fs_stress_dir, &count_entry, &listed);
+    if (listed != total) {
+        serial::printf("[smp-fs] FAIL: directory holds %lu entries, expected %lu\n", listed, total);
+        __atomic_fetch_add(&g_fs_stress_errors, 1u, __ATOMIC_SEQ_CST);
+    }
+    for (u64 w = 0; w < FS_STRESS_WORKERS; ++w) {
+        for (u64 j = 0; j < FS_STRESS_FILES; ++j) {
+            char name[24];
+            fs_stress_name(name, w, j);
+            u64 star = stellar::find(g_fs_stress_dir, name);
+            if (!file_equals(star, name) || !stellar::verify_file(star)) fs_stress_fail("file missing or corrupt", w, j);
+        }
+    }
+    for (u64 w = 0; w < FS_STRESS_WORKERS; ++w) {
+        for (u64 j = 0; j < FS_STRESS_FILES; ++j) {
+            char name[24];
+            fs_stress_name(name, w, j);
+            if (!stellar::unlink(g_fs_stress_dir, name)) fs_stress_fail("unlink failed", w, j);
+        }
+    }
+    if (!stellar::unlink(stellar::ROOT_STAR, "smpstress")) fs_stress_fail("could not remove the directory", 0, 0);
+    u32 errors = g_fs_stress_errors;
+    serial::printf("[smp-fs] %lu workers created %lu files in one directory, verified and removed them: %u error(s)\n",
+                    FS_STRESS_WORKERS, total, errors);
+    serial::printf("[selftest] smp-fs: %s\n", errors == 0 ? "ok" : "MISMATCH");
+}
+
+static void demo_fs_stress(void* arg) {
+    u64 w = reinterpret_cast<u64>(arg);
+    for (u64 j = 0; j < FS_STRESS_FILES; ++j) {
+        char name[24];
+        fs_stress_name(name, w, j);
+        u64 star = stellar::find(g_fs_stress_dir, name);
+        if (star == stellar::INVALID_STAR)
+            star = stellar::create_file(g_fs_stress_dir, name, name, cstr_len(name));
+        if (star == stellar::INVALID_STAR) fs_stress_fail("create failed", w, j);
+        else if (!file_equals(star, name)) fs_stress_fail("readback mismatch", w, j);
+        if ((j % 5) == 0) orbital::yield();
+    }
+    if (__atomic_sub_fetch(&g_fs_stress_remaining, 1u, __ATOMIC_SEQ_CST) == 0) fs_stress_finish();
     orbital::exit_current();
 }
 
@@ -468,6 +535,12 @@ extern "C" NORETURN void kernel_main() {
             u64 expected_dir_count = STRESS_COUNT + 4;
 
             bool stress_ok = stress_create_ok && (stress_mismatches == 0) && (dir_count == expected_dir_count);
+            if (stress_ok) {
+                g_fs_stress_dir = stellar::find(stellar::ROOT_STAR, "smpstress");
+                if (g_fs_stress_dir == stellar::INVALID_STAR)
+                    g_fs_stress_dir = stellar::create_constellation(stellar::ROOT_STAR, "smpstress");
+                g_fs_stress_enabled = g_fs_stress_dir != stellar::INVALID_STAR;
+            }
             fb::printf(stress_ok ? 0xC0FFC0 : 0xE0D080,
                        "[%s] Stellar FS B+tree + growable directory stress: %lu stars, %lu mismatch(es), %lu dir entries enumerated\n",
                        stress_ok ? "ok" : "--", STRESS_COUNT, stress_mismatches, dir_count);
@@ -510,6 +583,11 @@ extern "C" NORETURN void kernel_main() {
     orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
     for (u64 i = 0; i < WORKER_COUNT; ++i)
         orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
+    if (g_fs_stress_enabled) {
+        for (u64 i = 0; i < FS_STRESS_WORKERS; ++i)
+            orbital::spawn("fs-stress", &demo_fs_stress, reinterpret_cast<void*>(i));
+        fb::printf(0xC0FFC0, "[ok] %lu Satellites will hammer Stellar FS concurrently\n", FS_STRESS_WORKERS);
+    }
     fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
                WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");

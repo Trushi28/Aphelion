@@ -231,6 +231,13 @@ void yield() {
     cpu::sti();
 }
 
+u64 self_token() {
+    u64 flags = cpu::irq_save();
+    Satellite* cur = g_current[apic::id()];
+    cpu::irq_restore(flags);
+    return cur ? reinterpret_cast<u64>(cur) : 1;
+}
+
 NORETURN void start_core() {
     u32 me = apic::id();
     g_current[me] = &g_idle[me];

@@ -3,6 +3,7 @@
 #include <cosmos/pmm.hpp>
 #include <cosmos/serial.hpp>
 #include <cosmos/stellar.hpp>
+#include <cosmos/orbital.hpp>
 
 extern "C" {
 int printf(const char*, ...);
@@ -11,6 +12,10 @@ int puts(const char*);
 void* aligned_alloc(unsigned long, unsigned long);
 void* calloc(unsigned long, unsigned long);
 void free(void*);
+typedef unsigned long pthread_t;
+int pthread_create(pthread_t*, const void*, void* (*)(void*), void*);
+int pthread_join(pthread_t, void**);
+int sched_yield(void);
 }
 
 static u8* g_disk;
@@ -37,6 +42,11 @@ bool write_sectors(u64 s, u64 n, const void* b) {
     return ok_n == n;
 }
 u64 capacity_sectors() { return g_sectors; }
+}
+
+namespace orbital {
+void yield() { sched_yield(); }
+u64 self_token() { static thread_local char tag; return reinterpret_cast<u64>(&tag); }
 }
 
 static long g_allocs_until_fail = -1;
@@ -751,6 +761,68 @@ int main() {
         for (u64 i = 0; i < sizeof(blob); ++i) same = same && sink[i] == blob[i];
         CHECK(same, "and returns the original bytes");
         CHECK(eq(one, "tiny file\n"), "repaired small file reads again");
+    }
+
+    fresh_fs();
+    {
+        constexpr u64 THREADS = 4, FILES = 250;
+        static u64 shared_dir;
+        static volatile u64 thread_errors;
+        static volatile u64 ready;
+        shared_dir = stellar::create_constellation(stellar::ROOT_STAR, "mt");
+        thread_errors = 0;
+        ready = 0;
+        struct Worker {
+            static void* run(void* arg) {
+                u64 w = reinterpret_cast<u64>(arg);
+                __atomic_fetch_add(&ready, 1ull, __ATOMIC_SEQ_CST);
+                while (__atomic_load_n(&ready, __ATOMIC_SEQ_CST) < THREADS) {}
+                for (u64 j = 0; j < FILES; ++j) {
+                    char nm[32], tag[24];
+                    name_of(tag, "t", w);
+                    name_of(nm, tag, j);
+                    u64 st = stellar::create_file(shared_dir, nm, nm, strlen(nm));
+                    if (st == stellar::INVALID_STAR) { __atomic_fetch_add(&thread_errors, 1ull, __ATOMIC_SEQ_CST); continue; }
+                    if (!eq(st, nm)) __atomic_fetch_add(&thread_errors, 1ull, __ATOMIC_SEQ_CST);
+                    if (j % 7 == 3 && stellar::write_file(st, "rewritten", 9) == stellar::INVALID_STAR)
+                        __atomic_fetch_add(&thread_errors, 1ull, __ATOMIC_SEQ_CST);
+                    if (w == 0 && j % 50 == 0) stellar::snapshot();
+                    if (j % 11 == 5 && stellar::find(shared_dir, nm) != st) __atomic_fetch_add(&thread_errors, 1ull, __ATOMIC_SEQ_CST);
+                    if (j % 13 == 9) { u64 n = 0; stellar::list(shared_dir, &count_cb, &n); }
+                }
+                return nullptr;
+            }
+        };
+        pthread_t th[THREADS];
+        for (u64 w = 0; w < THREADS; ++w) pthread_create(&th[w], nullptr, &Worker::run, reinterpret_cast<void*>(w));
+        for (u64 w = 0; w < THREADS; ++w) pthread_join(th[w], nullptr);
+        CHECK(thread_errors == 0, "concurrent creates, rewrites, finds and lists report no errors");
+        CHECK(count_dir(shared_dir) == THREADS * FILES, "every concurrent create landed in the directory exactly once");
+        bool all = true;
+        for (u64 w = 0; w < THREADS; ++w)
+            for (u64 j = 0; j < FILES; ++j) {
+                char nm[32], tag[24];
+                name_of(tag, "t", w);
+                name_of(nm, tag, j);
+                u64 st = stellar::find(shared_dir, nm);
+                all = all && st != stellar::INVALID_STAR && stellar::verify_file(st) &&
+                      eq(st, (j % 7 == 3) ? "rewritten" : nm);
+            }
+        CHECK(all, "every file is present, checksums verify, and contents are right");
+        CHECK(stellar::mount() && count_dir(stellar::find(stellar::ROOT_STAR, "mt")) == THREADS * FILES, "the result persists across a remount");
+    }
+
+    fresh_fs();
+    {
+        stellar::begin_batch();
+        stellar::begin_batch();
+        CHECK(make(stellar::ROOT_STAR, "in-batch", "x") != stellar::INVALID_STAR, "operations run inside nested batches");
+        CHECK(!stellar::mount(), "mount is refused while a batch is open");
+        CHECK(!stellar::format(g_sectors), "format is refused while a batch is open");
+        CHECK(stellar::end_batch() && stellar::end_batch(), "nested batches close");
+        CHECK(!stellar::end_batch(), "closing a batch that was never opened is refused");
+        CHECK(stellar::find(stellar::ROOT_STAR, "in-batch") != stellar::INVALID_STAR, "the batched create is still there");
+        CHECK(stellar::mount(), "mount works again once the batch is closed");
     }
 
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);

@@ -30,6 +30,7 @@ fail() {
 
 finished() {
     if grep -q -e 'UNHANDLED INTERRUPT' -e 'FATAL' "$LOG"; then return 0; fi
+    grep -q -e '\[selftest\] smp-fs:' "$LOG" || return 1
     if [ "$CORES" -gt 1 ]; then
         grep -q -e 'stealing confirmed' -e 'no migration observed' "$LOG"
     else
@@ -64,6 +65,8 @@ check_common() {
     grep -q '\[selftest\] multi-request queueing: ok' "$LOG.clean" || fail "multi-request queueing self-test did not pass"
     grep -q '\[selftest\] bulk I/O: ok' "$LOG.clean" || fail "bulk I/O self-test did not pass"
     grep -q 'stress: 14 stars created (create_ok=1), 0 mismatch(es)' "$LOG.clean" || fail "filesystem stress test failed"
+    grep -q '\[smp-fs\] FAIL' "$LOG.clean" && fail "concurrent filesystem stress reported a failure"
+    grep -q '\[selftest\] smp-fs: ok' "$LOG.clean" || fail "concurrent filesystem stress did not pass"
     if [ "$CORES" -gt 1 ]; then
         grep -q 'stealing confirmed' "$LOG.clean" || fail "no cross-core work-stealing observed"
     fi

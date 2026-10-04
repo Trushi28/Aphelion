@@ -2,6 +2,7 @@
 #include <cosmos/blockdev.hpp>
 #include <cosmos/pmm.hpp>
 #include <cosmos/serial.hpp>
+#include <cosmos/orbital.hpp>
 
 namespace stellar {
 
@@ -112,6 +113,13 @@ static u64 g_bm_lo = ~0ull, g_bm_hi = 0;
 static bool g_sb_dirty = false;
 static u64 g_alloc_hint = 0;
 
+static orbital::Mutex g_lock;
+
+struct Guard {
+    Guard() { g_lock.lock(); }
+    ~Guard() { g_lock.unlock(); }
+};
+
 static CacheSlot g_cache[CACHE_SLOTS];
 static u64 g_io_reads = 0, g_io_writes = 0, g_cache_hits = 0;
 
@@ -186,8 +194,8 @@ static bool valid_name(const char* n) {
 
 void init(u64 hhdm_offset) { g_hhdm = hhdm_offset; }
 
-IoStats io_stats() { return { g_io_reads, g_io_writes, g_cache_hits }; }
-u32 snapshot_count() { return g_sb.snap_count; }
+IoStats io_stats() { Guard guard; return { g_io_reads, g_io_writes, g_cache_hits }; }
+u32 snapshot_count() { Guard guard; return g_sb.snap_count; }
 
 static void* alloc_ram(u64 bytes) {
     int order = 0;
@@ -332,12 +340,17 @@ struct Txn {
     }
 };
 
-void begin_batch() { ++g_txn_depth; }
+void begin_batch() {
+    g_lock.lock();
+    ++g_txn_depth;
+}
 
 bool end_batch() {
-    if (g_txn_depth == 0) return false;
-    if (--g_txn_depth == 0) return commit();
-    return true;
+    if (g_txn_depth == 0 || !g_lock.held_by_me()) return false;
+    bool ok = true;
+    if (--g_txn_depth == 0) ok = commit();
+    g_lock.unlock();
+    return ok;
 }
 
 static u64 find_run(u64 from, u64 to, u64 count) {
@@ -383,6 +396,7 @@ static void release_sectors(u64 first, u64 count) {
 }
 
 u64 free_space_sectors() {
+    Guard guard;
     if (!g_mounted) return 0;
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
     u64 n = 0;
@@ -750,6 +764,8 @@ static const char* superblock_problem(const Superblock& sb, u64 device_sectors) 
 }
 
 bool format(u64 total_sectors) {
+    Guard guard;
+    if (g_txn_depth != 0) return false;
     if (total_sectors < MIN_SECTORS || total_sectors > blockdev::capacity_sectors()) return false;
     for (auto& c : g_cache) c.valid = false;
     g_sb = Superblock{};
@@ -799,6 +815,8 @@ bool format(u64 total_sectors) {
 }
 
 bool mount() {
+    Guard guard;
+    if (g_txn_depth != 0) return false;
     g_mounted = false;
     u8 buf[SECTOR_SIZE];
     for (auto& c : g_cache) c.valid = false;
@@ -835,6 +853,7 @@ bool mount() {
 }
 
 u64 create_constellation(u64 parent, const char* name) {
+    Guard guard;
     if (!g_mounted) return INVALID_STAR;
     Txn txn;
     if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
@@ -860,6 +879,7 @@ u64 create_constellation(u64 parent, const char* name) {
 }
 
 u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
+    Guard guard;
     if (!g_mounted) return INVALID_STAR;
     Txn txn;
     if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
@@ -884,6 +904,7 @@ u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
 }
 
 u64 write_file(u64 star, const void* data, u64 size) {
+    Guard guard;
     if (!g_mounted) return INVALID_STAR;
     Txn txn;
     StarEntry old_e;
@@ -909,6 +930,7 @@ u64 write_file(u64 star, const void* data, u64 size) {
 }
 
 u64 snapshot() {
+    Guard guard;
     if (!g_mounted) return INVALID_STAR;
     u32 slot = g_sb.snap_count;
     for (u32 i = 0; i < g_sb.snap_count; ++i) {
@@ -925,6 +947,7 @@ u64 snapshot() {
 }
 
 bool link(u64 dir_star, const char* name, u64 target) {
+    Guard guard;
     if (!g_mounted || dir_star == target) return false;
     Txn txn;
     StarEntry e;
@@ -937,6 +960,7 @@ bool link(u64 dir_star, const char* name, u64 target) {
 }
 
 u32 live_snapshot_count() {
+    Guard guard;
     u32 n = 0;
     for (u32 i = 0; i < g_sb.snap_count; ++i)
         if (g_sb.snaps[i].catalog_root != 0) ++n;
@@ -944,6 +968,7 @@ u32 live_snapshot_count() {
 }
 
 bool delete_snapshot(u64 snap) {
+    Guard guard;
     if (!g_mounted || snap == LIVE || snap > g_sb.snap_count) return false;
     if (g_sb.snaps[snap - 1].catalog_root == 0) return false;
     Txn txn;
@@ -1010,6 +1035,7 @@ static void release_current_epoch(const StarEntry& t) {
 }
 
 bool unlink(u64 dir_star, const char* name) {
+    Guard guard;
     if (!g_mounted) return false;
     Txn txn;
     u64 target = find(dir_star, name);
@@ -1086,6 +1112,7 @@ static bool mark_tree(u64 sector, u32 depth) {
 }
 
 u64 gc() {
+    Guard guard;
     if (!g_mounted) return INVALID_STAR;
     Txn txn;
     u64 bm_bytes = g_sb.bitmap_sectors * SECTOR_SIZE;
@@ -1124,6 +1151,7 @@ u64 gc() {
 }
 
 bool verify_file(u64 star, u64 snap) {
+    Guard guard;
     if (!g_mounted) return false;
     u64 root;
     if (!view_root(snap, &root)) return false;
@@ -1160,6 +1188,7 @@ bool verify_file(u64 star, u64 snap) {
 }
 
 u64 read_file(u64 star, void* buf, u64 max_size, u64 snap) {
+    Guard guard;
     if (!g_mounted) return 0;
     u64 root;
     if (!view_root(snap, &root)) return 0;
@@ -1190,6 +1219,7 @@ u64 read_file(u64 star, void* buf, u64 max_size, u64 snap) {
 }
 
 u64 find(u64 dir_star, const char* name, u64 snap) {
+    Guard guard;
     if (!g_mounted) return INVALID_STAR;
     u64 root;
     if (!view_root(snap, &root)) return INVALID_STAR;
@@ -1200,6 +1230,7 @@ u64 find(u64 dir_star, const char* name, u64 snap) {
 }
 
 void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
+    Guard guard;
     if (!g_mounted) return;
     u64 root;
     if (!view_root(snap, &root)) return;
