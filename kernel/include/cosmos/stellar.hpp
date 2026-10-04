@@ -77,6 +77,7 @@ bool verify_file(u64 star, u64 snap = LIVE, Status* why = nullptr);
 IoStats io_stats();
 LookupStats lookup_stats();
 u64 free_space_sectors();
+u64 total_sectors();
 
 void test_set_hash_mask(u64 mask);
 

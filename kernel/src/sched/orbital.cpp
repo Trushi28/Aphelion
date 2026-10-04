@@ -10,7 +10,7 @@ extern "C" void switch_context(u64* old_rsp_out, u64 new_rsp);
 namespace orbital {
 
 constexpr int MAX_SATELLITES = 32;
-constexpr int STACK_ORDER = 2;
+constexpr int STACK_ORDER = 3;
 constexpr u32 MAX_CORES = 256;
 
 static u64 g_hhdm = 0;

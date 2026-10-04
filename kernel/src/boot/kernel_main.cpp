@@ -59,6 +59,7 @@ static volatile u64 g_cpus_online = 0;
 static volatile u64 g_next_core_idx = 1;
 static u64 g_hhdm_offset = 0;
 
+static constexpr u64 TEST_TAIL_SECTORS = 64;
 static constexpr const char* HELLO_REWRITTEN = "Aphelion Stellar FS -- rewritten after snapshot.\n";
 
 static u32 init_gdt_idt(bool is_bsp) {
@@ -430,13 +431,16 @@ extern "C" NORETURN void kernel_main() {
             u64 scratch_start = total_sectors - SCRATCH_COUNT;
             static u8 scratch_write[SCRATCH_COUNT * 512];
             static u8 scratch_read[SCRATCH_COUNT * 512];
+            static u8 scratch_saved[SCRATCH_COUNT * 512];
+            bool saved_ok = blockdev::read_sectors(scratch_start, SCRATCH_COUNT, scratch_saved);
             for (u64 i = 0; i < sizeof(scratch_write); ++i)
                 scratch_write[i] = static_cast<u8>((i * 2654435761u) >> 24);
-            bool batch_write_ok = blockdev::write_sectors(scratch_start, SCRATCH_COUNT, scratch_write);
-            bool batch_read_ok = blockdev::read_sectors(scratch_start, SCRATCH_COUNT, scratch_read);
+            bool batch_write_ok = saved_ok && blockdev::write_sectors(scratch_start, SCRATCH_COUNT, scratch_write);
+            bool batch_read_ok = batch_write_ok && blockdev::read_sectors(scratch_start, SCRATCH_COUNT, scratch_read);
             bool batch_match = batch_write_ok && batch_read_ok;
             for (u64 i = 0; batch_match && i < sizeof(scratch_write); ++i)
                 batch_match = (scratch_write[i] == scratch_read[i]);
+            if (batch_write_ok) blockdev::write_sectors(scratch_start, SCRATCH_COUNT, scratch_saved);
             fb::printf(batch_match ? 0xC0FFC0 : 0xE0D080,
                        "[%s] %s multi-request queueing: %lu sectors written+read in one batch, %s\n",
                        batch_match ? "ok" : "--", blockdev::active()->name(), SCRATCH_COUNT,
@@ -447,7 +451,11 @@ extern "C" NORETURN void kernel_main() {
         stellar::init(g_hhdm_offset);
         bool fs_ready = stellar::mount();
         bool fresh_fs = !fs_ready;
-        if (!fs_ready) fs_ready = stellar::format(blockdev::capacity_sectors());
+        if (!fs_ready) {
+            u64 capacity = blockdev::capacity_sectors();
+            u64 fs_sectors = capacity > TEST_TAIL_SECTORS + 64 ? capacity - TEST_TAIL_SECTORS : capacity;
+            fs_ready = stellar::format(fs_sectors);
+        }
 
         if (fs_ready) {
             const char* msg = "Aphelion Stellar FS -- real file, real disk, real bytes.\n";
@@ -668,10 +676,14 @@ extern "C" NORETURN void kernel_main() {
     for (u64 i = 0; i < WORKER_COUNT; ++i)
         orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
     if (blockdev::present() && blockdev::capacity_sectors() > 256) {
-        g_bd_base = blockdev::capacity_sectors() - 64;
-        g_bd_enabled = true;
-        for (u64 i = 0; i < BD_WORKERS; ++i)
-            orbital::spawn("bd-stress", &demo_blockdev_stress, reinterpret_cast<void*>(i));
+        if (stellar::total_sectors() + TEST_TAIL_SECTORS <= blockdev::capacity_sectors()) {
+            g_bd_base = blockdev::capacity_sectors() - TEST_TAIL_SECTORS;
+            g_bd_enabled = true;
+            for (u64 i = 0; i < BD_WORKERS; ++i)
+                orbital::spawn("bd-stress", &demo_blockdev_stress, reinterpret_cast<void*>(i));
+        } else {
+            serial::writeln("[boot] block-device stress skipped: the filesystem covers the last 64 sectors; run make reset-disk");
+        }
     }
     if (g_fs_stress_enabled) {
         for (u64 i = 0; i < FS_STRESS_WORKERS; ++i)

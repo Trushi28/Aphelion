@@ -466,6 +466,11 @@ static void release_sectors(u64 first, u64 count) {
     if (first < g_alloc_hint) g_alloc_hint = first;
 }
 
+u64 total_sectors() {
+    Guard guard;
+    return g_mounted ? g_sb.total_sectors : 0;
+}
+
 u64 free_space_sectors() {
     Guard guard;
     if (!g_mounted) return 0;
