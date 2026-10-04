@@ -28,6 +28,7 @@ void init_core();
 Satellite* spawn(const char* name, EntryFn entry, void* arg);
 
 void yield();
+void yield_contended();
 NORETURN void exit_current();
 
 NORETURN void start_core();
@@ -43,7 +44,7 @@ public:
             u64 expected = 0;
             if (__atomic_compare_exchange_n(&owner_, &expected, me, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
             if (me == NO_SCHEDULER) asm volatile("pause" ::: "memory");
-            else yield();
+            else yield_contended();
         }
         depth_ = 1;
     }

@@ -46,6 +46,7 @@ u64 capacity_sectors() { return g_sectors; }
 
 namespace orbital {
 void yield() { sched_yield(); }
+void yield_contended() { sched_yield(); }
 u64 self_token() { static thread_local char tag; return reinterpret_cast<u64>(&tag); }
 }
 

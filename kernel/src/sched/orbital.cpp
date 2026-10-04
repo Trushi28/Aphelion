@@ -231,6 +231,20 @@ void yield() {
     cpu::sti();
 }
 
+void yield_contended() {
+    cpu::cli();
+    u32 me = apic::id();
+    Satellite* cur = g_current[me];
+    if (cur == &g_idle[me]) {
+        cpu::sti();
+        return;
+    }
+    cur->ring = NUM_RINGS - 1;
+    g_lock[me].lock();
+    reschedule_locked(me, cur);
+    cpu::sti();
+}
+
 u64 self_token() {
     u64 flags = cpu::irq_save();
     Satellite* cur = g_current[apic::id()];
