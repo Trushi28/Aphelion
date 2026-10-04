@@ -170,6 +170,19 @@ static bool names_equal(const char* a, const char* b) {
     return true;
 }
 
+static bool valid_name(const char* n) {
+    if (!n) return false;
+    u32 len = 0;
+    while (len < NAME_LEN && n[len]) {
+        if (n[len] == '/') return false;
+        ++len;
+    }
+    if (len == 0 || len >= NAME_LEN) return false;
+    if (len == 1 && n[0] == '.') return false;
+    if (len == 2 && n[0] == '.' && n[1] == '.') return false;
+    return true;
+}
+
 void init(u64 hhdm_offset) { g_hhdm = hhdm_offset; }
 
 IoStats io_stats() { return { g_io_reads, g_io_writes, g_cache_hits }; }
@@ -514,6 +527,31 @@ static bool catalog_upsert(u64 key, const StarEntry& value) {
 
 static bool catalog_find(u64 key, StarEntry* out) { return bt_search(g_sb.catalog_root, key, out); }
 
+static int dir_lookup(const StarEntry& d, const char* name, u64* star) {
+    u64 sector = d.first_sector;
+    u8 buf[SECTOR_SIZE];
+    while (sector != 0) {
+        if (!rd(sector, buf)) return -1;
+        auto* ds = reinterpret_cast<DirSector*>(buf);
+        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
+            if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) {
+                *star = ds->entries[i].star;
+                return 1;
+            }
+        }
+        sector = ds->next_sector;
+    }
+    return 0;
+}
+
+static bool can_add(u64 parent, const char* name) {
+    if (!valid_name(name)) return false;
+    StarEntry d;
+    if (!catalog_find(parent, &d) || d.type != TYPE_CONSTELLATION) return false;
+    u64 existing;
+    return dir_lookup(d, name, &existing) == 0;
+}
+
 static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
     const u8* src = static_cast<const u8*>(data);
     u64 full = size / SECTOR_SIZE;
@@ -711,6 +749,7 @@ bool mount() {
 u64 create_constellation(u64 parent, const char* name) {
     if (!g_mounted) return INVALID_STAR;
     Txn txn;
+    if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
     u64 id = alloc_star_id();
     u64 start = alloc_sectors(1);
     if (start == 0) return INVALID_STAR;
@@ -735,6 +774,7 @@ u64 create_constellation(u64 parent, const char* name) {
 u64 create_file(u64 parent, const char* name, const void* data, u64 size) {
     if (!g_mounted) return INVALID_STAR;
     Txn txn;
+    if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
     u64 id = alloc_star_id();
     u64 nsec = size == 0 ? 1 : (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
     u64 start = alloc_sectors(nsec);
@@ -800,7 +840,8 @@ bool link(u64 dir_star, const char* name, u64 target) {
     if (!g_mounted || dir_star == target) return false;
     Txn txn;
     StarEntry e;
-    if (!catalog_find(target, &e) || e.type == TYPE_FREE) return false;
+    if (!catalog_find(target, &e) || e.type != TYPE_FILE) return false;
+    if (!can_add(dir_star, name)) return false;
     if (!add_edge(dir_star, name, target)) return false;
     if (!catalog_find(target, &e)) return false;
     ++e.nlink;
@@ -1063,16 +1104,8 @@ u64 find(u64 dir_star, const char* name, u64 snap) {
     if (!view_root(snap, &root)) return INVALID_STAR;
     StarEntry e;
     if (!bt_search(root, dir_star, &e) || e.type != TYPE_CONSTELLATION) return INVALID_STAR;
-    u64 sector = e.first_sector;
-    u8 buf[SECTOR_SIZE];
-    while (sector != 0) {
-        if (!rd(sector, buf)) return INVALID_STAR;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i)
-            if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) return ds->entries[i].star;
-        sector = ds->next_sector;
-    }
-    return INVALID_STAR;
+    u64 star;
+    return dir_lookup(e, name, &star) == 1 ? star : INVALID_STAR;
 }
 
 void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {

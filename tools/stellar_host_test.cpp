@@ -354,14 +354,22 @@ int main() {
     fresh_fs();
     {
         auto a = stellar::io_stats();
+        stellar::IoStats mark[4];
         for (u64 i = 0; i < 300; ++i) {
+            if (i % 100 == 0) mark[i / 100] = stellar::io_stats();
             char nm[32]; name_of(nm, "m", i);
             make(stellar::ROOT_STAR, nm, nm);
         }
         auto b = stellar::io_stats();
+        mark[3] = b;
         u64 lookups = (b.reads - a.reads) + (b.cache_hits - a.cache_hits);
-        printf("300 creates in one directory: %lu sector lookups (%.1f per create)\n", lookups, (double)lookups / 300.0);
-        CHECK(lookups <= 300 * 20, "directory append cost does not grow with directory size");
+        u64 early_writes = mark[1].writes - mark[0].writes;
+        u64 late_writes = mark[3].writes - mark[2].writes;
+        u64 chain = (300 + 6) / 7 + 1;
+        printf("300 creates in one directory: %lu sector lookups (%.1f per create), %lu disk reads, writes first/last 100: %lu/%lu\n",
+               lookups, (double)lookups / 300.0, b.reads - a.reads, early_writes, late_writes);
+        CHECK(late_writes <= early_writes + early_writes / 4, "disk writes per create stay flat as the directory grows");
+        CHECK(lookups <= 300 * (chain + 16), "duplicate check costs one pass over the directory chain, no more");
     }
 
     fresh_fs();
@@ -412,6 +420,93 @@ int main() {
         }
         CHECK(all, "batched creates persisted");
         CHECK(!stellar::end_batch(), "unbalanced end_batch is refused");
+    }
+
+    fresh_fs();
+    {
+        char n51[52], n52[53], n60[61], n300[301];
+        for (int i = 0; i < 51; ++i) n51[i] = static_cast<char>('a' + i % 26);
+        n51[51] = 0;
+        for (int i = 0; i < 52; ++i) n52[i] = static_cast<char>('a' + i % 26);
+        n52[52] = 0;
+        for (int i = 0; i < 60; ++i) n60[i] = static_cast<char>('a' + i % 26);
+        n60[60] = 0;
+        for (int i = 0; i < 300; ++i) n300[i] = 'z';
+        n300[300] = 0;
+
+        u64 free_before = stellar::free_space_sectors();
+        u64 ids_before = make(stellar::ROOT_STAR, "probe", "p");
+        CHECK(make(stellar::ROOT_STAR, n52, "x") == stellar::INVALID_STAR, "52-char name is refused");
+        CHECK(make(stellar::ROOT_STAR, n60, "x") == stellar::INVALID_STAR, "60-char name is refused");
+        CHECK(make(stellar::ROOT_STAR, n300, "x") == stellar::INVALID_STAR, "300-char name is refused");
+        CHECK(make(stellar::ROOT_STAR, "", "x") == stellar::INVALID_STAR, "empty name is refused");
+        CHECK(make(stellar::ROOT_STAR, ".", "x") == stellar::INVALID_STAR, "dot name is refused");
+        CHECK(make(stellar::ROOT_STAR, "..", "x") == stellar::INVALID_STAR, "dotdot name is refused");
+        CHECK(make(stellar::ROOT_STAR, "a/b", "x") == stellar::INVALID_STAR, "name with a slash is refused");
+        CHECK(stellar::create_constellation(stellar::ROOT_STAR, n60) == stellar::INVALID_STAR, "long directory name is refused");
+        CHECK(stellar::create_constellation(stellar::ROOT_STAR, "") == stellar::INVALID_STAR, "empty directory name is refused");
+        CHECK(count_dir(stellar::ROOT_STAR) == 1, "refused creates leave no directory entry");
+        u64 free_mid = stellar::free_space_sectors();
+        make(stellar::ROOT_STAR, n52, "x");
+        CHECK(stellar::free_space_sectors() == free_mid, "a refused create allocates nothing");
+        (void)free_before; (void)ids_before;
+
+        u64 longf = make(stellar::ROOT_STAR, n51, "longest");
+        CHECK(longf != stellar::INVALID_STAR, "51-char name is accepted");
+        CHECK(stellar::find(stellar::ROOT_STAR, n51) == longf, "51-char name is found again");
+        struct Seen { const char* want; bool hit; } seen{n51, false};
+        stellar::list(stellar::ROOT_STAR, [](const char* nm, u64, u32, void* c) {
+            auto* sn = static_cast<Seen*>(c);
+            if (strlen(nm) == strlen(sn->want) && __builtin_memcmp(nm, sn->want, strlen(nm)) == 0) sn->hit = true;
+        }, &seen);
+        CHECK(seen.hit, "list returns the full 51-char name");
+    }
+
+    fresh_fs();
+    {
+        u64 a1 = make(stellar::ROOT_STAR, "dup", "1");
+        CHECK(a1 != stellar::INVALID_STAR, "first create");
+        CHECK(make(stellar::ROOT_STAR, "dup", "2") == stellar::INVALID_STAR, "duplicate file name is refused");
+        CHECK(stellar::create_constellation(stellar::ROOT_STAR, "dup") == stellar::INVALID_STAR, "duplicate directory name is refused");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "dup"), "1"), "original survives a refused duplicate");
+        CHECK(count_dir(stellar::ROOT_STAR) == 1, "refused duplicates add no entry");
+
+        u64 other = stellar::create_constellation(stellar::ROOT_STAR, "other");
+        CHECK(make(other, "dup", "elsewhere") != stellar::INVALID_STAR, "same name in another directory is fine");
+        CHECK(!stellar::link(other, "dup", a1), "link onto an existing name is refused");
+        CHECK(stellar::link(other, "alias", a1), "link under a fresh name works");
+        CHECK(stellar::unlink(other, "alias") && stellar::unlink(stellar::ROOT_STAR, "dup"), "unlink both names");
+        u8 sink[16];
+        CHECK(stellar::read_file(a1, sink, sizeof(sink)) == 0 && stellar::find(stellar::ROOT_STAR, "dup") == stellar::INVALID_STAR,
+              "refused link did not leak a link count");
+
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "wide");
+        for (u64 i = 0; i < 20; ++i) { char nm[32]; name_of(nm, "e", i); make(d, nm, nm); }
+        CHECK(make(d, "e19", "x") == stellar::INVALID_STAR, "duplicate in the last sector of a chain is refused");
+        CHECK(make(d, "e0", "x") == stellar::INVALID_STAR, "duplicate in the first sector of a chain is refused");
+        CHECK(count_dir(d) == 20, "chain still holds exactly 20 entries");
+
+        u64 reuse = make(stellar::ROOT_STAR, "reuse", "v1");
+        u64 s = stellar::snapshot();
+        CHECK(stellar::unlink(stellar::ROOT_STAR, "reuse"), "unlink after snapshot");
+        u64 reuse2 = make(stellar::ROOT_STAR, "reuse", "v2");
+        CHECK(reuse2 != stellar::INVALID_STAR && reuse2 != reuse, "name can be reused after unlink");
+        CHECK(stellar::find(stellar::ROOT_STAR, "reuse", s) == reuse && eq(reuse, "v1", s), "snapshot still names the old star");
+        CHECK(make(stellar::ROOT_STAR, "reuse", "v3") == stellar::INVALID_STAR, "reused name is a duplicate again");
+    }
+
+    fresh_fs();
+    {
+        u64 d1 = stellar::create_constellation(stellar::ROOT_STAR, "ld");
+        u64 d2 = stellar::create_constellation(stellar::ROOT_STAR, "ld2");
+        u64 f = make(d1, "f", "file");
+        CHECK(!stellar::link(d1, "up", stellar::ROOT_STAR), "linking the root into a subdirectory is refused");
+        CHECK(!stellar::link(d2, "alias", d1), "linking a directory under a second parent is refused");
+        CHECK(!stellar::link(d1, "self", d1), "linking a directory into itself is refused");
+        CHECK(count_dir(d1) == 1 && count_dir(d2) == 0, "refused directory links add no entries");
+        CHECK(stellar::link(d2, "f2", f) && eq(stellar::find(d2, "f2"), "file"), "file hard links still work");
+        CHECK(stellar::unlink(d1, "f") && stellar::unlink(d2, "f2"), "both file links drop");
+        CHECK(stellar::unlink(stellar::ROOT_STAR, "ld"), "directory removes cleanly, so its link count was untouched");
     }
 
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
