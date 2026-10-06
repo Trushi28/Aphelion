@@ -40,7 +40,8 @@ built in, described under [Goals](#goals).
 - Preemptive MLFQ scheduler with per-core run queues and work-stealing
 - Storage drivers for virtio-blk, AHCI/SATA (NCQ) and NVMe, behind one block-device interface
 - Stellar FS, a copy-on-write filesystem with a B+tree catalog, CRC32 checksums, O(1) snapshots, hash-indexed directories,
-  Bloom-filtered snapshot lookups, path resolution and typed status codes
+  Bloom-filtered snapshot lookups, path resolution, typed status codes,
+  twin checksummed superblocks, flush-ordered crash-consistent commits and an fsck-style `check()`
 - PS/2 keyboard with extended keys, framebuffer console
 
 ## Goals

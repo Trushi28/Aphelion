@@ -65,8 +65,8 @@ flowchart TD
   HAL --> N["NVMe: MSI-X, 16 commands per batch"]
 ```
 
-The HAL is a small virtual interface (`read_sector`, `write_sector`, batched variants,
-`capacity_sectors`). Probe order is virtio-blk → AHCI → NVMe; the first that finds a disk
+The HAL is a small virtual interface (`read_sector`, `write_sector`, batched variants, `flush`,
+`capacity_sectors`). `flush` is a virtio FLUSH request, AHCI FLUSH CACHE EXT, or an NVMe Flush. Probe order is virtio-blk → AHCI → NVMe; the first that finds a disk
 registers.
 
 | Driver | Details |

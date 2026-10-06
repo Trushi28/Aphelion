@@ -1,6 +1,6 @@
 # Engineering notes
 
-Twenty-two real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Twenty-four real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 Kept here because they're the kind of thing worth not re-learning.
 
@@ -113,3 +113,14 @@ Kept here because they're the kind of thing worth not re-learning.
     allocated the code correctly fell back to scanning, but the allocator had already recorded `NoMemory` as the
     first error, so a duplicate create reported `NoMemory` instead of `Exists`. Found only by a test that
     starves the index of memory; the index and filter now allocate quietly.
+23. **A checksum does not defend against a logic bug.** Mutation-testing the crash harness (a protocol with a
+    deliberately wrong step) produced an AddressSanitizer stack-buffer-overflow in `bt_search`, then a stack
+    overflow in `bt_upsert`: a stale node that was still CRC-valid had an entry count larger than its array, and a
+    cyclic tree recursed forever. Node counts are now bounded, sector numbers range-checked, and directory chains
+    and tree recursion given cycle and depth limits. The same mutation run also showed the test helper had the
+    same unbounded recursion.
+24. **A block-device test wrote into live filesystem sectors.** The multi-request and 4-Satellite block-device
+    self-tests used the last sectors of the disk, but the filesystem was formatted to the whole disk, so on a
+    long-lived disk the "test" overwrote file data. Found by the author while running the CI disk repeatedly. The
+    filesystem is now formatted short of the disk, leaving a reserved test tail, and the scratch area is saved and
+    restored.
