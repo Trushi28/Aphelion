@@ -18,6 +18,7 @@ struct Device {
             if (!write_sector(start_sector + i, p + i * 512)) return false;
         return true;
     }
+    virtual bool flush() { return true; }
     virtual u64 capacity_sectors() = 0;
     virtual const char* name() = 0;
 };
@@ -31,5 +32,6 @@ bool write_sector(u64 sector, const void* buf512);
 bool read_sectors(u64 start_sector, u64 count, void* buf);
 bool write_sectors(u64 start_sector, u64 count, const void* buf);
 u64 capacity_sectors();
+bool flush();
 
 }

@@ -42,6 +42,7 @@ constexpr u64 CMD_TABLE_STRIDE = 256;
 constexpr u8 CAP_ID_MSI = 0x05;
 
 constexpr u8 ATA_CMD_IDENTIFY = 0xEC;
+constexpr u8 ATA_CMD_FLUSH_EXT = 0xEA;
 constexpr u8 ATA_CMD_READ_DMA_EXT = 0x25;
 constexpr u8 ATA_CMD_WRITE_DMA_EXT = 0x35;
 constexpr u8 ATA_CMD_READ_FPDMA = 0x60;
@@ -215,15 +216,17 @@ static bool run_command(u8 command, u64 lba, u16 count, void* buf, bool write) {
     HbaCmdHeader* hdr = &g_cmd_list[0];
     hdr->cfl_a_w_p = static_cast<u8>((sizeof(FisRegH2D) / 4) | (write ? (1u << 6) : 0));
     hdr->r_b_c_pmp = 0;
-    hdr->prdtl = 1;
+    hdr->prdtl = buf ? 1 : 0;
     hdr->prdbc = 0;
 
     HbaCmdTable* tbl = table_for(0);
     for (auto& b : tbl->cfis) b = 0;
 
-    tbl->prdt_entry[0].dba = static_cast<u32>(virt_to_phys(buf));
-    tbl->prdt_entry[0].dbau = static_cast<u32>(virt_to_phys(buf) >> 32);
-    tbl->prdt_entry[0].dbc_i = ((static_cast<u32>(count) * 512u) - 1) | (1u << 31);
+    if (buf) {
+        tbl->prdt_entry[0].dba = static_cast<u32>(virt_to_phys(buf));
+        tbl->prdt_entry[0].dbau = static_cast<u32>(virt_to_phys(buf) >> 32);
+        tbl->prdt_entry[0].dbc_i = ((static_cast<u32>(count) * 512u) - 1) | (1u << 31);
+    }
 
     auto* fis = reinterpret_cast<FisRegH2D*>(tbl->cfis);
     fis->fis_type = 0x27;
@@ -403,6 +406,11 @@ struct HalDevice : blockdev::Device {
             count -= batch;
         }
         return true;
+    }
+    bool flush() override {
+        DevGuard guard;
+        if (!g_present) return false;
+        return run_command(ATA_CMD_FLUSH_EXT, 0, 0, nullptr, false);
     }
     u64 capacity_sectors() override { return ahci::capacity_sectors(); }
     const char* name() override { return "ahci"; }

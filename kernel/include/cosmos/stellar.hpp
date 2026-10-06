@@ -14,6 +14,14 @@ constexpr u64 LIVE = 0;
 constexpr u32 SNAPSHOT_MAX = 24;
 constexpr u32 NAME_MAX_LEN = 51;
 
+constexpr u32 FLAG_EXTENT_TABLE = 1u << 0;
+constexpr u32 USER_FLAGS_MASK = 0xFFFF0000u;
+
+struct StatInfo {
+    u32 type, nlink, flags, sector_count;
+    u64 size_bytes, mtime, gen;
+};
+
 enum class Status : i32 {
     Ok = 0,
     NotMounted,
@@ -33,6 +41,7 @@ enum class Status : i32 {
     Busy,
     NoSuchSnapshot,
     TooManySnapshots,
+    Unsupported,
     Internal,
 };
 const char* status_name(Status s);
@@ -78,6 +87,9 @@ IoStats io_stats();
 LookupStats lookup_stats();
 u64 free_space_sectors();
 u64 total_sectors();
+bool stat(u64 star, StatInfo* out, u64 snap = LIVE, Status* why = nullptr);
+bool set_flags(u64 star, u32 flags, Status* why = nullptr);
+void set_clock(u64 (*fn)());
 
 void test_set_hash_mask(u64 mask);
 

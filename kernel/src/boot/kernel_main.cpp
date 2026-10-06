@@ -448,6 +448,13 @@ extern "C" NORETURN void kernel_main() {
             serial::printf("[selftest] multi-request queueing: %s\n", batch_match ? "ok" : "MISMATCH");
         }
 
+        {
+            bool flush_ok = blockdev::flush();
+            fb::printf(flush_ok ? 0xC0FFC0 : 0xE0D080, "[%s] %s write barrier (flush) completed\n",
+                       flush_ok ? "ok" : "--", blockdev::active()->name());
+            serial::printf("[selftest] flush: %s\n", flush_ok ? "ok" : "MISMATCH");
+        }
+
         stellar::init(g_hhdm_offset);
         bool fs_ready = stellar::mount();
         bool fresh_fs = !fs_ready;

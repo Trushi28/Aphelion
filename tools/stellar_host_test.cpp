@@ -22,6 +22,8 @@ static u8* g_disk;
 static u64 g_sectors;
 
 static u64 g_wcount = 0;
+static u64 g_flushes = 0;
+static bool g_flush_fails = false;
 static u64 g_fail_after = ~0ull;
 
 namespace blockdev {
@@ -42,6 +44,7 @@ bool write_sectors(u64 s, u64 n, const void* b) {
     return ok_n == n;
 }
 u64 capacity_sectors() { return g_sectors; }
+bool flush() { ++g_flushes; return !g_flush_fails; }
 }
 
 namespace orbital {
@@ -85,6 +88,14 @@ static bool eq(u64 star, const char* expect, u64 snap = stellar::LIVE) {
     return true;
 }
 
+static void sb_fix_crc(u8* sec) { u32 c = stellar::crc32(sec, 508); __builtin_memcpy(sec + 508, &c, 4); }
+static void sb_poke(u64 off, u64 val, int bytes) {
+    for (int slot = 0; slot < 2; ++slot) {
+        u8* sec = g_disk + slot * 512;
+        __builtin_memcpy(sec + off, &val, bytes);
+        sb_fix_crc(sec);
+    }
+}
 static bool strcmp_(const char* a, const char* b) { while (*a && *a == *b) { ++a; ++b; } return *a == *b; }
 static void count_cb(const char*, u64, u32, void* ctx) { ++*static_cast<u64*>(ctx); }
 static u64 count_dir(u64 dir, u64 snap = stellar::LIVE) {
@@ -546,51 +557,48 @@ int main() {
     {
         u64 keep = make(stellar::ROOT_STAR, "keep", "data");
         CHECK(keep != stellar::INVALID_STAR, "seed file for mount tests");
-        u8 good[512];
-        __builtin_memcpy(good, g_disk, 512);
+        u8 good[1024];
+        __builtin_memcpy(good, g_disk, 1024);
 
         struct Poke { u64 off; u64 val; int bytes; };
         struct Case { const char* name; Poke a; Poke b; };
         const u64 total = g_sectors;
+        const u64 bs = (((total + 7) / 8) + 507) / 508;
         const Case cases[] = {
             {"sector size is not 512", {12, 1024, 4}, {0, 0, 0}},
             {"total sectors larger than the device", {16, total + 1, 8}, {0, 0, 0}},
             {"total sectors zero", {16, 0, 8}, {0, 0, 0}},
             {"total sectors tiny", {16, 4, 8}, {0, 0, 0}},
-            {"bitmap does not start at sector 1", {24, 2, 8}, {0, 0, 0}},
+            {"bitmap does not follow the superblocks", {24, 3, 8}, {0, 0, 0}},
             {"bitmap sector count too large", {32, 9999, 8}, {0, 0, 0}},
             {"bitmap sector count zero", {32, 0, 8}, {0, 0, 0}},
-            {"bitmap sector count off by one", {32, 33, 8}, {0, 0, 0}},
+            {"bitmap sector count off by one", {32, bs + 1, 8}, {0, 0, 0}},
             {"catalog root zero", {40, 0, 8}, {0, 0, 0}},
-            {"catalog root inside the bitmap", {40, 1, 8}, {0, 0, 0}},
+            {"catalog root inside the bitmap", {40, 3, 8}, {0, 0, 0}},
             {"catalog root past the end", {40, total, 8}, {0, 0, 0}},
             {"epoch zero", {56, 0, 8}, {0, 0, 0}},
-            {"snapshot count over the table", {64, 25, 4}, {0, 0, 0}},
-            {"snapshot count huge", {64, 0xFFFFFFFFu, 4}, {0, 0, 0}},
-            {"snapshot root past the end", {64, 1, 4}, {72, total + 5, 8}},
-            {"snapshot root inside the bitmap", {64, 1, 4}, {72, 3, 8}},
+            {"snapshot count over the table", {80, 25, 4}, {0, 0, 0}},
+            {"snapshot count huge", {80, 0xFFFFFFFFu, 4}, {0, 0, 0}},
+            {"snapshot root past the end", {80, 1, 4}, {88, total + 5, 8}},
+            {"snapshot root inside the bitmap", {80, 1, 4}, {88, 3, 8}},
         };
         for (const Case& c : cases) {
-            __builtin_memcpy(g_disk, good, 512);
+            __builtin_memcpy(g_disk, good, 1024);
             const Poke pokes[2] = {c.a, c.b};
-            for (const Poke& p : pokes) {
-                if (!p.bytes) continue;
-                __builtin_memcpy(g_disk + p.off, &p.val, p.bytes);
-            }
+            for (const Poke& p : pokes) if (p.bytes) sb_poke(p.off, p.val, p.bytes);
             CHECK(!stellar::mount(), c.name);
             CHECK(stellar::find(stellar::ROOT_STAR, "keep") == stellar::INVALID_STAR, "a rejected mount leaves the filesystem unmounted");
             CHECK(stellar::create_file(stellar::ROOT_STAR, "x", "x", 1) == stellar::INVALID_STAR, "writes fail after a rejected mount");
         }
-        __builtin_memcpy(g_disk, good, 512);
-        CHECK(stellar::mount(), "the untouched superblock still mounts");
+        __builtin_memcpy(g_disk, good, 1024);
+        CHECK(stellar::mount(), "the untouched superblocks still mount");
         CHECK(eq(stellar::find(stellar::ROOT_STAR, "keep"), "data"), "and the data is intact");
 
-        __builtin_memcpy(g_disk, good, 512);
-        u32 snaps = 24;
-        __builtin_memcpy(g_disk + 64, &snaps, 4);
+        __builtin_memcpy(g_disk, good, 1024);
+        sb_poke(80, 24, 4);
         u64 root_copy;
         __builtin_memcpy(&root_copy, g_disk + 40, 8);
-        for (u32 i = 0; i < 24; ++i) __builtin_memcpy(g_disk + 72 + 16 * i, &root_copy, 8);
+        for (u32 i = 0; i < 24; ++i) sb_poke(88 + 16 * i, root_copy, 8);
         CHECK(stellar::mount(), "a full snapshot table with valid roots still mounts");
     }
 
@@ -736,7 +744,7 @@ int main() {
         CHECK(stellar::read_file(empty, sink, sizeof(sink)) == 0 && stellar::verify_file(empty), "empty file reads clean");
 
         u64 big_first = 0, one_first = 0;
-        for (u64 sec = 40; sec < g_sectors && (!big_first || !one_first); ++sec) {
+        for (u64 sec = 2; sec < g_sectors && (!big_first || !one_first); ++sec) {
             if (!big_first && __builtin_memcmp(g_disk + sec * 512, blob, 512) == 0) big_first = sec;
             if (!one_first && __builtin_memcmp(g_disk + sec * 512, "tiny file\n", 10) == 0) one_first = sec;
         }
@@ -910,16 +918,16 @@ int main() {
     {
         using stellar::Status;
         Status st = Status::Internal;
-        u8 zero[512] = {0};
-        __builtin_memcpy(g_disk, zero, 512);
+        u8 zero[1024] = {0};
+        __builtin_memcpy(g_disk, zero, 1024);
         CHECK(!stellar::mount(&st) && st == Status::NotFormatted, "blank disk reports NotFormatted");
         CHECK(stellar::format(g_sectors, &st) && st == Status::Ok, "format reports Ok");
-        u8 sb[512]; __builtin_memcpy(sb, g_disk, 512);
-        u32 bad = 99; __builtin_memcpy(g_disk + 64, &bad, 4);
+        u8 sb[1024]; __builtin_memcpy(sb, g_disk, 1024);
+        sb_poke(80, 99, 4);
         CHECK(!stellar::mount(&st) && st == Status::Corrupt, "bad superblock reports Corrupt");
         CHECK(stellar::find(stellar::ROOT_STAR, "x", stellar::LIVE, &st) == stellar::INVALID_STAR && st == Status::NotMounted,
               "operations after a rejected mount report NotMounted");
-        __builtin_memcpy(g_disk, sb, 512);
+        __builtin_memcpy(g_disk, sb, 1024);
         CHECK(stellar::mount(), "restore");
 
         u64 f = make(stellar::ROOT_STAR, "f", "payload");
@@ -1143,6 +1151,112 @@ int main() {
         }
         CHECK(again, "an index built afterwards agrees with what the scan path wrote");
         CHECK(make(d, "a0", "reborn") != stellar::INVALID_STAR && make(d, "b0", "x") == stellar::INVALID_STAR, "index path appends and rejects duplicates afterwards");
+    }
+
+    // ---------------------------------------------------------------- v6: checksums on every metadata sector
+    fresh_fs();
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "d");
+        for (u64 i = 0; i < 20; ++i) { char nm[32]; name_of(nm, "e", i); make(d, nm, nm); }
+        make(stellar::ROOT_STAR, "keep", "kept");
+        u8 saved[1024];
+        __builtin_memcpy(saved, g_disk, 1024);
+        auto cur_sb = [&]() -> const u8* {
+            u64 s0, s1; __builtin_memcpy(&s0, g_disk + 64, 8); __builtin_memcpy(&s1, g_disk + 512 + 64, 8);
+            return s1 > s0 ? g_disk + 512 : g_disk;
+        };
+        u64 s0, s1; __builtin_memcpy(&s0, g_disk + 64, 8); __builtin_memcpy(&s1, g_disk + 512 + 64, 8);
+        CHECK(s0 != s1, "the two superblock slots hold different commit numbers after commits");
+
+        u64 root_sec; __builtin_memcpy(&root_sec, cur_sb() + 40, 8);
+        g_disk[root_sec * 512 + 100] ^= 1;
+        CHECK(stellar::mount(), "mount does not read the catalog, so it still succeeds");
+        CHECK(stellar::find(stellar::ROOT_STAR, "keep", stellar::LIVE, &st) == stellar::INVALID_STAR && st == Status::Checksum,
+              "a corrupt catalog node is reported as Checksum, not trusted");
+        g_disk[root_sec * 512 + 100] ^= 1;
+        CHECK(stellar::mount() && eq(stellar::find(stellar::ROOT_STAR, "keep"), "kept"), "repairing the byte repairs the filesystem");
+
+        u64 dir_sec = 0;
+        for (u64 sec = 2; sec < g_sectors && !dir_sec; ++sec)
+            for (u32 slot = 0; slot < 7 && !dir_sec; ++slot)
+                if (__builtin_memcmp(g_disk + sec * 512 + 16 + slot * 64 + 12, "e0\0", 3) == 0 && g_disk[sec * 512 + 16 + slot * 64] == 1)
+                    dir_sec = sec;
+        CHECK(dir_sec != 0, "locate the directory sector holding e0");
+        g_disk[dir_sec * 512 + 200] ^= 0x10;
+        CHECK(stellar::mount(), "remount with a corrupt directory sector");
+        CHECK(stellar::find(d, "e0", stellar::LIVE, &st) == stellar::INVALID_STAR && st == Status::Checksum, "a corrupt directory sector is reported as Checksum");
+        u64 n = 0;
+        stellar::list(d, &count_cb, &n, stellar::LIVE, &st);
+        CHECK(st == Status::Checksum, "listing a corrupt directory reports Checksum");
+        CHECK(make(d, "newfile", "x") == stellar::INVALID_STAR, "and it refuses to write into it");
+        g_disk[dir_sec * 512 + 200] ^= 0x10;
+        CHECK(stellar::mount() && stellar::find(d, "e0") != stellar::INVALID_STAR, "repaired");
+
+        g_disk[2 * 512 + 10] ^= 1;
+        CHECK(!stellar::mount(&st) && st == Status::Checksum, "a corrupt bitmap sector refuses to mount");
+        g_disk[2 * 512 + 10] ^= 1;
+        CHECK(stellar::mount(), "repaired bitmap mounts");
+
+        g_disk[100] ^= 1;
+        CHECK(stellar::mount(&st), "one damaged superblock slot still mounts from the other");
+        g_disk[100] ^= 1;
+        g_disk[512 + 100] ^= 1;
+        CHECK(stellar::mount(), "the other slot alone also mounts");
+        g_disk[100] ^= 1;
+        CHECK(!stellar::mount(&st) && st == Status::Corrupt, "both superblock slots damaged refuses to mount");
+        g_disk[100] ^= 1;
+        g_disk[512 + 100] ^= 1;
+        CHECK(stellar::mount(), "both repaired");
+        __builtin_memcpy(g_disk, saved, 1024);
+        CHECK(stellar::mount(), "restored");
+
+        sb_poke(72, 1, 4);
+        CHECK(!stellar::mount(&st) && st == Status::Unsupported, "an unknown incompatible feature bit refuses to mount");
+        __builtin_memcpy(g_disk, saved, 1024);
+        sb_poke(76, 0xFFFFFFFFu, 4);
+        CHECK(stellar::mount(&st), "compatible feature bits are ignored, not refused");
+        __builtin_memcpy(g_disk, saved, 1024);
+        CHECK(stellar::mount(), "restored again");
+        make(stellar::ROOT_STAR, "after", "ok");
+        u64 t0, t1; __builtin_memcpy(&t0, g_disk + 64, 8); __builtin_memcpy(&t1, g_disk + 512 + 64, 8);
+        CHECK((t0 > s0 || t1 > s1) && t0 != t1, "a commit advances exactly one slot's commit number");
+    }
+
+    // ---------------------------------------------------------------- v6: stat, flags, clock
+    fresh_fs();
+    {
+        using stellar::Status;
+        static u64 fake_time;
+        stellar::set_clock([]() -> u64 { return fake_time; });
+        Status st = Status::Internal;
+        stellar::StatInfo si{};
+        fake_time = 1000;
+        u64 f = make(stellar::ROOT_STAR, "f", "one");
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "dir");
+        CHECK(stellar::stat(f, &si, stellar::LIVE, &st) && st == Status::Ok, "stat a file");
+        CHECK(si.type == stellar::TYPE_FILE && si.size_bytes == 3 && si.nlink == 1 && si.mtime == 1000 && si.flags == 0, "file metadata");
+        CHECK(stellar::stat(d, &si) && si.type == stellar::TYPE_CONSTELLATION && si.mtime == 1000, "directory metadata");
+        fake_time = 2000;
+        CHECK(stellar::write_file(f, "two22", 5) == f, "rewrite");
+        CHECK(stellar::stat(f, &si) && si.mtime == 2000 && si.size_bytes == 5, "a rewrite updates mtime and size");
+        u64 snap = stellar::snapshot();
+        fake_time = 3000;
+        stellar::write_file(f, "x", 1);
+        CHECK(stellar::stat(f, &si) && si.mtime == 3000, "live view sees the newest mtime");
+        CHECK(stellar::stat(f, &si, snap) && si.mtime == 2000 && si.size_bytes == 5, "the snapshot keeps the old metadata");
+        CHECK(stellar::set_flags(f, 0x10000, &st) && st == Status::Ok, "set a user flag");
+        CHECK(stellar::stat(f, &si) && si.flags == 0x10000, "flag is visible");
+        CHECK(stellar::mount() && stellar::stat(f, &si) && si.flags == 0x10000, "flag persists across a remount");
+        stellar::write_file(f, "yy", 2);
+        CHECK(stellar::stat(f, &si) && si.flags == 0x10000, "a rewrite preserves flags");
+        CHECK(!stellar::set_flags(f, stellar::FLAG_EXTENT_TABLE, &st) && st == Status::InvalidArgument, "reserved flag bits are refused");
+        CHECK(!stellar::set_flags(77777, 0x10000, &st) && st == Status::NotFound, "set_flags on a missing star");
+        CHECK(!stellar::stat(77777, &si, stellar::LIVE, &st) && st == Status::NotFound, "stat a missing star");
+        CHECK(!stellar::stat(f, nullptr, stellar::LIVE, &st) && st == Status::InvalidArgument, "stat with no output");
+        CHECK(!stellar::stat(f, &si, 9, &st) && st == Status::NoSuchSnapshot, "stat in a missing snapshot");
+        stellar::set_clock(nullptr);
     }
 
     // ---------------------------------------------------------------- bloom filter on snapshot lookups

@@ -64,6 +64,7 @@ check_common() {
     grep -q 'MISMATCH' "$LOG.clean" && fail "self-test mismatch"
     grep -q '\[selftest\] hello.txt: ok' "$LOG.clean" || fail "hello.txt self-test did not pass"
     grep -q '\[selftest\] multi-request queueing: ok' "$LOG.clean" || fail "multi-request queueing self-test did not pass"
+    grep -q '\[selftest\] flush: ok' "$LOG.clean" || fail "block-device flush self-test did not pass"
     grep -q '\[selftest\] bulk I/O: ok' "$LOG.clean" || fail "bulk I/O self-test did not pass"
     grep -q '\[selftest\] stellar api: ok' "$LOG.clean" || fail "filesystem API self-test did not pass"
     grep -q 'stress: 14 stars created (create_ok=1), 0 mismatch(es)' "$LOG.clean" || fail "filesystem stress test failed"

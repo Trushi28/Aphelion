@@ -36,6 +36,7 @@ constexpr u32 CSTS_CFS = 1u << 1;
 constexpr u8 ADMIN_CREATE_SQ = 0x01;
 constexpr u8 ADMIN_CREATE_CQ = 0x05;
 constexpr u8 ADMIN_IDENTIFY = 0x06;
+constexpr u8 IO_FLUSH = 0x00;
 constexpr u8 IO_WRITE = 0x01;
 constexpr u8 IO_READ = 0x02;
 
@@ -399,6 +400,7 @@ struct HalDevice : blockdev::Device {
     bool write_sector(u64 sector, const void* buf512) override;
     bool read_sectors(u64 start_sector, u64 count, void* buf) override;
     bool write_sectors(u64 start_sector, u64 count, const void* buf) override;
+    bool flush() override;
     u64 capacity_sectors() override { return nvme::capacity_sectors(); }
     const char* name() override { return "nvme"; }
 };
@@ -599,6 +601,15 @@ bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
         count -= batch;
     }
     return true;
+}
+
+bool HalDevice::flush() {
+    DevGuard guard;
+    if (!g_present) return false;
+    Sqe cmd{};
+    cmd.cdw0 = IO_FLUSH;
+    cmd.nsid = g_nsid;
+    return execute(g_io, cmd);
 }
 
 bool HalDevice::read_sector(u64 sector, void* buf512) {

@@ -35,6 +35,8 @@ constexpr int QSIZE = MAX_INFLIGHT * 3;
 
 constexpr u32 BLK_T_IN = 0;
 constexpr u32 BLK_T_OUT = 1;
+constexpr u32 BLK_T_FLUSH = 4;
+constexpr u32 FEATURE_BLK_FLUSH = 1u << 9;
 constexpr u8 BLK_S_OK = 0;
 
 struct PACKED VirtioPciCap {
@@ -88,6 +90,7 @@ static bool g_slot_ok[MAX_INFLIGHT];
 static volatile u32* g_msix_table = nullptr;
 static bool g_msix_ready = false;
 static u32 g_irq_count = 0;
+static bool g_flush_ok = false;
 
 static orbital::Mutex g_dev_lock;
 
@@ -165,6 +168,22 @@ static void submit(u32 slot, u64 sector, bool write) {
     __sync_synchronize();
 }
 
+static void submit_flush(u32 slot) {
+    g_hdrs[slot].type = BLK_T_FLUSH;
+    g_hdrs[slot].reserved = 0;
+    g_hdrs[slot].sector = 0;
+    g_status_arr[slot] = 0xFF;
+    g_slot_done[slot] = false;
+    u16 base = static_cast<u16>(slot * 3);
+    g_desc[base + 0] = { virt_to_phys(&g_hdrs[slot]), sizeof(BlkReqHeader), DESC_F_NEXT, static_cast<u16>(base + 2) };
+    g_desc[base + 2] = { virt_to_phys(&g_status_arr[slot]), 1, DESC_F_WRITE, 0 };
+    u16 ring_slot = g_avail->idx % g_negotiated_qsize;
+    g_avail->ring[ring_slot] = base;
+    __sync_synchronize();
+    g_avail->idx = static_cast<u16>(g_avail->idx + 1);
+    __sync_synchronize();
+}
+
 static u16 used_idx() { return reinterpret_cast<volatile VringUsed*>(g_used)->idx; }
 
 static bool drain(u32 pending) {
@@ -200,6 +219,7 @@ struct HalDevice : blockdev::Device {
     bool write_sector(u64 sector, const void* buf512) override;
     bool read_sectors(u64 start_sector, u64 count, void* buf) override;
     bool write_sectors(u64 start_sector, u64 count, const void* buf) override;
+    bool flush() override;
     u64 capacity_sectors() override { return virtioblk::capacity_sectors(); }
     const char* name() override { return "virtio-blk"; }
 };
@@ -279,10 +299,13 @@ bool init(u64 hhdm_offset) {
     g_common->device_status |= STATUS_ACK;
     g_common->device_status |= STATUS_DRIVER;
 
+    g_common->device_feature_select = 0;
+    u32 dev_low = g_common->device_feature;
+    g_flush_ok = (dev_low & FEATURE_BLK_FLUSH) != 0;
     g_common->driver_feature_select = 1;
     g_common->driver_feature = FEATURE_VERSION_1;
     g_common->driver_feature_select = 0;
-    g_common->driver_feature = 0;
+    g_common->driver_feature = g_flush_ok ? FEATURE_BLK_FLUSH : 0;
 
     g_common->device_status |= STATUS_FEATURES_OK;
     if (!(g_common->device_status & STATUS_FEATURES_OK)) {
@@ -370,6 +393,16 @@ bool HalDevice::write_sectors(u64 start_sector, u64 count, const void* buf) {
         count -= batch;
     }
     return true;
+}
+
+bool HalDevice::flush() {
+    DevGuard guard;
+    if (!g_present) return false;
+    if (!g_flush_ok) return true;
+    submit_flush(0);
+    notify_device();
+    if (!drain(1)) return false;
+    return g_slot_ok[0];
 }
 
 bool HalDevice::read_sector(u64 sector, void* buf512) { DevGuard guard; return read_sectors(sector, 1, buf512); }

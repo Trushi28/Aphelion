@@ -26,6 +26,9 @@ bool read_sectors(u64 start_sector, u64 count, void* buf) {
 bool write_sectors(u64 start_sector, u64 count, const void* buf) {
     return g_active && g_active->write_sectors(start_sector, count, buf);
 }
+bool flush() {
+    return g_active && g_active->flush();
+}
 u64 capacity_sectors() {
     return g_active ? g_active->capacity_sectors() : 0;
 }

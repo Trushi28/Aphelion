@@ -8,12 +8,16 @@ namespace stellar {
 
 constexpr u64 SECTOR_SIZE = 512;
 constexpr u64 MAGIC = 0x5AE1157A6111A2C5ull;
-constexpr u32 VERSION = 5;
+constexpr u32 VERSION = 6;
 constexpr u32 NAME_LEN = 52;
-constexpr u32 LEAF_MAX = 10;
+constexpr u32 LEAF_MAX = 7;
 constexpr u32 INTERNAL_MAX = 30;
 constexpr u32 CACHE_SLOTS = 256;
 constexpr u64 MIN_SECTORS = 64;
+constexpr u32 CRC_OFF = SECTOR_SIZE - 4;
+constexpr u64 BM_PAYLOAD = CRC_OFF;
+constexpr u32 SB_SLOTS = 2;
+constexpr u32 FEATURES_INCOMPAT_KNOWN = 0;
 
 struct PACKED SnapRec {
     u64 catalog_root;
@@ -30,11 +34,16 @@ struct PACKED Superblock {
     u64 catalog_root;
     u64 next_star_id;
     u64 epoch;
+    u64 seq;
+    u32 features_incompat;
+    u32 features_compat;
     u32 snap_count;
     u32 reserved;
     SnapRec snaps[SNAPSHOT_MAX];
+    u8 padding[CRC_OFF - 88 - SNAPSHOT_MAX * sizeof(SnapRec)];
+    u32 crc;
 };
-static_assert(sizeof(Superblock) <= SECTOR_SIZE, "superblock must fit one sector");
+static_assert(sizeof(Superblock) == SECTOR_SIZE, "superblock must fill one sector");
 
 struct PACKED StarEntry {
     u32 type;
@@ -44,8 +53,11 @@ struct PACKED StarEntry {
     u64 gen;
     u32 sector_count;
     u32 nlink;
+    u64 mtime;
+    u32 flags;
+    u32 reserved1;
 };
-static_assert(sizeof(StarEntry) == 40, "StarEntry must be 40 bytes");
+static_assert(sizeof(StarEntry) == 56, "StarEntry must be 56 bytes");
 
 struct PACKED DirEntry {
     u32 in_use;
@@ -54,13 +66,14 @@ struct PACKED DirEntry {
 };
 static_assert(sizeof(DirEntry) == 64, "DirEntry must be 64 bytes");
 
-constexpr u32 DIR_ENTRIES_PER_SECTOR = (SECTOR_SIZE - 16) / sizeof(DirEntry);
+constexpr u32 DIR_ENTRIES_PER_SECTOR = (CRC_OFF - 16) / sizeof(DirEntry);
 
 struct PACKED DirSector {
     u64 next_sector;
     u64 gen;
     DirEntry entries[DIR_ENTRIES_PER_SECTOR];
-    u8 padding[SECTOR_SIZE - 16 - DIR_ENTRIES_PER_SECTOR * sizeof(DirEntry)];
+    u8 padding[CRC_OFF - 16 - DIR_ENTRIES_PER_SECTOR * sizeof(DirEntry)];
+    u32 crc;
 };
 static_assert(sizeof(DirSector) == SECTOR_SIZE, "DirSector must fill one sector");
 
@@ -75,7 +88,7 @@ struct PACKED LeafEntry {
     u64 star_id;
     StarEntry entry;
 };
-static_assert(sizeof(LeafEntry) == 48, "LeafEntry must be 48 bytes");
+static_assert(sizeof(LeafEntry) == 64, "LeafEntry must be 64 bytes");
 
 struct PACKED LeafNode {
     u8 is_leaf;
@@ -83,7 +96,8 @@ struct PACKED LeafNode {
     u32 count;
     u64 gen;
     LeafEntry entries[LEAF_MAX];
-    u8 padding[SECTOR_SIZE - 16 - LEAF_MAX * sizeof(LeafEntry)];
+    u8 padding[CRC_OFF - 16 - LEAF_MAX * sizeof(LeafEntry)];
+    u32 crc;
 };
 static_assert(sizeof(LeafNode) == SECTOR_SIZE, "LeafNode must fill one sector");
 
@@ -94,7 +108,8 @@ struct PACKED InternalNode {
     u64 gen;
     u64 key[INTERNAL_MAX];
     u64 child[INTERNAL_MAX + 1];
-    u8 padding[SECTOR_SIZE - 16 - INTERNAL_MAX * 8 - (INTERNAL_MAX + 1) * 8];
+    u8 padding[CRC_OFF - 16 - INTERNAL_MAX * 8 - (INTERNAL_MAX + 1) * 8];
+    u32 crc;
 };
 static_assert(sizeof(InternalNode) == SECTOR_SIZE, "InternalNode must fill one sector");
 
@@ -169,10 +184,15 @@ const char* status_name(Status s) {
         case Status::Busy: return "busy (batch open)";
         case Status::NoSuchSnapshot: return "no such snapshot";
         case Status::TooManySnapshots: return "snapshot table full";
+        case Status::Unsupported: return "unsupported on-disk features";
         case Status::Internal: return "internal error";
     }
     return "unknown";
 }
+
+static u64 (*g_clock_fn)() = nullptr;
+static u64 now() { return g_clock_fn ? g_clock_fn() : 0; }
+void set_clock(u64 (*fn)()) { g_clock_fn = fn; }
 
 static void idx_drop_all();
 static void bloom_drop_all();
@@ -317,6 +337,18 @@ static bool raw_wr(u64 sector, const void* buf) {
     return true;
 }
 
+static u32 sector_crc(const u8* b) { return crc32_full(b, CRC_OFF); }
+static bool crc_ok(const u8* b) {
+    u32 stored;
+    __builtin_memcpy(&stored, b + CRC_OFF, sizeof(stored));
+    return stored == sector_crc(b);
+}
+static void crc_stamp(u8* b) {
+    u32 c = sector_crc(b);
+    __builtin_memcpy(b + CRC_OFF, &c, sizeof(c));
+}
+static void cache_drop(u64 first, u64 count);
+
 static bool rd(u64 sector, void* out) {
     CacheSlot& c = g_cache[sector % CACHE_SLOTS];
     if (c.valid && c.sector == sector) {
@@ -326,6 +358,11 @@ static bool rd(u64 sector, void* out) {
     }
     ++g_io_reads;
     if (!blockdev::read_sector(sector, c.data)) { c.valid = false; return fail(Status::Io); }
+    if (!crc_ok(c.data)) {
+        c.valid = false;
+        serial::printf("[stellar] metadata checksum mismatch at sector %lu\n", sector);
+        return fail(Status::Checksum);
+    }
     c.sector = sector;
     c.valid = true;
     __builtin_memcpy(out, c.data, SECTOR_SIZE);
@@ -335,13 +372,29 @@ static bool rd(u64 sector, void* out) {
 static bool wr(u64 sector, const void* in) {
     CacheSlot& c = g_cache[sector % CACHE_SLOTS];
     ++g_io_writes;
-    if (!blockdev::write_sector(sector, in)) {
+    u8 tmp[SECTOR_SIZE];
+    __builtin_memcpy(tmp, in, SECTOR_SIZE);
+    crc_stamp(tmp);
+    if (!blockdev::write_sector(sector, tmp)) {
         if (c.valid && c.sector == sector) c.valid = false;
         return fail(Status::Io);
     }
     c.sector = sector;
     c.valid = true;
-    __builtin_memcpy(c.data, in, SECTOR_SIZE);
+    __builtin_memcpy(c.data, tmp, SECTOR_SIZE);
+    return true;
+}
+
+static bool rd_data(u64 sector, void* out) {
+    ++g_io_reads;
+    if (!blockdev::read_sector(sector, out)) return fail(Status::Io);
+    return true;
+}
+
+static bool wr_data(u64 sector, const void* in) {
+    ++g_io_writes;
+    cache_drop(sector, 1);
+    if (!blockdev::write_sector(sector, in)) return fail(Status::Io);
     return true;
 }
 
@@ -360,10 +413,17 @@ static void cache_drop(u64 first, u64 count) {
 static void bm_set(u64 s, bool used) {
     if (used) g_bitmap[s / 8] |= static_cast<u8>(1u << (s % 8));
     else g_bitmap[s / 8] &= static_cast<u8>(~(1u << (s % 8)));
-    u64 idx = (s / 8) / SECTOR_SIZE;
+    u64 idx = (s / 8) / BM_PAYLOAD;
     g_bm_dirty[idx] = 1;
     if (idx < g_bm_lo) g_bm_lo = idx;
     if (idx > g_bm_hi) g_bm_hi = idx;
+}
+
+static bool sb_write_slot(u32 slot) {
+    u8 buf[SECTOR_SIZE];
+    __builtin_memcpy(buf, &g_sb, sizeof(g_sb));
+    crc_stamp(buf);
+    return raw_wr(slot, buf);
 }
 
 static bool commit() {
@@ -371,9 +431,17 @@ static bool commit() {
     bool ok = true;
     if (g_bm_lo <= g_bm_hi) {
         bool all = true;
+        u64 total_bytes = (g_sb.total_sectors + 7) / 8;
         for (u64 i = g_bm_lo; i <= g_bm_hi; ++i) {
             if (!g_bm_dirty[i]) continue;
-            if (raw_wr(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE)) g_bm_dirty[i] = 0;
+            u8 buf[SECTOR_SIZE];
+            for (auto& b : buf) b = 0;
+            u64 off = i * BM_PAYLOAD;
+            u64 n = off < total_bytes ? total_bytes - off : 0;
+            if (n > BM_PAYLOAD) n = BM_PAYLOAD;
+            __builtin_memcpy(buf, g_bitmap + off, n);
+            crc_stamp(buf);
+            if (raw_wr(g_sb.bitmap_start + i, buf)) g_bm_dirty[i] = 0;
             else all = false;
         }
         if (all) {
@@ -384,11 +452,9 @@ static bool commit() {
         }
     }
     if (g_sb_dirty && ok) {
-        u8 buf[SECTOR_SIZE];
-        for (auto& b : buf) b = 0;
-        __builtin_memcpy(buf, &g_sb, sizeof(g_sb));
-        if (raw_wr(0, buf)) g_sb_dirty = false;
-        else ok = false;
+        ++g_sb.seq;
+        if (sb_write_slot(static_cast<u32>(g_sb.seq & 1))) g_sb_dirty = false;
+        else { --g_sb.seq; ok = false; }
     }
     return ok;
 }
@@ -968,7 +1034,7 @@ static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
         u64 remaining = done < size ? size - done : 0;
         u64 chunk = remaining < SECTOR_SIZE ? remaining : SECTOR_SIZE;
         for (u64 b = 0; b < SECTOR_SIZE; ++b) buf[b] = (b < chunk) ? src[done + b] : 0;
-        if (!wr(start + i, buf)) return false;
+        if (!wr_data(start + i, buf)) return false;
     }
     return true;
 }
@@ -1125,7 +1191,8 @@ static bool add_edge(u64 dir_star, const char* name, u64 target) {
 }
 
 static u64 bitmap_sectors_for(u64 total_sectors) {
-    u64 n = (total_sectors / 8 + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    u64 bytes = (total_sectors + 7) / 8;
+    u64 n = (bytes + BM_PAYLOAD - 1) / BM_PAYLOAD;
     return n == 0 ? 1 : n;
 }
 
@@ -1133,7 +1200,7 @@ static const char* superblock_problem(const Superblock& sb, u64 device_sectors) 
     if (sb.sector_size != SECTOR_SIZE) return "sector size is not 512";
     if (sb.total_sectors < MIN_SECTORS) return "filesystem is too small";
     if (sb.total_sectors > device_sectors) return "filesystem is larger than the device";
-    if (sb.bitmap_start != 1) return "bitmap does not start at sector 1";
+    if (sb.bitmap_start != SB_SLOTS) return "bitmap does not follow the superblocks";
     if (sb.bitmap_sectors != bitmap_sectors_for(sb.total_sectors)) return "bitmap size does not match the disk size";
     u64 data_start = sb.bitmap_start + sb.bitmap_sectors;
     if (data_start >= sb.total_sectors) return "no data area";
@@ -1156,8 +1223,11 @@ static bool format_impl(u64 total_sectors) {
     g_sb.version = VERSION;
     g_sb.sector_size = SECTOR_SIZE;
     g_sb.total_sectors = total_sectors;
-    g_sb.bitmap_start = 1;
+    g_sb.bitmap_start = SB_SLOTS;
     g_sb.bitmap_sectors = bitmap_sectors_for(total_sectors);
+    g_sb.seq = 0;
+    g_sb.features_incompat = 0;
+    g_sb.features_compat = 0;
     g_sb.next_star_id = 0;
     g_sb.epoch = 1;
     g_sb.snap_count = 0;
@@ -1185,6 +1255,11 @@ static bool format_impl(u64 total_sectors) {
         release_runtime();
         return false;
     }
+    if (!sb_write_slot(0)) {
+        serial::writeln("[stellar] format: could not write the second superblock");
+        release_runtime();
+        return false;
+    }
 
     u64 root = create_constellation(INVALID_STAR, "");
     if (root != ROOT_STAR) {
@@ -1202,40 +1277,84 @@ bool format(u64 total_sectors, Status* why) {
     return api.ok(format_impl(total_sectors));
 }
 
-static bool mount_impl() {
-    if (g_txn_depth != 0) return fail(Status::Busy);
-    g_mounted = false;
+enum class SbState { Valid, Blank, Invalid, Unsupported, IoError };
+
+static SbState sb_parse(u32 slot, Superblock* out, const char** why) {
     u8 buf[SECTOR_SIZE];
-    for (auto& c : g_cache) c.valid = false;
-    if (!blockdev::read_sector(0, buf)) return fail(Status::Io);
     ++g_io_reads;
+    if (!blockdev::read_sector(slot, buf)) { *why = "unreadable"; return SbState::IoError; }
     Superblock sb;
     __builtin_memcpy(&sb, buf, sizeof(sb));
-    if (sb.magic != MAGIC || sb.version != VERSION) {
+    if (sb.magic != MAGIC || sb.version != VERSION) { *why = "not a v6 superblock"; return SbState::Blank; }
+    if (!crc_ok(buf)) { *why = "bad checksum"; return SbState::Invalid; }
+    if (sb.features_incompat & ~FEATURES_INCOMPAT_KNOWN) { *why = "unknown incompatible features"; return SbState::Unsupported; }
+    const char* problem = superblock_problem(sb, blockdev::capacity_sectors());
+    if (problem) { *why = problem; return SbState::Invalid; }
+    *out = sb;
+    return SbState::Valid;
+}
+
+static bool load_durable() {
+    g_mounted = false;
+    for (auto& c : g_cache) c.valid = false;
+    Superblock best{};
+    bool have = false, io_err = false, unsupported = false, invalid = false;
+    for (u32 slot = 0; slot < SB_SLOTS; ++slot) {
+        Superblock sb;
+        const char* why = "";
+        switch (sb_parse(slot, &sb, &why)) {
+            case SbState::Valid:
+                if (!have || sb.seq > best.seq) { best = sb; have = true; }
+                break;
+            case SbState::IoError: io_err = true; break;
+            case SbState::Unsupported: unsupported = true; break;
+            case SbState::Invalid:
+                invalid = true;
+                serial::printf("[stellar] mount: superblock %u rejected, %s\n", slot, why);
+                break;
+            case SbState::Blank: break;
+        }
+    }
+    if (!have) {
+        if (io_err) return fail(Status::Io);
+        if (unsupported) return fail(Status::Unsupported);
+        if (invalid) return fail(Status::Corrupt);
         serial::writeln("[stellar] mount: bad magic or version, not formatted");
         return fail(Status::NotFormatted);
     }
-    const char* problem = superblock_problem(sb, blockdev::capacity_sectors());
-    if (problem) {
-        serial::printf("[stellar] mount: superblock rejected, %s\n", problem);
-        return fail(Status::Corrupt);
-    }
-    g_sb = sb;
+    g_sb = best;
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
+    u64 total_bytes = (g_sb.total_sectors + 7) / 8;
     for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
+        u8 buf[SECTOR_SIZE];
         ++g_io_reads;
-        if (!blockdev::read_sector(g_sb.bitmap_start + i, g_bitmap + i * SECTOR_SIZE)) {
+        if (!blockdev::read_sector(g_sb.bitmap_start + i, buf)) {
             serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + i);
             release_runtime();
             return fail(Status::Io);
         }
+        if (!crc_ok(buf)) {
+            serial::printf("[stellar] mount: bitmap sector %lu failed its checksum\n", g_sb.bitmap_start + i);
+            release_runtime();
+            return fail(Status::Checksum);
+        }
+        u64 off = i * BM_PAYLOAD;
+        u64 n = off < total_bytes ? total_bytes - off : 0;
+        if (n > BM_PAYLOAD) n = BM_PAYLOAD;
+        __builtin_memcpy(g_bitmap + off, buf, n);
     }
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     g_sb_dirty = false;
     g_mounted = true;
     reset_runtime_state();
-    serial::printf("[stellar] mounted: %lu sectors, catalog root at sector %lu, epoch %lu, %u snapshot(s), next star id %lu\n",
-                    g_sb.total_sectors, g_sb.catalog_root, g_sb.epoch, g_sb.snap_count, g_sb.next_star_id);
+    return true;
+}
+
+static bool mount_impl() {
+    if (g_txn_depth != 0) return fail(Status::Busy);
+    if (!load_durable()) return false;
+    serial::printf("[stellar] mounted: %lu sectors, catalog root at sector %lu, epoch %lu, commit %lu, %u snapshot(s), next star id %lu\n",
+                    g_sb.total_sectors, g_sb.catalog_root, g_sb.epoch, g_sb.seq, g_sb.snap_count, g_sb.next_star_id);
     return true;
 }
 
@@ -1263,6 +1382,7 @@ static u64 create_constellation_impl(u64 parent, const char* name) {
     entry.sector_count = 1;
     entry.gen = g_sb.epoch;
     entry.nlink = 1;
+    entry.mtime = now();
     if (!catalog_upsert(id, entry)) return INVALID_STAR;
 
     if (parent != INVALID_STAR && !add_edge(parent, name, id)) return INVALID_STAR;
@@ -1291,6 +1411,7 @@ static u64 create_file_impl(u64 parent, const char* name, const void* data, u64 
     entry.sector_count = static_cast<u32>(nsec);
     entry.gen = g_sb.epoch;
     entry.nlink = 1;
+    entry.mtime = now();
     entry.checksum = crc32_full(static_cast<const u8*>(data), size);
     if (!catalog_upsert(id, entry)) return INVALID_STAR;
 
@@ -1323,6 +1444,8 @@ static u64 write_file_impl(u64 star, const void* data, u64 size) {
     new_e.sector_count = static_cast<u32>(nsec);
     new_e.gen = g_sb.epoch;
     new_e.nlink = old_e.nlink;
+    new_e.mtime = now();
+    new_e.flags = old_e.flags;
     new_e.checksum = crc32_full(static_cast<const u8*>(data), size);
 
     if (!catalog_upsert(star, new_e)) return INVALID_STAR;
@@ -1585,10 +1708,10 @@ static u64 gc_impl() {
             if (used && !mk_test(s)) ++freed;
         }
         for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
-            u8* cur = g_bitmap + i * SECTOR_SIZE;
-            const u8* want = g_mark + i * SECTOR_SIZE;
-            if (__builtin_memcmp(cur, want, SECTOR_SIZE) == 0) continue;
-            __builtin_memcpy(cur, want, SECTOR_SIZE);
+            u8* cur = g_bitmap + i * BM_PAYLOAD;
+            const u8* want = g_mark + i * BM_PAYLOAD;
+            if (__builtin_memcmp(cur, want, BM_PAYLOAD) == 0) continue;
+            __builtin_memcpy(cur, want, BM_PAYLOAD);
             g_bm_dirty[i] = 1;
             if (i < g_bm_lo) g_bm_lo = i;
             if (i > g_bm_hi) g_bm_hi = i;
@@ -1669,7 +1792,7 @@ static u64 read_file_impl(u64 star, void* buf, u64 max_size, u64 snap) {
     }
     u8 sector_buf[SECTOR_SIZE];
     for (u64 i = read_so_far / SECTOR_SIZE; i < e.sector_count && read_so_far < to_read; ++i) {
-        if (!rd(e.first_sector + i, sector_buf)) break;
+        if (!rd_data(e.first_sector + i, sector_buf)) break;
         u64 chunk = to_read - read_so_far;
         if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
         for (u64 b = 0; b < chunk; ++b) dst[read_so_far + b] = sector_buf[b];
@@ -1797,6 +1920,37 @@ static u64 resolve_parent_impl(const char* path, char* leaf, u64 leaf_size, u64 
 u64 resolve_parent(const char* path, char* leaf, u64 leaf_size, u64 snap, Status* why) {
     Api api(why);
     return api.val(resolve_parent_impl(path, leaf, leaf_size, snap));
+}
+
+static bool stat_impl(u64 star, StatInfo* out, u64 snap) {
+    if (!g_mounted) return fail(Status::NotMounted);
+    if (!out) return fail(Status::InvalidArgument);
+    u64 root;
+    if (!view_root(snap, &root)) return false;
+    StarEntry e;
+    if (!bt_search(root, star, &e) || e.type == TYPE_FREE) return fail(Status::NotFound);
+    *out = { e.type, e.nlink, e.flags, e.sector_count, e.size_bytes, e.mtime, e.gen };
+    return true;
+}
+
+bool stat(u64 star, StatInfo* out, u64 snap, Status* why) {
+    Api api(why);
+    return api.ok(stat_impl(star, out, snap));
+}
+
+static bool set_flags_impl(u64 star, u32 flags) {
+    if (!g_mounted) return fail(Status::NotMounted);
+    if (flags & ~USER_FLAGS_MASK) return fail(Status::InvalidArgument);
+    Txn txn;
+    StarEntry e;
+    if (!catalog_find(star, &e) || e.type == TYPE_FREE) return fail(Status::NotFound);
+    e.flags = (e.flags & ~USER_FLAGS_MASK) | flags;
+    return txn.finish(catalog_upsert(star, e));
+}
+
+bool set_flags(u64 star, u32 flags, Status* why) {
+    Api api(why);
+    return api.ok(set_flags_impl(star, flags));
 }
 
 LookupStats lookup_stats() {
