@@ -83,6 +83,13 @@ bool end_batch(Status* why = nullptr);
 u32 crc32(const void* data, u64 len);
 bool verify_file(u64 star, u64 snap = LIVE, Status* why = nullptr);
 
+struct CheckReport {
+    u64 snapshots, nodes, dirs, files, entries;
+    u64 bad_crc, bad_files, unmarked, leaked, bad_links, bad_structure;
+    bool ok() const { return !bad_crc && !bad_files && !unmarked && !bad_links && !bad_structure; }
+};
+bool check(CheckReport* out, bool deep = true, Status* why = nullptr);
+
 IoStats io_stats();
 LookupStats lookup_stats();
 u64 free_space_sectors();
