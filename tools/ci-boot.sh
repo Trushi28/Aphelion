@@ -11,16 +11,20 @@ LOG=""
 
 mkdir -p "$LOG_DIR"
 IMG="$(mktemp)"
-trap 'rm -f "$IMG"' EXIT
+FIMG="$(mktemp)"
+trap 'rm -f "$IMG" "$FIMG"' EXIT
 
 qemu-img create -f raw "$IMG" 64M >/dev/null
 
-case "$DISK_KIND" in
-    nvme)   DISK="-drive file=$IMG,if=none,id=d0,format=raw -device nvme,drive=d0,serial=aphelion0" ;;
-    ahci)   DISK="-drive file=$IMG,if=none,id=d0,format=raw -device ide-hd,drive=d0,bus=ide.0" ;;
-    virtio) DISK="-drive file=$IMG,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0" ;;
-    *) echo "unknown disk kind: $DISK_KIND" >&2; exit 2 ;;
-esac
+disk_args() {
+    case "$DISK_KIND" in
+        nvme)   echo "-drive file=$1,if=none,id=d0,format=raw -device nvme,drive=d0,serial=aphelion0" ;;
+        ahci)   echo "-drive file=$1,if=none,id=d0,format=raw -device ide-hd,drive=d0,bus=ide.0" ;;
+        virtio) echo "-drive file=$1,if=none,id=d0,format=raw -device virtio-blk-pci,drive=d0" ;;
+        *) echo "unknown disk kind: $DISK_KIND" >&2; exit 2 ;;
+    esac
+}
+DISK="$(disk_args "$IMG")"
 
 fail() {
     echo "FAIL ($DISK_KIND, $CORES core(s), $PASS boot): $1"
@@ -30,6 +34,10 @@ fail() {
 
 finished() {
     if grep -q -e 'UNHANDLED INTERRUPT' -e 'FATAL' "$LOG"; then return 0; fi
+    if [ "$PASS" = foreign ]; then
+        grep -q 'Aphelion is up' "$LOG"
+        return $?
+    fi
     grep -q -e '\[selftest\] smp-fs:' "$LOG" || return 1
     grep -q -e '\[selftest\] smp-blockdev:' "$LOG" || return 1
     if [ "$CORES" -gt 1 ]; then
@@ -43,6 +51,7 @@ boot() {
     PASS="$1"
     LOG="$LOG_DIR/$DISK_KIND-$CORES-$PASS.log"
     : > "$LOG"
+    started="$(date +%s)"
     qemu-system-x86_64 -M q35 -cpu max -m 256M -smp "$CORES" \
         -cdrom "$ISO" $DISK -serial "file:$LOG" -display none -no-reboot >/dev/null 2>&1 &
     qpid=$!
@@ -55,6 +64,10 @@ boot() {
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
     tr -d '\r' < "$LOG" > "$LOG.clean"
+    ELAPSED=$(( $(date +%s) - started ))
+    if [ "$PASS" = fresh ]; then : > "$LOG_DIR/$DISK_KIND-$CORES.time"; fi
+    echo "$PASS ${ELAPSED}s" >> "$LOG_DIR/$DISK_KIND-$CORES.time"
+    echo "boot time ($DISK_KIND, $CORES core(s), $PASS): ${ELAPSED}s"
 }
 
 check_common() {
@@ -89,4 +102,16 @@ grep -q '\[stellar\] mounted:' "$LOG.clean" || fail "existing filesystem was not
 grep -q '\[stellar\] formatted:' "$LOG.clean" && fail "existing filesystem was reformatted"
 grep -q 'snapshot self-tests skipped' "$LOG.clean" || fail "mounted-disk path was not taken"
 
-echo "ok: $DISK_KIND, $CORES core(s), fresh and persisted boot"
+head -c 67108864 /dev/urandom > "$FIMG"
+BEFORE="$(cksum < "$FIMG")"
+DISK="$(disk_args "$FIMG")"
+boot foreign
+grep -q 'Aphelion is up' "$LOG.clean" || fail "kernel did not finish booting on a foreign disk"
+grep -q 'UNHANDLED INTERRUPT' "$LOG.clean" && fail "unhandled interrupt on a foreign disk"
+grep -q 'FATAL' "$LOG.clean" && fail "fatal error on a foreign disk"
+grep -q 'refusing to format' "$LOG.clean" || fail "kernel did not refuse to format a foreign disk"
+grep -q '\[stellar\] formatted:' "$LOG.clean" && fail "kernel formatted a foreign disk"
+grep -q 'block-device stress skipped' "$LOG.clean" || fail "disk-tail stress ran without a mounted volume"
+[ "$(cksum < "$FIMG")" = "$BEFORE" ] || fail "the foreign disk was modified"
+
+echo "ok: $DISK_KIND, $CORES core(s), fresh, persisted and foreign-disk boot"

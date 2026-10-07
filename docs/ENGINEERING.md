@@ -1,8 +1,6 @@
 # Engineering notes
 
-Twenty-four real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
-
-Kept here because they're the kind of thing worth not re-learning.
+Twenty-five real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 1. **2MB huge pages silently break when virt/phys alignment don't match.**
    The kernel's physical load address (from Limine) is *not* 2MB-aligned,
@@ -124,3 +122,10 @@ Kept here because they're the kind of thing worth not re-learning.
     long-lived disk the "test" overwrote file data. Found by the author while running the CI disk repeatedly. The
     filesystem is now formatted short of the disk, leaving a reserved test tail, and the scratch area is saved and
     restored.
+25. **Any mount failure triggered a format.** `kernel_main` formatted whenever `mount()` returned false, so a
+    foreign filesystem, damaged superblocks, a transient read error or a newer incompatible feature bit all ended
+    in a silent reformat. Found by reading the boot path, then confirmed by booting the old kernel on a disk of
+    random bytes, which it formatted. The kernel now formats only on `NotFormatted`, and only when
+    `can_auto_format()` sees a blank disk or a Stellar magic (an older version, reformatted by policy). The two
+    self-tests that write the disk tail also only run on a mounted volume. CI boots a random-data disk and
+    requires it byte-identical afterwards.

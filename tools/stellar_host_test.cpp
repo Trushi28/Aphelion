@@ -1753,6 +1753,52 @@ int main() {
         (void)x;
     }
 
+    // ---------------------------------------------------------------- auto-format guard
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        auto blank_disk = [&](u64 sectors) {
+            free(g_disk);
+            g_sectors = sectors;
+            g_disk = static_cast<u8*>(calloc(g_sectors, 512));
+            stellar::init(0);
+        };
+
+        blank_disk(4096);
+        CHECK(!stellar::mount(&st) && st == Status::NotFormatted, "a blank disk mounts as NotFormatted");
+        CHECK(stellar::can_auto_format(), "a blank disk may be formatted");
+
+        const u64 foreign_sectors[] = {0, 1, 2, 33, 63};
+        for (u64 sec : foreign_sectors) {
+            blank_disk(4096);
+            g_disk[sec * 512 + 510] = 0x55;
+            g_disk[sec * 512 + 511] = 0xAA;
+            CHECK(!stellar::mount(&st) && st == Status::NotFormatted, "foreign data still reads as NotFormatted");
+            CHECK(!stellar::can_auto_format(), "foreign data in the probed area blocks auto-format");
+        }
+
+        blank_disk(4096);
+        CHECK(stellar::format(g_sectors), "format for the stale-version case");
+        sb_poke(8, 5, 4);
+        CHECK(!stellar::mount(&st) && st == Status::NotFormatted, "an older Stellar version reads as NotFormatted");
+        CHECK(stellar::can_auto_format(), "an older Stellar volume may be reformatted, as documented");
+
+        blank_disk(4096);
+        CHECK(stellar::format(g_sectors), "format for the damaged-superblock case");
+        g_disk[100] ^= 1;
+        g_disk[512 + 100] ^= 1;
+        CHECK(!stellar::mount(&st) && st == Status::Corrupt, "damaged superblocks report Corrupt, which the kernel never formats over");
+
+        blank_disk(4096);
+        CHECK(stellar::format(g_sectors), "format for the unsupported-features case");
+        sb_poke(72, 1, 4);
+        CHECK(!stellar::mount(&st) && st == Status::Unsupported, "unknown incompatible features report Unsupported, which the kernel never formats over");
+
+        blank_disk(63);
+        CHECK(!stellar::can_auto_format(), "a device smaller than the minimum is never auto-formatted");
+        fresh_fs();
+    }
+
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

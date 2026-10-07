@@ -1476,6 +1476,26 @@ bool mount(Status* why) {
     return api.ok(mount_impl());
 }
 
+bool can_auto_format() {
+    Guard guard;
+    constexpr u64 PROBE_SECTORS = 64;
+    if (blockdev::capacity_sectors() < MIN_SECTORS) return false;
+    bool blank = true;
+    u8 buf[SECTOR_SIZE];
+    for (u64 s = 0; s < PROBE_SECTORS; ++s) {
+        ++g_io_reads;
+        if (!blockdev::read_sector(s, buf)) return false;
+        if (s < SB_SLOTS) {
+            u64 magic;
+            __builtin_memcpy(&magic, buf, sizeof(magic));
+            if (magic == MAGIC) return true;
+        }
+        for (u32 i = 0; blank && i < SECTOR_SIZE; ++i)
+            if (buf[i]) blank = false;
+    }
+    return blank;
+}
+
 static u64 create_constellation_impl(u64 parent, const char* name) {
     if (!g_mounted) return fail_id(Status::NotMounted);
     Txn txn;

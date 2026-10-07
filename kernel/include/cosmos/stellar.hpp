@@ -57,6 +57,7 @@ struct LookupStats {
 
 bool format(u64 total_sectors, Status* why = nullptr);
 bool mount(Status* why = nullptr);
+bool can_auto_format();
 void init(u64 hhdm_offset);
 
 u64 create_file(u64 parent, const char* name, const void* data, u64 size, Status* why = nullptr);

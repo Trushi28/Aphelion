@@ -195,6 +195,16 @@ are refused; duplicates are refused with `Exists`.
 directory and a validated leaf name. Repeated and trailing slashes are accepted (a trailing slash requires a
 directory), and relative paths, `.` and `..` are refused because directories keep no parent pointer.
 
+## Mount and format policy
+
+`mount()` never formats. The kernel formats a disk only when `mount()` reports `NotFormatted` **and**
+`can_auto_format()` agrees: the first 64 sectors are all zero, or sector 0 or 1 carries the Stellar magic (an
+older on-disk version, which is reformatted on purpose). Every other outcome (`Corrupt`, `Unsupported`, `Io`, a
+disk holding someone else's data) leaves the disk untouched and boots without a filesystem. The block-device
+self-tests that write the last 64 sectors only run when a Stellar volume is mounted and stops short of them. The
+probe looks at the first 64 sectors only, so data that starts later on a disk whose first 32 KiB are zero is not
+detected. `stellarfs mkfs` and `format()` are explicit calls and are not guarded.
+
 ## Concurrency
 
 Every public function takes one recursive `orbital::Mutex` (owned by the Satellite, not the core), and

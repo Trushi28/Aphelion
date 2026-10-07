@@ -34,6 +34,15 @@ jobs:
       - name: Boot on virtio-blk
         run: tools/ci-boot.sh virtio 1
 
+      - name: Boot timings
+        if: always()
+        run: |
+          for f in build/ci-logs/*.time; do
+            [ -e "$f" ] || continue
+            echo "== $(basename "$f" .time)"
+            cat "$f"
+          done
+
       - name: Upload boot logs
         if: always()
         uses: actions/upload-artifact@v4

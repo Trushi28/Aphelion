@@ -425,8 +425,26 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
 
+        stellar::init(g_hhdm_offset);
+        stellar::Status mount_why = stellar::Status::Ok;
+        bool fs_ready = stellar::mount(&mount_why);
+        bool fresh_fs = false;
+        if (!fs_ready) {
+            if (mount_why == stellar::Status::NotFormatted && stellar::can_auto_format()) {
+                u64 capacity = blockdev::capacity_sectors();
+                u64 fs_sectors = capacity > TEST_TAIL_SECTORS + 64 ? capacity - TEST_TAIL_SECTORS : capacity;
+                fs_ready = stellar::format(fs_sectors);
+                fresh_fs = fs_ready;
+            } else {
+                serial::printf("[stellar] refusing to format: mount failed (%s)%s\n", stellar::status_name(mount_why),
+                                mount_why == stellar::Status::NotFormatted ? ", and the disk holds data that is not a Stellar volume" : "");
+                fb::printf(0xE0D080, "[--] Stellar FS: mount failed (%s), disk left untouched\n", stellar::status_name(mount_why));
+            }
+        }
+        bool tail_free = fs_ready && stellar::total_sectors() + TEST_TAIL_SECTORS <= blockdev::capacity_sectors();
+
         u64 total_sectors = blockdev::capacity_sectors();
-        if (total_sectors > 64) {
+        if (tail_free && total_sectors > 64) {
             constexpr u64 SCRATCH_COUNT = 32;
             u64 scratch_start = total_sectors - SCRATCH_COUNT;
             static u8 scratch_write[SCRATCH_COUNT * 512];
@@ -453,15 +471,6 @@ extern "C" NORETURN void kernel_main() {
             fb::printf(flush_ok ? 0xC0FFC0 : 0xE0D080, "[%s] %s write barrier (flush) completed\n",
                        flush_ok ? "ok" : "--", blockdev::active()->name());
             serial::printf("[selftest] flush: %s\n", flush_ok ? "ok" : "MISMATCH");
-        }
-
-        stellar::init(g_hhdm_offset);
-        bool fs_ready = stellar::mount();
-        bool fresh_fs = !fs_ready;
-        if (!fs_ready) {
-            u64 capacity = blockdev::capacity_sectors();
-            u64 fs_sectors = capacity > TEST_TAIL_SECTORS + 64 ? capacity - TEST_TAIL_SECTORS : capacity;
-            fs_ready = stellar::format(fs_sectors);
         }
 
         if (fs_ready) {
@@ -646,7 +655,7 @@ extern "C" NORETURN void kernel_main() {
             serial::printf("[stellar] stress: %lu stars created (create_ok=%d), %lu mismatch(es), root dir enumerates %lu/%lu entries across its sector chain\n",
                             STRESS_COUNT, stress_create_ok ? 1 : 0, stress_mismatches, dir_count, expected_dir_count);
         } else {
-            fb::printf(0xE0D080, "[--] Stellar FS: mount and format both failed\n");
+            fb::printf(0xE0D080, "[--] Stellar FS: not available, see the serial log\n");
         }
     } else {
         fb::printf(0xB0B0C0, "[--] No block device found\n");
@@ -682,8 +691,11 @@ extern "C" NORETURN void kernel_main() {
     orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
     for (u64 i = 0; i < WORKER_COUNT; ++i)
         orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
-    if (blockdev::present() && blockdev::capacity_sectors() > 256) {
-        if (stellar::total_sectors() + TEST_TAIL_SECTORS <= blockdev::capacity_sectors()) {
+    u64 fs_total = stellar::total_sectors();
+    if (blockdev::present() && fs_total == 0) {
+        serial::writeln("[boot] block-device stress skipped: no mounted Stellar volume, so the disk tail is not ours to write");
+    } else if (blockdev::present() && blockdev::capacity_sectors() > 256) {
+        if (fs_total + TEST_TAIL_SECTORS <= blockdev::capacity_sectors()) {
             g_bd_base = blockdev::capacity_sectors() - TEST_TAIL_SECTORS;
             g_bd_enabled = true;
             for (u64 i = 0; i < BD_WORKERS; ++i)
