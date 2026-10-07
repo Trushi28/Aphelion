@@ -7,6 +7,7 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/orbital.hpp>
 #include <cosmos/stellar.hpp>
+#include <cosmos/civil.hpp>
 
 extern "C" {
 int printf(const char*, ...);
@@ -57,8 +58,14 @@ static void ls_cb(const char* name, u64 star, u32 type, void* ctx) {
     stellar::StatInfo si{};
     stellar::stat(star, &si);
     for (u64 i = 0; i < depth; ++i) printf("  ");
-    if (type == stellar::TYPE_CONSTELLATION) printf("%s/  (star %llu)\n", name, star);
-    else printf("%s  (star %llu, %llu bytes, %u link(s))\n", name, star, si.size_bytes, si.nlink);
+    if (type == stellar::TYPE_CONSTELLATION) printf("%s/  (star %llu", name, star);
+    else printf("%s  (star %llu, %llu bytes, %u link(s)", name, star, si.size_bytes, si.nlink);
+    if (si.mtime) {
+        char iso[21];
+        civil::format_iso(civil::from_unix(si.mtime / 1000), iso);
+        printf(", mtime %s", iso);
+    }
+    printf(")\n");
     if (type == stellar::TYPE_CONSTELLATION) { u64 d = depth + 1; stellar::list(star, &ls_cb, &d); }
 }
 

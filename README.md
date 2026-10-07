@@ -43,6 +43,7 @@ built in, described under [Goals](#goals).
   Bloom-filtered snapshot lookups, path resolution, typed status codes,
   twin checksummed superblocks, flush-ordered crash-consistent commits and an fsck-style `check()`
 - PS/2 keyboard with extended keys, framebuffer console
+- RTC wall clock plus a tick counter, so files carry real modification times
 
 ## Goals
 

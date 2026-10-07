@@ -40,6 +40,7 @@ finished() {
     fi
     grep -q -e '\[selftest\] smp-fs:' "$LOG" || return 1
     grep -q -e '\[selftest\] smp-blockdev:' "$LOG" || return 1
+    grep -q -e '\[selftest\] clock ticks:' "$LOG" || return 1
     if [ "$CORES" -gt 1 ]; then
         grep -q -e 'stealing confirmed' -e 'no migration observed' "$LOG"
     else
@@ -80,6 +81,8 @@ check_common() {
     grep -q '\[selftest\] flush: ok' "$LOG.clean" || fail "block-device flush self-test did not pass"
     grep -q '\[selftest\] bulk I/O: ok' "$LOG.clean" || fail "bulk I/O self-test did not pass"
     grep -q '\[selftest\] stellar api: ok' "$LOG.clean" || fail "filesystem API self-test did not pass"
+    grep -q '\[selftest\] clock mtime: ok' "$LOG.clean" || fail "RTC-backed file mtime self-test did not pass"
+    grep -q '\[selftest\] clock ticks: ok' "$LOG.clean" || fail "BSP tick counter self-test did not pass"
     grep -q 'stress: 14 stars created (create_ok=1), 0 mismatch(es)' "$LOG.clean" || fail "filesystem stress test failed"
     grep -q '\[smp-fs\] FAIL' "$LOG.clean" && fail "concurrent filesystem stress reported a failure"
     grep -q '\[selftest\] smp-fs: ok' "$LOG.clean" || fail "concurrent filesystem stress did not pass"

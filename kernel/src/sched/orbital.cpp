@@ -4,6 +4,7 @@
 #include <cosmos/pmm.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/serial.hpp>
+#include <cosmos/clock.hpp>
 
 extern "C" void switch_context(u64* old_rsp_out, u64 new_rsp);
 
@@ -175,6 +176,7 @@ NORETURN void exit_current() {
 static void timer_tick_handler(idt::Frame*) {
     apic::eoi();
     u32 me = apic::id();
+    clock::tick(me);
     Satellite* cur = g_current[me];
     if (!cur) return;
 
@@ -190,9 +192,9 @@ static void timer_tick_handler(idt::Frame*) {
 void init(u64 hhdm_offset) {
     g_hhdm = hhdm_offset;
 
-    g_ticks_per_period = pit::calibrate_apic_ticks(10, 4);
-    serial::printf("[orbital] APIC timer calibrated: %u ticks per 10ms (divide/16)\n",
-                    g_ticks_per_period);
+    g_ticks_per_period = pit::calibrate_apic_ticks(clock::TICK_MS, 4);
+    serial::printf("[orbital] APIC timer calibrated: %u ticks per %ums (divide/16)\n",
+                    g_ticks_per_period, clock::TICK_MS);
 }
 
 void init_core() {

@@ -4,6 +4,7 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/stellar.hpp>
 #include <cosmos/orbital.hpp>
+#include <cosmos/civil.hpp>
 
 extern "C" {
 int printf(const char*, ...);
@@ -1751,6 +1752,70 @@ int main() {
         u64 made = stellar::create_file(p, leaf, "m", 1);
         CHECK(made != stellar::INVALID_STAR && stellar::resolve("/a/b/made.txt") == made, "create by path round trip");
         (void)x;
+    }
+
+    // ---------------------------------------------------------------- civil time and RTC decoding
+    {
+        struct Ref { u32 y, mo, d, h, mi, s; u64 unix_s; };
+        static const Ref refs[] = {
+            {1970, 1, 1, 0, 0, 0, 0ull},
+            {1999, 12, 31, 23, 59, 59, 946684799ull},
+            {2000, 1, 1, 0, 0, 0, 946684800ull},
+            {2000, 2, 29, 23, 59, 59, 951868799ull},
+            {2001, 3, 1, 0, 0, 0, 983404800ull},
+            {2024, 2, 29, 12, 34, 56, 1709210096ull},
+            {2026, 10, 7, 2, 13, 55, 1791339235ull},
+            {2038, 1, 19, 3, 14, 7, 2147483647ull},
+            {2099, 12, 31, 23, 59, 59, 4102444799ull},
+            {2100, 3, 1, 0, 0, 0, 4107542400ull},
+        };
+        bool all = true;
+        for (const Ref& r : refs) {
+            civil::Date d{r.y, r.mo, r.d, r.h, r.mi, r.s};
+            civil::Date back = civil::from_unix(r.unix_s);
+            all = all && civil::to_unix(d) == r.unix_s && back.year == r.y && back.month == r.mo && back.day == r.d &&
+                  back.hour == r.h && back.minute == r.mi && back.second == r.s;
+        }
+        CHECK(all, "civil conversion matches independently computed Unix times, both directions");
+
+        bool sweep = true;
+        for (u64 t = 0; t < 4200000000ull && sweep; t += 3607) {
+            civil::Date d = civil::from_unix(t);
+            sweep = civil::valid(d) && civil::to_unix(d) == t;
+        }
+        CHECK(sweep, "from_unix and to_unix round-trip every 3607 s from 1970 to 2103");
+
+        auto raw = [](u8 s, u8 mi, u8 h, u8 d, u8 mo, u8 y) { return civil::RtcRaw{s, mi, h, d, mo, y}; };
+        civil::Date out{};
+        CHECK(civil::decode_rtc(raw(0x55, 0x13, 0x02, 0x07, 0x10, 0x26), false, true, &out) &&
+              civil::to_unix(out) == 1791339235ull, "BCD, 24-hour register values decode");
+        CHECK(civil::decode_rtc(raw(55, 13, 2, 7, 10, 26), true, true, &out) &&
+              civil::to_unix(out) == 1791339235ull, "binary register values decode to the same instant");
+        CHECK(civil::decode_rtc(raw(0, 0, 12, 1, 1, 0), true, false, &out) && out.hour == 0, "12-hour binary: 12 AM is hour 0");
+        CHECK(civil::decode_rtc(raw(0, 0, 0x8C, 1, 1, 0), true, false, &out) && out.hour == 12, "12-hour binary: 12 PM is hour 12");
+        CHECK(civil::decode_rtc(raw(0, 0, 0x81, 1, 1, 0), true, false, &out) && out.hour == 13, "12-hour binary: 1 PM is hour 13");
+        CHECK(civil::decode_rtc(raw(0, 0, 0x81, 1, 1, 0), false, false, &out) && out.hour == 13, "12-hour BCD: 0x81 is 1 PM");
+        CHECK(civil::decode_rtc(raw(0, 0, 0x91, 1, 1, 0), false, false, &out) && out.hour == 23, "12-hour BCD: 0x91 is 11 PM");
+        CHECK(civil::decode_rtc(raw(0, 0, 0x92, 1, 1, 0), false, false, &out) && out.hour == 12, "12-hour BCD: 0x92 is 12 PM");
+        CHECK(civil::decode_rtc(raw(0, 0, 0x12, 1, 1, 0), false, false, &out) && out.hour == 0, "12-hour BCD: 0x12 is 12 AM");
+        CHECK(civil::decode_rtc(raw(0, 0, 0, 0x29, 0x02, 0x24), false, true, &out) && out.day == 29 && out.month == 2, "leap day accepted");
+
+        CHECK(!civil::decode_rtc(raw(0x1A, 0, 0, 1, 1, 0), false, true, &out), "bad BCD nibble is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 0, 1, 13, 0), true, true, &out), "month 13 is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 0, 0, 1, 0), true, true, &out), "day 0 is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 0, 30, 2, 24), true, true, &out), "Feb 30 is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 0, 29, 2, 25), true, true, &out), "Feb 29 in a non-leap year is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 24, 1, 1, 0), true, true, &out), "hour 24 is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 60, 0, 1, 1, 0), true, true, &out), "minute 60 is rejected");
+        CHECK(!civil::decode_rtc(raw(60, 0, 0, 1, 1, 0), true, true, &out), "second 60 is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 0, 1, 1, 0), true, false, &out), "12-hour mode hour 0 is rejected");
+        CHECK(!civil::decode_rtc(raw(0, 0, 0x8D, 1, 1, 0), true, false, &out), "12-hour mode hour 13 is rejected");
+
+        char iso[21];
+        civil::format_iso(civil::from_unix(1791339235ull), iso);
+        CHECK(strcmp_(iso, "2026-10-07T02:13:55Z"), "ISO formatting is zero-padded");
+        civil::format_iso(civil::from_unix(0), iso);
+        CHECK(strcmp_(iso, "1970-01-01T00:00:00Z"), "ISO formatting of the epoch");
     }
 
     // ---------------------------------------------------------------- auto-format guard

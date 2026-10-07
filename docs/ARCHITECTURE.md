@@ -85,6 +85,19 @@ puts it in the lowest ring: plain `yield()` promotes a Satellite, so waiters use
 and starve it (see [Engineering notes](ENGINEERING.md), item 20). Stellar has one mutex and each block driver has
 its own around every request, always acquired in that order. There is no sleeping lock or wait queue yet.
 
+### Clock
+
+`clock` (`drivers/clock.cpp`) gives the filesystem its `mtime`. It reads the CMOS RTC once after ACPI is up and
+again just before the scheduler starts (the filesystem self-tests run for seconds first), then adds a tick counter
+that only the boot core's APIC timer advances, 10 ms per tick. `now_ms()` is Unix milliseconds, or 0 if the RTC is
+unreadable or reports an invalid time, so a missing clock looks the same as before. The RTC is assumed to be UTC and
+in 2000 to 2099. Date math lives in `civil.hpp` so the host suite tests it.
+
+Resolution is one second until the scheduler starts and 10 ms after. Ticks are lost while interrupts are masked
+(the drivers do this in polled mode), so the clock can run slow, never fast; every boot re-reads the RTC, which
+bounds the error. A TSC-based clock would not lose ticks, but APs do not necessarily start with synchronised
+counters and Satellites migrate between cores, so it is not used.
+
 ### Hardware and interrupts
 
 x2APIC with xAPIC fallback. ACPI/MADT parsing for CPUs, IOAPIC and Interrupt Source

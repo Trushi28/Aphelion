@@ -18,6 +18,8 @@
 #include <cosmos/nvme.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/stellar.hpp>
+#include <cosmos/clock.hpp>
+#include <cosmos/civil.hpp>
 
 extern "C" char __kernel_start[];
 extern "C" char __kernel_end[];
@@ -160,6 +162,28 @@ static void demo_spinner(void* arg) {
             ++prints;
         }
     }
+}
+
+constexpr u64 CLOCK_TEST_MS = 50;
+constexpr u64 CLOCK_TEST_SPINS = 300000000ull;
+
+static void demo_clock(void*) {
+    u64 start = clock::uptime_ms();
+    u64 prev = start;
+    bool monotonic = true;
+    u64 spins = 0;
+    while (clock::uptime_ms() - start < CLOCK_TEST_MS && spins < CLOCK_TEST_SPINS) {
+        u64 now = clock::uptime_ms();
+        if (now < prev) monotonic = false;
+        prev = now;
+        ++spins;
+    }
+    u64 advanced = clock::uptime_ms() - start;
+    bool ok = monotonic && advanced >= CLOCK_TEST_MS;
+    serial::printf("[clock] BSP tick counter advanced %lu ms in the test window, %s\n",
+                    advanced, monotonic ? "monotonic" : "went backwards");
+    serial::printf("[selftest] clock ticks: %s\n", ok ? "ok" : "MISMATCH");
+    orbital::exit_current();
 }
 
 constexpr u64 WORKER_COUNT = 8;
@@ -402,6 +426,16 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] ACPI/MADT parsed: %d CPU(s) reported\n",
                static_cast<int>(acpi::info().cpu_count));
 
+    clock::init(apic::id());
+    stellar::set_clock(&clock::now_ms);
+    if (clock::wall_valid()) {
+        char iso[21];
+        civil::format_iso(civil::from_unix(clock::boot_wall_ms() / 1000), iso);
+        fb::printf(0xC0FFC0, "[ok] RTC clock: %s, file mtimes are Unix milliseconds\n", iso);
+    } else {
+        fb::printf(0xE0D080, "[--] RTC unreadable; file mtimes stay 0\n");
+    }
+
     constexpr u8 VEC_KEYBOARD = 0x21;
     if (acpi::info().ioapic_found) {
         u64 ioapic_2m = acpi::info().ioapic_base & ~0x1FFFFFull;
@@ -516,6 +550,25 @@ extern "C" NORETURN void kernel_main() {
                            "[%s] Stellar FS API: path resolution, duplicate/invalid-name/not-found/is-a-directory status codes, %s\n",
                            api_ok ? "ok" : "--", api_ok ? "all as expected" : "MISMATCH");
                 serial::printf("[selftest] stellar api: %s\n", api_ok ? "ok" : "MISMATCH");
+            }
+
+            {
+                constexpr u64 PLAUSIBLE_MIN_MS = 1704067200000ull;
+                u64 probe = stellar::find(subdir, "clock.probe");
+                if (probe == stellar::INVALID_STAR)
+                    probe = stellar::create_file(subdir, "clock.probe", "t", 1);
+                stellar::StatInfo probe_info{};
+                bool probe_ok = probe != stellar::INVALID_STAR && stellar::write_file(probe, "t", 1) == probe &&
+                                stellar::stat(probe, &probe_info);
+                if (!clock::wall_valid()) {
+                    serial::printf("[selftest] clock mtime: skipped, no wall clock\n");
+                } else {
+                    probe_ok = probe_ok && probe_info.mtime >= PLAUSIBLE_MIN_MS && probe_info.mtime >= clock::boot_wall_ms();
+                    char iso[21];
+                    civil::format_iso(civil::from_unix(probe_info.mtime / 1000), iso);
+                    serial::printf("[clock] /sub/clock.probe mtime %s (%lu ms)\n", iso, probe_info.mtime);
+                    serial::printf("[selftest] clock mtime: %s\n", probe_ok ? "ok" : "MISMATCH");
+                }
             }
 
             static u8 readback[128];
@@ -685,10 +738,12 @@ extern "C" NORETURN void kernel_main() {
     }
 
     fb::printf(0x8FD3FF, "\nOrbital scheduler: bringing up this core...\n");
+    clock::sync();
     orbital::init_core();
     orbital::spawn("alpha", &demo_cooperative, const_cast<char*>("alpha"));
     orbital::spawn("beta", &demo_cooperative_explicit_exit, const_cast<char*>("beta"));
     orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
+    orbital::spawn("clock-test", &demo_clock, nullptr);
     for (u64 i = 0; i < WORKER_COUNT; ++i)
         orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
     u64 fs_total = stellar::total_sectors();
