@@ -111,6 +111,8 @@ Twenty-five real bugs and design flaws found while building Aphelion, kept becau
     allocated the code correctly fell back to scanning, but the allocator had already recorded `NoMemory` as the
     first error, so a duplicate create reported `NoMemory` instead of `Exists`. Found only by a test that
     starves the index of memory; the index and filter now allocate quietly.
+    (The index and filter this note is about were later removed when directories became B+trees; the lesson
+    about fallback paths recording errors still applies to any future optional allocation.)
 23. **A checksum does not defend against a logic bug.** Mutation-testing the crash harness (a protocol with a
     deliberately wrong step) produced an AddressSanitizer stack-buffer-overflow in `bt_search`, then a stack
     overflow in `bt_upsert`: a stale node that was still CRC-valid had an entry count larger than its array, and a

@@ -1,11 +1,11 @@
 # Stellar FS
 
-`kernel/src/fs/stellar.cpp`. A `Constellation` (directory) is a star whose data is a chain of
-edge sectors (7 per sector, unbounded), so one star can be linked from several directories
+`kernel/src/fs/stellar.cpp`. A `Constellation` (directory) is a star whose data is a copy-on-write
+B+tree of edges keyed by name hash, so one star can be linked from several directories
 with no hard-link special case.
 
 ```text
-sectors 0 and 1   twin superblocks: magic, version 6, commit number, epoch, catalog root, next star id, snapshot table
+sectors 0 and 1   twin superblocks: magic, version 7, commit number, epoch, catalog root, next star id, snapshot table
 sectors 2..n      free-sector bitmap
 sectors n+1..     B+tree nodes (1 sector each), directory sectors, file extents
 ```
@@ -41,9 +41,8 @@ ID (`stellar::LIVE` = 0 is the default), and star IDs are stable across views.
 - **File rewrites** allocate a fresh extent. The old one is freed immediately if it was born in
   the current epoch (no snapshot can reference it) and retained if older. Rewriting one file
   300 times with no snapshot in between costs no net space.
-- **First write after a snapshot** costs O(log n) node copies in the catalog, and for a directory
-  copies that directory's sector chain: O(directory size), the same order as the linear scan every
-  directory operation already does.
+- **First write after a snapshot** costs O(log n) node copies in the catalog and O(log n) in the
+  directory being written.
 
 ### Deletion and reclamation
 
@@ -54,7 +53,7 @@ Anything older stays allocated for the snapshots that may still use it.
 
 `delete_snapshot(id)` tombstones a slot in the snapshot table, and the next `snapshot()` reuses it.
 Space is reclaimed by `gc()`, a stop-the-world mark and sweep: it marks the metadata region plus
-every catalog node, directory chain and file extent reachable from the live root and from each
+every catalog node, directory node and file extent reachable from the live root and from each
 remaining snapshot root, then rewrites the free bitmap to match. Nothing reachable can be freed,
 and sectors leaked by failed operations are recovered as a side effect. It is O(filesystem size)
 and needs one bit of RAM per sector.
@@ -78,9 +77,6 @@ Measured with the host-side harness (131072-sector disk), old implementation vs 
 
 ### Second pass
 
-- **Directory appends are O(1).** A directory whose head sector is current has a current chain, so
-  `dir_make_current` checks one sector instead of walking the chain, and `add_edge` resumes from the
-  last sector it filled instead of the head. `unlink` drops that hint.
 - **Extents move in batches.** Writes send every whole sector in one batched request and only the
   padded tail sector singly. `read_file` and `verify_file` batch the same way, and a read no longer
   needs an output buffer rounded up to a sector.
@@ -90,13 +86,13 @@ Measured with the host-side harness (131072-sector disk), old implementation vs 
 - **CRC32 is slice-by-8**, checked against the bitwise reference at every length and alignment.
 - **The cache is 256 slots**, so B+tree interior nodes survive a directory walk.
 
-## On-disk format v6
+## On-disk format v7
 
 ```text
-sectors 0 and 1   twin superblocks: magic, version 6, commit number, epoch, catalog root, next star id,
+sectors 0 and 1   twin superblocks: magic, version 7, commit number, epoch, catalog root, next star id,
                   feature flags, snapshot table, CRC32 in the last 4 bytes
 sectors 2..n      free-sector bitmap, 508 bytes of bits per sector plus a CRC32
-sectors n+1..     B+tree nodes, directory sectors (each ending in a CRC32), file extents
+sectors n+1..     catalog nodes, directory nodes (each ending in a CRC32), file extents
 ```
 
 Every metadata sector ends in a CRC32 of the sector, verified on every read from disk and stamped on every
@@ -148,34 +144,40 @@ silent corruption that happens to preserve a CRC.
 sectors the bitmap says are free (the dangerous case), leaked sectors, wrong link counts, dangling or malformed
 directory entries, sectors referenced twice, and malformed nodes. Reads also defend themselves against stale or
 wrong structure that a CRC cannot catch: node entry counts are bounded, sector numbers must lie in the data area,
-and directory chains and tree recursion have cycle and depth limits. Those limits were added after mutation testing
+and directory trees and tree recursion have cycle and depth limits. Those limits were added after mutation testing
 of the crash harness produced a stack overflow from a cyclic tree.
 
-## Directory index and snapshot filters
+## Directory tree
 
-Directories stay a chain of 7-entry sectors on disk, and nothing in the on-disk format changed. Lookups
-are served from RAM instead of walking that chain.
+A directory is a copy-on-write B+tree stored in the same kind of sectors as the catalog and under the same
+epoch rule: a node is modified in place only if it was born in the current epoch, otherwise it is copied and the
+copy is linked in along the path to the root. A directory star's catalog entry holds the tree root in
+`first_sector` and its parent directory in `size_bytes` (`stat` reports 0 for directories); the root directory's
+parent is `INVALID_STAR`. The parent pointer is what lets a later `rename` refuse to move a directory under its
+own descendant without walking the subtree.
 
-**Live view: a hash index per directory.** The first access to a directory scans its chain once and builds an
-open-addressing table (4 directories cached, least recently used evicted). Each entry is
-`hash -> (star, sector, slot)`: the *address of the node* holding the entry. A lookup probes the table, then
-reads that one sector and compares the real name, so a hash collision can never return a wrong answer.
-Appends go to a slot from a small free-slot stack (filled by `unlink`) or to the tail sector, and
-`unlink` finds its entry the same way instead of scanning. Measured in the host harness: 1000 creates in one
-directory cost the same number of sector lookups per create at the start and at the end, and a find in a
-1000-entry directory costs about 4 sector lookups.
+**Keys.** An entry is `(key, star, name[52])`, 68 bytes, 7 per leaf; internal nodes are the catalog's, 30-way.
+The key is the top 48 bits of the name's hash followed by a 16-bit ordinal, so keys are unique and all names with
+the same 48-bit prefix sit next to each other. A lookup seeks to the first key with that prefix and compares real
+names along the run, so a hash collision can never return a wrong answer; creating a name takes the lowest free
+ordinal in its run. A run can hold 65536 names, after which a create reports `NoSpace`. The hash (FNV-1a with a
+final mix) is now part of the on-disk format and is not keyed, so a determined user can build colliding names.
+Listings come out in hash order.
 
-The index is keyed on the directory's head sector. A snapshot starts a new epoch and the next write to the
-directory copies its chain to new sectors, which changes the head, so a stale index is never used and is
-rebuilt on the next access (one pass over the directory, the same order as the copy). If memory for an
-index cannot be had, every operation falls back to the chain scan and still works.
+**Cost.** Lookups, creates and unlinks descend one path. With fanouts of 7 and 30 the tree is 3 levels at 1000
+entries and 4 at around 100,000 (computed from the fanouts, not measured). The first write after each commit copies that path, not the directory. Measured in the host
+harness, a single-operation create (one commit each) costs 10.5, 13.4 and 13.6 sector writes into directories of
+100, 400 and 1000 entries; the chain it replaced cost 25.9, 70.7 and 156.7. Snapshot views use the same lookup, so
+there is no per-snapshot filter and no RAM index, and no directory operation allocates RAM.
 
-**Snapshot views: a Bloom filter per (snapshot, directory).** Snapshots are immutable, so one pass builds a
-filter of about 16 bits per entry (4 probes) and it never goes stale. A name the filter rejects is reported
-absent without touching the directory: in the host harness 1996 of 2000 absent-name lookups were rejected,
-and the 4 that were not were the filter's false positives. A name the filter passes is then looked up by the
-scan, so positive lookups in a snapshot are still linear in the directory. 8 filters are cached; they are
-dropped when a snapshot is deleted, on mount and on format.
+**Delete.** An unlink removes the entry from its leaf. A leaf that becomes empty is removed from its parent and
+its sector returned under the usual epoch rule; an internal node left with one child is collapsed at the root.
+Nodes are not merged when they are merely sparse, so a directory that once held many entries keeps a few sparse
+nodes. A completely empty directory is a single empty leaf.
+
+`check()` walks every directory tree with key bounds (every key must lie between its parent's separators and be
+strictly ascending), verifies each key's prefix against its name's hash, each entry's target, and each
+subdirectory's parent pointer, and counts the edges that feed the link-count check.
 
 ## Status codes
 
@@ -219,24 +221,20 @@ sinks to the lowest scheduler ring so a runnable holder always outranks it.
 
 Stated plainly:
 
-- **Directory copy-on-write is O(directory size) per commit.** A directory is still a linked chain of
-  sectors, so the first write after each commit copies the whole chain. Within a `begin_batch` group appends stay
-  O(1) (and the RAM index is built once), but a stream of single-operation commits into a 1000-entry directory
-  copies about 140 sectors per create. This is why the 4-core boot self-tests got slower (about 60 s per NVMe
-  boot, was about 20 s). A tree-shaped directory fixes it.
 - Crash safety rests on the assumptions listed above; it has been tested by simulation, not on hardware.
 - **gc() is stop-the-world**, O(filesystem size): it holds the filesystem lock for its whole run. Space held
   by older epochs only comes back via `delete_snapshot` and `gc()`.
 - Dead stars keep a 56-byte catalog entry and their IDs are never reused; the B+tree has no delete.
 - A deleted snapshot's ID can be handed out again by a later `snapshot()`. The snapshot table holds 24.
 - Snapshots are **whole-filesystem**, not per-subtree.
-- The on-disk directory is still a linear chain. The live view is indexed in RAM, but `list`, the first access
-  after a snapshot, and positive lookups in a snapshot walk the chain.
-- Free slots in a directory beyond the 32 the index tracks are only reused after the next rebuild.
+- Directory nodes are not merged on delete, only dropped when empty, and a name hash prefix holds at most 65536
+  names. Directory listings are in hash order, not creation order.
+- Dead stars cost catalog space: 6000 create/unlink pairs grew the catalog by about 1600 sectors in the host
+  harness, while 6000 link/unlink pairs of one file cost nothing.
 - `read_file` can only verify the checksum when the whole file is read; partial reads are unchecked.
 - Free space is a linear bitmap, not the Universe/Orbit buddy machinery.
 - Per-file CRC32 only; no per-extent or per-node checksums.
-- Bumping the superblock version reformats an existing disk on next boot (v3, v4 and v5 images aren't migrated).
+- Bumping the superblock version reformats an existing disk on next boot (v3 to v6 images aren't migrated).
 - The boot self-tests that take snapshots are skipped on a mounted disk to avoid exhausting the table.
 
 ---

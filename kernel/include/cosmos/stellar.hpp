@@ -50,11 +50,6 @@ constexpr u64 READ_ERROR = INVALID_STAR;
 
 struct IoStats { u64 reads, writes, cache_hits; };
 
-struct LookupStats {
-    u64 index_builds, index_grows, index_lookups, scan_lookups;
-    u64 bloom_builds, bloom_rejects, bloom_passes, bloom_false_positives;
-};
-
 bool format(u64 total_sectors, Status* why = nullptr);
 bool mount(Status* why = nullptr);
 bool can_auto_format();
@@ -92,7 +87,6 @@ struct CheckReport {
 bool check(CheckReport* out, bool deep = true, Status* why = nullptr);
 
 IoStats io_stats();
-LookupStats lookup_stats();
 u64 free_space_sectors();
 u64 total_sectors();
 bool stat(u64 star, StatInfo* out, u64 snap = LIVE, Status* why = nullptr);

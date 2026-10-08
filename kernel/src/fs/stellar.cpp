@@ -8,7 +8,7 @@ namespace stellar {
 
 constexpr u64 SECTOR_SIZE = 512;
 constexpr u64 MAGIC = 0x5AE1157A6111A2C5ull;
-constexpr u32 VERSION = 6;
+constexpr u32 VERSION = 7;
 constexpr u32 NAME_LEN = 52;
 constexpr u32 LEAF_MAX = 7;
 constexpr u32 INTERNAL_MAX = 30;
@@ -59,23 +59,24 @@ struct PACKED StarEntry {
 };
 static_assert(sizeof(StarEntry) == 56, "StarEntry must be 56 bytes");
 
-struct PACKED DirEntry {
-    u32 in_use;
+struct PACKED DirLeafEntry {
+    u64 key;
     u64 star;
     char name[NAME_LEN];
 };
-static_assert(sizeof(DirEntry) == 64, "DirEntry must be 64 bytes");
+static_assert(sizeof(DirLeafEntry) == 68, "DirLeafEntry must be 68 bytes");
 
-constexpr u32 DIR_ENTRIES_PER_SECTOR = (CRC_OFF - 16) / sizeof(DirEntry);
-
-struct PACKED DirSector {
-    u64 next_sector;
+struct PACKED DirLeaf {
+    using EntryT = DirLeafEntry;
+    u8 is_leaf;
+    u8 reserved0[3];
+    u32 count;
     u64 gen;
-    DirEntry entries[DIR_ENTRIES_PER_SECTOR];
-    u8 padding[CRC_OFF - 16 - DIR_ENTRIES_PER_SECTOR * sizeof(DirEntry)];
+    DirLeafEntry entries[LEAF_MAX];
+    u8 padding[CRC_OFF - 16 - LEAF_MAX * sizeof(DirLeafEntry)];
     u32 crc;
 };
-static_assert(sizeof(DirSector) == SECTOR_SIZE, "DirSector must fill one sector");
+static_assert(sizeof(DirLeaf) == SECTOR_SIZE, "DirLeaf must fill one sector");
 
 struct PACKED NodeHeader {
     u8 is_leaf;
@@ -91,6 +92,7 @@ struct PACKED LeafEntry {
 static_assert(sizeof(LeafEntry) == 64, "LeafEntry must be 64 bytes");
 
 struct PACKED LeafNode {
+    using EntryT = LeafEntry;
     u8 is_leaf;
     u8 reserved0[3];
     u32 count;
@@ -196,8 +198,6 @@ static u64 (*g_clock_fn)() = nullptr;
 static u64 now() { return g_clock_fn ? g_clock_fn() : 0; }
 void set_clock(u64 (*fn)()) { g_clock_fn = fn; }
 
-static void idx_drop_all();
-static void bloom_drop_all();
 
 static CacheSlot g_cache[CACHE_SLOTS];
 static u64 g_io_reads = 0, g_io_writes = 0, g_cache_hits = 0;
@@ -287,13 +287,6 @@ static void* alloc_ram(u64 bytes) {
     return v;
 }
 
-static void* alloc_ram_soft(u64 bytes) {
-    Status saved = g_err;
-    void* p = alloc_ram(bytes);
-    if (!p) g_err = saved;
-    return p;
-}
-
 static void free_ram(void* p, u64 bytes) {
     if (!p) return;
     int order = 0;
@@ -307,8 +300,6 @@ static u8* g_verify_scratch = nullptr;
 
 static void release_runtime() {
     g_mounted = false;
-    idx_drop_all();
-    bloom_drop_all();
     free_ram(g_bitmap, g_bitmap_bytes);
     free_ram(g_bm_dirty, g_bitmap_bytes / SECTOR_SIZE);
     free_ram(g_verify_scratch, VERIFY_CHUNK * SECTOR_SIZE);
@@ -693,27 +684,31 @@ struct BtDepth {
     ~BtDepth() { --g_bt_depth; }
 };
 
-static bool bt_upsert(u64 node_sector, u64 key, const StarEntry& value, Up* out) {
+static u64 leaf_key(const LeafEntry& e) { return e.star_id; }
+static u64 leaf_key(const DirLeafEntry& e) { return e.key; }
+
+template <typename LeafT>
+static bool bt_upsert(u64 node_sector, const typename LeafT::EntryT& ne, Up* out) {
     BtDepth depth_guard;
     if (g_bt_depth > 32) return fail(Status::Corrupt);
     u8 buf[SECTOR_SIZE];
     if (!rd(node_sector, buf)) return false;
+    const u64 key = leaf_key(ne);
 
     if (buf[0]) {
-        auto* leaf = reinterpret_cast<LeafNode*>(buf);
+        auto* leaf = reinterpret_cast<LeafT*>(buf);
         if (leaf->count > LEAF_MAX) return fail(Status::Corrupt);
-        LeafEntry tmp[LEAF_MAX + 1];
+        typename LeafT::EntryT tmp[LEAF_MAX + 1];
         u32 pos = 0;
-        while (pos < leaf->count && leaf->entries[pos].star_id < key) ++pos;
+        while (pos < leaf->count && leaf_key(leaf->entries[pos]) < key) ++pos;
         u32 total;
-        if (pos < leaf->count && leaf->entries[pos].star_id == key) {
+        if (pos < leaf->count && leaf_key(leaf->entries[pos]) == key) {
             for (u32 i = 0; i < leaf->count; ++i) tmp[i] = leaf->entries[i];
-            tmp[pos].entry = value;
+            tmp[pos] = ne;
             total = leaf->count;
         } else {
             for (u32 i = 0; i < pos; ++i) tmp[i] = leaf->entries[i];
-            tmp[pos].star_id = key;
-            tmp[pos].entry = value;
+            tmp[pos] = ne;
             for (u32 i = pos; i < leaf->count; ++i) tmp[i + 1] = leaf->entries[i];
             total = leaf->count + 1;
         }
@@ -734,7 +729,7 @@ static bool bt_upsert(u64 node_sector, u64 key, const StarEntry& value, Up* out)
 
         u8 rbuf[SECTOR_SIZE];
         for (auto& b : rbuf) b = 0;
-        auto* rleaf = reinterpret_cast<LeafNode*>(rbuf);
+        auto* rleaf = reinterpret_cast<LeafT*>(rbuf);
         rleaf->is_leaf = 1;
         rleaf->count = right_count;
         for (u32 i = 0; i < right_count; ++i) rleaf->entries[i] = tmp[left_count + i];
@@ -743,7 +738,7 @@ static bool bt_upsert(u64 node_sector, u64 key, const StarEntry& value, Up* out)
         if (!rs) return false;
         u64 ls = place_node(node_sector, buf);
         if (!ls) return false;
-        *out = { ls, true, tmp[left_count].star_id, rs };
+        *out = { ls, true, leaf_key(tmp[left_count]), rs };
         return true;
     }
 
@@ -753,7 +748,7 @@ static bool bt_upsert(u64 node_sector, u64 key, const StarEntry& value, Up* out)
     while (i < node->count && key >= node->key[i]) ++i;
 
     Up c;
-    if (!bt_upsert(node->child[i], key, value, &c)) return false;
+    if (!bt_upsert<LeafT>(node->child[i], ne, &c)) return false;
     node->child[i] = c.sector;
 
     if (!c.split) {
@@ -806,9 +801,10 @@ static bool bt_upsert(u64 node_sector, u64 key, const StarEntry& value, Up* out)
     return true;
 }
 
-static bool catalog_upsert(u64 key, const StarEntry& value) {
+template <typename LeafT>
+static bool tree_upsert(u64 root_sector, const typename LeafT::EntryT& ne, u64* new_root) {
     Up r;
-    if (!bt_upsert(g_sb.catalog_root, key, value, &r)) return false;
+    if (!bt_upsert<LeafT>(root_sector, ne, &r)) return false;
     u64 root = r.sector;
     if (r.split) {
         u8 buf[SECTOR_SIZE];
@@ -822,6 +818,16 @@ static bool catalog_upsert(u64 key, const StarEntry& value) {
         root = place_node(0, buf);
         if (!root) return false;
     }
+    *new_root = root;
+    return true;
+}
+
+static bool catalog_upsert(u64 key, const StarEntry& value) {
+    LeafEntry le;
+    le.star_id = key;
+    le.entry = value;
+    u64 root;
+    if (!tree_upsert<LeafNode>(g_sb.catalog_root, le, &root)) return false;
     if (root != g_sb.catalog_root) {
         g_sb.catalog_root = root;
         touch_sb();
@@ -830,25 +836,6 @@ static bool catalog_upsert(u64 key, const StarEntry& value) {
 }
 
 static bool catalog_find(u64 key, StarEntry* out) { return bt_search(g_sb.catalog_root, key, out); }
-
-static int dir_lookup(const StarEntry& d, const char* name, u64* star) {
-    u64 sector = d.first_sector;
-    u8 buf[SECTOR_SIZE];
-    u64 hops = 0;
-    while (sector != 0) {
-        if (++hops > g_sb.total_sectors) { fail(Status::Corrupt); return -1; }
-        if (!rd(sector, buf)) return -1;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
-            if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) {
-                *star = ds->entries[i].star;
-                return 1;
-            }
-        }
-        sector = ds->next_sector;
-    }
-    return 0;
-}
 
 static u64 g_hash_mask = ~0ull;
 
@@ -864,242 +851,218 @@ static u64 hash_name(const char* n) {
     return h & g_hash_mask;
 }
 
-static LookupStats g_ls{};
-static u64 g_clock = 0;
+constexpr u64 DIR_PREFIX_MASK = 0xFFFFFFFFFFFFull;
+constexpr u32 DIR_ORD_BITS = 16;
+constexpr u64 DIR_ORD_MAX = 0xFFFF;
+constexpr u32 DT_MAX_DEPTH = 12;
 
-constexpr u32 IDX_SLOTS = 4;
-constexpr u32 IDX_FREE_MAX = 32;
-constexpr u32 IDX_MIN_CAP = 64;
+static u64 name_prefix(const char* n) { return hash_name(n) & DIR_PREFIX_MASK; }
 
-struct IdxEntry { u64 hash; u64 star; u64 sector; u32 slot; u32 state; };
-struct FreeSlot { u64 sector; u32 slot; u32 pad; };
-struct DirIndex {
-    bool valid;
-    u64 dir, head, stamp, tail;
-    IdxEntry* tab;
-    u32 cap, count, tombs, nfree;
-    FreeSlot freed[IDX_FREE_MAX];
+struct DtCursor {
+    struct Frame { u64 sector; u32 idx; };
+    Frame frames[DT_MAX_DEPTH];
+    u32 depth;
+    u32 pos;
+    bool end;
+    u64 hops;
+    u8 buf[SECTOR_SIZE];
+    DirLeaf* leaf() { return reinterpret_cast<DirLeaf*>(buf); }
 };
-static DirIndex g_idx[IDX_SLOTS];
 
-static void idx_release(DirIndex& ix) {
-    if (ix.tab) free_ram(ix.tab, static_cast<u64>(ix.cap) * sizeof(IdxEntry));
-    ix = DirIndex{};
-}
-static void idx_drop_all() { for (auto& ix : g_idx) idx_release(ix); }
-static void idx_drop(u64 dir) { for (auto& ix : g_idx) if (ix.valid && ix.dir == dir) idx_release(ix); }
-
-static void idx_put_raw(DirIndex& ix, u64 hash, u64 star, u64 sector, u32 slot) {
-    u32 i = static_cast<u32>(hash) & (ix.cap - 1);
-    while (ix.tab[i].state == 1) i = (i + 1) & (ix.cap - 1);
-    if (ix.tab[i].state == 2) --ix.tombs;
-    ix.tab[i] = { hash, star, sector, slot, 1 };
-    ++ix.count;
-}
-
-static bool idx_resize(DirIndex& ix, u32 new_cap) {
-    auto* t = static_cast<IdxEntry*>(alloc_ram_soft(static_cast<u64>(new_cap) * sizeof(IdxEntry)));
-    if (!t) return false;
-    IdxEntry* old = ix.tab;
-    u32 old_cap = ix.cap;
-    if (new_cap > ix.cap) ++g_ls.index_grows;
-    ix.tab = t;
-    ix.cap = new_cap;
-    ix.count = 0;
-    ix.tombs = 0;
-    for (u32 i = 0; i < old_cap; ++i)
-        if (old[i].state == 1) idx_put_raw(ix, old[i].hash, old[i].star, old[i].sector, old[i].slot);
-    if (old) free_ram(old, static_cast<u64>(old_cap) * sizeof(IdxEntry));
-    return true;
-}
-
-static bool idx_room(DirIndex& ix) {
-    if ((static_cast<u64>(ix.count) + ix.tombs + 1) * 4 <= static_cast<u64>(ix.cap) * 3) return true;
-    u32 want = ix.cap;
-    if ((static_cast<u64>(ix.count) + 1) * 2 > want) want *= 2;
-    return idx_resize(ix, want);
-}
-
-static bool idx_insert(DirIndex& ix, const char* name, u64 star, u64 sector, u32 slot) {
-    if (!idx_room(ix)) return false;
-    idx_put_raw(ix, hash_name(name), star, sector, slot);
-    return true;
-}
-
-static void idx_erase(DirIndex& ix, const char* name, u64 sector, u32 slot) {
-    u64 h = hash_name(name);
-    u32 i = static_cast<u32>(h) & (ix.cap - 1);
-    for (u32 n = 0; n < ix.cap; ++n, i = (i + 1) & (ix.cap - 1)) {
-        IdxEntry& e = ix.tab[i];
-        if (e.state == 0) return;
-        if (e.state == 1 && e.hash == h && e.sector == sector && e.slot == slot) {
-            e.state = 2;
-            --ix.count;
-            ++ix.tombs;
-            return;
+static bool dt_descend(DtCursor& c, u64 sector, bool has_key, u64 key) {
+    for (;;) {
+        if (++c.hops > g_sb.total_sectors) return fail(Status::Corrupt);
+        if (!rd(sector, c.buf)) return false;
+        if (c.buf[0]) {
+            if (c.leaf()->count > LEAF_MAX) return fail(Status::Corrupt);
+            return true;
         }
+        auto* n = reinterpret_cast<InternalNode*>(c.buf);
+        if (n->count > INTERNAL_MAX) return fail(Status::Corrupt);
+        u32 i = 0;
+        if (has_key) while (i < n->count && key >= n->key[i]) ++i;
+        if (c.depth >= DT_MAX_DEPTH) return fail(Status::Corrupt);
+        c.frames[c.depth++] = { sector, i };
+        sector = n->child[i];
     }
 }
 
-static int idx_find(DirIndex& ix, const char* name, u64* star, u64* sector, u32* slot) {
-    u64 h = hash_name(name);
-    u32 i = static_cast<u32>(h) & (ix.cap - 1);
-    for (u32 n = 0; n < ix.cap; ++n, i = (i + 1) & (ix.cap - 1)) {
-        IdxEntry& e = ix.tab[i];
-        if (e.state == 0) return 0;
-        if (e.state != 1 || e.hash != h) continue;
-        u8 buf[SECTOR_SIZE];
-        if (!rd(e.sector, buf)) return -1;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        if (e.slot < DIR_ENTRIES_PER_SECTOR && ds->entries[e.slot].in_use &&
-            names_equal(ds->entries[e.slot].name, name)) {
-            *star = ds->entries[e.slot].star;
-            *sector = e.sector;
-            *slot = e.slot;
+static bool dt_settle(DtCursor& c) {
+    while (c.pos >= c.leaf()->count) {
+        bool moved = false;
+        while (c.depth > 0) {
+            DtCursor::Frame& f = c.frames[c.depth - 1];
+            u8 nb[SECTOR_SIZE];
+            if (!rd(f.sector, nb)) return false;
+            auto* n = reinterpret_cast<InternalNode*>(nb);
+            if (n->count > INTERNAL_MAX) return fail(Status::Corrupt);
+            if (f.idx < n->count) {
+                ++f.idx;
+                if (!dt_descend(c, n->child[f.idx], false, 0)) return false;
+                c.pos = 0;
+                moved = true;
+                break;
+            }
+            --c.depth;
+        }
+        if (!moved) { c.end = true; return true; }
+    }
+    return true;
+}
+
+static bool dt_seek(DtCursor& c, u64 root, u64 key) {
+    c.depth = 0;
+    c.hops = 0;
+    c.end = false;
+    if (!dt_descend(c, root, true, key)) return false;
+    c.pos = 0;
+    while (c.pos < c.leaf()->count && c.leaf()->entries[c.pos].key < key) ++c.pos;
+    return dt_settle(c);
+}
+
+static bool dt_next(DtCursor& c) {
+    ++c.pos;
+    return dt_settle(c);
+}
+
+static int dt_scan_run(u64 root, const char* name, u64* star, u64* key, u64* free_ord) {
+    u64 lo = name_prefix(name) << DIR_ORD_BITS;
+    u64 hi = lo | DIR_ORD_MAX;
+    DtCursor c;
+    if (!dt_seek(c, root, lo)) return -1;
+    u64 next_free = 0;
+    while (!c.end) {
+        const DirLeafEntry& e = c.leaf()->entries[c.pos];
+        if (e.key > hi) break;
+        if (names_equal(e.name, name)) {
+            if (star) *star = e.star;
+            if (key) *key = e.key;
             return 1;
         }
+        if ((e.key & DIR_ORD_MAX) == next_free) ++next_free;
+        if (!dt_next(c)) return -1;
     }
+    if (free_ord) *free_ord = next_free;
     return 0;
 }
 
-static DirIndex* idx_build(u64 dir_star, const StarEntry& e) {
-    DirIndex* v = nullptr;
-    for (auto& ix : g_idx) if (!ix.valid) { v = &ix; break; }
-    if (!v) {
-        v = &g_idx[0];
-        for (auto& ix : g_idx) if (ix.stamp < v->stamp) v = &ix;
-    }
-    idx_release(*v);
-    u64 est = static_cast<u64>(e.sector_count) * DIR_ENTRIES_PER_SECTOR * 2;
-    u32 want = IDX_MIN_CAP;
-    while (want < est && want < (1u << 20)) want <<= 1;
-    auto* t = static_cast<IdxEntry*>(alloc_ram_soft(static_cast<u64>(want) * sizeof(IdxEntry)));
-    if (!t) return nullptr;
-    v->tab = t;
-    v->cap = want;
-    v->dir = dir_star;
-    v->head = e.first_sector;
+static bool dt_insert(u64 root, const char* name, u64 star, u64* new_root) {
+    u64 free_ord = 0;
+    int r = dt_scan_run(root, name, nullptr, nullptr, &free_ord);
+    if (r < 0) return false;
+    if (r == 1) return fail(Status::Exists);
+    if (free_ord > DIR_ORD_MAX) return fail(Status::NoSpace);
+    DirLeafEntry ne{};
+    ne.key = (name_prefix(name) << DIR_ORD_BITS) | free_ord;
+    ne.star = star;
+    copy_name(ne.name, name);
+    return tree_upsert<DirLeaf>(root, ne, new_root);
+}
 
-    u64 sector = e.first_sector;
+struct Rm {
+    u64 sector;
+    bool empty;
+};
+
+static bool dt_remove_rec(u64 node_sector, u64 key, u32 depth, Rm* out) {
+    if (depth > DT_MAX_DEPTH) return fail(Status::Corrupt);
     u8 buf[SECTOR_SIZE];
-    for (u64 hops = 0; sector != 0; ++hops) {
-        if (hops > (1ull << 24) || !rd(sector, buf)) {
-            if (hops > (1ull << 24)) fail(Status::Corrupt);
-            idx_release(*v);
-            return nullptr;
+    if (!rd(node_sector, buf)) return false;
+    u64 old_gen = reinterpret_cast<NodeHeader*>(buf)->gen;
+
+    if (buf[0]) {
+        auto* leaf = reinterpret_cast<DirLeaf*>(buf);
+        if (leaf->count > LEAF_MAX) return fail(Status::Corrupt);
+        u32 pos = 0;
+        while (pos < leaf->count && leaf->entries[pos].key < key) ++pos;
+        if (pos >= leaf->count || leaf->entries[pos].key != key) return fail(Status::NotFound);
+        for (u32 j = pos + 1; j < leaf->count; ++j) leaf->entries[j - 1] = leaf->entries[j];
+        --leaf->count;
+        if (leaf->count == 0 && depth > 0) {
+            release_extent(node_sector, 1, old_gen);
+            *out = { 0, true };
+            return true;
         }
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
-            if (ds->entries[i].in_use) {
-                if (!idx_insert(*v, ds->entries[i].name, ds->entries[i].star, sector, i)) {
-                    idx_release(*v);
-                    return nullptr;
-                }
-            } else if (v->nfree < IDX_FREE_MAX) {
-                v->freed[v->nfree++] = { sector, i, 0 };
-            }
-        }
-        v->tail = sector;
-        sector = ds->next_sector;
+        u64 s = place_node(node_sector, buf);
+        if (!s) return false;
+        *out = { s, false };
+        return true;
     }
-    v->valid = true;
-    v->stamp = ++g_clock;
-    ++g_ls.index_builds;
-    return v;
-}
 
-static DirIndex* idx_get(u64 dir_star, const StarEntry& e) {
-    for (auto& ix : g_idx) {
-        if (!ix.valid || ix.dir != dir_star) continue;
-        if (ix.head == e.first_sector) { ix.stamp = ++g_clock; return &ix; }
-        idx_release(ix);
-        break;
+    auto* node = reinterpret_cast<InternalNode*>(buf);
+    if (node->count > INTERNAL_MAX) return fail(Status::Corrupt);
+    u32 i = 0;
+    while (i < node->count && key >= node->key[i]) ++i;
+
+    Rm c;
+    if (!dt_remove_rec(node->child[i], key, depth + 1, &c)) return false;
+    if (!c.empty) {
+        node->child[i] = c.sector;
+        u64 s = place_node(node_sector, buf);
+        if (!s) return false;
+        *out = { s, false };
+        return true;
     }
-    return idx_build(dir_star, e);
-}
 
-constexpr u32 BLOOM_SLOTS = 8;
-constexpr u64 BLOOM_BITS_PER_ENTRY = 16;
-constexpr u64 BLOOM_MAX_BITS = 1ull << 23;
+    if (node->count == 0) {
+        release_extent(node_sector, 1, old_gen);
+        if (depth > 0) { *out = { 0, true }; return true; }
+        u8 eb[SECTOR_SIZE];
+        for (auto& b : eb) b = 0;
+        reinterpret_cast<DirLeaf*>(eb)->is_leaf = 1;
+        u64 s = place_node(0, eb);
+        if (!s) return false;
+        *out = { s, false };
+        return true;
+    }
 
-struct Bloom { bool valid; u64 root, dir, stamp, nbits; u8* bits; };
-static Bloom g_bloom[BLOOM_SLOTS];
-
-static void bloom_release(Bloom& b) {
-    if (b.bits) free_ram(b.bits, b.nbits / 8);
-    b = Bloom{};
-}
-static void bloom_drop_all() { for (auto& b : g_bloom) bloom_release(b); }
-
-static void bloom_positions(u64 h, u64 nbits, u64* p) {
-    u64 step = ((h >> 32) ^ (h << 7)) | 1;
-    for (u32 i = 0; i < 4; ++i) p[i] = (h + i * step) & (nbits - 1);
-}
-static void bloom_add(Bloom& b, u64 h) {
-    u64 p[4];
-    bloom_positions(h, b.nbits, p);
-    for (u32 i = 0; i < 4; ++i) b.bits[p[i] / 8] |= static_cast<u8>(1u << (p[i] % 8));
-}
-static bool bloom_maybe(const Bloom& b, u64 h) {
-    u64 p[4];
-    bloom_positions(h, b.nbits, p);
-    for (u32 i = 0; i < 4; ++i)
-        if (!(b.bits[p[i] / 8] & (1u << (p[i] % 8)))) return false;
+    u32 kill_key = i < node->count ? i : node->count - 1;
+    for (u32 j = kill_key + 1; j < node->count; ++j) node->key[j - 1] = node->key[j];
+    for (u32 j = i + 1; j <= node->count; ++j) node->child[j - 1] = node->child[j];
+    --node->count;
+    u64 s = place_node(node_sector, buf);
+    if (!s) return false;
+    *out = { s, false };
     return true;
 }
 
-static Bloom* bloom_get(u64 root, u64 dir, const StarEntry& e) {
-    for (auto& b : g_bloom)
-        if (b.valid && b.root == root && b.dir == dir) { b.stamp = ++g_clock; return &b; }
-    Bloom* v = nullptr;
-    for (auto& b : g_bloom) if (!b.valid) { v = &b; break; }
-    if (!v) {
-        v = &g_bloom[0];
-        for (auto& b : g_bloom) if (b.stamp < v->stamp) v = &b;
+static bool dt_remove(u64 root, u64 key, u64* new_root) {
+    Rm r;
+    if (!dt_remove_rec(root, key, 0, &r)) return false;
+    u64 cur = r.sector;
+    for (u32 guard = 0; guard < DT_MAX_DEPTH; ++guard) {
+        u8 buf[SECTOR_SIZE];
+        if (!rd(cur, buf)) return false;
+        if (buf[0]) break;
+        auto* n = reinterpret_cast<InternalNode*>(buf);
+        if (n->count != 0) break;
+        u64 child = n->child[0];
+        release_extent(cur, 1, n->gen);
+        cur = child;
     }
-    bloom_release(*v);
-    u64 entries = static_cast<u64>(e.sector_count) * DIR_ENTRIES_PER_SECTOR;
-    u64 nbits = 256;
-    while (nbits < entries * BLOOM_BITS_PER_ENTRY && nbits < BLOOM_MAX_BITS) nbits <<= 1;
-    u8* bits = static_cast<u8*>(alloc_ram_soft(nbits / 8));
-    if (!bits) return nullptr;
-    v->bits = bits;
-    v->nbits = nbits;
-    u64 sector = e.first_sector;
+    *new_root = cur;
+    return true;
+}
+
+using DtVisit = bool (*)(u64 sector, const u8* node, void* ctx);
+
+static bool dt_walk_rec(u64 sector, u32 depth, u64* budget, DtVisit visit, void* ctx) {
+    if (depth > DT_MAX_DEPTH) return fail(Status::Corrupt);
+    if ((*budget)-- == 0) return fail(Status::Corrupt);
     u8 buf[SECTOR_SIZE];
-    for (u64 hops = 0; sector != 0; ++hops) {
-        if (hops > (1ull << 24) || !rd(sector, buf)) { bloom_release(*v); return nullptr; }
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i)
-            if (ds->entries[i].in_use) bloom_add(*v, hash_name(ds->entries[i].name));
-        sector = ds->next_sector;
-    }
-    v->root = root;
-    v->dir = dir;
-    v->valid = true;
-    v->stamp = ++g_clock;
-    ++g_ls.bloom_builds;
-    return v;
+    if (!rd(sector, buf)) return false;
+    if (!visit(sector, buf, ctx)) return false;
+    if (buf[0]) return true;
+    auto* n = reinterpret_cast<InternalNode*>(buf);
+    if (n->count > INTERNAL_MAX) return fail(Status::Corrupt);
+    for (u32 i = 0; i <= n->count; ++i)
+        if (!dt_walk_rec(n->child[i], depth + 1, budget, visit, ctx)) return false;
+    return true;
 }
 
-static int snapshot_lookup(u64 root, u64 dir_star, const StarEntry& e, const char* name, u64* star) {
-    Bloom* b = bloom_get(root, dir_star, e);
-    if (b) {
-        if (!bloom_maybe(*b, hash_name(name))) { ++g_ls.bloom_rejects; return 0; }
-        ++g_ls.bloom_passes;
-    }
-    ++g_ls.scan_lookups;
-    int r = dir_lookup(e, name, star);
-    if (r == 0 && b) ++g_ls.bloom_false_positives;
-    return r;
-}
-
-static int live_lookup(u64 dir_star, const StarEntry& d, const char* name, u64* star) {
-    DirIndex* ix = idx_get(dir_star, d);
-    if (!ix) { ++g_ls.scan_lookups; return dir_lookup(d, name, star); }
-    ++g_ls.index_lookups;
-    u64 sector; u32 slot;
-    return idx_find(*ix, name, star, &sector, &slot);
+static bool dt_walk(u64 root, DtVisit visit, void* ctx) {
+    u64 budget = g_sb.total_sectors;
+    return dt_walk_rec(root, 0, &budget, visit, ctx);
 }
 
 static bool can_add(u64 parent, const char* name) {
@@ -1108,7 +1071,7 @@ static bool can_add(u64 parent, const char* name) {
     if (!catalog_find(parent, &d)) return fail(Status::NotFound);
     if (d.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
     u64 existing;
-    int r = live_lookup(parent, d, name, &existing);
+    int r = dt_scan_run(d.first_sector, name, &existing, nullptr, nullptr);
     if (r < 0) return false;
     if (r == 1) return fail(Status::Exists);
     return true;
@@ -1135,160 +1098,22 @@ static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
     return true;
 }
 
-static bool dir_make_current(StarEntry& e, u64 dir_star) {
-    {
-        u8 head[SECTOR_SIZE];
-        if (e.first_sector != 0) {
-            if (!rd(e.first_sector, head)) return false;
-            if (reinterpret_cast<DirSector*>(head)->gen == g_sb.epoch) return true;
-        }
-    }
-    u8 prev[SECTOR_SIZE];
-    u64 prev_sector = 0;
-    bool prev_dirty = false;
-    bool head_changed = false;
-    u64 sector = e.first_sector;
-
-    u64 hops = 0;
-    while (sector != 0) {
-        if (++hops > g_sb.total_sectors) return fail(Status::Corrupt);
-        u8 cur[SECTOR_SIZE];
-        if (!rd(sector, cur)) return false;
-        auto* ds = reinterpret_cast<DirSector*>(cur);
-        u64 orig_next = ds->next_sector;
-        u64 final_sector = sector;
-        bool dirty = false;
-        if (ds->gen != g_sb.epoch) {
-            u64 old_gen = ds->gen;
-            final_sector = alloc_sectors(1);
-            if (!final_sector) return false;
-            ds->gen = g_sb.epoch;
-            dirty = true;
-            release_extent(sector, 1, old_gen);
-        }
-        if (prev_sector == 0) {
-            if (final_sector != e.first_sector) { e.first_sector = final_sector; head_changed = true; }
-        } else {
-            auto* pd = reinterpret_cast<DirSector*>(prev);
-            if (pd->next_sector != final_sector) { pd->next_sector = final_sector; prev_dirty = true; }
-            if (prev_dirty && !wr(prev_sector, prev)) return false;
-        }
-        __builtin_memcpy(prev, cur, SECTOR_SIZE);
-        prev_sector = final_sector;
-        prev_dirty = dirty;
-        sector = orig_next;
-    }
-    if (prev_sector && prev_dirty && !wr(prev_sector, prev)) return false;
-    if (head_changed && !catalog_upsert(dir_star, e)) return false;
-    return true;
-}
-
-static u64 g_hint_dir = INVALID_STAR;
-static u64 g_hint_sector = 0;
-static u64 g_hint_epoch = 0;
-
 static void reset_runtime_state() {
     g_defer_n = 0;
     g_txn_poisoned = false;
-    idx_drop_all();
-    bloom_drop_all();
-    g_hint_dir = INVALID_STAR;
-    g_hint_sector = 0;
-    g_hint_epoch = 0;
     g_txn_depth = 0;
-}
-
-static bool add_edge_scan(u64 dir_star, const char* name, u64 target, StarEntry& e) {
-
-    u64 sector = e.first_sector;
-    if (g_hint_dir == dir_star && g_hint_epoch == g_sb.epoch && g_hint_sector != 0)
-        sector = g_hint_sector;
-    u8 buf[SECTOR_SIZE];
-    for (;;) {
-        if (!rd(sector, buf)) return false;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
-            if (!ds->entries[i].in_use) {
-                ds->entries[i].in_use = 1;
-                ds->entries[i].star = target;
-                copy_name(ds->entries[i].name, name);
-                if (!wr(sector, buf)) return false;
-                g_hint_dir = dir_star;
-                g_hint_sector = sector;
-                g_hint_epoch = g_sb.epoch;
-                return true;
-            }
-        }
-        if (ds->next_sector != 0) {
-            sector = ds->next_sector;
-            continue;
-        }
-
-        u64 new_sector = alloc_sectors(1);
-        if (new_sector == 0) return false;
-        u8 zero[SECTOR_SIZE];
-        for (auto& b : zero) b = 0;
-        reinterpret_cast<DirSector*>(zero)->gen = g_sb.epoch;
-        if (!wr(new_sector, zero)) return false;
-
-        ds->next_sector = new_sector;
-        if (!wr(sector, buf)) return false;
-
-        e.sector_count += 1;
-        if (!catalog_upsert(dir_star, e)) return false;
-        sector = new_sector;
-    }
 }
 
 static bool add_edge(u64 dir_star, const char* name, u64 target) {
     StarEntry e;
     if (!catalog_find(dir_star, &e)) return fail(Status::NotFound);
     if (e.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
-    if (!dir_make_current(e, dir_star)) return false;
-    DirIndex* ix = idx_get(dir_star, e);
-    if (!ix) return add_edge_scan(dir_star, name, target, e);
-    g_hint_dir = INVALID_STAR;
-
-    u8 buf[SECTOR_SIZE];
-    u64 sector = 0;
-    u32 slot = 0;
-    bool placed = false;
-    while (ix->nfree > 0 && !placed) {
-        FreeSlot f = ix->freed[--ix->nfree];
-        if (!rd(f.sector, buf)) { idx_release(*ix); return false; }
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        if (f.slot < DIR_ENTRIES_PER_SECTOR && !ds->entries[f.slot].in_use) { sector = f.sector; slot = f.slot; placed = true; }
+    u64 root;
+    if (!dt_insert(e.first_sector, name, target, &root)) return false;
+    if (root != e.first_sector) {
+        e.first_sector = root;
+        if (!catalog_upsert(dir_star, e)) return false;
     }
-    if (!placed) {
-        if (!rd(ix->tail, buf)) { idx_release(*ix); return false; }
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        if (ds->next_sector != 0) { idx_release(*ix); return add_edge_scan(dir_star, name, target, e); }
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR && !placed; ++i)
-            if (!ds->entries[i].in_use) { sector = ix->tail; slot = i; placed = true; }
-        if (!placed) {
-            u64 ns = alloc_sectors(1);
-            if (ns == 0) return false;
-            u8 zero[SECTOR_SIZE];
-            for (auto& b : zero) b = 0;
-            reinterpret_cast<DirSector*>(zero)->gen = g_sb.epoch;
-            if (!wr(ns, zero)) return false;
-            ds->next_sector = ns;
-            if (!wr(ix->tail, buf)) { idx_release(*ix); return false; }
-            e.sector_count += 1;
-            if (!catalog_upsert(dir_star, e)) { idx_release(*ix); return false; }
-            ix->tail = ns;
-            sector = ns;
-            slot = 0;
-            placed = true;
-        }
-    }
-    if (!rd(sector, buf)) { idx_release(*ix); return false; }
-    auto* ds = reinterpret_cast<DirSector*>(buf);
-    ds->entries[slot].in_use = 1;
-    ds->entries[slot].star = target;
-    copy_name(ds->entries[slot].name, name);
-    if (!wr(sector, buf)) { idx_release(*ix); return false; }
-    if (!idx_insert(*ix, ds->entries[slot].name, target, sector, slot)) idx_release(*ix);
     return true;
 }
 
@@ -1369,8 +1194,8 @@ static bool format_impl(u64 total_sectors) {
         release_runtime();
         return false;
     }
-    serial::printf("[stellar] formatted: %lu sectors, COW B+tree catalog (leaf fanout %u, internal fanout %u), directory fanout %u/sector, O(1) epoch snapshots (max %u)\n",
-                    total_sectors, LEAF_MAX, INTERNAL_MAX, DIR_ENTRIES_PER_SECTOR, SNAPSHOT_MAX);
+    serial::printf("[stellar] formatted: %lu sectors, COW B+tree catalog and B+tree directories (leaf fanout %u, internal fanout %u), O(1) epoch snapshots (max %u)\n",
+                    total_sectors, LEAF_MAX, INTERNAL_MAX, SNAPSHOT_MAX);
     return true;
 }
 
@@ -1387,7 +1212,7 @@ static SbState sb_parse(u32 slot, Superblock* out, const char** why) {
     if (!blockdev::read_sector(slot, buf)) { *why = "unreadable"; return SbState::IoError; }
     Superblock sb;
     __builtin_memcpy(&sb, buf, sizeof(sb));
-    if (sb.magic != MAGIC || sb.version != VERSION) { *why = "not a v6 superblock"; return SbState::Blank; }
+    if (sb.magic != MAGIC || sb.version != VERSION) { *why = "not a v7 superblock"; return SbState::Blank; }
     if (!crc_ok(buf)) { *why = "bad checksum"; return SbState::Invalid; }
     if (sb.features_incompat & ~FEATURES_INCOMPAT_KNOWN) { *why = "unknown incompatible features"; return SbState::Unsupported; }
     const char* problem = superblock_problem(sb, blockdev::capacity_sectors());
@@ -1506,13 +1331,15 @@ static u64 create_constellation_impl(u64 parent, const char* name) {
 
     u8 zero[SECTOR_SIZE];
     for (auto& b : zero) b = 0;
-    reinterpret_cast<DirSector*>(zero)->gen = g_sb.epoch;
+    auto* root_leaf = reinterpret_cast<DirLeaf*>(zero);
+    root_leaf->is_leaf = 1;
+    root_leaf->gen = g_sb.epoch;
     if (!wr(start, zero)) return INVALID_STAR;
 
     StarEntry entry{};
     entry.type = TYPE_CONSTELLATION;
     entry.first_sector = start;
-    entry.sector_count = 1;
+    entry.size_bytes = parent;
     entry.gen = g_sb.epoch;
     entry.nlink = 1;
     entry.mtime = now();
@@ -1644,7 +1471,6 @@ static bool delete_snapshot_impl(u64 snap) {
     if (snap > g_sb.snap_count) return fail(Status::NoSuchSnapshot);
     if (g_sb.snaps[snap - 1].catalog_root == 0) return fail(Status::NoSuchSnapshot);
     Txn txn;
-    bloom_drop_all();
     g_sb.snaps[snap - 1].catalog_root = 0;
     g_sb.snaps[snap - 1].epoch = 0;
     while (g_sb.snap_count > 0 && g_sb.snaps[g_sb.snap_count - 1].catalog_root == 0)
@@ -1659,68 +1485,31 @@ bool delete_snapshot(u64 snap, Status* why) {
 }
 
 static bool dir_is_empty(const StarEntry& d) {
-    u64 sector = d.first_sector;
     u8 buf[SECTOR_SIZE];
-    u64 hops = 0;
-    while (sector != 0) {
-        if (++hops > g_sb.total_sectors) { fail(Status::Corrupt); return false; }
-        if (!rd(sector, buf)) return false;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i)
-            if (ds->entries[i].in_use) return false;
-        sector = ds->next_sector;
-    }
-    return true;
-}
-
-static bool remove_edge_scan(const char* name, u64* target_out, StarEntry& e) {
-
-    u64 sector = e.first_sector;
-    u8 buf[SECTOR_SIZE];
-    u64 hops = 0;
-    while (sector != 0) {
-        if (++hops > g_sb.total_sectors) return fail(Status::Corrupt);
-        if (!rd(sector, buf)) return false;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
-            if (ds->entries[i].in_use && names_equal(ds->entries[i].name, name)) {
-                g_hint_dir = INVALID_STAR;
-                *target_out = ds->entries[i].star;
-                ds->entries[i].in_use = 0;
-                ds->entries[i].star = 0;
-                ds->entries[i].name[0] = 0;
-                return wr(sector, buf);
-            }
-        }
-        sector = ds->next_sector;
-    }
-    return false;
+    if (!rd(d.first_sector, buf)) return false;
+    return buf[0] && reinterpret_cast<DirLeaf*>(buf)->count == 0;
 }
 
 static bool remove_edge(u64 dir_star, const char* name, u64* target_out) {
     StarEntry e;
     if (!catalog_find(dir_star, &e)) return fail(Status::NotFound);
     if (e.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
-    if (!dir_make_current(e, dir_star)) return false;
-    DirIndex* ix = idx_get(dir_star, e);
-    if (!ix) return remove_edge_scan(name, target_out, e);
-
-    u64 star, sector;
-    u32 slot;
-    int r = idx_find(*ix, name, &star, &sector, &slot);
-    if (r < 0) { idx_release(*ix); return false; }
+    u64 star, key;
+    int r = dt_scan_run(e.first_sector, name, &star, &key, nullptr);
+    if (r < 0) return false;
     if (r == 0) return fail(Status::NotFound);
-    u8 buf[SECTOR_SIZE];
-    if (!rd(sector, buf)) { idx_release(*ix); return false; }
-    auto* ds = reinterpret_cast<DirSector*>(buf);
-    ds->entries[slot].in_use = 0;
-    ds->entries[slot].star = 0;
-    ds->entries[slot].name[0] = 0;
-    if (!wr(sector, buf)) { idx_release(*ix); return false; }
-    g_hint_dir = INVALID_STAR;
-    idx_erase(*ix, name, sector, slot);
-    if (ix->nfree < IDX_FREE_MAX) ix->freed[ix->nfree++] = { sector, slot, 0 };
+    u64 root;
+    if (!dt_remove(e.first_sector, key, &root)) return false;
+    if (root != e.first_sector) {
+        e.first_sector = root;
+        if (!catalog_upsert(dir_star, e)) return false;
+    }
     *target_out = star;
+    return true;
+}
+
+static bool release_visit(u64 sector, const u8* node, void*) {
+    release_extent(sector, 1, reinterpret_cast<const NodeHeader*>(node)->gen);
     return true;
 }
 
@@ -1729,17 +1518,7 @@ static void release_current_epoch(const StarEntry& t) {
         release_extent(t.first_sector, t.sector_count, t.gen);
         return;
     }
-    u64 sector = t.first_sector;
-    u8 buf[SECTOR_SIZE];
-    u64 hops = 0;
-    while (sector != 0) {
-        if (++hops > g_sb.total_sectors) return;
-        if (!rd(sector, buf)) return;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        u64 next = ds->next_sector;
-        release_extent(sector, 1, ds->gen);
-        sector = next;
-    }
+    dt_walk(t.first_sector, &release_visit, nullptr);
 }
 
 static bool unlink_impl(u64 dir_star, const char* name) {
@@ -1769,7 +1548,6 @@ static bool unlink_impl(u64 dir_star, const char* name) {
     dead.sector_count = 0;
     dead.checksum = 0;
     if (!catalog_upsert(target, dead)) return false;
-    if (t.type == TYPE_CONSTELLATION) idx_drop(target);
     release_current_epoch(t);
     return txn.finish(true);
 }
@@ -1787,13 +1565,18 @@ static void mk_range(u64 first, u64 count) {
     for (u64 s = first; s < first + count && s < g_sb.total_sectors; ++s) mk_set(s);
 }
 
-static bool mark_dir_chain(u64 sector) {
+static bool mark_dir_tree(u64 sector, u32 depth) {
+    if (depth > DT_MAX_DEPTH || sector == 0 || sector >= g_sb.total_sectors) return false;
+    if (mk_test(sector)) return true;
+    mk_set(sector);
     u8 buf[SECTOR_SIZE];
-    while (sector != 0 && sector < g_sb.total_sectors && !mk_test(sector)) {
-        mk_set(sector);
-        if (!rd(sector, buf)) return false;
-        sector = reinterpret_cast<DirSector*>(buf)->next_sector;
-    }
+    if (!rd(sector, buf)) return false;
+    if (buf[0]) return true;
+    auto* node = reinterpret_cast<InternalNode*>(buf);
+    u32 n = node->count;
+    if (n > INTERNAL_MAX) n = INTERNAL_MAX;
+    for (u32 i = 0; i <= n; ++i)
+        if (!mark_dir_tree(node->child[i], depth + 1)) return false;
     return true;
 }
 
@@ -1812,7 +1595,7 @@ static bool mark_tree(u64 sector, u32 depth) {
         for (u32 i = 0; i < n; ++i) {
             StarEntry e = leaf->entries[i].entry;
             if (e.type == TYPE_FILE) mk_range(e.first_sector, e.sector_count);
-            else if (e.type == TYPE_CONSTELLATION && !mark_dir_chain(e.first_sector)) return false;
+            else if (e.type == TYPE_CONSTELLATION && !mark_dir_tree(e.first_sector, 0)) return false;
         }
         return true;
     }
@@ -1966,8 +1749,7 @@ static u64 find_impl(u64 dir_star, const char* name, u64 snap) {
     if (!bt_search(root, dir_star, &e)) return fail_id(Status::NotFound);
     if (e.type != TYPE_CONSTELLATION) return fail_id(Status::NotADirectory);
     u64 star = INVALID_STAR;
-    int r = snap == LIVE ? live_lookup(dir_star, e, name, &star)
-                         : snapshot_lookup(root, dir_star, e, name, &star);
+    int r = dt_scan_run(e.first_sector, name, &star, nullptr, nullptr);
     if (r < 0) return INVALID_STAR;
     if (r == 0) return fail_id(Status::NotFound);
     return star;
@@ -1978,6 +1760,25 @@ u64 find(u64 dir_star, const char* name, u64 snap, Status* why) {
     return api.val(find_impl(dir_star, name, snap));
 }
 
+struct ListCtx {
+    u64 root;
+    ListCallback cb;
+    void* ctx;
+};
+
+static bool list_visit(u64, const u8* node, void* c) {
+    if (!node[0]) return true;
+    auto* lc = static_cast<ListCtx*>(c);
+    auto* leaf = reinterpret_cast<const DirLeaf*>(node);
+    if (leaf->count > LEAF_MAX) return fail(Status::Corrupt);
+    for (u32 i = 0; i < leaf->count; ++i) {
+        StarEntry child;
+        u32 type = bt_search(lc->root, leaf->entries[i].star, &child) ? child.type : TYPE_FREE;
+        lc->cb(leaf->entries[i].name, leaf->entries[i].star, type, lc->ctx);
+    }
+    return true;
+}
+
 static void list_impl(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
     if (!g_mounted) { fail(Status::NotMounted); return; }
     u64 root;
@@ -1985,21 +1786,8 @@ static void list_impl(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
     StarEntry e;
     if (!bt_search(root, dir_star, &e)) { fail(Status::NotFound); return; }
     if (e.type != TYPE_CONSTELLATION) { fail(Status::NotADirectory); return; }
-    u64 sector = e.first_sector;
-    u8 buf[SECTOR_SIZE];
-    u64 hops = 0;
-    while (sector != 0) {
-        if (++hops > g_sb.total_sectors) { fail(Status::Corrupt); return; }
-        if (!rd(sector, buf)) return;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
-            if (!ds->entries[i].in_use) continue;
-            StarEntry child;
-            u32 type = bt_search(root, ds->entries[i].star, &child) ? child.type : TYPE_FREE;
-            cb(ds->entries[i].name, ds->entries[i].star, type, ctx);
-        }
-        sector = ds->next_sector;
-    }
+    ListCtx lc{ root, cb, ctx };
+    dt_walk(e.first_sector, &list_visit, &lc);
 }
 
 void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap, Status* why) {
@@ -2122,30 +1910,51 @@ static bool ck_extent_ok(const StarEntry& e) {
     return (crc ^ 0xFFFFFFFFu) == e.checksum;
 }
 
-static void ck_dir(const StarEntry& e) {
-    ++g_ck.r->dirs;
-    u64 sector = e.first_sector, count = 0;
+static void ck_dnode(u64 dir_star, u64 sector, u32 depth, u64 lo, bool has_hi, u64 hi) {
+    if (depth > DT_MAX_DEPTH) { ++g_ck.r->bad_structure; return; }
+    if (!ck_claim(sector, 1)) return;
     u8 buf[SECTOR_SIZE];
-    while (sector != 0) {
-        if (!ck_claim(sector, 1)) return;
-        ++count;
-        if (!ck_read(sector, buf)) return;
-        auto* ds = reinterpret_cast<DirSector*>(buf);
-        for (u32 i = 0; i < DIR_ENTRIES_PER_SECTOR; ++i) {
-            if (!ds->entries[i].in_use) continue;
+    if (!ck_read(sector, buf)) return;
+    if (buf[0]) {
+        auto* leaf = reinterpret_cast<DirLeaf*>(buf);
+        if (leaf->count > LEAF_MAX) { ++g_ck.r->bad_structure; return; }
+        if (leaf->count == 0 && depth > 0) ++g_ck.r->bad_structure;
+        u64 prev = 0;
+        for (u32 i = 0; i < leaf->count; ++i) {
+            DirLeafEntry le = leaf->entries[i];
+            if ((i > 0 && le.key <= prev) || le.key < lo || (has_hi && le.key >= hi)) ++g_ck.r->bad_structure;
+            prev = le.key;
             ++g_ck.r->entries;
             bool named = false;
-            for (u32 k = 0; k < NAME_LEN; ++k) if (!ds->entries[i].name[k]) { named = k > 0; break; }
-            if (!named) ++g_ck.r->bad_structure;
-            u64 target = ds->entries[i].star;
+            for (u32 k = 0; k < NAME_LEN; ++k) if (!le.name[k]) { named = k > 0; break; }
+            if (!named || !valid_name(le.name) || (le.key >> DIR_ORD_BITS) != name_prefix(le.name)) ++g_ck.r->bad_structure;
             StarEntry child;
-            if (!bt_search(g_ck.root, target, &child) || child.type == TYPE_FREE) ++g_ck.r->bad_structure;
-            else if (g_ck.live && target < g_ck.nstars) ++g_ck.edges[target];
+            if (!bt_search(g_ck.root, le.star, &child) || child.type == TYPE_FREE) {
+                ++g_ck.r->bad_structure;
+            } else {
+                if (child.type == TYPE_CONSTELLATION && child.size_bytes != dir_star) ++g_ck.r->bad_structure;
+                if (g_ck.live && le.star < g_ck.nstars) ++g_ck.edges[le.star];
+            }
         }
-        sector = ds->next_sector;
-        if (count > (1ull << 24)) { ++g_ck.r->bad_structure; return; }
+        return;
     }
-    if (count != e.sector_count) ++g_ck.r->bad_structure;
+    auto* node = reinterpret_cast<InternalNode*>(buf);
+    if (node->count > INTERNAL_MAX) { ++g_ck.r->bad_structure; return; }
+    for (u32 i = 0; i < node->count; ++i) {
+        if ((i > 0 && node->key[i] <= node->key[i - 1]) || node->key[i] < lo || (has_hi && node->key[i] >= hi))
+            ++g_ck.r->bad_structure;
+    }
+    for (u32 i = 0; i <= node->count; ++i) {
+        u64 clo = i == 0 ? lo : node->key[i - 1];
+        bool chi_set = i < node->count || has_hi;
+        u64 chi = i < node->count ? node->key[i] : hi;
+        ck_dnode(dir_star, node->child[i], depth + 1, clo, chi_set, chi);
+    }
+}
+
+static void ck_dir(u64 dir_star, const StarEntry& e) {
+    ++g_ck.r->dirs;
+    ck_dnode(dir_star, e.first_sector, 0, 0, false, 0);
 }
 
 static void ck_node(u64 sector, u32 depth) {
@@ -2176,7 +1985,8 @@ static void ck_node(u64 sector, u32 depth) {
                 bool first_time = in_range && !ck_bit(g_ck.ref, e.first_sector);
                 if (ck_claim(e.first_sector, e.sector_count) && g_ck.deep && first_time && !ck_extent_ok(e)) ++g_ck.r->bad_files;
             } else if (e.type == TYPE_CONSTELLATION) {
-                ck_dir(e);
+                if (le.star_id == ROOT_STAR && e.size_bytes != INVALID_STAR) ++g_ck.r->bad_structure;
+                ck_dir(le.star_id, e);
             } else if (e.type != TYPE_FREE) {
                 ++g_ck.r->bad_structure;
             }
@@ -2254,7 +2064,7 @@ static bool stat_impl(u64 star, StatInfo* out, u64 snap) {
     if (!view_root(snap, &root)) return false;
     StarEntry e;
     if (!bt_search(root, star, &e) || e.type == TYPE_FREE) return fail(Status::NotFound);
-    *out = { e.type, e.nlink, e.flags, e.sector_count, e.size_bytes, e.mtime, e.gen };
+    *out = { e.type, e.nlink, e.flags, e.sector_count, e.type == TYPE_CONSTELLATION ? 0 : e.size_bytes, e.mtime, e.gen };
     return true;
 }
 
@@ -2278,15 +2088,8 @@ bool set_flags(u64 star, u32 flags, Status* why) {
     return api.ok(set_flags_impl(star, flags));
 }
 
-LookupStats lookup_stats() {
-    Guard guard;
-    return g_ls;
-}
-
 void test_set_hash_mask(u64 mask) {
     Guard guard;
-    idx_drop_all();
-    bloom_drop_all();
     g_hash_mask = mask ? mask : ~0ull;
 }
 

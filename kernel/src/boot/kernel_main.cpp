@@ -705,7 +705,7 @@ extern "C" NORETURN void kernel_main() {
             fb::printf(stress_ok ? 0xC0FFC0 : 0xE0D080,
                        "[%s] Stellar FS B+tree + growable directory stress: %lu stars, %lu mismatch(es), %lu dir entries enumerated\n",
                        stress_ok ? "ok" : "--", STRESS_COUNT, stress_mismatches, dir_count);
-            serial::printf("[stellar] stress: %lu stars created (create_ok=%d), %lu mismatch(es), root dir enumerates %lu/%lu entries across its sector chain\n",
+            serial::printf("[stellar] stress: %lu stars created (create_ok=%d), %lu mismatch(es), root dir enumerates %lu/%lu entries across its B+tree\n",
                             STRESS_COUNT, stress_create_ok ? 1 : 0, stress_mismatches, dir_count, expected_dir_count);
         } else {
             fb::printf(0xE0D080, "[--] Stellar FS: not available, see the serial log\n");
