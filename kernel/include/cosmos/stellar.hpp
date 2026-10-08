@@ -14,6 +14,8 @@ constexpr u64 LIVE = 0;
 constexpr u32 SNAPSHOT_MAX = 24;
 constexpr u32 NAME_MAX_LEN = 51;
 
+constexpr u32 RENAME_NOREPLACE = 1u << 0;
+
 constexpr u32 FLAG_EXTENT_TABLE = 1u << 0;
 constexpr u32 USER_FLAGS_MASK = 0xFFFF0000u;
 
@@ -42,6 +44,7 @@ enum class Status : i32 {
     NoSuchSnapshot,
     TooManySnapshots,
     Unsupported,
+    WouldCycle,
     Internal,
 };
 const char* status_name(Status s);
@@ -71,6 +74,8 @@ u64 snapshot(Status* why = nullptr);
 u32 snapshot_count();
 bool link(u64 dir_star, const char* name, u64 target, Status* why = nullptr);
 bool unlink(u64 dir_star, const char* name, Status* why = nullptr);
+bool rename(u64 src_dir, const char* src_name, u64 dst_dir, const char* dst_name, u32 flags = 0, Status* why = nullptr);
+bool rename_path(const char* from, const char* to, u32 flags = 0, Status* why = nullptr);
 bool delete_snapshot(u64 snap, Status* why = nullptr);
 u32 live_snapshot_count();
 u64 gc(Status* why = nullptr);

@@ -340,6 +340,68 @@ static void demo_blockdev_stress(void* arg) {
     orbital::exit_current();
 }
 
+struct PurgeList {
+    char names[8][stellar::NAME_MAX_LEN + 1];
+    u64 stars[8];
+    u32 types[8];
+    u32 n;
+};
+
+static void purge_collect(const char* name, u64 star, u32 type, void* ctx) {
+    auto* p = static_cast<PurgeList*>(ctx);
+    if (p->n >= 8) return;
+    u32 i = 0;
+    for (; name[i] && i < stellar::NAME_MAX_LEN; ++i) p->names[p->n][i] = name[i];
+    p->names[p->n][i] = 0;
+    p->stars[p->n] = star;
+    p->types[p->n] = type;
+    ++p->n;
+}
+
+static void purge_dir(u64 dir, u32 depth) {
+    if (depth > 4) return;
+    PurgeList pl;
+    pl.n = 0;
+    stellar::list(dir, &purge_collect, &pl);
+    for (u32 i = 0; i < pl.n; ++i) {
+        if (pl.types[i] == stellar::TYPE_CONSTELLATION) purge_dir(pl.stars[i], depth + 1);
+        stellar::unlink(dir, pl.names[i]);
+    }
+}
+
+static bool selftest_rename() {
+    using stellar::Status;
+    const u64 NONE = stellar::INVALID_STAR;
+    const u64 root = stellar::ROOT_STAR;
+    u64 rn = stellar::find(root, "rn-selftest");
+    if (rn != NONE) purge_dir(rn, 0);
+    else rn = stellar::create_constellation(root, "rn-selftest");
+    if (rn == NONE) return false;
+
+    Status why = Status::Ok;
+    u8 sink[8];
+    u64 f = stellar::create_file(rn, "a", "one", 3);
+    u64 d1 = stellar::create_constellation(rn, "d1");
+    u64 d2 = stellar::create_constellation(d1, "d2");
+    bool ok = f != NONE && d1 != NONE && d2 != NONE;
+
+    ok = ok && stellar::rename(rn, "a", d1, "b");
+    ok = ok && stellar::find(d1, "b") == f && stellar::find(rn, "a") == NONE && file_equals(f, "one");
+
+    u64 g = stellar::create_file(rn, "c", "two", 3);
+    ok = ok && g != NONE && stellar::rename(d1, "b", rn, "c");
+    ok = ok && stellar::find(rn, "c") == f && file_equals(f, "one") && stellar::read_file(g, sink, sizeof(sink)) == stellar::READ_ERROR;
+
+    ok = ok && !stellar::rename(rn, "d1", d2, "x", 0, &why) && why == Status::WouldCycle;
+    ok = ok && stellar::rename(d1, "d2", rn, "d2m") && stellar::find(rn, "d2m") == d2;
+    ok = ok && !stellar::rename(rn, "c", rn, "d1", stellar::RENAME_NOREPLACE, &why) && why == Status::Exists;
+
+    purge_dir(rn, 0);
+    ok = ok && stellar::unlink(root, "rn-selftest");
+    stellar::CheckReport rep{};
+    return ok && stellar::check(&rep, false) && rep.ok();
+}
+
 extern "C" NORETURN void kernel_main() {
     serial::init();
     serial::writeln("\n=== Aphelion booting ===");
@@ -569,6 +631,14 @@ extern "C" NORETURN void kernel_main() {
                     serial::printf("[clock] /sub/clock.probe mtime %s (%lu ms)\n", iso, probe_info.mtime);
                     serial::printf("[selftest] clock mtime: %s\n", probe_ok ? "ok" : "MISMATCH");
                 }
+            }
+
+            {
+                bool rename_ok = selftest_rename();
+                fb::printf(rename_ok ? 0xC0FFC0 : 0xE0D080,
+                           "[%s] Stellar FS rename: move, replace, NOREPLACE and directory-cycle refusal, %s\n",
+                           rename_ok ? "ok" : "--", rename_ok ? "all as expected" : "MISMATCH");
+                serial::printf("[selftest] rename: %s\n", rename_ok ? "ok" : "MISMATCH");
             }
 
             static u8 readback[128];

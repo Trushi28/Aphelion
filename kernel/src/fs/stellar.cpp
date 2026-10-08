@@ -189,6 +189,7 @@ const char* status_name(Status s) {
         case Status::NoSuchSnapshot: return "no such snapshot";
         case Status::TooManySnapshots: return "snapshot table full";
         case Status::Unsupported: return "unsupported on-disk features";
+        case Status::WouldCycle: return "would move a directory into itself";
         case Status::Internal: return "internal error";
     }
     return "unknown";
@@ -1521,9 +1522,7 @@ static void release_current_epoch(const StarEntry& t) {
     dt_walk(t.first_sector, &release_visit, nullptr);
 }
 
-static bool unlink_impl(u64 dir_star, const char* name) {
-    if (!g_mounted) return fail(Status::NotMounted);
-    Txn txn;
+static bool unlink_edge(u64 dir_star, const char* name) {
     u64 target = find(dir_star, name);
     if (target == INVALID_STAR) return false;
     if (target == ROOT_STAR) return fail(Status::InvalidArgument);
@@ -1538,7 +1537,7 @@ static bool unlink_impl(u64 dir_star, const char* name) {
     if (!catalog_find(target, &t)) return fail(Status::NotFound);
     if (t.nlink > 1) {
         --t.nlink;
-        return txn.finish(catalog_upsert(target, t));
+        return catalog_upsert(target, t);
     }
     StarEntry dead = t;
     dead.type = TYPE_FREE;
@@ -1549,7 +1548,13 @@ static bool unlink_impl(u64 dir_star, const char* name) {
     dead.checksum = 0;
     if (!catalog_upsert(target, dead)) return false;
     release_current_epoch(t);
-    return txn.finish(true);
+    return true;
+}
+
+static bool unlink_impl(u64 dir_star, const char* name) {
+    if (!g_mounted) return fail(Status::NotMounted);
+    Txn txn;
+    return txn.finish(unlink_edge(dir_star, name));
 }
 
 bool unlink(u64 dir_star, const char* name, Status* why) {
@@ -1855,6 +1860,83 @@ static u64 resolve_parent_impl(const char* path, char* leaf, u64 leaf_size, u64 
 u64 resolve_parent(const char* path, char* leaf, u64 leaf_size, u64 snap, Status* why) {
     Api api(why);
     return api.val(resolve_parent_impl(path, leaf, leaf_size, snap));
+}
+
+static int is_self_or_ancestor(u64 candidate, u64 start) {
+    u64 cur = start;
+    for (u64 hops = 0; cur != INVALID_STAR; ++hops) {
+        if (cur == candidate) return 1;
+        if (hops > g_sb.next_star_id) { fail(Status::Corrupt); return -1; }
+        StarEntry e;
+        if (!catalog_find(cur, &e) || e.type != TYPE_CONSTELLATION) { fail(Status::Corrupt); return -1; }
+        cur = e.size_bytes;
+    }
+    return 0;
+}
+
+static bool rename_impl(u64 src_dir, const char* src_name, u64 dst_dir, const char* dst_name, u32 flags) {
+    if (!g_mounted) return fail(Status::NotMounted);
+    if (flags & ~RENAME_NOREPLACE) return fail(Status::InvalidArgument);
+    if (!valid_name(src_name) || !valid_name(dst_name)) return fail(Status::InvalidName);
+    Txn txn;
+    StarEntry sd, dd;
+    if (!catalog_find(src_dir, &sd) || !catalog_find(dst_dir, &dd)) return fail(Status::NotFound);
+    if (sd.type != TYPE_CONSTELLATION || dd.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
+
+    u64 src_star = INVALID_STAR;
+    int r = dt_scan_run(sd.first_sector, src_name, &src_star, nullptr, nullptr);
+    if (r < 0) return false;
+    if (r == 0) return fail(Status::NotFound);
+    if (src_dir == dst_dir && names_equal(src_name, dst_name)) return txn.finish(true);
+
+    StarEntry s;
+    if (!catalog_find(src_star, &s)) return fail(Status::NotFound);
+    if (s.type == TYPE_CONSTELLATION && src_dir != dst_dir) {
+        int c = is_self_or_ancestor(src_star, dst_dir);
+        if (c < 0) return false;
+        if (c == 1) return fail(Status::WouldCycle);
+    }
+
+    u64 dst_star = INVALID_STAR;
+    r = dt_scan_run(dd.first_sector, dst_name, &dst_star, nullptr, nullptr);
+    if (r < 0) return false;
+    bool replacing = r == 1;
+    if (replacing) {
+        if (flags & RENAME_NOREPLACE) return fail(Status::Exists);
+        if (dst_star == src_star) return txn.finish(true);
+        StarEntry t;
+        if (!catalog_find(dst_star, &t)) return fail(Status::NotFound);
+        if (s.type == TYPE_CONSTELLATION && t.type != TYPE_CONSTELLATION) return fail(Status::NotADirectory);
+        if (s.type != TYPE_CONSTELLATION && t.type == TYPE_CONSTELLATION) return fail(Status::IsADirectory);
+        if (t.type == TYPE_CONSTELLATION && !dir_is_empty(t)) return fail(Status::NotEmpty);
+    }
+
+    if (replacing && !unlink_edge(dst_dir, dst_name)) return false;
+    u64 removed = INVALID_STAR;
+    if (!remove_edge(src_dir, src_name, &removed)) return false;
+    if (removed != src_star) return fail(Status::Corrupt);
+    if (!add_edge(dst_dir, dst_name, src_star)) return false;
+    if (s.type == TYPE_CONSTELLATION && src_dir != dst_dir) {
+        if (!catalog_find(src_star, &s)) return fail(Status::NotFound);
+        s.size_bytes = dst_dir;
+        if (!catalog_upsert(src_star, s)) return false;
+    }
+    return txn.finish(true);
+}
+
+bool rename(u64 src_dir, const char* src_name, u64 dst_dir, const char* dst_name, u32 flags, Status* why) {
+    Api api(why);
+    return api.ok(rename_impl(src_dir, src_name, dst_dir, dst_name, flags));
+}
+
+bool rename_path(const char* from, const char* to, u32 flags, Status* why) {
+    Api api(why);
+    char src_leaf[NAME_LEN], dst_leaf[NAME_LEN];
+    u64 src_dir = resolve_parent_impl(from, src_leaf, sizeof(src_leaf), LIVE);
+    if (src_dir == INVALID_STAR) return api.ok(false);
+    u64 dst_dir = resolve_parent_impl(to, dst_leaf, sizeof(dst_leaf), LIVE);
+    if (dst_dir == INVALID_STAR) return api.ok(false);
+    return api.ok(rename_impl(src_dir, src_leaf, dst_dir, dst_leaf, flags));
 }
 
 struct CkState {

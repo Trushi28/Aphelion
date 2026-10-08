@@ -184,7 +184,7 @@ subdirectory's parent pointer, and counts the edges that feed the link-count che
 Every operation that can fail takes an optional trailing `Status* why`. The return value keeps its old shape
 (`bool`, a star ID or `INVALID_STAR`), and `*why` says which of these happened: `NotMounted`, `NotFormatted`,
 `InvalidArgument`, `InvalidName`, `NotFound`, `Exists`, `NotADirectory`, `IsADirectory`, `NotEmpty`,
-`NoSpace`, `NoMemory`, `Io`, `Checksum`, `Corrupt`, `Busy`, `NoSuchSnapshot`, `TooManySnapshots`. `Internal`
+`NoSpace`, `NoMemory`, `Io`, `Checksum`, `Corrupt`, `Busy`, `NoSuchSnapshot`, `TooManySnapshots`, `Unsupported`, `WouldCycle`. `Internal`
 means a failure path forgot to say why; the tests assert it never appears. It is an out-parameter rather than
 the return type because `Ok` is 0, so a function returning `Status` would silently invert every existing
 `if (!unlink(...))`.
@@ -196,6 +196,24 @@ are refused; duplicates are refused with `Exists`.
 `resolve("/a/b/c")` walks a path from the root in any view, and `resolve_parent` splits a path into the parent
 directory and a validated leaf name. Repeated and trailing slashes are accepted (a trailing slash requires a
 directory), and relative paths, `.` and `..` are refused because directories keep no parent pointer.
+
+## Rename
+
+`rename(src_dir, src_name, dst_dir, dst_name, flags)` and `rename_path(from, to, flags)` move an entry between
+names and directories in one transaction, so a crash leaves the old name or the new one and never both or neither.
+The star keeps its ID, size, link count and `mtime`; only the edge moves. Snapshots keep showing the old name where
+it was.
+
+- **Replacing.** If the destination exists it is replaced atomically. A file replaces a file, a directory replaces
+  an *empty* directory; a file over a directory is `IsADirectory`, a directory over a file `NotADirectory`, over a
+  non-empty directory `NotEmpty`. The replaced star goes through the same death-or-link-count path as `unlink`, so
+  replacing one of two hard links leaves the other intact. `RENAME_NOREPLACE` turns any existing destination into
+  `Exists`.
+- **No-ops.** Renaming a name onto itself, or onto another name of the same star, succeeds and changes nothing.
+- **Cycles.** Moving a directory into itself or any descendant is `WouldCycle`. The check walks the destination's
+  parent pointers up to the root, so it costs the depth of the destination, not the size of the moved subtree. A
+  moved directory's parent pointer is rewritten in the same transaction, and `check()` verifies it.
+- A rename does not update the `mtime` of either directory.
 
 ## Mount and format policy
 

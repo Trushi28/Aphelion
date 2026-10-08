@@ -712,6 +712,12 @@ int main() {
                        [] { return stellar::unlink(stellar::ROOT_STAR, "f"); }},
             {"unlink (frees extents)", [] { st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)); },
                        [] { return stellar::unlink(stellar::ROOT_STAR, "f"); }},
+            {"rename", [] { st_file = make(stellar::ROOT_STAR, "f", "x"); st_dir = stellar::create_constellation(stellar::ROOT_STAR, "d"); },
+                       [] { return stellar::rename(stellar::ROOT_STAR, "f", st_dir, "g"); }},
+            {"rename (replacing a file)", [] { st_file = make(stellar::ROOT_STAR, "f", "x"); make(stellar::ROOT_STAR, "g", "y"); },
+                       [] { return stellar::rename(stellar::ROOT_STAR, "f", stellar::ROOT_STAR, "g"); }},
+            {"rename (moving a directory)", [] { st_dir = stellar::create_constellation(stellar::ROOT_STAR, "d"); st_file = stellar::create_constellation(stellar::ROOT_STAR, "e"); make(st_dir, "in", "i"); },
+                       [] { return stellar::rename(stellar::ROOT_STAR, "d", st_file, "d2"); }},
             {"delete_snapshot", [] { st_snap = stellar::snapshot(); }, [] { return stellar::delete_snapshot(st_snap); }},
             {"gc", [] {
                         st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload));
@@ -1007,8 +1013,8 @@ int main() {
 
         fresh_fs();
         make(stellar::ROOT_STAR, "keep", "k");
-        const char* names[4] = {"create_file", "write_file", "snapshot", "unlink"};
-        for (int which = 0; which < 4; ++which) {
+        const char* names[5] = {"create_file", "write_file", "snapshot", "unlink", "rename"};
+        for (int which = 0; which < 5; ++which) {
             fresh_fs();
             u64 star = make(stellar::ROOT_STAR, "x", "old");
             g_wcount = 0; g_fail_after = ~0ull; g_last_sb_w = 0;
@@ -1017,7 +1023,8 @@ int main() {
                     case 0: return stellar::create_file(stellar::ROOT_STAR, "n", "new", 3, w) != stellar::INVALID_STAR;
                     case 1: return stellar::write_file(star, "newer", 5, w) != stellar::INVALID_STAR;
                     case 2: return stellar::snapshot(w) != stellar::INVALID_STAR;
-                    default: return stellar::unlink(stellar::ROOT_STAR, "x", w);
+                    case 3: return stellar::unlink(stellar::ROOT_STAR, "x", w);
+                    default: return stellar::rename(stellar::ROOT_STAR, "x", stellar::ROOT_STAR, "y", 0, w);
                 }
             };
             CHECK(run(&st) && st == Status::Ok, names[which]);
@@ -1111,14 +1118,23 @@ int main() {
                 int k = static_cast<int>(rnd() % N);
                 char nm[16]; name_of(nm, "n", static_cast<u64>(k));
                 stellar::Status st = stellar::Status::Internal;
-                if (op < 38) {
+                if (op < 32) {
                     u64 id = stellar::create_file(d, nm, nm, strlen(nm), &st);
                     if (live.present[k]) note(id == stellar::INVALID_STAR && st == stellar::Status::Exists, "duplicate create", step);
                     else { note(id != stellar::INVALID_STAR && st == stellar::Status::Ok, "create", step); live.present[k] = true; live.star[k] = id; }
-                } else if (op < 63) {
+                } else if (op < 54) {
                     bool ok = stellar::unlink(d, nm, &st);
                     if (live.present[k]) { note(ok && st == stellar::Status::Ok, "unlink", step); live.present[k] = false; }
                     else note(!ok && st == stellar::Status::NotFound, "unlink missing", step);
+                } else if (op < 66) {
+                    int k2 = static_cast<int>(rnd() % N);
+                    char nm2[16]; name_of(nm2, "n", static_cast<u64>(k2));
+                    bool ok = stellar::rename(d, nm, d, nm2, 0, &st);
+                    if (!live.present[k]) note(!ok && st == stellar::Status::NotFound, "rename of a missing name", step);
+                    else {
+                        note(ok && st == stellar::Status::Ok, "rename", step);
+                        if (k2 != k) { live.present[k2] = true; live.star[k2] = live.star[k]; live.present[k] = false; }
+                    }
                 } else if (op < 88) {
                     u64 id = stellar::find(d, nm, stellar::LIVE, &st);
                     if (live.present[k]) note(id == live.star[k] && st == stellar::Status::Ok, "find present", step);
@@ -1467,7 +1483,7 @@ int main() {
     // ---------------------------------------------------------------- crash consistency
     {
         using stellar::Status;
-        const u32 SEEDS = 2;
+        const u32 SEEDS = 3;
         u64 grand_states = 0, grand_bad = 0, grand_garbage = 0;
         for (u32 seed = 1; seed <= SEEDS; ++seed) {
             fresh_fs(1024);
@@ -1507,25 +1523,40 @@ int main() {
             for (int i = 0; i < NOPS; ++i) {
                 pos_start[i] = g_log_n;
                 u32 r = rnd() % 100;
-                if (r < 30) create();
-                else if (r < 38 && ndirs < 9) {
+                if (r < 27) create();
+                else if (r < 33 && ndirs < 9) {
                     char nm[16]; name_of(nm, "d", counter++);
                     u64 id = stellar::create_constellation(dirs[rnd() % ndirs], nm);
                     if (id != stellar::INVALID_STAR) dirs[ndirs++] = id;
-                } else if (r < 54) {
+                } else if (r < 47) {
                     int f = pick_alive();
                     if (f >= 0) { u32 size = rnd() % 2500; fill(size); stellar::write_file(files[f].star, data, size); }
-                } else if (r < 68) {
+                } else if (r < 59) {
                     int f = pick_alive();
                     if (f >= 0 && stellar::unlink(files[f].dir, files[f].name)) files[f].alive = false;
-                } else if (r < 74) {
+                } else if (r < 70) {
+                    int f = pick_alive();
+                    if (f >= 0) {
+                        u64 to_dir = dirs[rnd() % ndirs];
+                        int t = (rnd() % 3 == 0) ? pick_alive() : -1;
+                        char fresh[16];
+                        const char* to = fresh;
+                        if (t >= 0 && t != f) { to_dir = files[t].dir; to = files[t].name; }
+                        else name_of(fresh, "r", counter++);
+                        if (stellar::rename(files[f].dir, files[f].name, to_dir, to)) {
+                            if (t >= 0 && t != f) files[t].alive = false;
+                            files[f].dir = to_dir;
+                            u32 k = 0; for (; to[k]; ++k) files[f].name[k] = to[k]; files[f].name[k] = 0;
+                        }
+                    }
+                } else if (r < 75) {
                     int f = pick_alive();
                     if (f >= 0) { char nm[16]; name_of(nm, "l", counter++); stellar::link(dirs[rnd() % ndirs], nm, files[f].star); }
                 } else if (r < 81) {
                     if (nsnap < 4) { u64 id = stellar::snapshot(); if (id != stellar::INVALID_STAR) snaps[nsnap++] = id; }
-                } else if (r < 86) {
+                } else if (r < 85) {
                     if (nsnap) { u32 k = rnd() % nsnap; if (stellar::delete_snapshot(snaps[k])) { snaps[k] = snaps[--nsnap]; } }
-                } else if (r < 90) {
+                } else if (r < 89) {
                     stellar::gc();
                 } else {
                     stellar::begin_batch();
@@ -1802,6 +1833,111 @@ int main() {
         u64 made = stellar::create_file(p, leaf, "m", 1);
         CHECK(made != stellar::INVALID_STAR && stellar::resolve("/a/b/made.txt") == made, "create by path round trip");
         (void)x;
+    }
+
+    // ---------------------------------------------------------------- rename
+    fresh_fs();
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        stellar::CheckReport r{};
+        const u64 NONE = stellar::INVALID_STAR;
+        const u64 ROOT = stellar::ROOT_STAR;
+        u64 a = stellar::create_constellation(ROOT, "a");
+        u64 b = stellar::create_constellation(ROOT, "b");
+        u64 f = make(a, "f", "file");
+        stellar::StatInfo before{}, after{};
+        stellar::stat(f, &before);
+
+        CHECK(stellar::rename(a, "f", a, "g", 0, &st) && st == Status::Ok, "rename within a directory");
+        CHECK(stellar::find(a, "g") == f && stellar::find(a, "f") == NONE && eq(f, "file"), "same star, new name, old name gone, bytes intact");
+        stellar::stat(f, &after);
+        CHECK(after.nlink == before.nlink && after.size_bytes == before.size_bytes && after.mtime == before.mtime, "rename changes no metadata");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "a rename with no snapshot alive leaks nothing");
+
+        u64 snap = stellar::snapshot();
+        CHECK(stellar::rename(a, "g", b, "h"), "move a file to another directory");
+        CHECK(stellar::find(b, "h") == f && stellar::find(a, "g") == NONE, "the file moved");
+        CHECK(stellar::find(a, "g", snap) == f && stellar::find(b, "h", snap) == NONE, "a snapshot still sees the old name in the old place");
+        CHECK(stellar::delete_snapshot(snap), "drop the snapshot");
+        CHECK(stellar::gc() != NONE, "gc returns what the snapshot was holding");
+
+        CHECK(stellar::rename(b, "h", b, "h", 0, &st) && st == Status::Ok && stellar::find(b, "h") == f, "renaming a name onto itself is a no-op");
+        CHECK(stellar::link(b, "h2", f), "second name for the same file");
+        CHECK(stellar::rename(b, "h", b, "h2", 0, &st) && st == Status::Ok, "renaming onto another name of the same file succeeds");
+        stellar::stat(f, &after);
+        CHECK(stellar::find(b, "h") == f && stellar::find(b, "h2") == f && after.nlink == 2, "and changes nothing, both names remain");
+        CHECK(stellar::unlink(b, "h2"), "drop the extra name");
+
+        stellar::rename(a, "nope", a, "x", 0, &st);                 CHECK(st == Status::NotFound, "missing source");
+        stellar::rename(a, "", a, "x", 0, &st);                     CHECK(st == Status::InvalidName, "empty source name");
+        stellar::rename(b, "h", b, "p/q", 0, &st);                  CHECK(st == Status::InvalidName, "slash in the new name");
+        stellar::rename(b, "h", b, "..", 0, &st);                   CHECK(st == Status::InvalidName, "dotdot as the new name");
+        stellar::rename(f, "x", b, "y", 0, &st);                    CHECK(st == Status::NotADirectory, "source directory is a file");
+        stellar::rename(b, "h", f, "y", 0, &st);                    CHECK(st == Status::NotADirectory, "destination directory is a file");
+        stellar::rename(77777, "x", b, "y", 0, &st);                CHECK(st == Status::NotFound, "missing source directory");
+        stellar::rename(b, "h", b, "y", 0x80, &st);                 CHECK(st == Status::InvalidArgument, "unknown flags are refused");
+        CHECK(stellar::find(b, "h") == f, "none of the refused renames changed anything");
+
+        u64 occupied = make(b, "occupied", "x");
+        stellar::rename(b, "h", b, "occupied", stellar::RENAME_NOREPLACE, &st);
+        CHECK(st == Status::Exists && stellar::find(b, "occupied") == occupied && stellar::find(b, "h") == f, "NOREPLACE refuses to replace");
+        CHECK(stellar::rename(b, "h", b, "occupied", 0, &st) && st == Status::Ok, "replacing an existing file");
+        u8 sink[64];
+        CHECK(stellar::find(b, "occupied") == f && stellar::find(b, "h") == NONE && stellar::read_file(occupied, sink, sizeof(sink)) == stellar::READ_ERROR,
+              "the replaced file is gone and its star is dead");
+
+        u64 keep = make(a, "keep", "k");
+        CHECK(stellar::link(b, "keep2", keep), "second link to keep");
+        u64 mover = make(a, "mover", "m");
+        CHECK(stellar::rename(a, "mover", b, "keep2") && stellar::find(b, "keep2") == mover, "replacing one name of a multiply linked file");
+        stellar::stat(keep, &after);
+        CHECK(eq(keep, "k") && after.nlink == 1 && stellar::find(a, "keep") == keep, "the other link keeps the file alive with a corrected link count");
+
+        u64 d1 = stellar::create_constellation(a, "d1");
+        make(a, "x", "plain");
+        stellar::rename(a, "x", a, "d1", 0, &st);                   CHECK(st == Status::IsADirectory, "a file cannot replace a directory");
+        stellar::rename(a, "d1", a, "x", 0, &st);                   CHECK(st == Status::NotADirectory, "a directory cannot replace a file");
+        u64 d2 = stellar::create_constellation(a, "d2");
+        make(d1, "in", "i");
+        stellar::rename(a, "d2", a, "d1", 0, &st);                  CHECK(st == Status::NotEmpty, "a directory cannot replace a non-empty directory");
+        CHECK(stellar::unlink(d1, "in"), "empty the target");
+        CHECK(stellar::rename(a, "d2", a, "d1"), "a directory replaces an empty directory");
+        stellar::StatInfo si{};
+        CHECK(stellar::find(a, "d1") == d2 && !stellar::stat(d1, &si), "and the replaced directory star is dead");
+
+        u64 top = stellar::create_constellation(a, "top");
+        u64 mid = stellar::create_constellation(top, "mid");
+        u64 leafd = stellar::create_constellation(mid, "leaf");
+        make(leafd, "deep", "deep");
+        stellar::rename(a, "top", top, "x", 0, &st);                CHECK(st == Status::WouldCycle, "a directory cannot move into itself");
+        stellar::rename(a, "top", leafd, "x", 0, &st);              CHECK(st == Status::WouldCycle, "or into its own grandchild");
+        stellar::rename(top, "mid", leafd, "x", 0, &st);            CHECK(st == Status::WouldCycle, "or a subdirectory into its own child");
+        CHECK(stellar::find(a, "top") == top && stellar::find(top, "mid") == mid, "refused moves change nothing");
+        CHECK(stellar::rename(top, "mid", b, "mid2"), "moving a populated directory elsewhere works");
+        CHECK(stellar::resolve("/b/mid2/leaf/deep") != NONE && eq(stellar::resolve("/b/mid2/leaf/deep"), "deep"), "its contents followed it");
+        CHECK(stellar::check(&r) && r.ok(), "parent pointers stay consistent after a directory move");
+        CHECK(stellar::rename(b, "mid2", ROOT, "up"), "moving a directory to the root");
+        u64 leaf_now = stellar::resolve("/up/leaf");
+        CHECK(leaf_now != NONE && stellar::rename(a, "top", leaf_now, "t", 0, &st) && st == Status::Ok, "a directory can move under a directory that is not its descendant");
+        CHECK(stellar::rename(ROOT, "up", a, "top2", 0, &st) && st == Status::Ok, "a directory that already holds moved directories can move again");
+        CHECK(stellar::resolve("/a/top2/leaf/t/x") == NONE && stellar::resolve("/a/top2/leaf/t") == top, "the whole subtree followed");
+        stellar::rename(a, "top2", top, "z", 0, &st);
+        CHECK(st == Status::WouldCycle, "and it cannot move beneath what was moved into it");
+        CHECK(stellar::check(&r) && r.ok(), "still consistent");
+
+        stellar::rename_path("/missing/x", "/b/y", 0, &st);         CHECK(st == Status::NotFound, "path rename: missing parent");
+        stellar::rename_path("a", "/b/y", 0, &st);                  CHECK(st == Status::InvalidName, "path rename: relative path");
+        u64 pf = make(b, "pf", "path");
+        CHECK(stellar::rename_path("/b/pf", "/a/pf2", 0, &st) && st == Status::Ok && eq(stellar::resolve("/a/pf2"), "path") && stellar::find(b, "pf") == NONE,
+              "path rename moves a file");
+        (void)pf;
+
+        CHECK(stellar::mount(), "remount");
+        CHECK(eq(stellar::resolve("/a/pf2"), "path"), "the renamed file persists");
+        bool clean = stellar::check(&r);
+        CHECK(clean && r.ok(), "the filesystem checks clean after renames and a remount");
+        CHECK(r.leaked == 0, "and nothing leaked");
     }
 
     // ---------------------------------------------------------------- directory scaling
