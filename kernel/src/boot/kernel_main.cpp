@@ -641,6 +641,9 @@ extern "C" NORETURN void kernel_main() {
                 serial::printf("[selftest] rename: %s\n", rename_ok ? "ok" : "MISMATCH");
             }
 
+            serial::printf("[stellar] free-space bitmap: %lu KiB resident, %lu of %lu sectors free\n",
+                            stellar::bitmap_ram_bytes() / 1024, stellar::free_space_sectors(), stellar::total_sectors());
+
             static u8 readback[128];
             u64 n = stellar::read_file(file, readback, sizeof(readback) - 1);
             if (n == stellar::READ_ERROR) n = 0;

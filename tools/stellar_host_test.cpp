@@ -32,10 +32,12 @@ static bool g_rec = false, g_quiet = false;
 static void rec_write(u64 s, const void* d) { if (g_rec && g_log_n < 24576) { g_log[g_log_n].sector = s; __builtin_memcpy(g_log[g_log_n].data, d, 512); ++g_log_n; } }
 static void rec_barrier() { if (g_rec && g_log_n < 24576) g_log[g_log_n++].sector = ~0ull; }
 static bool g_flush_fails = false;
+static u64 g_bad_read_sector = ~0ull;
+static bool g_batch_read_fails = false;
 static u64 g_fail_after = ~0ull;
 
 namespace blockdev {
-bool read_sector(u64 s, void* b) { if (s >= g_sectors) return false; __builtin_memcpy(b, g_disk + s * 512, 512); return true; }
+bool read_sector(u64 s, void* b) { if (s >= g_sectors || s == g_bad_read_sector) return false; __builtin_memcpy(b, g_disk + s * 512, 512); return true; }
 bool write_sector(u64 s, const void* b) {
     if (s >= g_sectors || g_wcount >= g_fail_after) return false;
     ++g_wcount;
@@ -44,7 +46,7 @@ bool write_sector(u64 s, const void* b) {
     __builtin_memcpy(g_disk + s * 512, b, 512);
     return true;
 }
-bool read_sectors(u64 s, u64 n, void* b) { if (s + n > g_sectors) return false; __builtin_memcpy(b, g_disk + s * 512, n * 512); return true; }
+bool read_sectors(u64 s, u64 n, void* b) { if (s + n > g_sectors || g_batch_read_fails || (g_bad_read_sector >= s && g_bad_read_sector < s + n)) return false; __builtin_memcpy(b, g_disk + s * 512, n * 512); return true; }
 bool write_sectors(u64 s, u64 n, const void* b) {
     if (s + n > g_sectors) return false;
     u64 ok_n = n;
@@ -180,6 +182,56 @@ static u64 tree_digest() {
         if (stellar::stat(stellar::ROOT_STAR, &si, snap)) d = dmix(d, snap) + digest_dir(stellar::ROOT_STAR, snap, snap * 131);
     }
     return d;
+}
+
+static void det_workload(u64 seed, u32 steps) {
+    static u8 data[700 * 1024];
+    struct F { u64 star; char name[16]; bool alive; };
+    static F files[80];
+    u32 n = 0, counter = 0;
+    u64 snaps[8];
+    u32 nsnap = 0;
+    u64 rng = 0x9E3779B97F4A7C15ull * seed + 77;
+    auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return static_cast<u32>(rng >> 11); };
+    auto pick = [&]() -> int {
+        for (int tries = 0; tries < 8 && n; ++tries) { u32 i = rnd() % n; if (files[i].alive) return static_cast<int>(i); }
+        return -1;
+    };
+    for (u32 step = 0; step < steps; ++step) {
+        u32 r = rnd() % 100;
+        if (r < 45) {
+            u32 size = (rnd() % 8 == 0) ? 150000 + rnd() % 500000 : rnd() % 20000;
+            if (n >= 80 || stellar::free_space_sectors() < size / 512 + 4000) continue;
+            u32 salt = rnd();
+            for (u32 i = 0; i < size; ++i) data[i] = static_cast<u8>(i * 31 + salt);
+            char nm[16]; name_of(nm, "w", counter++);
+            u64 st = stellar::create_file(stellar::ROOT_STAR, nm, data, size);
+            if (st != stellar::INVALID_STAR) {
+                files[n].star = st; files[n].alive = true;
+                u32 k = 0; for (; nm[k]; ++k) files[n].name[k] = nm[k]; files[n].name[k] = 0;
+                ++n;
+            }
+        } else if (r < 65) {
+            int f = pick();
+            if (f >= 0 && stellar::unlink(stellar::ROOT_STAR, files[f].name)) files[f].alive = false;
+        } else if (r < 80) {
+            int f = pick();
+            u32 size = rnd() % 30000;
+            if (f >= 0 && stellar::free_space_sectors() > size / 512 + 4000) {
+                u32 salt = rnd();
+                for (u32 i = 0; i < size; ++i) data[i] = static_cast<u8>(i * 17 + salt);
+                stellar::write_file(files[f].star, data, size);
+            }
+        } else if (r < 85) {
+            if (nsnap < 6) { u64 id = stellar::snapshot(); if (id != stellar::INVALID_STAR) snaps[nsnap++] = id; }
+        } else if (r < 89) {
+            if (nsnap) { u32 k = rnd() % nsnap; if (stellar::delete_snapshot(snaps[k])) snaps[k] = snaps[--nsnap]; }
+        } else if (r < 94) {
+            stellar::gc();
+        } else {
+            stellar::mount();
+        }
+    }
 }
 
 int main() {
@@ -1483,16 +1535,18 @@ int main() {
     // ---------------------------------------------------------------- crash consistency
     {
         using stellar::Status;
-        const u32 SEEDS = 3;
+        const u32 SEEDS = 4;
         u64 grand_states = 0, grand_bad = 0, grand_garbage = 0;
         for (u32 seed = 1; seed <= SEEDS; ++seed) {
-            fresh_fs(1024);
-            static u8 base[1024 * 512], dur[1024 * 512], work[1024 * 512];
-            __builtin_memcpy(base, g_disk, sizeof(base));
+            const u64 sectors = seed == 4 ? 8192 : 1024;
+            const u64 disk_bytes = sectors * 512;
+            fresh_fs(sectors);
+            stellar::test_set_bitmap_cache_slots(seed == 4 ? 1 : 64);
+            static u8 base[8192 * 512], dur[8192 * 512], work[8192 * 512];
             static u64 pos_start[128], pos_end[128], dg[129];
             const int NOPS = 64;
-            g_log_n = 0; g_rec = true; g_quiet = true;
-            dg[0] = tree_digest();
+            g_quiet = true;
+            stellar::BitmapStats bs0 = stellar::bitmap_stats();
 
             u64 rng = 0x9E3779B97F4A7C15ull * seed + 12345;
             auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return static_cast<u32>(rng >> 11); };
@@ -1520,6 +1574,14 @@ int main() {
                 for (int tries = 0; tries < 8; ++tries) { u32 i = rnd() % nfiles; if (files[i].alive) return static_cast<int>(i); }
                 return -1;
             };
+            if (seed == 4) {
+                for (int i = 0; i < 24; ++i) create();
+                static u8 filler[4100 * 512];
+                stellar::create_file(stellar::ROOT_STAR, "filler", filler, sizeof(filler));
+            }
+            __builtin_memcpy(base, g_disk, disk_bytes);
+            g_log_n = 0; g_rec = true;
+            dg[0] = tree_digest();
             for (int i = 0; i < NOPS; ++i) {
                 pos_start[i] = g_log_n;
                 u32 r = rnd() % 100;
@@ -1574,7 +1636,7 @@ int main() {
             CHECK(stellar::check(&final_r) && final_r.ok(), "the recorded workload ends in a clean filesystem");
 
             u8* heap = g_disk;
-            __builtin_memcpy(dur, base, sizeof(dur));
+            __builtin_memcpy(dur, base, disk_bytes);
             u32 bnd = 0, scan = 0;
             u64 states = 0, bad = 0, garbage_states = 0, deep = 0;
             u64 rng2 = 0xD1B54A32D192ED03ull * seed;
@@ -1599,7 +1661,7 @@ int main() {
 
                 for (int variant = 0; variant < 7; ++variant) {
                     if (variant >= 2 && wn == 0) break;
-                    __builtin_memcpy(work, dur, sizeof(work));
+                    __builtin_memcpy(work, dur, disk_bytes);
                     bool inc[512];
                     int garbage = -1;
                     for (u32 q = 0; q < wn; ++q) {
@@ -1628,6 +1690,7 @@ int main() {
                         stellar::CheckReport r{};
                         if (d != a1 && d != a2) why = "state is neither before nor after the in-flight operation";
                         else if (!stellar::check(&r, true) || r.unmarked || r.bad_crc || r.bad_files || r.bad_links || r.bad_structure) why = "check() found damage";
+                        else if (!stellar::test_bitmap_summary_ok()) why = "the free-space summary disagrees with the bitmap";
                         else if (states % 5 == 0) {
                             ++deep;
                             if (stellar::gc() == stellar::INVALID_STAR) why = "gc failed on the crashed image";
@@ -1649,6 +1712,9 @@ int main() {
             process(g_log_n);
             g_disk = heap;
             g_quiet = false;
+            stellar::BitmapStats bs1 = stellar::bitmap_stats();
+            if (seed == 4) CHECK(bs1.early_writes > bs0.early_writes, "the one-slot bitmap cache really did write pages early during the crash exploration");
+            stellar::test_set_bitmap_cache_slots(64);
             printf("crash exploration seed %u: %d ops, %lu writes, %lu flush barriers, %lu crash states (%lu with a torn write, %lu with recovery+continue), %lu bad\n",
                    seed, NOPS, writes, barriers, states, garbage_states, deep, bad);
             grand_states += states; grand_bad += bad; grand_garbage += garbage_states;
@@ -1833,6 +1899,129 @@ int main() {
         u64 made = stellar::create_file(p, leaf, "m", 1);
         CHECK(made != stellar::INVALID_STAR && stellar::resolve("/a/b/made.txt") == made, "create by path round trip");
         (void)x;
+    }
+
+    // ---------------------------------------------------------------- paged bitmap
+    {
+        using stellar::Status;
+        stellar::CheckReport r{};
+        const u64 SECT = 40000;
+        static u8 img_ref[40000 * 512], img_other[40000 * 512];
+        u64 early_ref = 0, early_small = 0;
+
+        auto run = [&](u32 slots, u64 window, u8* out, u64* early) {
+            fresh_fs(SECT);
+            stellar::test_set_bitmap_cache_slots(slots);
+            stellar::test_set_gc_window_pages(window);
+            stellar::BitmapStats a = stellar::bitmap_stats();
+            det_workload(1, 260);
+            stellar::BitmapStats b = stellar::bitmap_stats();
+            if (early) *early = b.early_writes - a.early_writes;
+            CHECK(stellar::check(&r) && r.ok(), "the workload leaves a clean filesystem");
+            CHECK(stellar::test_bitmap_summary_ok(), "the free-space summary agrees with the bitmap pages");
+            __builtin_memcpy(out, g_disk, SECT * 512);
+        };
+        auto same_image = [&](const char* msg) {
+            u64 bad = ~0ull;
+            for (u64 sec = 0; sec < SECT && bad == ~0ull; ++sec)
+                if (__builtin_memcmp(img_ref + sec * 512, img_other + sec * 512, 512) != 0) bad = sec;
+            if (bad != ~0ull) printf("  first differing sector: %lu\n", bad);
+            CHECK(bad == ~0ull, msg);
+        };
+
+        run(64, 0, img_ref, &early_ref);
+        CHECK(early_ref == 0, "a 10-page disk fits the default cache, so nothing is written early");
+        run(1, 0, img_other, &early_small);
+        printf("paged bitmap: %lu early page writes with a one-slot cache, %lu with the default\n", early_small, early_ref);
+        CHECK(early_small > 0, "a one-slot cache evicts dirty pages");
+        same_image("a one-slot bitmap cache produces a byte-identical disk image");
+        run(2, 1, img_other, nullptr);
+        same_image("a two-slot cache with one-page gc windows produces the same image");
+        run(64, 3, img_other, nullptr);
+        same_image("three-page gc windows produce the same image");
+        stellar::test_set_bitmap_cache_slots(64);
+        stellar::test_set_gc_window_pages(0);
+    }
+
+    // ---------------------------------------------------------------- bitmap I/O faults and damage
+    fresh_fs(40000);
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        stellar::CheckReport r{};
+        for (u64 i = 0; i < 12; ++i) { char nm[32]; name_of(nm, "p", i); make(stellar::ROOT_STAR, nm, nm); }
+
+        g_bad_read_sector = 2 + 3;
+        CHECK(!stellar::mount(&st) && st == Status::Io, "an unreadable bitmap sector fails the mount with Io");
+        g_bad_read_sector = ~0ull;
+        CHECK(stellar::mount(&st) && st == Status::Ok, "and the mount works once the sector reads again");
+        g_batch_read_fails = true;
+        CHECK(stellar::mount(&st) && st == Status::Ok, "if only batched reads fail, mount falls back to single reads");
+        g_batch_read_fails = false;
+        CHECK(stellar::check(&r) && r.ok() && stellar::test_bitmap_summary_ok(), "and the result is sound");
+
+        const u32 slot_counts[2] = {64, 1};
+        for (u32 slots : slot_counts) {
+            stellar::test_set_bitmap_cache_slots(slots);
+            u64 page_sec = 2 + (slots == 1 ? 9 : 7);
+            g_disk[page_sec * 512 + 20] ^= 1;
+            CHECK(stellar::mount(&st) && st == Status::Ok, "a damaged bitmap page is rebuilt at mount");
+            u32 stored;
+            __builtin_memcpy(&stored, g_disk + page_sec * 512 + 508, 4);
+            CHECK(stored == stellar::crc32(g_disk + page_sec * 512, 508), "the page was rewritten with a valid checksum, even though it holds only free space");
+            CHECK(g_disk[page_sec * 512 + 20] == 0, "and the flipped bit is gone");
+            CHECK(stellar::check(&r) && r.ok() && r.leaked == 0 && stellar::test_bitmap_summary_ok(), "rebuilt state is exact");
+        }
+        stellar::test_set_bitmap_cache_slots(64);
+    }
+
+    // ---------------------------------------------------------------- a 2 GiB disk
+    {
+        using stellar::Status;
+        stellar::CheckReport r{};
+        constexpr u64 FILE_BYTES = 40ull << 20;
+        constexpr u64 FILE_SECTORS = FILE_BYTES / 512;
+        static u8 payload[40 << 20], readback[40 << 20];
+        auto fill = [&](u64 i) {
+            __builtin_memset(payload, static_cast<int>(0x41 + i), FILE_BYTES);
+            for (u64 k = 0; k < FILE_BYTES; k += 509) payload[k] = static_cast<u8>((k >> 9) + i);
+        };
+        fresh_fs(1ull << 22);
+        u64 free0 = stellar::free_space_sectors();
+        stellar::BitmapStats a = stellar::bitmap_stats();
+        u64 stars[5];
+        bool made = true;
+        stellar::begin_batch();
+        for (u64 i = 0; i < 5; ++i) {
+            fill(i);
+            char nm[16]; name_of(nm, "big", i);
+            stars[i] = stellar::create_file(stellar::ROOT_STAR, nm, payload, FILE_BYTES);
+            made = made && stars[i] != stellar::INVALID_STAR;
+        }
+        CHECK(stellar::end_batch() && made, "five 40 MiB files on a 2 GiB disk, in one group commit");
+        stellar::BitmapStats b = stellar::bitmap_stats();
+        printf("2 GiB disk: %lu bitmap page reads, %lu page writes, %lu of them early\n", b.page_reads - a.page_reads, b.page_writes - a.page_writes, b.early_writes - a.early_writes);
+        CHECK(b.early_writes > a.early_writes, "one transaction touching more than 64 bitmap pages writes some early");
+        CHECK(stellar::test_bitmap_summary_ok(), "summary agrees with the bitmap after crossing 100 pages");
+        u64 used = free0 - stellar::free_space_sectors();
+        CHECK(used >= 5 * FILE_SECTORS && used < 5 * FILE_SECTORS + 64, "the free count is the five extents plus a few metadata nodes");
+
+        u64 free_before = stellar::free_space_sectors();
+        CHECK(stellar::mount() && stellar::free_space_sectors() == free_before && stellar::test_bitmap_summary_ok(), "a remount rebuilds the identical summary from 1031 pages");
+        fill(3);
+        u64 got = stellar::read_file(stars[3], readback, FILE_BYTES);
+        CHECK(got == FILE_BYTES && __builtin_memcmp(payload, readback, FILE_BYTES) == 0, "a file read back after the remount is intact");
+
+        for (u64 i = 0; i < 3; ++i) { char nm[16]; name_of(nm, "big", i); CHECK(stellar::unlink(stellar::ROOT_STAR, nm), "unlink a 40 MiB file"); }
+        stellar::test_set_gc_window_pages(100);
+        CHECK(stellar::gc() != stellar::INVALID_STAR, "gc over eleven windows");
+        CHECK(stellar::check(&r, false) && r.ok() && r.leaked == 0 && stellar::test_bitmap_summary_ok(), "and the result is exact");
+        u64 now_free = stellar::free_space_sectors();
+        CHECK(now_free + 2 * FILE_SECTORS + 64 >= free0 && now_free + 2 * FILE_SECTORS <= free0, "three of the five extents were returned");
+        for (u64 i = 3; i < 5; ++i) { char nm[16]; name_of(nm, "big", i); CHECK(stellar::unlink(stellar::ROOT_STAR, nm), "unlink the rest"); }
+        stellar::test_set_gc_window_pages(0);
+        CHECK(stellar::gc() != stellar::INVALID_STAR && stellar::check(&r, false) && r.ok() && r.leaked == 0, "everything is returned");
+        CHECK(stellar::free_space_sectors() + 64 >= free0, "free space is back to where it started, less a few catalog nodes");
     }
 
     // ---------------------------------------------------------------- rename

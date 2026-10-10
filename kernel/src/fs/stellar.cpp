@@ -124,9 +124,27 @@ struct CacheSlot {
 static u64 g_hhdm = 0;
 static bool g_mounted = false;
 static Superblock g_sb{};
-static u8* g_bitmap = nullptr;
-static u8* g_bm_dirty = nullptr;
-static u64 g_bm_lo = ~0ull, g_bm_hi = 0;
+constexpr u32 BM_SLOTS = 64;
+constexpr u32 BM_BATCH = 32;
+constexpr u64 PAGE_BITS = BM_PAYLOAD * 8;
+constexpr u8 BM_BAD = 1;
+
+struct BmSlot {
+    u64 page;
+    u64 stamp;
+    bool valid, dirty;
+    u8 data[SECTOR_SIZE];
+};
+static BmSlot g_bm_slots[BM_SLOTS];
+static u32 g_bm_slot_limit = BM_SLOTS;
+static u64 g_bm_clock = 0;
+static u32 g_bm_ndirty = 0;
+static bool g_bm_early = false;
+static u16* g_bm_free = nullptr;
+static u8* g_bm_flags = nullptr;
+static u8* g_bm_scratch = nullptr;
+static u64 g_bm_pages = 0;
+static u64 g_bm_page_reads = 0, g_bm_page_writes = 0, g_bm_early_writes = 0;
 static bool g_sb_dirty = false;
 static u64 g_mut = 0;
 static void touch_sb() { g_sb_dirty = true; ++g_mut; }
@@ -296,30 +314,37 @@ static void free_ram(void* p, u64 bytes) {
 }
 
 constexpr u64 VERIFY_CHUNK = 16;
-static u64 g_bitmap_bytes = 0;
 static u8* g_verify_scratch = nullptr;
+
+static void bm_reset_slots() {
+    for (auto& sl : g_bm_slots) { sl.valid = false; sl.dirty = false; }
+    g_bm_ndirty = 0;
+    g_bm_early = false;
+}
 
 static void release_runtime() {
     g_mounted = false;
-    free_ram(g_bitmap, g_bitmap_bytes);
-    free_ram(g_bm_dirty, g_bitmap_bytes / SECTOR_SIZE);
+    free_ram(g_bm_free, g_bm_pages * sizeof(u16));
+    free_ram(g_bm_flags, g_bm_pages);
+    free_ram(g_bm_scratch, BM_BATCH * SECTOR_SIZE);
     free_ram(g_verify_scratch, VERIFY_CHUNK * SECTOR_SIZE);
-    g_bitmap = nullptr;
-    g_bm_dirty = nullptr;
+    g_bm_free = nullptr;
+    g_bm_flags = nullptr;
+    g_bm_scratch = nullptr;
     g_verify_scratch = nullptr;
-    g_bitmap_bytes = 0;
-    g_bm_lo = ~0ull;
-    g_bm_hi = 0;
+    g_bm_pages = 0;
+    bm_reset_slots();
 }
 
 static bool alloc_runtime(u64 bitmap_sectors) {
     release_runtime();
-    g_bitmap_bytes = bitmap_sectors * SECTOR_SIZE;
-    g_bitmap = static_cast<u8*>(alloc_ram(g_bitmap_bytes));
-    g_bm_dirty = static_cast<u8*>(alloc_ram(bitmap_sectors));
-    if (!g_bitmap || !g_bm_dirty) {
+    g_bm_pages = bitmap_sectors;
+    g_bm_free = static_cast<u16*>(alloc_ram(bitmap_sectors * sizeof(u16)));
+    g_bm_flags = static_cast<u8*>(alloc_ram(bitmap_sectors));
+    g_bm_scratch = static_cast<u8*>(alloc_ram(BM_BATCH * SECTOR_SIZE));
+    if (!g_bm_free || !g_bm_flags || !g_bm_scratch) {
         release_runtime();
-        serial::writeln("[stellar] out of memory for the free-space bitmap");
+        serial::writeln("[stellar] out of memory for the free-space summary");
         return false;
     }
     return true;
@@ -416,14 +441,213 @@ static void cache_drop(u64 first, u64 count) {
     }
 }
 
-static void bm_set(u64 s, bool used) {
+static u32 pop8(u8 v) {
+    v = static_cast<u8>(v - ((v >> 1) & 0x55));
+    v = static_cast<u8>((v & 0x33) + ((v >> 2) & 0x33));
+    return (v + (v >> 4)) & 0x0F;
+}
+
+static u64 count_zero_bits(const u8* d, u64 from, u64 to) {
+    u64 n = 0, b = from;
+    while (b < to && (b & 7)) { if (!(d[b >> 3] & (1u << (b & 7)))) ++n; ++b; }
+    while (b + 8 <= to) { n += 8 - pop8(d[b >> 3]); b += 8; }
+    while (b < to) { if (!(d[b >> 3] & (1u << (b & 7)))) ++n; ++b; }
+    return n;
+}
+
+static u64 count_leaked(const u8* cur, const u8* want, u64 from, u64 to) {
+    u64 n = 0, b = from;
+    while (b < to && (b & 7)) { if (static_cast<u8>(cur[b >> 3] & ~want[b >> 3]) & (1u << (b & 7))) ++n; ++b; }
+    while (b + 8 <= to) { n += pop8(static_cast<u8>(cur[b >> 3] & ~want[b >> 3])); b += 8; }
+    while (b < to) { if (static_cast<u8>(cur[b >> 3] & ~want[b >> 3]) & (1u << (b & 7))) ++n; ++b; }
+    return n;
+}
+
+static u64 page_data_lo(u64 p) {
+    u64 lo = p * PAGE_BITS;
+    u64 ds = g_sb.bitmap_start + g_sb.bitmap_sectors;
+    return lo > ds ? lo : ds;
+}
+static u64 page_hi(u64 p) {
+    u64 hi = (p + 1) * PAGE_BITS;
+    return hi < g_sb.total_sectors ? hi : g_sb.total_sectors;
+}
+static u64 page_capacity(u64 p) {
+    u64 lo = page_data_lo(p), hi = page_hi(p);
+    return hi > lo ? hi - lo : 0;
+}
+static u64 page_zero_bits(u64 p, const u8* data) {
+    u64 lo = page_data_lo(p), hi = page_hi(p);
+    if (hi <= lo) return 0;
+    return count_zero_bits(data, lo - p * PAGE_BITS, hi - p * PAGE_BITS);
+}
+
+static bool bm_flush_slot(BmSlot& sl) {
+    u8 buf[SECTOR_SIZE];
+    for (auto& b : buf) b = 0;
+    u64 total_bytes = (g_sb.total_sectors + 7) / 8;
+    u64 off = sl.page * BM_PAYLOAD;
+    u64 n = off < total_bytes ? total_bytes - off : 0;
+    if (n > BM_PAYLOAD) n = BM_PAYLOAD;
+    __builtin_memcpy(buf, sl.data, n);
+    crc_stamp(buf);
+    ++g_bm_page_writes;
+    if (!raw_wr(g_sb.bitmap_start + sl.page, buf)) return false;
+    g_bm_flags[sl.page] &= static_cast<u8>(~BM_BAD);
+    return true;
+}
+
+static void bm_mark_dirty(BmSlot* sl) {
+    if (!sl->dirty) { sl->dirty = true; ++g_bm_ndirty; }
+}
+
+static BmSlot* bm_slot(u64 page) {
+    u32 limit = g_bm_slot_limit;
+    for (u32 i = 0; i < limit; ++i) {
+        BmSlot& sl = g_bm_slots[i];
+        if (sl.valid && sl.page == page) { sl.stamp = ++g_bm_clock; return &sl; }
+    }
+    BmSlot* victim = nullptr;
+    for (u32 i = 0; i < limit && !victim; ++i)
+        if (!g_bm_slots[i].valid) victim = &g_bm_slots[i];
+    for (u32 i = 0; i < limit && !victim; ++i) {
+        BmSlot& sl = g_bm_slots[i];
+        if (!sl.dirty && (!victim || sl.stamp < victim->stamp)) victim = &sl;
+    }
+    if (!victim) {
+        for (u32 i = 0; i < limit; ++i) {
+            BmSlot& sl = g_bm_slots[i];
+            if (!victim || sl.stamp < victim->stamp) victim = &sl;
+        }
+    }
+    if (victim->valid && victim->dirty) {
+        if (!bm_flush_slot(*victim)) return nullptr;
+        victim->dirty = false;
+        --g_bm_ndirty;
+        g_bm_early = true;
+        ++g_bm_early_writes;
+    }
+    victim->valid = false;
+    victim->dirty = false;
+    victim->data[BM_PAYLOAD] = victim->data[BM_PAYLOAD + 1] = victim->data[BM_PAYLOAD + 2] = victim->data[BM_PAYLOAD + 3] = 0;
+    if (g_bm_flags[page] & BM_BAD) {
+        for (u64 i = 0; i < BM_PAYLOAD; ++i) victim->data[i] = 0;
+        victim->dirty = true;
+        ++g_bm_ndirty;
+    } else {
+        u8 buf[SECTOR_SIZE];
+        ++g_io_reads;
+        ++g_bm_page_reads;
+        if (!blockdev::read_sector(g_sb.bitmap_start + page, buf)) {
+            fail(Status::Io);
+            return nullptr;
+        }
+        if (!crc_ok(buf)) {
+            serial::printf("[stellar] bitmap sector %lu failed its checksum\n", g_sb.bitmap_start + page);
+            fail(Status::Checksum);
+            return nullptr;
+        }
+        __builtin_memcpy(victim->data, buf, BM_PAYLOAD);
+    }
+    victim->page = page;
+    victim->valid = true;
+    victim->stamp = ++g_bm_clock;
+    return victim;
+}
+
+struct BmStream {
+    u64 base = 0;
+    u64 n = 0;
+};
+
+static const u8 g_zero_page[SECTOR_SIZE] = {};
+
+static const u8* bm_peek(BmStream& st, u64 p) {
+    for (u32 i = 0; i < g_bm_slot_limit; ++i) {
+        BmSlot& sl = g_bm_slots[i];
+        if (sl.valid && sl.page == p) return sl.data;
+    }
+    if (g_bm_flags[p] & BM_BAD) return g_zero_page;
+    if (st.n == 0 || p < st.base || p >= st.base + st.n) {
+        st.base = p;
+        st.n = g_bm_pages - p < BM_BATCH ? g_bm_pages - p : BM_BATCH;
+        g_io_reads += st.n;
+        if (!blockdev::read_sectors(g_sb.bitmap_start + p, st.n, g_bm_scratch)) {
+            for (u64 j = 0; j < st.n; ++j) {
+                if (!blockdev::read_sector(g_sb.bitmap_start + p + j, g_bm_scratch + j * SECTOR_SIZE)) {
+                    st.n = 0;
+                    fail(Status::Io);
+                    return nullptr;
+                }
+            }
+        }
+    }
+    const u8* pg = g_bm_scratch + (p - st.base) * SECTOR_SIZE;
+    if (!crc_ok(pg)) {
+        serial::printf("[stellar] bitmap sector %lu failed its checksum\n", g_sb.bitmap_start + p);
+        fail(Status::Checksum);
+        return nullptr;
+    }
+    return pg;
+}
+
+static u32 bm_apply(u8* d, u64 from, u64 count, bool used) {
+    u32 changed = 0;
+    u64 b = from, end = from + count;
+    auto flip = [&](u64 bit) {
+        u8 m = static_cast<u8>(1u << (bit & 7));
+        bool cur = (d[bit >> 3] & m) != 0;
+        if (cur != used) {
+            if (used) d[bit >> 3] |= m;
+            else d[bit >> 3] &= static_cast<u8>(~m);
+            ++changed;
+        }
+    };
+    while (b < end && (b & 7)) flip(b++);
+    while (b + 8 <= end) {
+        u8 old = d[b >> 3];
+        changed += used ? 8 - pop8(old) : pop8(old);
+        d[b >> 3] = used ? 0xFF : 0x00;
+        b += 8;
+    }
+    while (b < end) flip(b++);
+    return changed;
+}
+
+static bool bm_set_range(u64 first, u64 count, bool used) {
     ++g_mut;
-    if (used) g_bitmap[s / 8] |= static_cast<u8>(1u << (s % 8));
-    else g_bitmap[s / 8] &= static_cast<u8>(~(1u << (s % 8)));
-    u64 idx = (s / 8) / BM_PAYLOAD;
-    g_bm_dirty[idx] = 1;
-    if (idx < g_bm_lo) g_bm_lo = idx;
-    if (idx > g_bm_hi) g_bm_hi = idx;
+    while (count) {
+        u64 page = first / PAGE_BITS, in_page = first % PAGE_BITS;
+        u64 n = PAGE_BITS - in_page;
+        if (n > count) n = count;
+        BmSlot* sl = bm_slot(page);
+        if (!sl) return false;
+        u32 changed = bm_apply(sl->data, in_page, n, used);
+        if (changed) {
+            bm_mark_dirty(sl);
+            g_bm_free[page] = static_cast<u16>(used ? g_bm_free[page] - changed : g_bm_free[page] + changed);
+        }
+        first += n;
+        count -= n;
+    }
+    return true;
+}
+
+static bool format_bitmap() {
+    u8 zero[SECTOR_SIZE];
+    for (auto& b : zero) b = 0;
+    crc_stamp(zero);
+    for (u32 i = 0; i < BM_BATCH; ++i) __builtin_memcpy(g_bm_scratch + i * SECTOR_SIZE, zero, SECTOR_SIZE);
+    for (u64 p = 0; p < g_bm_pages; p += BM_BATCH) {
+        u64 n = g_bm_pages - p < BM_BATCH ? g_bm_pages - p : BM_BATCH;
+        g_io_writes += n;
+        if (!blockdev::write_sectors(g_sb.bitmap_start + p, n, g_bm_scratch)) return fail(Status::Io);
+    }
+    for (u64 p = 0; p < g_bm_pages; ++p) {
+        g_bm_free[p] = static_cast<u16>(page_capacity(p));
+        g_bm_flags[p] = 0;
+    }
+    return true;
 }
 
 static bool sb_write_slot(u32 slot) {
@@ -435,24 +659,13 @@ static bool sb_write_slot(u32 slot) {
 
 static void apply_deferred();
 static bool write_dirty_bitmap() {
-    if (g_bm_lo > g_bm_hi) return true;
+    if (g_bm_ndirty == 0) return true;
     bool all = true;
-    u64 total_bytes = (g_sb.total_sectors + 7) / 8;
-    for (u64 i = g_bm_lo; i <= g_bm_hi; ++i) {
-        if (!g_bm_dirty[i]) continue;
-        u8 buf[SECTOR_SIZE];
-        for (auto& b : buf) b = 0;
-        u64 off = i * BM_PAYLOAD;
-        u64 n = off < total_bytes ? total_bytes - off : 0;
-        if (n > BM_PAYLOAD) n = BM_PAYLOAD;
-        __builtin_memcpy(buf, g_bitmap + off, n);
-        crc_stamp(buf);
-        if (raw_wr(g_sb.bitmap_start + i, buf)) g_bm_dirty[i] = 0;
+    for (u32 i = 0; i < g_bm_slot_limit; ++i) {
+        BmSlot& sl = g_bm_slots[i];
+        if (!sl.valid || !sl.dirty) continue;
+        if (bm_flush_slot(sl)) { sl.dirty = false; --g_bm_ndirty; }
         else all = false;
-    }
-    if (all) {
-        g_bm_lo = ~0ull;
-        g_bm_hi = 0;
     }
     return all;
 }
@@ -464,10 +677,11 @@ static bool flush_dev() {
 
 static bool commit() {
     if (!g_mounted) return true;
-    bool bm_dirty = g_bm_lo <= g_bm_hi;
+    bool bm_dirty = g_bm_ndirty > 0 || g_bm_early;
     if (!bm_dirty && !g_sb_dirty) return true;
     bool ok = flush_dev();
-    if (ok && bm_dirty) ok = write_dirty_bitmap() && flush_dev();
+    if (ok) g_bm_early = false;
+    if (ok && g_bm_ndirty > 0) ok = write_dirty_bitmap() && flush_dev();
     if (ok && g_sb_dirty) {
         ++g_sb.seq;
         ++g_sb.epoch;
@@ -544,45 +758,68 @@ bool end_batch(Status* why) {
     return ok;
 }
 
-static u64 find_run(u64 from, u64 to, u64 count) {
+static bool find_run(u64 from, u64 to, u64 count, u64* out) {
+    *out = 0;
     u64 run = 0, run_start = 0;
     for (u64 s = from; s < to;) {
-        if ((s & 7) == 0 && g_bitmap[s / 8] == 0xFF) { run = 0; s += 8; continue; }
-        if ((s & 7) == 0 && s + 8 <= to && g_bitmap[s / 8] == 0x00) {
+        u64 page = s / PAGE_BITS;
+        u64 page_lo = page * PAGE_BITS;
+        u64 page_end = (page + 1) * PAGE_BITS;
+        if (page_end > to) page_end = to;
+        u64 whole_hi = page_hi(page);
+        if (g_bm_free[page] == 0) { run = 0; s = page_end; continue; }
+        if (s == page_lo && page_end == whole_hi && g_bm_free[page] == whole_hi - page_lo) {
             if (run == 0) run_start = s;
-            run += 8;
-            if (run >= count) return run_start;
-            s += 8;
+            run += page_end - s;
+            if (run >= count) { *out = run_start; return true; }
+            s = page_end;
             continue;
         }
-        if (!(g_bitmap[s / 8] & (1u << (s % 8)))) {
-            if (run == 0) run_start = s;
-            if (++run == count) return run_start;
-        } else {
-            run = 0;
+        BmSlot* sl = bm_slot(page);
+        if (!sl) return false;
+        const u8* d = sl->data;
+        u64 hi_bit = page_end - page_lo;
+        for (u64 b = s - page_lo; b < hi_bit;) {
+            u8 byte = d[b >> 3];
+            if ((b & 7) == 0 && byte == 0xFF) { run = 0; b += 8; continue; }
+            if ((b & 7) == 0 && b + 8 <= hi_bit && byte == 0x00) {
+                if (run == 0) run_start = page_lo + b;
+                run += 8;
+                if (run >= count) { *out = run_start; return true; }
+                b += 8;
+                continue;
+            }
+            if (!(byte & (1u << (b & 7)))) {
+                if (run == 0) run_start = page_lo + b;
+                if (++run == count) { *out = run_start; return true; }
+            } else {
+                run = 0;
+            }
+            ++b;
         }
-        ++s;
+        s = page_end;
     }
-    return 0;
+    return true;
 }
 
 static u64 alloc_sectors(u64 count) {
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
     u64 hint = g_alloc_hint < data_start ? data_start : g_alloc_hint;
-    u64 r = find_run(hint, g_sb.total_sectors, count);
+    u64 r;
+    if (!find_run(hint, g_sb.total_sectors, count, &r)) return 0;
     if (!r) {
         u64 end = hint + count;
         if (end > g_sb.total_sectors) end = g_sb.total_sectors;
-        r = find_run(data_start, end, count);
+        if (!find_run(data_start, end, count, &r)) return 0;
     }
     if (!r) { fail(Status::NoSpace); return 0; }
-    for (u64 j = r; j < r + count; ++j) bm_set(j, true);
+    if (!bm_set_range(r, count, true)) return 0;
     g_alloc_hint = r + count;
     return r;
 }
 
 static void release_sectors(u64 first, u64 count) {
-    for (u64 j = first; j < first + count; ++j) bm_set(j, false);
+    bm_set_range(first, count, false);
     if (first < g_alloc_hint) g_alloc_hint = first;
 }
 
@@ -608,14 +845,47 @@ u64 total_sectors() {
     return g_mounted ? g_sb.total_sectors : 0;
 }
 
+u64 bitmap_ram_bytes() {
+    Guard guard;
+    return g_bm_pages * (sizeof(u16) + 1) + sizeof(g_bm_slots) + BM_BATCH * SECTOR_SIZE;
+}
+
 u64 free_space_sectors() {
     Guard guard;
     if (!g_mounted) return 0;
-    u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
     u64 n = 0;
-    for (u64 s = data_start; s < g_sb.total_sectors; ++s)
-        if (!(g_bitmap[s / 8] & (1u << (s % 8)))) ++n;
+    for (u64 p = 0; p < g_bm_pages; ++p) n += g_bm_free[p];
     return n;
+}
+
+BitmapStats bitmap_stats() {
+    Guard guard;
+    return { g_bm_page_reads, g_bm_page_writes, g_bm_early_writes };
+}
+
+void test_set_bitmap_cache_slots(u32 n) {
+    Guard guard;
+    for (auto& sl : g_bm_slots) { sl.valid = false; sl.dirty = false; }
+    g_bm_ndirty = 0;
+    g_bm_slot_limit = n < 1 ? 1 : (n > BM_SLOTS ? BM_SLOTS : n);
+}
+
+static u64 g_gc_window_pages = 0;
+void test_set_gc_window_pages(u64 pages) {
+    Guard guard;
+    g_gc_window_pages = pages;
+}
+
+bool test_bitmap_summary_ok() {
+    Guard guard;
+    if (!g_mounted) return false;
+    BmStream stream;
+    for (u64 p = 0; p < g_bm_pages; ++p) {
+        const u8* bits = bm_peek(stream, p);
+        if (!bits) return false;
+        if (page_zero_bits(p, bits) != g_bm_free[p]) return false;
+    }
+    return true;
 }
 
 static u64 alloc_star_id() {
@@ -1161,9 +1431,7 @@ static bool format_impl(u64 total_sectors) {
     g_sb.snap_count = 0;
 
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
-    for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) g_bm_dirty[i] = 1;
-    g_bm_lo = 0;
-    g_bm_hi = g_sb.bitmap_sectors - 1;
+    if (!format_bitmap()) { release_runtime(); return false; }
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     touch_sb();
     g_mounted = true;
@@ -1254,25 +1522,32 @@ static bool load_durable() {
     }
     g_sb = best;
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
-    u64 total_bytes = (g_sb.total_sectors + 7) / 8;
     bool bitmap_damaged = false;
-    for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
-        u8 buf[SECTOR_SIZE];
-        ++g_io_reads;
-        if (!blockdev::read_sector(g_sb.bitmap_start + i, buf)) {
-            serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + i);
-            release_runtime();
-            return fail(Status::Io);
+    for (u64 p0 = 0; p0 < g_bm_pages; p0 += BM_BATCH) {
+        u64 n = g_bm_pages - p0 < BM_BATCH ? g_bm_pages - p0 : BM_BATCH;
+        g_io_reads += n;
+        bool batched = blockdev::read_sectors(g_sb.bitmap_start + p0, n, g_bm_scratch);
+        for (u64 j = 0; j < n; ++j) {
+            u64 p = p0 + j;
+            u8 single[SECTOR_SIZE];
+            const u8* pg = g_bm_scratch + j * SECTOR_SIZE;
+            if (!batched) {
+                if (!blockdev::read_sector(g_sb.bitmap_start + p, single)) {
+                    serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + p);
+                    release_runtime();
+                    return fail(Status::Io);
+                }
+                pg = single;
+            }
+            if (!crc_ok(pg)) {
+                serial::printf("[stellar] mount: bitmap sector %lu failed its checksum, it will be rebuilt\n", g_sb.bitmap_start + p);
+                bitmap_damaged = true;
+                g_bm_flags[p] |= BM_BAD;
+                g_bm_free[p] = static_cast<u16>(page_capacity(p));
+                continue;
+            }
+            g_bm_free[p] = static_cast<u16>(page_zero_bits(p, pg));
         }
-        if (!crc_ok(buf)) {
-            serial::printf("[stellar] mount: bitmap sector %lu failed its checksum, it will be rebuilt\n", g_sb.bitmap_start + i);
-            bitmap_damaged = true;
-            continue;
-        }
-        u64 off = i * BM_PAYLOAD;
-        u64 n = off < total_bytes ? total_bytes - off : 0;
-        if (n > BM_PAYLOAD) n = BM_PAYLOAD;
-        __builtin_memcpy(g_bitmap + off, buf, n);
     }
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     g_sb_dirty = false;
@@ -1563,11 +1838,28 @@ bool unlink(u64 dir_star, const char* name, Status* why) {
 }
 
 static u8* g_mark = nullptr;
+static u64 g_mark_base = 0, g_mark_limit = 0;
+constexpr u64 GC_WINDOW_PAGES = (16ull << 20) / BM_PAYLOAD;
 
-static bool mk_test(u64 s) { return ((g_mark[s / 8] >> (s % 8)) & 1u) != 0; }
-static void mk_set(u64 s) { g_mark[s / 8] |= static_cast<u8>(1u << (s % 8)); }
+static bool mk_test(u64 s) {
+    if (s < g_mark_base || s >= g_mark_limit) return false;
+    u64 r = s - g_mark_base;
+    return ((g_mark[r / 8] >> (r % 8)) & 1u) != 0;
+}
+static void mk_set(u64 s) {
+    if (s < g_mark_base || s >= g_mark_limit) return;
+    u64 r = s - g_mark_base;
+    g_mark[r / 8] |= static_cast<u8>(1u << (r % 8));
+}
 static void mk_range(u64 first, u64 count) {
-    for (u64 s = first; s < first + count && s < g_sb.total_sectors; ++s) mk_set(s);
+    u64 lo = first > g_mark_base ? first : g_mark_base;
+    u64 end = first + count;
+    if (end > g_mark_limit) end = g_mark_limit;
+    if (lo >= end) return;
+    u64 b = lo - g_mark_base, e = end - g_mark_base;
+    while (b < e && (b & 7)) { g_mark[b / 8] |= static_cast<u8>(1u << (b % 8)); ++b; }
+    while (b + 8 <= e) { g_mark[b / 8] = 0xFF; b += 8; }
+    while (b < e) { g_mark[b / 8] |= static_cast<u8>(1u << (b % 8)); ++b; }
 }
 
 static bool mark_dir_tree(u64 sector, u32 depth) {
@@ -1614,38 +1906,51 @@ static bool mark_tree(u64 sector, u32 depth) {
 }
 
 static u64 gc_core() {
-    u64 bm_bytes = g_sb.bitmap_sectors * SECTOR_SIZE;
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
-    g_mark = static_cast<u8*>(alloc_ram(bm_bytes));
+    u64 wp = g_gc_window_pages ? g_gc_window_pages : GC_WINDOW_PAGES;
+    if (wp > g_bm_pages) wp = g_bm_pages;
+    g_mark = static_cast<u8*>(alloc_ram(wp * BM_PAYLOAD));
     if (!g_mark) return INVALID_STAR;
-    mk_range(0, data_start);
 
-    bool ok = mark_tree(g_sb.catalog_root, 0);
-    for (u32 i = 0; ok && i < g_sb.snap_count; ++i)
-        if (g_sb.snaps[i].catalog_root != 0) ok = mark_tree(g_sb.snaps[i].catalog_root, 0);
+    u64 freed = 0;
+    bool ok = true;
+    for (u64 w = 0; ok && w < g_bm_pages; w += wp) {
+        u64 np = g_bm_pages - w < wp ? g_bm_pages - w : wp;
+        g_mark_base = w * PAGE_BITS;
+        g_mark_limit = (w + np) * PAGE_BITS;
+        if (g_mark_limit > g_sb.total_sectors) g_mark_limit = g_sb.total_sectors;
+        __builtin_memset(g_mark, 0, np * BM_PAYLOAD);
+        mk_range(0, data_start);
 
-    u64 freed = INVALID_STAR;
-    if (ok) {
-        freed = 0;
-        for (u64 s = data_start; s < g_sb.total_sectors; ++s) {
-            bool used = ((g_bitmap[s / 8] >> (s % 8)) & 1u) != 0;
-            if (used && !mk_test(s)) ++freed;
-        }
-        for (u64 i = 0; i < g_sb.bitmap_sectors; ++i) {
-            u8* cur = g_bitmap + i * BM_PAYLOAD;
+        ok = mark_tree(g_sb.catalog_root, 0);
+        for (u32 i = 0; ok && i < g_sb.snap_count; ++i)
+            if (g_sb.snaps[i].catalog_root != 0) ok = mark_tree(g_sb.snaps[i].catalog_root, 0);
+        if (!ok) break;
+
+        BmStream stream;
+        for (u64 i = 0; i < np; ++i) {
+            u64 p = w + i;
+            const u8* cur = bm_peek(stream, p);
+            if (!cur) { ok = false; break; }
             const u8* want = g_mark + i * BM_PAYLOAD;
-            if (__builtin_memcmp(cur, want, BM_PAYLOAD) == 0) continue;
-            __builtin_memcpy(cur, want, BM_PAYLOAD);
-            g_bm_dirty[i] = 1;
-            if (i < g_bm_lo) g_bm_lo = i;
-            if (i > g_bm_hi) g_bm_hi = i;
+            u64 lo = page_data_lo(p), hi = page_hi(p);
+            if (hi > lo) freed += count_leaked(cur, want, lo - p * PAGE_BITS, hi - p * PAGE_BITS);
+            if (__builtin_memcmp(cur, want, BM_PAYLOAD) != 0 || (g_bm_flags[p] & BM_BAD)) {
+                BmSlot* sl = bm_slot(p);
+                if (!sl) { ok = false; break; }
+                __builtin_memcpy(sl->data, want, BM_PAYLOAD);
+                bm_mark_dirty(sl);
+                ++g_mut;
+            }
+            g_bm_free[p] = static_cast<u16>(page_zero_bits(p, want));
         }
-        g_alloc_hint = data_start;
     }
+    if (ok) g_alloc_hint = data_start;
 
-    free_ram(g_mark, bm_bytes);
+    free_ram(g_mark, wp * BM_PAYLOAD);
     g_mark = nullptr;
-    if (freed == INVALID_STAR) return fail_id(Status::Corrupt);
+    g_mark_base = g_mark_limit = 0;
+    if (!ok) return fail_id(Status::Corrupt);
     return freed;
 }
 
@@ -2116,11 +2421,18 @@ static bool check_impl(CheckReport* out, bool deep) {
             g_ck.root = g_sb.snaps[i].catalog_root;
             ck_node(g_ck.root, 0);
         }
-        u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
-        for (u64 sec = data_start; sec < g_sb.total_sectors; ++sec) {
-            bool used = ck_bit(g_bitmap, sec), refd = ck_bit(g_ck.ref, sec);
-            if (refd && !used) ++out->unmarked;
-            else if (used && !refd) ++out->leaked;
+        BmStream bstream;
+        for (u64 pg = 0; pg < g_bm_pages; ++pg) {
+            u64 lo = page_data_lo(pg), hi = page_hi(pg);
+            if (hi <= lo) continue;
+            const u8* bits = bm_peek(bstream, pg);
+            if (!bits) { g_ck.io_error = true; break; }
+            for (u64 sec = lo; sec < hi; ++sec) {
+                u64 bit = sec - pg * PAGE_BITS;
+                bool used = ((bits[bit >> 3] >> (bit & 7)) & 1u) != 0, refd = ck_bit(g_ck.ref, sec);
+                if (refd && !used) ++out->unmarked;
+                else if (used && !refd) ++out->leaked;
+            }
         }
     }
     bool io_error = g_ck.io_error;

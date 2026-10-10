@@ -93,11 +93,18 @@ bool check(CheckReport* out, bool deep = true, Status* why = nullptr);
 
 IoStats io_stats();
 u64 free_space_sectors();
+u64 bitmap_ram_bytes();
+
+struct BitmapStats { u64 page_reads, page_writes, early_writes; };
+BitmapStats bitmap_stats();
 u64 total_sectors();
 bool stat(u64 star, StatInfo* out, u64 snap = LIVE, Status* why = nullptr);
 bool set_flags(u64 star, u32 flags, Status* why = nullptr);
 void set_clock(u64 (*fn)());
 
 void test_set_hash_mask(u64 mask);
+void test_set_bitmap_cache_slots(u32 n);
+void test_set_gc_window_pages(u64 pages);
+bool test_bitmap_summary_ok();
 
 }

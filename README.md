@@ -87,6 +87,7 @@ make run-nvme       # boot with an NVMe disk (SMP=4 for multi-core)
 make run-ahci       # boot with an AHCI/SATA disk
 make run-headless   # serial output only
 make test-stellar   # run the filesystem tests on the host, without QEMU
+make bench-stellar  # filesystem scaling benchmark on sparse virtual disks up to 8 GiB
 make reset-disk     # delete disk.img so the next run formats a fresh filesystem
 ```
 

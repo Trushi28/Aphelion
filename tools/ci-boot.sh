@@ -76,6 +76,8 @@ check_common() {
     grep -q 'UNHANDLED INTERRUPT' "$LOG.clean" && fail "unhandled interrupt"
     grep -q 'FATAL' "$LOG.clean" && fail "fatal error"
     grep -q 'MISMATCH' "$LOG.clean" && fail "self-test mismatch"
+    grep -q 'failed its checksum' "$LOG.clean" && fail "a bitmap or metadata sector failed its checksum on a clean boot"
+    grep -q '\[stellar\] free-space bitmap:' "$LOG.clean" || fail "the free-space bitmap was not reported"
     grep -q '\[selftest\] hello.txt: ok' "$LOG.clean" || fail "hello.txt self-test did not pass"
     grep -q '\[selftest\] multi-request queueing: ok' "$LOG.clean" || fail "multi-request queueing self-test did not pass"
     grep -q '\[selftest\] flush: ok' "$LOG.clean" || fail "block-device flush self-test did not pass"

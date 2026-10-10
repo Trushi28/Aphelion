@@ -55,8 +55,8 @@ Anything older stays allocated for the snapshots that may still use it.
 Space is reclaimed by `gc()`, a stop-the-world mark and sweep: it marks the metadata region plus
 every catalog node, directory node and file extent reachable from the live root and from each
 remaining snapshot root, then rewrites the free bitmap to match. Nothing reachable can be freed,
-and sectors leaked by failed operations are recovered as a side effect. It is O(filesystem size)
-and needs one bit of RAM per sector.
+and sectors leaked by failed operations are recovered as a side effect. It is O(filesystem size) and works in
+windows of at most 16 MiB of mark bitmap (64 GiB of disk), see [Free-space bitmap](#free-space-bitmap).
 
 ### I/O efficiency
 
@@ -106,7 +106,8 @@ disk is reformatted on the next boot, as with earlier bumps.
 
 A commit is the only thing that makes anything durable, and it is ordered:
 
-1. every data extent and metadata node was already written (but is not yet durable);
+1. every data extent and metadata node was already written (but is not yet durable), along with any bitmap page
+   the cache had to write early;
 2. **flush**;
 3. write the dirty bitmap sectors; **flush**;
 4. write the new superblock to the slot *not* holding the current one, with a higher commit number; **flush**;
@@ -215,6 +216,55 @@ it was.
   moved directory's parent pointer is rewritten in the same transaction, and `check()` verifies it.
 - A rename does not update the `mtime` of either directory.
 
+## Free-space bitmap
+
+The on-disk bitmap is unchanged: one bit per sector, 508 bytes of bits plus a CRC32 per sector ("page", 4064
+sectors of disk each). What changed is that it is no longer held in RAM.
+
+- **Page cache.** 64 slots (32 KiB). Dirty pages stay in a slot until the commit writes them; if one transaction
+  dirties more pages than there are slots, the least recently used dirty page is written early. That is safe for
+  the crash model: RAM never clears a bit the durable state references before the commit (those frees are
+  deferred), so any page image is a superset of what is durable and the worst outcome of a crash is a leak that
+  `gc()` recovers. Early writes need a group commit or a very large file; a single create dirties about as many
+  pages as the extent spans (a 40 MiB file: 20 pages). The commit flushes the device if any early write happened.
+- **Summary.** A 16-bit count of free data sectors per page, built while mounting and kept exact by every
+  allocate and free. Allocation skips full pages without reading them and takes a completely free page without
+  reading it either, so a fresh disk is searched without touching the bitmap. `free_space_sectors()` sums the
+  counts. RAM is 3 bytes per page, 1.5 MiB per TB.
+- **Batched I/O.** Mount and `format` move the bitmap 32 sectors per device command, with a fallback to single
+  reads. `gc()` and `check()` read it through a streaming reader that prefers a cached (possibly dirty) page and
+  does not disturb the cache.
+- **Windowed gc.** The mark bitmap covers at most 16 MiB at a time (64 GiB of disk); a larger disk is processed in
+  windows, re-walking the trees for each one. A disk of up to 64 GiB is one window, as before.
+- **Damaged pages.** A page failing its checksum at mount is flagged, counted as free, and rebuilt by the gc that
+  mount runs; it is rewritten even when its rebuilt contents are all zero.
+
+Measured with `make bench-stellar` on sparse virtual disks (host RAM disk, so device commands are the figure that
+carries over; before is the fully resident bitmap):
+
+| 8 GiB disk | Before | After |
+|---|---:|---:|
+| Bitmap RAM | 2,068 KiB | 61 KiB |
+| `format` device commands | 4,137 | 140 |
+| `mount` device commands | 4,131 | 132 |
+| `free_space_sectors()` (one call) | 16 ms | a few microseconds |
+| `gc()` device commands | 96 | 229 |
+| `check()` device commands | 22 | 151 |
+
+`gc` and `check` now read the bitmap, which they did not have to when it was resident, so their command counts went
+up; the first version of this change did that one page per command (4,226 and 4,087) and the streaming reader is what
+brought it back. Extrapolated linearly to 1 TB, the resident bitmap would have been 258 MiB plus another 258 MiB for
+a gc mark; now it is 1.5 MiB plus the 32 KiB cache.
+
+**How it is tested.** The same randomized workload on a 40,000-sector disk, run with a 64-slot cache, a 1-slot
+cache, and a 2-slot cache with 1-page gc windows, produces byte-identical disk images. The crash exploration has a
+fourth configuration (a 3-page disk with a 1-slot cache, 2,650 crash states) in which early writes really happen.
+A 2 GiB disk takes five 40 MiB files in one group commit (38 early writes), remounts, and windowed gc runs over
+eleven windows. Mount is tested against an unreadable bitmap sector, failing batched reads, and a damaged page that
+holds only free space. Every one of five mutations (dropping a dirty page on eviction, a wrong free-page shortcut, a
+summary that forgets frees, a gc window offset error, and a damaged page that is not forced to rewrite) fails the
+suite.
+
 ## Mount and format policy
 
 `mount()` never formats. The kernel formats a disk only when `mount()` reports `NotFormatted` **and**
@@ -241,7 +291,8 @@ Stated plainly:
 
 - Crash safety rests on the assumptions listed above; it has been tested by simulation, not on hardware.
 - **gc() is stop-the-world**, O(filesystem size): it holds the filesystem lock for its whole run. Space held
-  by older epochs only comes back via `delete_snapshot` and `gc()`.
+  by older epochs only comes back via `delete_snapshot` and `gc()`. On a disk over 64 GiB it walks the catalog
+  once per window (and once per snapshot root per window), so cost grows with disks x snapshots x catalog size.
 - Dead stars keep a 56-byte catalog entry and their IDs are never reused; the B+tree has no delete.
 - A deleted snapshot's ID can be handed out again by a later `snapshot()`. The snapshot table holds 24.
 - Snapshots are **whole-filesystem**, not per-subtree.
@@ -250,7 +301,12 @@ Stated plainly:
 - Dead stars cost catalog space: 6000 create/unlink pairs grew the catalog by about 1600 sectors in the host
   harness, while 6000 link/unlink pairs of one file cost nothing.
 - `read_file` can only verify the checksum when the whole file is read; partial reads are unchecked.
-- Free space is a linear bitmap, not the Universe/Orbit buddy machinery.
+- Free space is a bitmap, not the Universe/Orbit buddy machinery. Mount reads all of it (in 32-sector commands)
+  to build the page summary, so mount time is linear in disk size: about 130 commands per 8 GiB.
+- `check()` still needs two disk-sized bit arrays plus 8 bytes per star in RAM (about 0.5 GiB per TB of disk), so
+  on very large disks run it with the host `stellarfs fsck`, not in the kernel.
+- A failure to read a bitmap page while *freeing* sectors is not reported to the caller: the sectors stay marked
+  used (a leak that `gc()` recovers) and the first error is kept for the next call that does report.
 - Per-file CRC32 only; no per-extent or per-node checksums.
 - Bumping the superblock version reformats an existing disk on next boot (v3 to v6 images aren't migrated).
 - The boot self-tests that take snapshots are skipped on a mounted disk to avoid exhausting the table.

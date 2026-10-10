@@ -1,6 +1,6 @@
 # Engineering notes
 
-Twenty-five real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Twenty-six real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 1. **2MB huge pages silently break when virt/phys alignment don't match.**
    The kernel's physical load address (from Limine) is *not* 2MB-aligned,
@@ -131,3 +131,10 @@ Twenty-five real bugs and design flaws found while building Aphelion, kept becau
     `can_auto_format()` sees a blank disk or a Stellar magic (an older version, reformatted by policy). The two
     self-tests that write the disk tail also only run on a mounted volume. CI boots a random-data disk and
     requires it byte-identical afterwards.
+26. **A scaling change that made `gc` and `check` issue one device command per bitmap page.** Paging the free-space
+    bitmap out of RAM was correct and passed every test, but `gc` and `check` then read each page with its own
+    single-sector command: 4,226 and 4,087 commands on an 8 GiB disk against 96 and 22 before. Found by the
+    benchmark's command counts. Its timings hid it, because a host RAM disk makes a command free. Sequential
+    scans now go through a streaming reader that fetches 32 pages per command. The lesson is to benchmark the
+    quantity that costs money on the real device, not the one that is easy to time.
+
