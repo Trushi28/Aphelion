@@ -11,7 +11,8 @@ sectors n+1..     B+tree nodes (1 sector each), directory sectors, file extents
 ```
 
 The **catalog** is a disk-backed B+tree keyed by 64-bit star ID (leaf fanout 7, internal
-fanout 30). Files are one contiguous extent with a CRC32 in the catalog entry.
+fanout 30). A file is one contiguous extent, or an [extent table](#extent-tables) when no single run fits,
+with one CRC32 over the whole file in the catalog entry.
 
 ### O(1) snapshots via epoch copy-on-write
 
@@ -99,8 +100,8 @@ Every metadata sector ends in a CRC32 of the sector, verified on every read from
 write; file data keeps its own CRC32 in the catalog. Catalog entries are 56 bytes (type, checksum, size, extent,
 generation, link count, `mtime`, `flags`, one reserved word), so a leaf holds 7. Feature flags in the superblock
 gate future layout additions: an unknown *incompatible* bit refuses to mount (`Unsupported`), compatible bits are
-ignored. `FLAG_EXTENT_TABLE` (bit 0 of a star's flags) is reserved for extent-list files and is not used yet. A v5
-disk is reformatted on the next boot, as with earlier bumps.
+ignored. Incompatible bit 0 means "this volume has extent-table files" and is set by the first one; `FLAG_EXTENT_TABLE`
+(bit 0 of a star's flags) marks such a file. A v5 disk is reformatted on the next boot, as with earlier bumps.
 
 ## Crash consistency
 
@@ -197,6 +198,49 @@ are refused; duplicates are refused with `Exists`.
 `resolve("/a/b/c")` walks a path from the root in any view, and `resolve_parent` splits a path into the parent
 directory and a validated leaf name. Repeated and trailing slashes are accepted (a trailing slash requires a
 directory), and relative paths, `.` and `..` are refused because directories keep no parent pointer.
+
+## Extent tables
+
+A file is one contiguous run of sectors whenever one exists, exactly as before. Only when no single run is long
+enough does the file become an **extent-table file**: its catalog entry has `FLAG_EXTENT_TABLE` set, `first_sector`
+points at the head of a chain of table sectors, and `sector_count` is the total number of data sectors.
+
+```text
+table sector   next table (0 = last) | gen | count | 40 x (start sector, sector count) | CRC32
+```
+
+- **Allocation.** The allocator asks for the whole file first. If that fails and the disk has enough free sectors in
+  total, it asks for half, then a quarter, and so on, so large extents are used wherever they exist; adjacent pieces
+  are merged. Then it writes the data, then the table sectors from the last to the first (so each knows its `next`),
+  and the head is what the catalog entry points to. A failure at any point is rolled back with the rest of the
+  operation, so there is no cleanup code to get wrong.
+- **Tables are immutable.** A file is only ever replaced (`write_file` allocates a new layout), so table sectors are
+  written once and never copied on write. They are released with the file, under the same epoch rule as its extents,
+  and snapshots keep both the old extents and the old table.
+- **Reading.** `read_file`, `verify_file`, the deep `check`, gc marking and release all walk the chain through one
+  function that validates as it goes: 1 to 40 extents per table, every extent inside the data area, the extents
+  summing to exactly `sector_count`, and no more tables than the file could need, so a table that loops or is cut short
+  is refused with `Corrupt` instead of followed or returning short data.
+- **Compatibility.** The first extent-table file sets incompatible feature bit 0 in the same commit. Older code
+  refuses a volume with that bit (`Unsupported`, never reformatted), which was checked against the previous build.
+  The bit is never cleared, even if every such file is later deleted. The boot self-test creates and removes one, so
+  **the first boot of a kernel with this change marks the volume** and an older kernel can no longer mount it.
+- **Limits.** Space for the table sectors is only found after the data, so a file that needs every free sector
+  gets `NoSpace` (and leaks nothing) even though its data would fit. `stat` reports the extent count. Reads go front to
+  back through the chain; there is no seek, which no current interface needs.
+
+**Tests.** A disk fragmented into runs of one sector (709 free sectors, where a 40-sector file used to fail with
+`NoSpace`) takes a 40-sector file, and a file that needs every free sector is refused with `NoSpace` and leaks nothing. A test hook that caps extent length gives exact extent and table
+counts (1, 2, 39, 40, 41, 80, 81, 120, 121) and reads of every length across boundaries. The file is rewritten between
+contiguous and table form, under snapshots, with hard links, and over gc windows. Seven on-disk corruptions of a table
+are each found by `check` and refused by `read_file`: a bad checksum, a sum that is too high or too low, overlapping
+extents, a chain that loops, a chain cut short, and an extent inside the metadata area. Two model-based fuzz runs (2,500
+operations with a forced cap, 1,500 on a nearly full disk where table files arise on their own) check every file after
+every change and found no mismatch. Two more crash-exploration configurations (a
+forced cap, and a naturally fragmented nearly-full disk, 5,481 crash states together) recover exactly; the
+fail-every-write table covers table create, rewrite and unlink. Six mutations of the code each fail the suite: a
+walker that no longer checks the extents add up, a release that forgets the table sectors, a gc that does not mark them,
+extents written from the wrong buffer offset, a feature bit that is never set, and a rewrite that keeps a stale table flag.
 
 ## Rename
 
@@ -307,7 +351,8 @@ Stated plainly:
   on very large disks run it with the host `stellarfs fsck`, not in the kernel.
 - A failure to read a bitmap page while *freeing* sectors is not reported to the caller: the sectors stay marked
   used (a leak that `gc()` recovers) and the first error is kept for the next call that does report.
-- Per-file CRC32 only; no per-extent or per-node checksums.
+- File data has one CRC32 for the whole file, not one per extent, so a partial read cannot be verified and a bad
+  extent is only found by reading the whole file. Metadata sectors, including extent tables, are checksummed.
 - Bumping the superblock version reformats an existing disk on next boot (v3 to v6 images aren't migrated).
 - The boot self-tests that take snapshots are skipped on a mounted disk to avoid exhausting the table.
 

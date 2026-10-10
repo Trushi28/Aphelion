@@ -770,6 +770,14 @@ int main() {
                        [] { return stellar::rename(stellar::ROOT_STAR, "f", stellar::ROOT_STAR, "g"); }},
             {"rename (moving a directory)", [] { st_dir = stellar::create_constellation(stellar::ROOT_STAR, "d"); st_file = stellar::create_constellation(stellar::ROOT_STAR, "e"); make(st_dir, "in", "i"); },
                        [] { return stellar::rename(stellar::ROOT_STAR, "d", st_file, "d2"); }},
+            {"create_file (extent table)", [] { stellar::test_set_max_extent_sectors(2); },
+                       [] { bool ok = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)) != stellar::INVALID_STAR; stellar::test_set_max_extent_sectors(0); return ok; }},
+            {"write_file (to an extent table)", [] { stellar::test_set_max_extent_sectors(2); st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)); stellar::test_set_max_extent_sectors(0); },
+                       [] { return stellar::write_file(st_file, "short", 5) != stellar::INVALID_STAR; }},
+            {"write_file (extent table to extent table)", [] { stellar::test_set_max_extent_sectors(2); st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)); },
+                       [] { bool ok = stellar::write_file(st_file, payload, sizeof(payload) - 700) != stellar::INVALID_STAR; stellar::test_set_max_extent_sectors(0); return ok; }},
+            {"unlink (extent table)", [] { stellar::test_set_max_extent_sectors(2); st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload)); stellar::test_set_max_extent_sectors(0); },
+                       [] { return stellar::unlink(stellar::ROOT_STAR, "f"); }},
             {"delete_snapshot", [] { st_snap = stellar::snapshot(); }, [] { return stellar::delete_snapshot(st_snap); }},
             {"gc", [] {
                         st_file = stellar::create_file(stellar::ROOT_STAR, "f", payload, sizeof(payload));
@@ -1353,7 +1361,7 @@ int main() {
         __builtin_memcpy(g_disk, saved, 1024);
         CHECK(stellar::mount(), "restored");
 
-        sb_poke(72, 1, 4);
+        sb_poke(72, 2, 4);
         CHECK(!stellar::mount(&st) && st == Status::Unsupported, "an unknown incompatible feature bit refuses to mount");
         __builtin_memcpy(g_disk, saved, 1024);
         sb_poke(76, 0xFFFFFFFFu, 4);
@@ -1535,7 +1543,7 @@ int main() {
     // ---------------------------------------------------------------- crash consistency
     {
         using stellar::Status;
-        const u32 SEEDS = 4;
+        const u32 SEEDS = 6;
         u64 grand_states = 0, grand_bad = 0, grand_garbage = 0;
         for (u32 seed = 1; seed <= SEEDS; ++seed) {
             const u64 sectors = seed == 4 ? 8192 : 1024;
@@ -1578,6 +1586,12 @@ int main() {
                 for (int i = 0; i < 24; ++i) create();
                 static u8 filler[4100 * 512];
                 stellar::create_file(stellar::ROOT_STAR, "filler", filler, sizeof(filler));
+            }
+            if (seed == 5) stellar::test_set_max_extent_sectors(2);
+            if (seed == 6) {
+                u32 n = 0;
+                for (;; ++n) { char nm[16]; name_of(nm, "z", n); if (stellar::create_file(stellar::ROOT_STAR, nm, "x", 1) == stellar::INVALID_STAR) break; }
+                for (u32 i = 0; i < n; i += 2) { char nm[16]; name_of(nm, "z", i); stellar::unlink(stellar::ROOT_STAR, nm); }
             }
             __builtin_memcpy(base, g_disk, disk_bytes);
             g_log_n = 0; g_rec = true;
@@ -1715,6 +1729,7 @@ int main() {
             stellar::BitmapStats bs1 = stellar::bitmap_stats();
             if (seed == 4) CHECK(bs1.early_writes > bs0.early_writes, "the one-slot bitmap cache really did write pages early during the crash exploration");
             stellar::test_set_bitmap_cache_slots(64);
+            stellar::test_set_max_extent_sectors(0);
             printf("crash exploration seed %u: %d ops, %lu writes, %lu flush barriers, %lu crash states (%lu with a torn write, %lu with recovery+continue), %lu bad\n",
                    seed, NOPS, writes, barriers, states, garbage_states, deep, bad);
             grand_states += states; grand_bad += bad; grand_garbage += garbage_states;
@@ -2024,6 +2039,303 @@ int main() {
         CHECK(stellar::free_space_sectors() + 64 >= free0, "free space is back to where it started, less a few catalog nodes");
     }
 
+    // ---------------------------------------------------------------- extent-table files
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        stellar::CheckReport r{};
+        stellar::StatInfo si{};
+        const u64 NONE = stellar::INVALID_STAR;
+        const u64 ROOT = stellar::ROOT_STAR;
+        static u8 pat[400000], back[400000];
+        auto fillp = [&](u64 n, u32 salt) { for (u64 i = 0; i < n; ++i) pat[i] = static_cast<u8>(i * 7 + salt + (i >> 9)); };
+        auto same = [&](u64 star, u64 n, u64 snap = stellar::LIVE) {
+            for (u64 i = 0; i < n + 8 && i < sizeof(back); ++i) back[i] = 0xEE;
+            u64 got = stellar::read_file(star, back, sizeof(back), snap);
+            return got == n && __builtin_memcmp(pat, back, n) == 0;
+        };
+        auto incompat = [&]() -> u32 {
+            u64 s0, s1; __builtin_memcpy(&s0, g_disk + 64, 8); __builtin_memcpy(&s1, g_disk + 512 + 64, 8);
+            u32 f; __builtin_memcpy(&f, g_disk + (s1 > s0 ? 512 : 0) + 72, 4);
+            return f;
+        };
+        auto chain_len = [&](u64 head) {
+            u64 n = 0;
+            for (u64 t = head; t && n < 1000; ++n) __builtin_memcpy(&t, g_disk + t * 512, 8);
+            return n;
+        };
+        const u32 TABLE = stellar::FLAG_EXTENT_TABLE;
+
+        fresh_fs(4096);
+        fillp(20000, 1);
+        u64 plain = stellar::create_file(ROOT, "plain", pat, 20000);
+        CHECK(plain != NONE && stellar::stat(plain, &si) && si.extents == 1 && !(si.flags & TABLE), "a contiguous file has one extent and no table");
+        CHECK(incompat() == 0, "contiguous files do not set the incompatible-feature bit");
+
+        stellar::test_set_max_extent_sectors(1);
+        const u64 sector_counts[] = {1, 2, 39, 40, 41, 80, 81, 120, 121};
+        for (u64 ns : sector_counts) {
+            u64 bytes = ns * 512 - 100;
+            fillp(bytes, static_cast<u32>(ns));
+            char nm[16]; name_of(nm, "x", ns);
+            u64 f = stellar::create_file(ROOT, nm, pat, bytes);
+            bool have = f != NONE && stellar::stat(f, &si);
+            CHECK(have && si.extents == ns && si.sector_count == ns, "extent count follows the cap");
+            if (have && ns > 1) CHECK((si.flags & TABLE) && chain_len(stellar::test_first_sector(f)) == (ns + 39) / 40, "the table chain holds 40 extents per sector");
+            if (have && ns == 1) CHECK(!(si.flags & TABLE), "a file that fits one extent needs no table");
+            CHECK(have && same(f, bytes) && stellar::verify_file(f), "contents round-trip across many extents");
+        }
+        CHECK((incompat() & 1) != 0, "the first table file sets the incompatible-feature bit");
+        CHECK(stellar::check(&r) && r.ok(), "a deep check accepts every table file");
+        CHECK(stellar::mount() && stellar::check(&r) && r.ok(), "and so does a remount");
+        stellar::test_set_max_extent_sectors(0);
+
+        fresh_fs(4096);
+        stellar::test_set_max_extent_sectors(3);
+        fillp(3684, 5);
+        u64 pf = stellar::create_file(ROOT, "partial", pat, 3684);
+        const u64 lens[] = {0, 1, 511, 512, 513, 1535, 1536, 1537, 3583, 3684, 5000};
+        bool part_ok = pf != NONE;
+        for (u64 len : lens) {
+            for (u64 i = 0; i < 4200; ++i) back[i] = 0xEE;
+            u64 got = stellar::read_file(pf, back, len);
+            u64 want = len < 3684 ? len : 3684;
+            bool good = got == want && __builtin_memcmp(pat, back, want) == 0 && back[want] == 0xEE;
+            if (!good) printf("  partial read of %lu bytes returned %lu\n", len, got);
+            part_ok = part_ok && good;
+        }
+        CHECK(part_ok, "reads of every length across extent boundaries return exactly the right bytes and nothing more");
+        stellar::test_set_max_extent_sectors(0);
+
+        fresh_fs(4096);
+        u64 free0 = stellar::free_space_sectors();
+        fillp(5000, 1);
+        u64 t = stellar::create_file(ROOT, "t", pat, 5000);
+        stellar::test_set_max_extent_sectors(2);
+        fillp(9000, 2);
+        CHECK(stellar::write_file(t, pat, 9000, &st) == t, "rewrite a contiguous file as a table file");
+        CHECK(stellar::stat(t, &si) && (si.flags & TABLE) && si.extents == 9 && same(t, 9000), "now 9 extents, same star, new contents");
+        stellar::test_set_max_extent_sectors(0);
+        fillp(4000, 3);
+        CHECK(stellar::write_file(t, pat, 4000) == t, "rewrite the table file as a contiguous file");
+        CHECK(stellar::stat(t, &si) && !(si.flags & TABLE) && si.extents == 1 && same(t, 4000), "the table flag is cleared and the contents are right");
+        stellar::test_set_max_extent_sectors(5);
+        fillp(30000, 4);
+        CHECK(stellar::write_file(t, pat, 30000) == t && stellar::stat(t, &si) && (si.flags & TABLE) && same(t, 30000), "and back to a table file of a different size");
+        CHECK(stellar::link(ROOT, "t2", t) && stellar::unlink(ROOT, "t") && same(stellar::find(ROOT, "t2"), 30000), "a second name keeps a table file alive");
+        CHECK(stellar::unlink(ROOT, "t2"), "unlink the last name");
+        stellar::test_set_max_extent_sectors(0);
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "every extent and table sector was returned");
+        CHECK(stellar::free_space_sectors() + 8 >= free0, "free space is back to the start, less a dead catalog entry");
+
+        fresh_fs(4096);
+        stellar::test_set_max_extent_sectors(3);
+        fillp(7000, 1);
+        u64 sf = stellar::create_file(ROOT, "s", pat, 7000);
+        u64 snap = stellar::snapshot();
+        fillp(9000, 2);
+        CHECK(stellar::write_file(sf, pat, 9000) == sf, "rewrite after a snapshot");
+        CHECK(same(sf, 9000), "the live view has the new bytes");
+        fillp(7000, 1);
+        CHECK(same(sf, 7000, snap) && stellar::verify_file(sf, snap), "the snapshot still has the old extents and the old table");
+        CHECK(stellar::check(&r) && r.ok(), "a deep check walks both views");
+        CHECK(stellar::delete_snapshot(snap) && stellar::gc() != NONE, "drop the snapshot and collect");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "nothing is leaked");
+        fillp(9000, 2);
+        CHECK(same(sf, 9000), "and the live file is intact");
+        stellar::test_set_max_extent_sectors(0);
+
+        fresh_fs(40000);
+        stellar::test_set_max_extent_sectors(3);
+        bool made = true;
+        for (u64 i = 0; i < 100; ++i) {
+            char nm[16]; name_of(nm, "g", i);
+            fillp(25000, static_cast<u32>(i));
+            made = made && stellar::create_file(ROOT, nm, pat, 25000) != NONE;
+        }
+        CHECK(made, "100 table files of 49 sectors, spanning two bitmap pages");
+        stellar::test_set_gc_window_pages(1);
+        CHECK(stellar::gc() == 0, "gc over one-page windows finds nothing to free");
+        stellar::test_set_gc_window_pages(0);
+        bool intact = true;
+        for (u64 i = 0; i < 100; ++i) {
+            char nm[16]; name_of(nm, "g", i);
+            fillp(25000, static_cast<u32>(i));
+            intact = intact && same(stellar::find(ROOT, nm), 25000);
+        }
+        CHECK(intact && stellar::check(&r) && r.ok() && r.leaked == 0, "every file survived and check() agrees");
+        stellar::test_set_max_extent_sectors(0);
+
+        static u8 saved[4096 * 512];
+        fresh_fs(4096);
+        stellar::test_set_max_extent_sectors(3);
+        fillp(4000, 9);
+        u64 cf = stellar::create_file(ROOT, "c", pat, 4000);
+        stellar::test_set_max_extent_sectors(0);
+        u64 T = stellar::test_first_sector(cf);
+        __builtin_memcpy(saved, g_disk, sizeof(saved));
+        auto restore = [&]() { __builtin_memcpy(g_disk, saved, sizeof(saved)); CHECK(stellar::mount(), "restore"); };
+        u8* tab = g_disk + T * 512;
+        auto ext_start = [&](u32 i) { u64 v; __builtin_memcpy(&v, tab + 24 + i * 12, 8); return v; };
+        CHECK(stellar::stat(cf, &si) && si.extents == 3 && chain_len(T) == 1, "an 8-sector file at cap 3 has extents of 3, 3 and 2 sectors in one table");
+
+        tab[100] ^= 1;
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_crc >= 1, "a table sector with a bad checksum is found");
+        CHECK(stellar::read_file(cf, back, sizeof(back), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Checksum, "and the file is refused with Checksum");
+        restore();
+
+        { u32 c; __builtin_memcpy(&c, tab + 32, 4); ++c; __builtin_memcpy(tab + 32, &c, 4); sb_fix_crc(tab); }
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "extents summing to more than the file is found");
+        CHECK(stellar::read_file(cf, back, sizeof(back), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Corrupt, "and the read is refused with Corrupt");
+        CHECK(stellar::gc(&st) == NONE && st == Status::Corrupt, "gc refuses to run over a damaged extent table rather than free the file's data");
+        restore();
+
+        { u64 v = ext_start(0); __builtin_memcpy(tab + 24 + 12, &v, 8); sb_fix_crc(tab); }
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "two extents claiming the same sectors is found");
+        restore();
+
+        { u64 self = T; __builtin_memcpy(tab, &self, 8); sb_fix_crc(tab); }
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "a table whose next pointer is itself is found, without looping");
+        CHECK(stellar::read_file(cf, back, sizeof(back), stellar::LIVE, &st) == stellar::READ_ERROR && !stellar::verify_file(cf), "and reads and verification stop instead of looping");
+        restore();
+
+        { u64 v = 1; __builtin_memcpy(tab + 24 + 2 * 12, &v, 8); sb_fix_crc(tab); }
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "an extent pointing into the metadata area is found");
+        restore();
+
+        { u64 v = ext_start(2); g_disk[v * 512 + 3] ^= 1; }
+        CHECK(stellar::mount() && stellar::check(&r, false) && r.ok(), "a shallow check does not read file data");
+        CHECK(!stellar::check(&r, true) && r.bad_files >= 1, "a deep check finds corruption in the last extent");
+        CHECK(stellar::read_file(cf, back, sizeof(back), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Checksum, "and a full read is refused");
+        restore();
+        CHECK(stellar::check(&r) && r.ok(), "the restored image is clean");
+
+        { u32 c; __builtin_memcpy(&c, tab + 32, 4); --c; __builtin_memcpy(tab + 32, &c, 4); sb_fix_crc(tab); }
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "extents summing to less than the file is found");
+        CHECK(stellar::read_file(cf, back, sizeof(back), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Corrupt, "and the read is refused with Corrupt rather than returning short data");
+        restore();
+
+        fresh_fs(4096);
+        stellar::test_set_max_extent_sectors(1);
+        fillp(100 * 512, 3);
+        u64 lf = stellar::create_file(ROOT, "long", pat, 100 * 512);
+        stellar::test_set_max_extent_sectors(0);
+        u64 L = stellar::test_first_sector(lf);
+        CHECK(lf != NONE && chain_len(L) == 3 && same(lf, 100 * 512), "a 100-extent file has a chain of three tables");
+        { u64 zero = 0; __builtin_memcpy(g_disk + L * 512, &zero, 8); sb_fix_crc(g_disk + L * 512); }
+        CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "a chain cut short after its first table is found");
+        CHECK(stellar::read_file(lf, back, sizeof(back), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Corrupt, "and a read of it is refused");
+
+        fresh_fs(2048);
+        {
+            static u64 stars[2000];
+            u32 n = 0;
+            for (;; ++n) { char nm[16]; name_of(nm, "f", n); stars[n] = stellar::create_file(ROOT, nm, pat, 512); if (stars[n] == NONE) break; }
+            for (u32 i = 0; i < n; i += 2) { char nm[16]; name_of(nm, "f", i); stellar::unlink(ROOT, nm); }
+            u64 free_now = stellar::free_space_sectors();
+            printf("fragmented 2048-sector disk: %lu free sectors scattered in short runs\n", free_now);
+            u64 entries = count_dir(ROOT);
+
+            fillp(40 * 512, 1);
+            u64 w40 = stellar::create_file(ROOT, "w40", pat, 40 * 512, &st);
+            CHECK(w40 != NONE && st == Status::Ok && stellar::stat(w40, &si) && (si.flags & TABLE) && si.extents >= 2, "a 40-sector file fits a disk with no run longer than a few sectors");
+            CHECK(same(w40, 40 * 512) && stellar::verify_file(w40), "and reads back exactly");
+
+            u64 f1 = stellar::free_space_sectors();
+            stellar::create_file(ROOT, "toobig", pat, (f1 + 1) * 512 > sizeof(pat) ? sizeof(pat) : (f1 + 1) * 512, &st);
+            CHECK(st == Status::NoSpace, "a file larger than the free space is refused with NoSpace");
+            u64 exact = f1 > 700 ? 700 : f1;
+            u64 before_entries = count_dir(ROOT);
+            u64 fb = stellar::free_space_sectors();
+            stellar::create_file(ROOT, "exact", pat, exact * 512, &st);
+            if (exact == f1) CHECK(st == Status::NoSpace, "a file that takes every free sector has no room for its own table: NoSpace");
+            CHECK(count_dir(ROOT) == before_entries + (st == Status::Ok ? 1 : 0), "a refused create adds no entry");
+            if (st != Status::Ok) CHECK(stellar::free_space_sectors() == fb, "and leaks no sectors");
+            CHECK(stellar::check(&r) && r.ok(), "the disk is consistent afterwards");
+            (void)entries;
+        }
+    }
+
+    // ---------------------------------------------------------------- extent fuzz
+    {
+        struct Cfg { u64 sectors, cap, filler, steps; };
+        const Cfg cfgs[2] = { {4096, 3, 0, 2500}, {1500, 0, 900, 1500} };
+        const u64 NONE = stellar::INVALID_STAR;
+        static u8 pat[40000], back[40000];
+        for (const Cfg& c : cfgs) {
+            fresh_fs(c.sectors);
+            if (c.filler) { static u8 fill[1000 * 512]; stellar::create_file(stellar::ROOT_STAR, "filler", fill, c.filler * 512); }
+            stellar::test_set_max_extent_sectors(c.cap);
+            struct F { u64 star; u32 size, salt; bool alive; char name[16]; };
+            static F files[40];
+            u32 nf = 0, counter = 0, nsnap = 0;
+            u64 snaps[4];
+            u64 rng = 0x2545F4914F6CDD1Dull ^ c.sectors;
+            auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return static_cast<u32>(rng >> 11); };
+            auto gen = [&](u32 size, u32 salt) { for (u32 i = 0; i < size; ++i) pat[i] = static_cast<u8>(i * 13 + salt + (i >> 8)); };
+            auto verify = [&](F& f) {
+                gen(f.size, f.salt);
+                for (u32 i = 0; i < f.size + 4 && i < sizeof(back); ++i) back[i] = 0xEE;
+                u64 got = stellar::read_file(f.star, back, sizeof(back));
+                return got == f.size && __builtin_memcmp(pat, back, f.size) == 0;
+            };
+            u64 bad = 0, tables = 0, creates = 0, refused = 0;
+            for (u64 step = 0; step < c.steps; ++step) {
+                u32 r = rnd() % 100;
+                if (r < 35) {
+                    int slot = -1;
+                    if (nf < 40) slot = static_cast<int>(nf);
+                    else for (u32 i = 0; i < 40 && slot < 0; ++i) if (!files[i].alive) slot = static_cast<int>(i);
+                    if (slot < 0) continue;
+                    u32 size = rnd() % 12000, salt = rnd();
+                    gen(size, salt);
+                    char nm[16]; name_of(nm, "e", counter++);
+                    u64 id = stellar::create_file(stellar::ROOT_STAR, nm, pat, size);
+                    if (id == NONE) { ++refused; continue; }
+                    F& f = files[slot];
+                    if (static_cast<u32>(slot) == nf) ++nf;
+                    f.star = id; f.size = size; f.salt = salt; f.alive = true;
+                    u32 k = 0; for (; nm[k]; ++k) f.name[k] = nm[k]; f.name[k] = 0;
+                    stellar::StatInfo si{};
+                    ++creates;
+                    if (stellar::stat(id, &si) && (si.flags & stellar::FLAG_EXTENT_TABLE)) ++tables;
+                    if (!verify(f)) ++bad;
+                } else if (r < 55 && nf) {
+                    F& f = files[rnd() % nf];
+                    if (!f.alive) continue;
+                    u32 size = rnd() % 12000, salt = rnd();
+                    gen(size, salt);
+                    if (stellar::write_file(f.star, pat, size) == NONE) { ++refused; if (!verify(f)) ++bad; continue; }
+                    f.size = size; f.salt = salt;
+                    if (!verify(f)) ++bad;
+                } else if (r < 70 && nf) {
+                    F& f = files[rnd() % nf];
+                    if (f.alive && stellar::unlink(stellar::ROOT_STAR, f.name)) f.alive = false;
+                } else if (r < 90 && nf) {
+                    F& f = files[rnd() % nf];
+                    if (f.alive && (!verify(f) || !stellar::verify_file(f.star))) ++bad;
+                } else if (r < 93) {
+                    if (nsnap < 4) { u64 id = stellar::snapshot(); if (id != NONE) snaps[nsnap++] = id; }
+                } else if (r < 95) {
+                    if (nsnap) { u32 k = rnd() % nsnap; if (stellar::delete_snapshot(snaps[k])) snaps[k] = snaps[--nsnap]; }
+                } else if (r < 97) {
+                    if (stellar::gc() == NONE) ++bad;
+                } else {
+                    if (!stellar::mount()) ++bad;
+                }
+            }
+            bool all = true;
+            for (u32 i = 0; i < nf; ++i) if (files[i].alive) all = all && verify(files[i]);
+            stellar::CheckReport rep{};
+            bool clean = stellar::check(&rep) && rep.ok();
+            printf("extent fuzz (%lu sectors, cap %lu): %lu creates, %lu as table files, %lu refused, %lu failure(s)\n", c.sectors, c.cap, creates, tables, refused, bad);
+            CHECK(bad == 0 && all, "every file always reads back exactly what was written");
+            CHECK(clean && stellar::test_bitmap_summary_ok(), "and the filesystem checks clean with an exact free-space summary");
+            CHECK(tables > 0, "the run really did produce table files");
+            stellar::test_set_max_extent_sectors(0);
+        }
+    }
+
     // ---------------------------------------------------------------- rename
     fresh_fs();
     {
@@ -2255,7 +2567,7 @@ int main() {
 
         blank_disk(4096);
         CHECK(stellar::format(g_sectors), "format for the unsupported-features case");
-        sb_poke(72, 1, 4);
+        sb_poke(72, 2, 4);
         CHECK(!stellar::mount(&st) && st == Status::Unsupported, "unknown incompatible features report Unsupported, which the kernel never formats over");
 
         blank_disk(63);

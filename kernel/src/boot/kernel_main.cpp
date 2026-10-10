@@ -402,6 +402,35 @@ static bool selftest_rename() {
     return ok && stellar::check(&rep, false) && rep.ok();
 }
 
+static bool selftest_extents() {
+    using stellar::Status;
+    const u64 NONE = stellar::INVALID_STAR;
+    const u64 root = stellar::ROOT_STAR;
+    static u8 pat[40960], back[40960];
+    u64 dir = stellar::find(root, "ext-selftest");
+    if (dir != NONE) purge_dir(dir, 0);
+    else dir = stellar::create_constellation(root, "ext-selftest");
+    if (dir == NONE) return false;
+
+    for (u64 i = 0; i < sizeof(pat); ++i) pat[i] = static_cast<u8>(i * 7 + (i >> 9));
+    stellar::StatInfo si{};
+    stellar::test_set_max_extent_sectors(4);
+    u64 f = stellar::create_file(dir, "a", pat, sizeof(pat));
+    stellar::test_set_max_extent_sectors(0);
+    bool ok = f != NONE && stellar::stat(f, &si) && (si.flags & stellar::FLAG_EXTENT_TABLE) && si.extents == 20;
+    ok = ok && stellar::read_file(f, back, sizeof(back)) == sizeof(pat) && __builtin_memcmp(pat, back, sizeof(pat)) == 0;
+    ok = ok && stellar::verify_file(f);
+
+    for (u64 i = 0; i < 30000; ++i) pat[i] = static_cast<u8>(i * 5 + 3);
+    ok = ok && stellar::write_file(f, pat, 30000) == f && stellar::stat(f, &si) && !(si.flags & stellar::FLAG_EXTENT_TABLE) && si.extents == 1;
+    ok = ok && stellar::read_file(f, back, sizeof(back)) == 30000 && __builtin_memcmp(pat, back, 30000) == 0;
+
+    purge_dir(dir, 0);
+    ok = ok && stellar::unlink(root, "ext-selftest");
+    stellar::CheckReport rep{};
+    return ok && stellar::check(&rep, false) && rep.ok();
+}
+
 extern "C" NORETURN void kernel_main() {
     serial::init();
     serial::writeln("\n=== Aphelion booting ===");
@@ -631,6 +660,14 @@ extern "C" NORETURN void kernel_main() {
                     serial::printf("[clock] /sub/clock.probe mtime %s (%lu ms)\n", iso, probe_info.mtime);
                     serial::printf("[selftest] clock mtime: %s\n", probe_ok ? "ok" : "MISMATCH");
                 }
+            }
+
+            {
+                bool extents_ok = selftest_extents();
+                fb::printf(extents_ok ? 0xC0FFC0 : 0xE0D080,
+                           "[%s] Stellar FS extent tables: a 20-extent file written and read through the block driver, rewritten contiguous, %s\n",
+                           extents_ok ? "ok" : "--", extents_ok ? "all as expected" : "MISMATCH");
+                serial::printf("[selftest] extents: %s\n", extents_ok ? "ok" : "MISMATCH");
             }
 
             {

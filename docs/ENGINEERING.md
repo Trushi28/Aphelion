@@ -1,6 +1,6 @@
 # Engineering notes
 
-Twenty-six real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Twenty-seven real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 1. **2MB huge pages silently break when virt/phys alignment don't match.**
    The kernel's physical load address (from Limine) is *not* 2MB-aligned,
@@ -137,4 +137,11 @@ Twenty-six real bugs and design flaws found while building Aphelion, kept becaus
     benchmark's command counts. Its timings hid it, because a host RAM disk makes a command free. Sequential
     scans now go through a streaming reader that fetches 32 pages per command. The lesson is to benchmark the
     quantity that costs money on the real device, not the one that is easy to time.
+27. **A file had to be one contiguous run.** On a disk fragmented into one-sector holes (709 free sectors in
+    this case), creating a 40-sector file failed with "no space left on device". Nothing in the tests ever made free
+    space discontiguous, because every test disk was filled and emptied in order. Files that cannot find one run now
+    fall back to an extent table. The first version of the tests did not notice when the table walker lost its
+    "extents add up to the file" check, because they only corrupted a table in the direction (too many sectors) that a
+    different check catches first; a short table, which would have returned truncated data without an error, needed its
+    own test.
 

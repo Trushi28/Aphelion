@@ -17,7 +17,8 @@ constexpr u64 MIN_SECTORS = 64;
 constexpr u32 CRC_OFF = SECTOR_SIZE - 4;
 constexpr u64 BM_PAYLOAD = CRC_OFF;
 constexpr u32 SB_SLOTS = 2;
-constexpr u32 FEATURES_INCOMPAT_KNOWN = 0;
+constexpr u32 FEAT_EXTENT_TABLES = 1u << 0;
+constexpr u32 FEATURES_INCOMPAT_KNOWN = FEAT_EXTENT_TABLES;
 
 struct PACKED SnapRec {
     u64 catalog_root;
@@ -77,6 +78,25 @@ struct PACKED DirLeaf {
     u32 crc;
 };
 static_assert(sizeof(DirLeaf) == SECTOR_SIZE, "DirLeaf must fill one sector");
+
+struct PACKED ExtentRec {
+    u64 start;
+    u32 count;
+};
+static_assert(sizeof(ExtentRec) == 12, "ExtentRec must be 12 bytes");
+
+constexpr u32 EXT_PER_TABLE = 40;
+
+struct PACKED ExtentTable {
+    u64 next_sector;
+    u64 gen;
+    u32 count;
+    u32 reserved;
+    ExtentRec ext[EXT_PER_TABLE];
+    u8 padding[CRC_OFF - 24 - EXT_PER_TABLE * sizeof(ExtentRec)];
+    u32 crc;
+};
+static_assert(sizeof(ExtentTable) == SECTOR_SIZE, "ExtentTable must fill one sector");
 
 struct PACKED NodeHeader {
     u8 is_leaf;
@@ -802,19 +822,28 @@ static bool find_run(u64 from, u64 to, u64 count, u64* out) {
     return true;
 }
 
-static u64 alloc_sectors(u64 count) {
+static int alloc_run(u64 count, u64* out) {
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
     u64 hint = g_alloc_hint < data_start ? data_start : g_alloc_hint;
     u64 r;
-    if (!find_run(hint, g_sb.total_sectors, count, &r)) return 0;
+    if (!find_run(hint, g_sb.total_sectors, count, &r)) return -1;
     if (!r) {
         u64 end = hint + count;
         if (end > g_sb.total_sectors) end = g_sb.total_sectors;
-        if (!find_run(data_start, end, count, &r)) return 0;
+        if (!find_run(data_start, end, count, &r)) return -1;
     }
-    if (!r) { fail(Status::NoSpace); return 0; }
-    if (!bm_set_range(r, count, true)) return 0;
+    if (!r) return 0;
+    if (!bm_set_range(r, count, true)) return -1;
     g_alloc_hint = r + count;
+    *out = r;
+    return 1;
+}
+
+static u64 alloc_sectors(u64 count) {
+    u64 r = 0;
+    int k = alloc_run(count, &r);
+    if (k < 0) return 0;
+    if (k == 0) { fail(Status::NoSpace); return 0; }
     return r;
 }
 
@@ -1369,6 +1398,204 @@ static bool write_extent(u64 start, u64 nsec, const void* data, u64 size) {
     return true;
 }
 
+using ExtVisit = bool (*)(u64 start, u64 count, bool is_table, void* ctx);
+
+static bool walk_extents(const StarEntry& e, ExtVisit visit, void* ctx) {
+    if (!(e.flags & FLAG_EXTENT_TABLE)) return visit(e.first_sector, e.sector_count, false, ctx);
+    u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
+    u64 limit = (static_cast<u64>(e.sector_count) + EXT_PER_TABLE - 1) / EXT_PER_TABLE;
+    u64 table = e.first_sector, total = 0, hops = 0;
+    while (table != 0) {
+        if (++hops > limit) return fail(Status::Corrupt);
+        u8 buf[SECTOR_SIZE];
+        if (!rd(table, buf)) return false;
+        auto* t = reinterpret_cast<ExtentTable*>(buf);
+        if (t->count == 0 || t->count > EXT_PER_TABLE) return fail(Status::Corrupt);
+        if (!visit(table, 1, true, ctx)) return false;
+        for (u32 i = 0; i < t->count; ++i) {
+            ExtentRec r = t->ext[i];
+            if (r.count == 0 || r.start < data_start || r.start + r.count > g_sb.total_sectors) return fail(Status::Corrupt);
+            total += r.count;
+            if (total > e.sector_count) return fail(Status::Corrupt);
+            if (!visit(r.start, r.count, false, ctx)) return false;
+        }
+        table = t->next_sector;
+    }
+    if (total != e.sector_count) return fail(Status::Corrupt);
+    return true;
+}
+
+struct RelCtx { u64 gen; };
+static bool release_ext_visit(u64 start, u64 count, bool, void* c) {
+    release_extent(start, count, static_cast<RelCtx*>(c)->gen);
+    return true;
+}
+static void release_file(const StarEntry& e) {
+    RelCtx rc{ e.gen };
+    walk_extents(e, &release_ext_visit, &rc);
+}
+
+struct CrcCtx { u32 crc; u64 remaining; };
+static bool crc_visit(u64 start, u64 count, bool is_table, void* c) {
+    if (is_table) return true;
+    auto* cc = static_cast<CrcCtx*>(c);
+    u64 sec = 0;
+    while (cc->remaining > 0 && sec < count) {
+        u64 n = count - sec;
+        if (n > VERIFY_CHUNK) n = VERIFY_CHUNK;
+        g_io_reads += n;
+        if (!blockdev::read_sectors(start + sec, n, g_verify_scratch)) return fail(Status::Io);
+        u64 bytes = n * SECTOR_SIZE;
+        if (bytes > cc->remaining) bytes = cc->remaining;
+        cc->crc = crc32_update(cc->crc, g_verify_scratch, bytes);
+        cc->remaining -= bytes;
+        sec += n;
+    }
+    return true;
+}
+static bool file_crc(const StarEntry& e, u32* out) {
+    if (!g_verify_scratch) g_verify_scratch = static_cast<u8*>(alloc_ram(VERIFY_CHUNK * SECTOR_SIZE));
+    if (!g_verify_scratch) return false;
+    CrcCtx cc{ 0xFFFFFFFFu, e.size_bytes };
+    if (!walk_extents(e, &crc_visit, &cc)) return false;
+    *out = cc.crc ^ 0xFFFFFFFFu;
+    return true;
+}
+
+static bool read_run(u64 start, u64 count, u8* dst, u64 want) {
+    u64 done = 0;
+    u64 full = want / SECTOR_SIZE;
+    if (full >= 2 && blockdev::read_sectors(start, full, dst)) {
+        g_io_reads += full;
+        done = full * SECTOR_SIZE;
+    }
+    u8 sector_buf[SECTOR_SIZE];
+    for (u64 i = done / SECTOR_SIZE; i < count && done < want; ++i) {
+        if (!rd_data(start + i, sector_buf)) return false;
+        u64 chunk = want - done;
+        if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
+        for (u64 b = 0; b < chunk; ++b) dst[done + b] = sector_buf[b];
+        done += chunk;
+    }
+    return done >= want;
+}
+
+struct ReadCtx { u8* dst; u64 want; u64 done; };
+static bool read_visit(u64 start, u64 count, bool is_table, void* c) {
+    if (is_table) return true;
+    auto* rc = static_cast<ReadCtx*>(c);
+    if (rc->done >= rc->want) return true;
+    u64 take = count * SECTOR_SIZE;
+    if (take > rc->want - rc->done) take = rc->want - rc->done;
+    if (!read_run(start, count, rc->dst + rc->done, take)) return false;
+    rc->done += take;
+    return true;
+}
+
+static u64 g_max_extent = 0;
+
+static u64 free_sectors_locked() {
+    u64 n = 0;
+    for (u64 p = 0; p < g_bm_pages; ++p) n += g_bm_free[p];
+    return n;
+}
+
+struct RunBuf {
+    struct Run { u64 start; u32 count; };
+    Run* v = nullptr;
+    u32 n = 0, cap = 0;
+    ~RunBuf() { free_ram(v, cap * sizeof(Run)); }
+    bool push(u64 start, u32 count) {
+        if (!g_max_extent && n && v[n - 1].start + v[n - 1].count == start && static_cast<u64>(v[n - 1].count) + count <= 0xFFFFFFFFull) {
+            v[n - 1].count += count;
+            return true;
+        }
+        if (n == cap) {
+            u32 nc = cap ? cap * 2 : 64;
+            Run* nv = static_cast<Run*>(alloc_ram(static_cast<u64>(nc) * sizeof(Run)));
+            if (!nv) return false;
+            if (v) {
+                __builtin_memcpy(nv, v, static_cast<u64>(n) * sizeof(Run));
+                free_ram(v, cap * sizeof(Run));
+            }
+            v = nv;
+            cap = nc;
+        }
+        v[n++] = { start, count };
+        return true;
+    }
+};
+
+static bool place_fragmented(u64 nsec, const void* data, u64 size, StarEntry& e) {
+    if (free_sectors_locked() < nsec) return fail(Status::NoSpace);
+    u64 cap = g_max_extent ? g_max_extent : nsec;
+    RunBuf rb;
+    u64 remaining = nsec;
+    while (remaining) {
+        u64 w = remaining < cap ? remaining : cap;
+        u64 at = 0, got = 0;
+        while (w) {
+            int r = alloc_run(w, &at);
+            if (r < 0) return false;
+            if (r == 1) { got = w; break; }
+            w >>= 1;
+        }
+        if (!got) return fail(Status::NoSpace);
+        if (!rb.push(at, static_cast<u32>(got))) return false;
+        remaining -= got;
+    }
+
+    const u8* src = static_cast<const u8*>(data);
+    u64 off = 0;
+    for (u32 i = 0; i < rb.n; ++i) {
+        u64 bytes = size > off ? size - off : 0;
+        u64 room = static_cast<u64>(rb.v[i].count) * SECTOR_SIZE;
+        if (bytes > room) bytes = room;
+        if (!write_extent(rb.v[i].start, rb.v[i].count, bytes ? src + off : src, bytes)) return false;
+        off += room;
+    }
+
+    u32 groups = (rb.n + EXT_PER_TABLE - 1) / EXT_PER_TABLE;
+    u64 next = 0;
+    for (u32 g = groups; g-- > 0;) {
+        u64 sec = alloc_sectors(1);
+        if (!sec) return false;
+        u8 buf[SECTOR_SIZE];
+        for (auto& b : buf) b = 0;
+        auto* t = reinterpret_cast<ExtentTable*>(buf);
+        u32 first = g * EXT_PER_TABLE;
+        u32 cnt = rb.n - first < EXT_PER_TABLE ? rb.n - first : EXT_PER_TABLE;
+        t->next_sector = next;
+        t->gen = g_sb.epoch;
+        t->count = cnt;
+        for (u32 i = 0; i < cnt; ++i) t->ext[i] = { rb.v[first + i].start, rb.v[first + i].count };
+        if (!wr(sec, buf)) return false;
+        next = sec;
+    }
+    e.first_sector = next;
+    e.flags |= FLAG_EXTENT_TABLE;
+    if (!(g_sb.features_incompat & FEAT_EXTENT_TABLES)) {
+        g_sb.features_incompat |= FEAT_EXTENT_TABLES;
+        touch_sb();
+    }
+    return true;
+}
+
+static bool place_data(u64 nsec, const void* data, u64 size, StarEntry& e) {
+    e.flags &= ~FLAG_EXTENT_TABLE;
+    if (!g_max_extent || nsec <= g_max_extent) {
+        u64 start = 0;
+        int r = alloc_run(nsec, &start);
+        if (r < 0) return false;
+        if (r == 1) {
+            if (!write_extent(start, nsec, data, size)) return false;
+            e.first_sector = start;
+            return true;
+        }
+    }
+    return place_fragmented(nsec, data, size, e);
+}
+
 static void reset_runtime_state() {
     g_defer_n = 0;
     g_txn_poisoned = false;
@@ -1636,14 +1863,12 @@ static u64 create_file_impl(u64 parent, const char* name, const void* data, u64 
     if (parent != INVALID_STAR && !can_add(parent, name)) return INVALID_STAR;
     u64 id = alloc_star_id();
     u64 nsec = size == 0 ? 1 : (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    u64 start = alloc_sectors(nsec);
-    if (start == 0) return INVALID_STAR;
-    if (!write_extent(start, nsec, data, size)) return INVALID_STAR;
+    if (nsec > 0xFFFFFFFFull) return fail_id(Status::InvalidArgument);
 
     StarEntry entry{};
+    if (!place_data(nsec, data, size, entry)) return INVALID_STAR;
     entry.type = TYPE_FILE;
     entry.size_bytes = size;
-    entry.first_sector = start;
     entry.sector_count = static_cast<u32>(nsec);
     entry.gen = g_sb.epoch;
     entry.nlink = 1;
@@ -1669,23 +1894,21 @@ static u64 write_file_impl(u64 star, const void* data, u64 size) {
     if (old_e.type != TYPE_FILE) return fail_id(Status::NotFound);
 
     u64 nsec = size == 0 ? 1 : (size + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    u64 start = alloc_sectors(nsec);
-    if (start == 0) return INVALID_STAR;
-    if (!write_extent(start, nsec, data, size)) return INVALID_STAR;
+    if (nsec > 0xFFFFFFFFull) return fail_id(Status::InvalidArgument);
 
     StarEntry new_e{};
+    new_e.flags = old_e.flags;
+    if (!place_data(nsec, data, size, new_e)) return INVALID_STAR;
     new_e.type = TYPE_FILE;
     new_e.size_bytes = size;
-    new_e.first_sector = start;
     new_e.sector_count = static_cast<u32>(nsec);
     new_e.gen = g_sb.epoch;
     new_e.nlink = old_e.nlink;
     new_e.mtime = now();
-    new_e.flags = old_e.flags;
     new_e.checksum = crc32_full(static_cast<const u8*>(data), size);
 
     if (!catalog_upsert(star, new_e)) return INVALID_STAR;
-    release_extent(old_e.first_sector, old_e.sector_count, old_e.gen);
+    release_file(old_e);
     return txn.finish(true) ? star : INVALID_STAR;
 }
 
@@ -1791,7 +2014,7 @@ static bool release_visit(u64 sector, const u8* node, void*) {
 
 static void release_current_epoch(const StarEntry& t) {
     if (t.type == TYPE_FILE) {
-        release_extent(t.first_sector, t.sector_count, t.gen);
+        release_file(t);
         return;
     }
     dt_walk(t.first_sector, &release_visit, nullptr);
@@ -1862,6 +2085,12 @@ static void mk_range(u64 first, u64 count) {
     while (b < e) { g_mark[b / 8] |= static_cast<u8>(1u << (b % 8)); ++b; }
 }
 
+static bool mark_visit(u64 start, u64 count, bool is_table, void*) {
+    if (is_table) mk_set(start);
+    else mk_range(start, count);
+    return true;
+}
+
 static bool mark_dir_tree(u64 sector, u32 depth) {
     if (depth > DT_MAX_DEPTH || sector == 0 || sector >= g_sb.total_sectors) return false;
     if (mk_test(sector)) return true;
@@ -1891,8 +2120,11 @@ static bool mark_tree(u64 sector, u32 depth) {
         if (n > LEAF_MAX) n = LEAF_MAX;
         for (u32 i = 0; i < n; ++i) {
             StarEntry e = leaf->entries[i].entry;
-            if (e.type == TYPE_FILE) mk_range(e.first_sector, e.sector_count);
-            else if (e.type == TYPE_CONSTELLATION && !mark_dir_tree(e.first_sector, 0)) return false;
+            if (e.type == TYPE_FILE) {
+                if (!walk_extents(e, &mark_visit, nullptr)) return false;
+            } else if (e.type == TYPE_CONSTELLATION && !mark_dir_tree(e.first_sector, 0)) {
+                return false;
+            }
         }
         return true;
     }
@@ -1977,26 +2209,8 @@ static bool verify_file_impl(u64 star, u64 snap) {
     if (e.type == TYPE_CONSTELLATION) return fail(Status::IsADirectory);
     if (e.type != TYPE_FILE) return fail(Status::NotFound);
 
-    constexpr u64 CHUNK = VERIFY_CHUNK;
-    if (!g_verify_scratch) g_verify_scratch = static_cast<u8*>(alloc_ram(CHUNK * SECTOR_SIZE));
-    if (!g_verify_scratch) return false;
-    u8* scratch = g_verify_scratch;
-
-    u32 crc = 0xFFFFFFFFu;
-    u64 remaining = e.size_bytes;
-    u64 sec = 0;
-    while (remaining > 0 && sec < e.sector_count) {
-        u64 n = e.sector_count - sec;
-        if (n > CHUNK) n = CHUNK;
-        g_io_reads += n;
-        if (!blockdev::read_sectors(e.first_sector + sec, n, scratch)) return false;
-        u64 bytes = n * SECTOR_SIZE;
-        if (bytes > remaining) bytes = remaining;
-        crc = crc32_update(crc, scratch, bytes);
-        remaining -= bytes;
-        sec += n;
-    }
-    crc ^= 0xFFFFFFFFu;
+    u32 crc;
+    if (!file_crc(e, &crc)) return false;
 
     if (crc != e.checksum) {
         serial::printf("[stellar] checksum mismatch on star %lu: stored %x computed %x\n",
@@ -2022,21 +2236,10 @@ static u64 read_file_impl(u64 star, void* buf, u64 max_size, u64 snap) {
     u64 size = e.size_bytes;
     u64 to_read = size < max_size ? size : max_size;
     u8* dst = static_cast<u8*>(buf);
-    u64 read_so_far = 0;
-    u64 full = to_read / SECTOR_SIZE;
-    if (full >= 2 && blockdev::read_sectors(e.first_sector, full, dst)) {
-        g_io_reads += full;
-        read_so_far = full * SECTOR_SIZE;
-    }
-    u8 sector_buf[SECTOR_SIZE];
-    for (u64 i = read_so_far / SECTOR_SIZE; i < e.sector_count && read_so_far < to_read; ++i) {
-        if (!rd_data(e.first_sector + i, sector_buf)) break;
-        u64 chunk = to_read - read_so_far;
-        if (chunk > SECTOR_SIZE) chunk = SECTOR_SIZE;
-        for (u64 b = 0; b < chunk; ++b) dst[read_so_far + b] = sector_buf[b];
-        read_so_far += chunk;
-    }
-    if (read_so_far < to_read) return READ_ERROR;
+    ReadCtx rc{ dst, to_read, 0 };
+    if (!walk_extents(e, &read_visit, &rc)) return READ_ERROR;
+    if (rc.done < to_read) return READ_ERROR;
+    u64 read_so_far = rc.done;
     if (read_so_far == size && crc32_full(dst, size) != e.checksum) {
         serial::printf("[stellar] checksum mismatch reading star %lu, refusing the data\n", star);
         fail(Status::Checksum);
@@ -2280,21 +2483,33 @@ static bool ck_read(u64 sector, u8* buf) {
 }
 
 static bool ck_extent_ok(const StarEntry& e) {
-    if (!g_verify_scratch) g_verify_scratch = static_cast<u8*>(alloc_ram(VERIFY_CHUNK * SECTOR_SIZE));
-    if (!g_verify_scratch) { g_ck.io_error = true; return true; }
-    u32 crc = 0xFFFFFFFFu;
-    u64 remaining = e.size_bytes, sec = 0;
-    while (remaining > 0 && sec < e.sector_count) {
-        u64 n = e.sector_count - sec;
-        if (n > VERIFY_CHUNK) n = VERIFY_CHUNK;
-        if (!blockdev::read_sectors(e.first_sector + sec, n, g_verify_scratch)) { g_ck.io_error = true; return true; }
-        u64 bytes = n * SECTOR_SIZE;
-        if (bytes > remaining) bytes = remaining;
-        crc = crc32_update(crc, g_verify_scratch, bytes);
-        remaining -= bytes;
-        sec += n;
+    u32 crc;
+    if (!file_crc(e, &crc)) { g_ck.io_error = true; return true; }
+    return crc == e.checksum;
+}
+
+static bool ck_file_extents(const StarEntry& e) {
+    if (!(e.flags & FLAG_EXTENT_TABLE)) return ck_claim(e.first_sector, e.sector_count);
+    u64 limit = (static_cast<u64>(e.sector_count) + EXT_PER_TABLE - 1) / EXT_PER_TABLE;
+    u64 table = e.first_sector, total = 0, hops = 0;
+    bool ok = true;
+    while (table != 0) {
+        if (++hops > limit) { ++g_ck.r->bad_structure; return false; }
+        if (!ck_claim(table, 1)) return false;
+        u8 buf[SECTOR_SIZE];
+        if (!ck_read(table, buf)) return false;
+        auto* t = reinterpret_cast<ExtentTable*>(buf);
+        if (t->count == 0 || t->count > EXT_PER_TABLE) { ++g_ck.r->bad_structure; return false; }
+        for (u32 i = 0; i < t->count; ++i) {
+            ExtentRec r = t->ext[i];
+            if (r.count == 0 || total + r.count > e.sector_count) { ++g_ck.r->bad_structure; return false; }
+            total += r.count;
+            if (!ck_claim(r.start, r.count)) ok = false;
+        }
+        table = t->next_sector;
     }
-    return (crc ^ 0xFFFFFFFFu) == e.checksum;
+    if (total != e.sector_count) { ++g_ck.r->bad_structure; return false; }
+    return ok;
 }
 
 static void ck_dnode(u64 dir_star, u64 sector, u32 depth, u64 lo, bool has_hi, u64 hi) {
@@ -2370,7 +2585,7 @@ static void ck_node(u64 sector, u32 depth) {
                 if (e.sector_count != need) ++g_ck.r->bad_structure;
                 bool in_range = e.first_sector < g_sb.total_sectors;
                 bool first_time = in_range && !ck_bit(g_ck.ref, e.first_sector);
-                if (ck_claim(e.first_sector, e.sector_count) && g_ck.deep && first_time && !ck_extent_ok(e)) ++g_ck.r->bad_files;
+                if (ck_file_extents(e) && g_ck.deep && first_time && !ck_extent_ok(e)) ++g_ck.r->bad_files;
             } else if (e.type == TYPE_CONSTELLATION) {
                 if (le.star_id == ROOT_STAR && e.size_bytes != INVALID_STAR) ++g_ck.r->bad_structure;
                 ck_dir(le.star_id, e);
@@ -2451,6 +2666,12 @@ bool check(CheckReport* out, bool deep, Status* why) {
     return api.ok(check_impl(out, deep));
 }
 
+struct CountCtx { u32 n; };
+static bool count_visit(u64, u64, bool is_table, void* c) {
+    if (!is_table) ++static_cast<CountCtx*>(c)->n;
+    return true;
+}
+
 static bool stat_impl(u64 star, StatInfo* out, u64 snap) {
     if (!g_mounted) return fail(Status::NotMounted);
     if (!out) return fail(Status::InvalidArgument);
@@ -2458,7 +2679,12 @@ static bool stat_impl(u64 star, StatInfo* out, u64 snap) {
     if (!view_root(snap, &root)) return false;
     StarEntry e;
     if (!bt_search(root, star, &e) || e.type == TYPE_FREE) return fail(Status::NotFound);
-    *out = { e.type, e.nlink, e.flags, e.sector_count, e.type == TYPE_CONSTELLATION ? 0 : e.size_bytes, e.mtime, e.gen };
+    u32 extents = 0;
+    if (e.type == TYPE_FILE) {
+        CountCtx cc{ 0 };
+        if (walk_extents(e, &count_visit, &cc)) extents = cc.n;
+    }
+    *out = { e.type, e.nlink, e.flags, e.sector_count, e.type == TYPE_CONSTELLATION ? 0 : e.size_bytes, e.mtime, e.gen, extents };
     return true;
 }
 
@@ -2480,6 +2706,19 @@ static bool set_flags_impl(u64 star, u32 flags) {
 bool set_flags(u64 star, u32 flags, Status* why) {
     Api api(why);
     return api.ok(set_flags_impl(star, flags));
+}
+
+u64 test_first_sector(u64 star, u64 snap) {
+    Guard guard;
+    u64 root;
+    StarEntry e;
+    if (!g_mounted || !view_root(snap, &root) || !bt_search(root, star, &e)) return INVALID_STAR;
+    return e.first_sector;
+}
+
+void test_set_max_extent_sectors(u64 n) {
+    Guard guard;
+    g_max_extent = n;
 }
 
 void test_set_hash_mask(u64 mask) {

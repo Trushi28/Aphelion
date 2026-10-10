@@ -22,6 +22,7 @@ constexpr u32 USER_FLAGS_MASK = 0xFFFF0000u;
 struct StatInfo {
     u32 type, nlink, flags, sector_count;
     u64 size_bytes, mtime, gen;
+    u32 extents;
 };
 
 enum class Status : i32 {
@@ -104,6 +105,8 @@ void set_clock(u64 (*fn)());
 
 void test_set_hash_mask(u64 mask);
 void test_set_bitmap_cache_slots(u32 n);
+void test_set_max_extent_sectors(u64 n);
+u64 test_first_sector(u64 star, u64 snap = LIVE);
 void test_set_gc_window_pages(u64 pages);
 bool test_bitmap_summary_ok();
 

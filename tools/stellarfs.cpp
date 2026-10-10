@@ -60,6 +60,7 @@ static void ls_cb(const char* name, u64 star, u32 type, void* ctx) {
     for (u64 i = 0; i < depth; ++i) printf("  ");
     if (type == stellar::TYPE_CONSTELLATION) printf("%s/  (star %llu", name, star);
     else printf("%s  (star %llu, %llu bytes, %u link(s)", name, star, si.size_bytes, si.nlink);
+    if (si.extents > 1) printf(", %u extents", si.extents);
     if (si.mtime) {
         char iso[21];
         civil::format_iso(civil::from_unix(si.mtime / 1000), iso);
