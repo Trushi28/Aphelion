@@ -1639,6 +1639,16 @@ static const char* superblock_problem(const Superblock& sb, u64 device_sectors) 
     return nullptr;
 }
 
+static bool write_format_markers() {
+    u8 buf[SECTOR_SIZE];
+    for (auto& b : buf) b = 0;
+    u64 magic = MAGIC;
+    __builtin_memcpy(buf, &magic, sizeof(magic));
+    for (u32 slot = 0; slot < SB_SLOTS; ++slot)
+        if (!raw_wr(slot, buf)) return false;
+    return flush_dev();
+}
+
 static bool format_impl(u64 total_sectors) {
     if (g_txn_depth != 0) return fail(Status::Busy);
     if (total_sectors < MIN_SECTORS || total_sectors > blockdev::capacity_sectors()) return fail(Status::InvalidArgument);
@@ -1658,6 +1668,7 @@ static bool format_impl(u64 total_sectors) {
     g_sb.snap_count = 0;
 
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
+    if (!write_format_markers()) { release_runtime(); return false; }
     if (!format_bitmap()) { release_runtime(); return false; }
     g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
     touch_sb();
@@ -1673,20 +1684,15 @@ static bool format_impl(u64 total_sectors) {
     leaf->gen = g_sb.epoch;
     if (!wr(root_sector, buf)) { release_runtime(); return false; }
     g_sb.catalog_root = root_sector;
-    if (!commit()) {
-        serial::writeln("[stellar] format: could not write the initial metadata");
+
+    u64 root = create_constellation(INVALID_STAR, "");
+    if (root != ROOT_STAR) {
+        serial::writeln("[stellar] format: could not create the root directory");
         release_runtime();
         return false;
     }
     if (!sb_write_slot(0)) {
         serial::writeln("[stellar] format: could not write the second superblock");
-        release_runtime();
-        return false;
-    }
-
-    u64 root = create_constellation(INVALID_STAR, "");
-    if (root != ROOT_STAR) {
-        serial::writeln("[stellar] format: root did not land at star 0");
         release_runtime();
         return false;
     }

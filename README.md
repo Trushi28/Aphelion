@@ -88,6 +88,7 @@ make run-ahci       # boot with an AHCI/SATA disk
 make run-headless   # serial output only
 make test-stellar   # run the filesystem tests on the host, without QEMU
 make bench-stellar  # filesystem scaling benchmark on sparse virtual disks up to 8 GiB
+make crash-fuzz     # kill QEMU at random instants, fsck the crashed disk, boot it again (FUZZ_KIND, FUZZ_CORES, FUZZ_ROUNDS)
 make reset-disk     # delete disk.img so the next run formats a fresh filesystem
 ```
 

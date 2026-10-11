@@ -1,6 +1,6 @@
 # Engineering notes
 
-Twenty-seven real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Twenty-nine real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 1. **2MB huge pages silently break when virt/phys alignment don't match.**
    The kernel's physical load address (from Limine) is *not* 2MB-aligned,
@@ -144,4 +144,18 @@ Twenty-seven real bugs and design flaws found while building Aphelion, kept beca
     "extents add up to the file" check, because they only corrupted a table in the direction (too many sectors) that a
     different check catches first; a short table, which would have returned truncated data without an error, needed its
     own test.
+28. **A crash during `format` left a disk that could never be formatted again, or a volume with no root directory.**
+    `format` wrote the zeroed free-space bitmap (non-zero bytes, since each page has a CRC) before either superblock
+    held anything, and the format guard from note 25 correctly refuses to overwrite a non-blank disk that does not
+    carry the Stellar magic. Separately it made a superblock durable with an empty catalog and created star 0, the
+    root directory, in a later transaction. Of 90 simulated crash states, 25 were unbootable and 41 mounted without a
+    root. The earlier crash exploration never saw it because it always started from an already formatted disk. The
+    bug in note 25's fix exposed this one: a guard that refuses to format unrecognised disks needs `format` to leave a
+    recognisable disk at every instant.
+29. **Random kill times missed a window a millisecond wide, and the boot self-test assumed a pristine disk.** The
+    QEMU kill fuzzer found no format bug in about 60 uniformly random kills, because the format takes about a millisecond
+    and a shell cannot aim that finely; it needed a throttled disk and a kill keyed to a log line. What it did find
+    was the kernel's own stress self-test failing after a boot that had been killed mid-run, because it hard-coded how
+    many entries the root directory should hold. A fuzzer is only as good as the window it can reach, and a test that
+    only passes on a clean disk will fail for the wrong reason the first time anything crashes.
 

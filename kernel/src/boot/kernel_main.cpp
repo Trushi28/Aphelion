@@ -360,12 +360,15 @@ static void purge_collect(const char* name, u64 star, u32 type, void* ctx) {
 
 static void purge_dir(u64 dir, u32 depth) {
     if (depth > 4) return;
-    PurgeList pl;
-    pl.n = 0;
-    stellar::list(dir, &purge_collect, &pl);
-    for (u32 i = 0; i < pl.n; ++i) {
-        if (pl.types[i] == stellar::TYPE_CONSTELLATION) purge_dir(pl.stars[i], depth + 1);
-        stellar::unlink(dir, pl.names[i]);
+    for (u32 pass = 0; pass < 64; ++pass) {
+        PurgeList pl;
+        pl.n = 0;
+        stellar::list(dir, &purge_collect, &pl);
+        if (pl.n == 0) return;
+        for (u32 i = 0; i < pl.n; ++i) {
+            if (pl.types[i] == stellar::TYPE_CONSTELLATION) purge_dir(pl.stars[i], depth + 1);
+            stellar::unlink(dir, pl.names[i]);
+        }
     }
 }
 
@@ -556,6 +559,7 @@ extern "C" NORETURN void kernel_main() {
         bool fresh_fs = false;
         if (!fs_ready) {
             if (mount_why == stellar::Status::NotFormatted && stellar::can_auto_format()) {
+                serial::writeln("[stellar] blank disk: formatting");
                 u64 capacity = blockdev::capacity_sectors();
                 u64 fs_sectors = capacity > TEST_TAIL_SECTORS + 64 ? capacity - TEST_TAIL_SECTORS : capacity;
                 fs_ready = stellar::format(fs_sectors);
@@ -778,6 +782,13 @@ extern "C" NORETURN void kernel_main() {
             constexpr u64 STRESS_COUNT = 14;
             static u64 stress_ids[STRESS_COUNT];
             bool stress_create_ok = true;
+
+            u64 stale_stress = stellar::find(stellar::ROOT_STAR, "smpstress");
+            if (stale_stress != stellar::INVALID_STAR) {
+                purge_dir(stale_stress, 0);
+                stellar::unlink(stellar::ROOT_STAR, "smpstress");
+                serial::writeln("[stellar] removed the smpstress directory left behind by an interrupted boot");
+            }
             for (u64 i = 0; i < STRESS_COUNT; ++i) {
                 char digits[20];
                 u32 dlen = itoa_dec(i, digits);
@@ -803,7 +814,10 @@ extern "C" NORETURN void kernel_main() {
 
             u64 dir_count = 0;
             stellar::list(stellar::ROOT_STAR, &count_entry, &dir_count);
-            u64 expected_dir_count = STRESS_COUNT + 4;
+            u64 expected_dir_count = STRESS_COUNT;
+            const char* const known_names[4] = { "hello.txt", "sub", "tree", "bulk.bin" };
+            for (const char* known : known_names)
+                if (stellar::find(stellar::ROOT_STAR, known) != stellar::INVALID_STAR) ++expected_dir_count;
 
             bool stress_ok = stress_create_ok && (stress_mismatches == 0) && (dir_count == expected_dir_count);
             if (stress_ok) {

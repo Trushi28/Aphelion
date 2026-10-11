@@ -34,6 +34,18 @@ jobs:
       - name: Boot on virtio-blk
         run: tools/ci-boot.sh virtio 1
 
+      - name: Build host filesystem tools
+        run: make stellarfs
+
+      - name: Crash fuzz, NVMe
+        run: tools/crash-fuzz.sh nvme 1 16 7
+
+      - name: Crash fuzz, AHCI
+        run: tools/crash-fuzz.sh ahci 1 10 7
+
+      - name: Crash fuzz, virtio-blk
+        run: tools/crash-fuzz.sh virtio 1 10 7
+
       - name: Boot timings
         if: always()
         run: |

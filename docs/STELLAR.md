@@ -140,6 +140,57 @@ replaced sectors immediately, and making `flush()` a no-op each fail the suite.
 device honours `flush()`. Not modelled: a device that acknowledges a flush without making the data durable, and
 silent corruption that happens to preserve a CRC.
 
+### Crash testing
+
+Three layers, in decreasing order of how much they control and increasing order of how real they are:
+
+1. **The write-log simulation** (above). Every crash point of a random workload, with the unflushed writes applied as
+   an arbitrary subset, in any order, some torn. It starts from an already formatted disk, so it says nothing about
+   `format`.
+2. **Crash during format.** The same idea applied to `format()` itself, from a blank disk: every cut point, 24
+   recoveries per cut (ordered prefix, nothing, and random subsets of the unflushed window). The requirement is that
+   a disk either mounts with its root directory and checks clean, or is `NotFormatted` and safe for the kernel to
+   format again. This found two bugs, below.
+3. **`tools/crash-fuzz.sh` (`make crash-fuzz`).** Boots the real kernel under QEMU on a real driver, kills the
+   emulator with SIGKILL, runs the host `fsck` on a copy of the crashed disk, and every few rounds boots the crashed
+   disk to completion and requires every self-test to pass and `fsck` to stay clean. Every fourth round starts from a
+   blank disk, throttled to 200 IOPS and killed 0 to 90 ms after the kernel prints that it is about to format, so the
+   kill lands inside the format; the other rounds kill at a uniformly random instant of the first 4.5 seconds.
+
+What layer 3 does **not** show. Killing an emulator produces only crashes that are an in-order prefix of the writes
+the guest had issued: nothing is reordered, torn, or lost from a device cache, because the host keeps everything the
+guest wrote. So it does not test whether the kernel's flush ordering is right (layer 1 does, in simulation) or
+whether a real device honours `flush()` (nothing here does). Kill times are seeded, but QEMU's own timing is not, so a
+run cannot be replayed exactly; a failing run keeps the crashed disk image, which is the reproduction.
+
+What it found, and what it missed:
+
+- It found that the kernel's boot self-test assumed a pristine disk: it hard-coded the number of entries in the root
+  directory, so a boot killed during the SMP stress left a `smpstress/` directory that made the next boot skip its own
+  test. The filesystem was fine; the test was wrong. The test now removes the stale directory and counts only entries
+  that exist.
+- Uniformly random kill times never found the format bug: about 60 kills against the build without the fix (two
+  of three runs stopped early on the self-test problem above), none in the window, because the whole format takes a millisecond or two and a shell cannot aim that finely. The deterministic
+  layer-2 test found it first. The fuzzer found it only after the disk was throttled and the kill was keyed to a log
+  line, and then 14 of 16 aimed kills against the old build produced the bad state.
+- It also found two bugs in itself: `od` collapses repeated lines, which made a blank sector look non-empty, and a
+  guard that waited for a log line printed 0.6 seconds before the format began.
+
+**Format is now crash-safe.** It used to write the zeroed bitmap before any superblock existed, so a crash there left
+a disk with data but no Stellar marker, which the format guard (correctly) refuses to overwrite: the kernel would
+never have formatted it again. It also made an empty-catalog superblock durable before creating the root directory in
+a separate transaction, so a crash between them left a volume that mounted but had no root. Now both superblock
+slots are first overwritten with the Stellar magic and no valid version (and flushed), the bitmap is written, and the
+root directory is created inside the same commit that makes the first superblock durable; the second slot is
+mirrored afterwards. Crashing at any of the 14 writes leaves either a marked disk the kernel reformats or a complete
+volume.
+
+**On real hardware.** None of this has been run on a physical disk. A power cut is the only test of the device
+assumptions above. If you try it, use a spare disk that holds nothing you want (the kernel formats a blank disk and
+an unmarked non-blank one is refused), cut power while it is booting or while the stress test runs, then attach the
+disk to another machine and run `build/stellarfs fsck /dev/sdX`. Expect a clean result with, possibly, some leaked
+sectors (harmless, `gc` returns them). `referenced-but-free` or bad checksums on a committed file would be a real finding.
+
 ## Verification and hardening
 
 `check(report, deep)` walks the live tree and every snapshot and reports bad checksums, bad file data, referenced
@@ -333,7 +384,8 @@ sinks to the lowest scheduler ring so a runnable holder always outranks it.
 
 Stated plainly:
 
-- Crash safety rests on the assumptions listed above; it has been tested by simulation, not on hardware.
+- Crash safety rests on the assumptions listed above. It has been tested by simulation and by killing the kernel
+  under QEMU (in-order prefixes only), never on hardware.
 - **gc() is stop-the-world**, O(filesystem size): it holds the filesystem lock for its whole run. Space held
   by older epochs only comes back via `delete_snapshot` and `gc()`. On a disk over 64 GiB it walks the catalog
   once per window (and once per snapshot root per window), so cost grows with disks x snapshots x catalog size.

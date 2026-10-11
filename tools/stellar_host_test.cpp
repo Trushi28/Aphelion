@@ -2529,6 +2529,61 @@ int main() {
         CHECK(strcmp_(iso, "1970-01-01T00:00:00Z"), "ISO formatting of the epoch");
     }
 
+    // ---------------------------------------------------------------- crash during format
+    {
+        using stellar::Status;
+        const u64 SECT = 4096;
+        static u8 work[4096 * 512];
+        free(g_disk);
+        g_sectors = SECT;
+        g_disk = static_cast<u8*>(calloc(g_sectors, 512));
+        stellar::init(0);
+        g_log_n = 0; g_rec = true; g_quiet = true;
+        bool formatted = stellar::format(SECT);
+        g_rec = false; g_quiet = false;
+        CHECK(formatted, "format on a blank disk");
+        const u32 total = g_log_n;
+        u8* heap = g_disk;
+        u64 rng = 0xA24BAED4963EE407ull;
+        auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return static_cast<u32>(rng >> 11); };
+        u64 states = 0, unbootable = 0, rootless = 0, damaged = 0;
+        for (u32 k = 0; k <= total; ++k) {
+            u32 last_barrier = 0;
+            for (u32 q = 0; q < k; ++q) if (g_log[q].sector == ~0ull) last_barrier = q + 1;
+            for (int variant = 0; variant < 24; ++variant) {
+                __builtin_memset(work, 0, sizeof(work));
+                for (u32 q = 0; q < last_barrier; ++q)
+                    if (g_log[q].sector != ~0ull) __builtin_memcpy(work + g_log[q].sector * 512, g_log[q].data, 512);
+                for (u32 q = last_barrier; q < k; ++q) {
+                    if (g_log[q].sector == ~0ull) continue;
+                    bool take = variant == 0 ? true : variant == 1 ? false : (rnd() & 1);
+                    if (take) __builtin_memcpy(work + g_log[q].sector * 512, g_log[q].data, 512);
+                }
+                ++states;
+                g_disk = work;
+                stellar::init(0);
+                Status st = Status::Internal;
+                if (stellar::mount(&st)) {
+                    stellar::StatInfo si{};
+                    stellar::CheckReport r{};
+                    if (!stellar::stat(stellar::ROOT_STAR, &si) || si.type != stellar::TYPE_CONSTELLATION) ++rootless;
+                    else if (!stellar::check(&r) || !r.ok()) ++damaged;
+                } else if (st != Status::NotFormatted || !stellar::can_auto_format()) {
+                    ++unbootable;
+                    if (unbootable == 1) printf("  first unbootable state: cut %u of %u, variant %d, mount said '%s'\n", k, total, variant, stellar::status_name(st));
+                } else if (!stellar::format(SECT) || !stellar::mount()) {
+                    ++unbootable;
+                }
+            }
+        }
+        g_disk = heap;
+        printf("crash during format: %lu states over %u writes, %lu unbootable, %lu mounted without a root directory, %lu damaged\n",
+               states, total, unbootable, rootless, damaged);
+        CHECK(unbootable == 0, "a crash at any point of format leaves a disk that mounts or is safe to format again");
+        CHECK(rootless == 0, "and a volume that mounts always has its root directory");
+        CHECK(damaged == 0, "and checks clean");
+    }
+
     // ---------------------------------------------------------------- auto-format guard
     {
         using stellar::Status;

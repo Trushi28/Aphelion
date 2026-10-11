@@ -40,7 +40,7 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
 
-.PHONY: all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar stellarfs clean distclean
+.PHONY: all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -149,6 +149,14 @@ test-stellar:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp -o $(BUILD)/stellar_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/stellar_host_test
+
+FUZZ_KIND   ?= nvme
+FUZZ_CORES  ?= 1
+FUZZ_ROUNDS ?= 30
+FUZZ_SEED   ?= 1
+
+crash-fuzz: iso stellarfs
+	tools/crash-fuzz.sh $(FUZZ_KIND) $(FUZZ_CORES) $(FUZZ_ROUNDS) $(FUZZ_SEED)
 
 bench-stellar:
 	@mkdir -p $(BUILD)
