@@ -93,7 +93,7 @@ static int g_fail = 0;
 #define CHECK(c, msg) do { if (!(c)) { ++g_fail; printf("FAIL: %s  (line %d)\n", msg, __LINE__); } } while (0)
 
 static bool eq(u64 star, const char* expect, u64 snap = stellar::LIVE) {
-    static u8 tmp[4096];
+    u8 tmp[4096];
     u64 want = strlen(expect);
     if (star == stellar::INVALID_STAR) return false;
     u64 got = stellar::read_file(star, tmp, sizeof(tmp), snap);
@@ -951,6 +951,112 @@ int main() {
 
     fresh_fs();
     {
+        using stellar::Status;
+        constexpr u64 THREADS = 4, FILES = 30, ROUNDS = 12;
+        static u64 box[2];
+        static u64 shared_star;
+        static u64 file_star[THREADS][FILES];
+        static u32 file_at[THREADS][FILES];
+        static u64 dir_star[THREADS];
+        static u32 dir_at[THREADS];
+        static volatile u64 rn_errors, rn_ready, shared_moves;
+        stellar::CheckReport rr{};
+        box[0] = stellar::create_constellation(stellar::ROOT_STAR, "ra");
+        box[1] = stellar::create_constellation(stellar::ROOT_STAR, "rb");
+        shared_star = make(box[0], "shared", "shared");
+        rn_errors = 0;
+        rn_ready = 0;
+        shared_moves = 0;
+        struct RnWorker {
+            static void bad() { __atomic_fetch_add(&rn_errors, 1ull, __ATOMIC_SEQ_CST); }
+            static void* run(void* arg) {
+                u64 w = reinterpret_cast<u64>(arg);
+                char tag[24], dn[24];
+                name_of(tag, "q", w);
+                name_of(dn, "sub", w);
+                for (u64 j = 0; j < FILES; ++j) {
+                    char nm[32];
+                    name_of(nm, tag, j);
+                    u64 st = stellar::create_file(box[0], nm, nm, strlen(nm));
+                    if (st == stellar::INVALID_STAR) bad();
+                    file_star[w][j] = st;
+                    file_at[w][j] = 0;
+                }
+                dir_star[w] = stellar::create_constellation(box[0], dn);
+                dir_at[w] = 0;
+                if (dir_star[w] == stellar::INVALID_STAR || stellar::create_file(dir_star[w], "in", "in", 2) == stellar::INVALID_STAR) bad();
+                __atomic_fetch_add(&rn_ready, 1ull, __ATOMIC_SEQ_CST);
+                while (__atomic_load_n(&rn_ready, __ATOMIC_SEQ_CST) < THREADS) sched_yield();
+                for (u64 round = 0; round < ROUNDS; ++round) {
+                    for (u64 j = 0; j < FILES; ++j) {
+                        char nm[32];
+                        name_of(nm, tag, j);
+                        u32 from = file_at[w][j], to = from ^ 1u;
+                        Status s = Status::Internal;
+                        if (!stellar::rename(box[from], nm, box[to], nm, stellar::RENAME_NOREPLACE, &s) || s != Status::Ok) { bad(); continue; }
+                        file_at[w][j] = to;
+                        if (stellar::find(box[to], nm) != file_star[w][j]) bad();
+                        if (stellar::find(box[from], nm) != stellar::INVALID_STAR) bad();
+                        if (j % 5 == 0) {
+                            u32 a = static_cast<u32>((round + j) & 1);
+                            Status s2 = Status::Internal;
+                            if (stellar::rename(box[a], "shared", box[a ^ 1u], "shared", stellar::RENAME_NOREPLACE, &s2)) {
+                                if (s2 != Status::Ok) bad();
+                                __atomic_fetch_add(&shared_moves, 1ull, __ATOMIC_SEQ_CST);
+                            } else if (s2 != Status::NotFound) {
+                                bad();
+                            }
+                        }
+                    }
+                    u32 df = dir_at[w], dt = df ^ 1u;
+                    Status s = Status::Internal;
+                    if (!stellar::rename(box[df], dn, box[dt], dn, 0, &s) || s != Status::Ok) bad();
+                    else dir_at[w] = dt;
+                    s = Status::Internal;
+                    if (stellar::rename(box[dir_at[w]], dn, dir_star[w], "inside", 0, &s) || s != Status::WouldCycle) bad();
+                    if (stellar::find(dir_star[w], "in") == stellar::INVALID_STAR) bad();
+                }
+                return nullptr;
+            }
+        };
+        pthread_t th[THREADS];
+        for (u64 w = 0; w < THREADS; ++w) pthread_create(&th[w], nullptr, &RnWorker::run, reinterpret_cast<void*>(w));
+        for (u64 w = 0; w < THREADS; ++w) pthread_join(th[w], nullptr);
+        CHECK(rn_errors == 0, "concurrent renames of files, a contended file and directories, plus refused cycles, report no unexpected status");
+        CHECK(shared_moves > 0, "the contended file was moved by competing threads");
+        u64 s_at0 = stellar::find(box[0], "shared"), s_at1 = stellar::find(box[1], "shared");
+        CHECK(((s_at0 == shared_star) ? 1 : 0) + ((s_at1 == shared_star) ? 1 : 0) == 1, "the contended file exists under exactly one name in exactly one directory");
+        CHECK(count_dir(box[0]) + count_dir(box[1]) == THREADS * FILES + THREADS + 1, "no entry was lost or duplicated by concurrent renames");
+        bool every = true;
+        for (u64 w = 0; w < THREADS; ++w) {
+            char tag[24], dn[24];
+            name_of(tag, "q", w);
+            name_of(dn, "sub", w);
+            for (u64 j = 0; j < FILES; ++j) {
+                char nm[32];
+                name_of(nm, tag, j);
+                u64 here = stellar::find(box[file_at[w][j]], nm);
+                u64 there = stellar::find(box[file_at[w][j] ^ 1u], nm);
+                every = every && here == file_star[w][j] && there == stellar::INVALID_STAR && eq(here, nm) && stellar::verify_file(here);
+            }
+            every = every && stellar::find(box[dir_at[w]], dn) == dir_star[w] && stellar::find(dir_star[w], "in") != stellar::INVALID_STAR;
+        }
+        CHECK(every, "every file and directory ended up exactly where its owner left it, with intact contents");
+        CHECK(stellar::check(&rr) && rr.ok(), "check() accepts the tree after concurrent renames");
+        CHECK(stellar::mount() && stellar::check(&rr) && rr.ok(), "and after a remount");
+    }
+
+#ifdef __SANITIZE_THREAD__
+    if (g_fail) {
+        printf("%d check(s) failed\n", g_fail);
+        return 1;
+    }
+    printf("thread sanitizer: both concurrency tests ran race-free; the single-threaded tests are covered by test-stellar\n");
+    return 0;
+#endif
+
+    fresh_fs();
+    {
         stellar::begin_batch();
         stellar::begin_batch();
         CHECK(make(stellar::ROOT_STAR, "in-batch", "x") != stellar::INVALID_STAR, "operations run inside nested batches");
@@ -1244,7 +1350,7 @@ int main() {
         u64 free_after = stellar::free_space_sectors();
         CHECK(ok, "6000 create/unlink pairs in a directory that holds 8 entries");
         printf("churn: free sectors %lu -> %lu over 6000 create/unlink pairs\n", free_before, free_after);
-        printf("      (the difference is dead stars: each create allocates a star and a dead star keeps its catalog entry)\n");
+        CHECK(free_after + 16 >= free_before, "unlinking removes the catalog entry, so create/unlink churn does not grow the catalog");
         CHECK(count_dir(d) == 8, "and the directory still holds exactly its 8 entries");
         stellar::CheckReport cr{};
         CHECK(stellar::check(&cr) && cr.ok() && cr.leaked == 0, "check() finds nothing leaked after the churn");
@@ -1987,6 +2093,45 @@ int main() {
             CHECK(g_disk[page_sec * 512 + 20] == 0, "and the flipped bit is gone");
             CHECK(stellar::check(&r) && r.ok() && r.leaked == 0 && stellar::test_bitmap_summary_ok(), "rebuilt state is exact");
         }
+        stellar::test_set_bitmap_cache_slots(64);
+    }
+
+    fresh_fs(40000);
+    {
+        using stellar::Status;
+        Status st = Status::Internal;
+        stellar::CheckReport r{};
+        const u64 NONE = stellar::INVALID_STAR;
+        static u8 blob[9000 * 512];
+        for (u64 i = 0; i < sizeof(blob); i += 509) blob[i] = static_cast<u8>((i >> 9) + 1);
+
+        u64 big = stellar::create_file(stellar::ROOT_STAR, "big", blob, sizeof(blob));
+        CHECK(big != NONE, "create a file that spans three bitmap pages");
+        stellar::test_set_bitmap_cache_slots(1);
+        u64 failures0 = stellar::free_failures();
+        g_bad_read_sector = 2 + stellar::test_first_sector(big) / 4064 + 1;
+        bool gone = stellar::unlink(stellar::ROOT_STAR, "big", &st);
+        g_bad_read_sector = ~0ull;
+        CHECK(gone && st == Status::Ok, "an unlink whose deferred free meets an unreadable bitmap page has already committed, so it succeeds");
+        CHECK(stellar::free_failures() > failures0, "and the failed free is counted instead of vanishing");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked > 0, "the sectors that were not freed are leaked, never lost and never freed twice");
+        CHECK(stellar::gc() != NONE && stellar::check(&r) && r.ok() && r.leaked == 0, "and gc returns them");
+        stellar::test_set_bitmap_cache_slots(64);
+
+        fresh_fs(40000);
+        stellar::test_set_bitmap_cache_slots(1);
+        make(stellar::ROOT_STAR, "keep", "keep");
+        stellar::begin_batch();
+        u64 tmp = stellar::create_file(stellar::ROOT_STAR, "tmp", blob, sizeof(blob));
+        CHECK(tmp != NONE, "create a file inside a batch");
+        g_bad_read_sector = 2 + stellar::test_first_sector(tmp) / 4064 + 1;
+        bool dropped = stellar::unlink(stellar::ROOT_STAR, "tmp");
+        g_bad_read_sector = ~0ull;
+        CHECK(dropped, "the unlink itself returns before the batch settles");
+        CHECK(!stellar::end_batch(&st) && st == Status::Io, "a free that cannot read its bitmap page inside the operation's own epoch fails the batch with Io");
+        CHECK(stellar::find(stellar::ROOT_STAR, "tmp") == NONE && eq(stellar::find(stellar::ROOT_STAR, "keep"), "keep"), "and the whole batch is rolled back");
+        CHECK(stellar::check(&r) && r.ok(), "the filesystem is consistent after the rollback");
+        CHECK(stellar::gc() != NONE && stellar::check(&r) && r.ok() && r.leaked == 0, "and gc leaves an exact bitmap");
         stellar::test_set_bitmap_cache_slots(64);
     }
 

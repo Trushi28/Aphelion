@@ -98,6 +98,7 @@ u64 bitmap_ram_bytes();
 
 struct BitmapStats { u64 page_reads, page_writes, early_writes; };
 BitmapStats bitmap_stats();
+u64 free_failures();
 u64 total_sectors();
 bool stat(u64 star, StatInfo* out, u64 snap = LIVE, Status* why = nullptr);
 bool set_flags(u64 star, u32 flags, Status* why = nullptr);

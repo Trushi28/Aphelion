@@ -150,8 +150,13 @@ test-stellar:
 	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp -o $(BUILD)/stellar_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/stellar_host_test
 
+test-stellar-thread:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=thread -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp -o $(BUILD)/stellar_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/stellar_host_test
+
 FUZZ_KIND   ?= nvme
-FUZZ_CORES  ?= 1
+FUZZ_CORES  ?= 4
 FUZZ_ROUNDS ?= 30
 FUZZ_SEED   ?= 1
 

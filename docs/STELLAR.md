@@ -48,7 +48,7 @@ ID (`stellar::LIVE` = 0 is the default), and star IDs are stable across views.
 ### Deletion and reclamation
 
 Each catalog entry carries a link count. `unlink(dir, name)` removes one edge; the star dies when
-its last edge goes, and a non-empty directory is refused. A dead star's extents are returned
+its last edge goes and its catalog entry is removed, and a non-empty directory is refused. A dead star's extents are returned
 immediately if they were born in the current epoch, because no snapshot can reference them.
 Anything older stays allocated for the snapshots that may still use it.
 
@@ -389,20 +389,27 @@ Stated plainly:
 - **gc() is stop-the-world**, O(filesystem size): it holds the filesystem lock for its whole run. Space held
   by older epochs only comes back via `delete_snapshot` and `gc()`. On a disk over 64 GiB it walks the catalog
   once per window (and once per snapshot root per window), so cost grows with disks x snapshots x catalog size.
-- Dead stars keep a 56-byte catalog entry and their IDs are never reused; the B+tree has no delete.
+- Star IDs are never reused, so a snapshot's view of a star can never be confused with a later star. A dead star's
+  catalog entry is removed from the live catalog when its last link goes; snapshots keep their own copy for as long as
+  they live. Entries left behind by earlier kernels stay on an existing volume until it is reformatted.
 - A deleted snapshot's ID can be handed out again by a later `snapshot()`. The snapshot table holds 24.
 - Snapshots are **whole-filesystem**, not per-subtree.
 - Directory nodes are not merged on delete, only dropped when empty, and a name hash prefix holds at most 65536
   names. Directory listings are in hash order, not creation order.
-- Dead stars cost catalog space: 6000 create/unlink pairs grew the catalog by about 1600 sectors in the host
-  harness, while 6000 link/unlink pairs of one file cost nothing.
+- Catalog nodes are not merged when merely sparse, only dropped when empty, so a catalog that once held many live
+  stars keeps some sparse nodes.
 - `read_file` can only verify the checksum when the whole file is read; partial reads are unchecked.
+- Concurrency is tested on host threads (a four-thread create/find/list/snapshot test and a four-thread `rename` test that
+  checks for lost, duplicated and misplaced entries). The in-kernel SMP stress covers create, find and unlink, not rename.
 - Free space is a bitmap, not the Universe/Orbit buddy machinery. Mount reads all of it (in 32-sector commands)
   to build the page summary, so mount time is linear in disk size: about 130 commands per 8 GiB.
 - `check()` still needs two disk-sized bit arrays plus 8 bytes per star in RAM (about 0.5 GiB per TB of disk), so
   on very large disks run it with the host `stellarfs fsck`, not in the kernel.
-- A failure to read a bitmap page while *freeing* sectors is not reported to the caller: the sectors stay marked
-  used (a leak that `gc()` recovers) and the first error is kept for the next call that does report.
+- A failure to read a bitmap page while freeing sectors leaves them marked used (a leak that `gc()` recovers). If the
+  free happens inside the operation, the operation fails with `Io` and is rolled back. If it happens after the commit
+  is already durable (the deferred frees of replaced sectors), the operation has succeeded and cannot be undone, so the
+  failure is logged on the serial console and counted by `free_failures()`. If the page stays unreadable, the rollback
+  itself cannot reload the volume and it is left unmounted.
 - File data has one CRC32 for the whole file, not one per extent, so a partial read cannot be verified and a bad
   extent is only found by reading the whole file. Metadata sectors, including extent tables, are checksummed.
 - Bumping the superblock version reformats an existing disk on next boot (v3 to v6 images aren't migrated).

@@ -722,17 +722,28 @@ static bool commit() {
 
 static u32 g_txn_depth = 0;
 static bool g_txn_poisoned = false;
+static bool g_free_failed = false;
+static bool g_in_deferred = false;
+static u64 g_free_failures = 0;
 static bool load_durable();
 
 static void rollback() {
     Status saved = g_err;
     g_txn_depth = 0;
     g_txn_poisoned = false;
+    g_free_failed = false;
     if (!load_durable()) g_mounted = false;
     if (saved != Status::Ok) g_err = saved;
 }
 
 static bool end_outermost(bool ok) {
+    if (g_free_failed) {
+        g_free_failed = false;
+        if (ok) {
+            fail(Status::Io);
+            g_txn_poisoned = true;
+        }
+    }
     if (g_txn_poisoned) {
         g_txn_poisoned = false;
         rollback();
@@ -848,7 +859,11 @@ static u64 alloc_sectors(u64 count) {
 }
 
 static void release_sectors(u64 first, u64 count) {
-    bm_set_range(first, count, false);
+    if (!bm_set_range(first, count, false)) {
+        ++g_free_failures;
+        serial::printf("[stellar] could not free %lu sector(s) at %lu: a bitmap page was unreadable, they stay allocated until gc()\n", count, first);
+        if (!g_in_deferred) g_free_failed = true;
+    }
     if (first < g_alloc_hint) g_alloc_hint = first;
 }
 
@@ -865,7 +880,9 @@ static void release_extent(u64 first, u64 count, u64 born) {
 }
 
 static void apply_deferred() {
+    g_in_deferred = true;
     for (u32 i = 0; i < g_defer_n; ++i) release_sectors(g_defer[i].first, g_defer[i].count);
+    g_in_deferred = false;
     g_defer_n = 0;
 }
 
@@ -890,6 +907,11 @@ u64 free_space_sectors() {
 BitmapStats bitmap_stats() {
     Guard guard;
     return { g_bm_page_reads, g_bm_page_writes, g_bm_early_writes };
+}
+
+u64 free_failures() {
+    Guard guard;
+    return g_free_failures;
 }
 
 void test_set_bitmap_cache_slots(u32 n) {
@@ -1264,18 +1286,19 @@ struct Rm {
     bool empty;
 };
 
-static bool dt_remove_rec(u64 node_sector, u64 key, u32 depth, Rm* out) {
+template <typename LeafT>
+static bool bt_remove_rec(u64 node_sector, u64 key, u32 depth, Rm* out) {
     if (depth > DT_MAX_DEPTH) return fail(Status::Corrupt);
     u8 buf[SECTOR_SIZE];
     if (!rd(node_sector, buf)) return false;
     u64 old_gen = reinterpret_cast<NodeHeader*>(buf)->gen;
 
     if (buf[0]) {
-        auto* leaf = reinterpret_cast<DirLeaf*>(buf);
+        auto* leaf = reinterpret_cast<LeafT*>(buf);
         if (leaf->count > LEAF_MAX) return fail(Status::Corrupt);
         u32 pos = 0;
-        while (pos < leaf->count && leaf->entries[pos].key < key) ++pos;
-        if (pos >= leaf->count || leaf->entries[pos].key != key) return fail(Status::NotFound);
+        while (pos < leaf->count && leaf_key(leaf->entries[pos]) < key) ++pos;
+        if (pos >= leaf->count || leaf_key(leaf->entries[pos]) != key) return fail(Status::NotFound);
         for (u32 j = pos + 1; j < leaf->count; ++j) leaf->entries[j - 1] = leaf->entries[j];
         --leaf->count;
         if (leaf->count == 0 && depth > 0) {
@@ -1295,7 +1318,7 @@ static bool dt_remove_rec(u64 node_sector, u64 key, u32 depth, Rm* out) {
     while (i < node->count && key >= node->key[i]) ++i;
 
     Rm c;
-    if (!dt_remove_rec(node->child[i], key, depth + 1, &c)) return false;
+    if (!bt_remove_rec<LeafT>(node->child[i], key, depth + 1, &c)) return false;
     if (!c.empty) {
         node->child[i] = c.sector;
         u64 s = place_node(node_sector, buf);
@@ -1309,7 +1332,7 @@ static bool dt_remove_rec(u64 node_sector, u64 key, u32 depth, Rm* out) {
         if (depth > 0) { *out = { 0, true }; return true; }
         u8 eb[SECTOR_SIZE];
         for (auto& b : eb) b = 0;
-        reinterpret_cast<DirLeaf*>(eb)->is_leaf = 1;
+        reinterpret_cast<LeafT*>(eb)->is_leaf = 1;
         u64 s = place_node(0, eb);
         if (!s) return false;
         *out = { s, false };
@@ -1326,9 +1349,10 @@ static bool dt_remove_rec(u64 node_sector, u64 key, u32 depth, Rm* out) {
     return true;
 }
 
-static bool dt_remove(u64 root, u64 key, u64* new_root) {
+template <typename LeafT>
+static bool tree_remove(u64 root, u64 key, u64* new_root) {
     Rm r;
-    if (!dt_remove_rec(root, key, 0, &r)) return false;
+    if (!bt_remove_rec<LeafT>(root, key, 0, &r)) return false;
     u64 cur = r.sector;
     for (u32 guard = 0; guard < DT_MAX_DEPTH; ++guard) {
         u8 buf[SECTOR_SIZE];
@@ -1341,6 +1365,20 @@ static bool dt_remove(u64 root, u64 key, u64* new_root) {
         cur = child;
     }
     *new_root = cur;
+    return true;
+}
+
+static bool dt_remove(u64 root, u64 key, u64* new_root) {
+    return tree_remove<DirLeaf>(root, key, new_root);
+}
+
+static bool catalog_remove(u64 key) {
+    u64 root;
+    if (!tree_remove<LeafNode>(g_sb.catalog_root, key, &root)) return false;
+    if (root != g_sb.catalog_root) {
+        g_sb.catalog_root = root;
+        touch_sb();
+    }
     return true;
 }
 
@@ -1599,6 +1637,7 @@ static bool place_data(u64 nsec, const void* data, u64 size, StarEntry& e) {
 static void reset_runtime_state() {
     g_defer_n = 0;
     g_txn_poisoned = false;
+    g_free_failed = false;
     g_txn_depth = 0;
 }
 
@@ -2043,14 +2082,7 @@ static bool unlink_edge(u64 dir_star, const char* name) {
         --t.nlink;
         return catalog_upsert(target, t);
     }
-    StarEntry dead = t;
-    dead.type = TYPE_FREE;
-    dead.nlink = 0;
-    dead.size_bytes = 0;
-    dead.first_sector = 0;
-    dead.sector_count = 0;
-    dead.checksum = 0;
-    if (!catalog_upsert(target, dead)) return false;
+    if (!catalog_remove(target)) return false;
     release_current_epoch(t);
     return true;
 }
