@@ -247,7 +247,7 @@ int main() {
     u64 s1 = stellar::snapshot();
     auto b = stellar::io_stats();
     printf("tiny tree   snapshot: %lu write(s), %lu read(s)\n", b.writes - a.writes, b.reads - a.reads);
-    CHECK(s1 == 1 && b.writes - a.writes == 1 && b.reads - a.reads == 0, "snapshot is 1 write, 0 reads");
+    CHECK(s1 == 1 && b.writes - a.writes <= 6 && b.reads - a.reads == 0, "snapshot writes a table page, the directory, the bitmap and the superblock and reads nothing");
 
     CHECK(stellar::write_file(hello, "changed\n", 8) == hello, "write_file after snapshot");
     u64 extra = make(sub, "extra.txt", "x\n");
@@ -279,7 +279,7 @@ int main() {
     b = stellar::io_stats();
     printf("big tree    snapshot: %lu write(s), %lu read(s)  (%lu entries in root, 5-deep subtree)\n",
            b.writes - a.writes, b.reads - a.reads, total_live);
-    CHECK(s2 == 2 && b.writes - a.writes == 1 && b.reads - a.reads == 0, "snapshot cost independent of tree size");
+    CHECK(s2 == 2 && b.writes - a.writes <= 6 && b.reads - a.reads == 0, "snapshot cost independent of tree size");
 
     for (u64 i = 0; i < N; i += 7) {
         char nm[32]; name_of(nm, "f", i);
@@ -408,8 +408,8 @@ int main() {
         CHECK(stellar::read_file(big, sink, sizeof(sink), s) == sizeof(blob) && stellar::verify_file(big, s),
               "gc keeps every extent a snapshot references");
 
-        u64 before = stellar::free_space_sectors();
         CHECK(stellar::delete_snapshot(s), "delete snapshot");
+        u64 before = stellar::free_space_sectors();
         CHECK(!stellar::delete_snapshot(s), "deleting twice fails");
         CHECK(stellar::find(stellar::ROOT_STAR, "big", s) == stellar::INVALID_STAR, "deleted snapshot is not addressable");
         u64 freed = stellar::gc();
@@ -443,10 +443,12 @@ int main() {
         CHECK(a1 == 1 && a2 == 2 && a3 == 3, "snapshot ids");
         CHECK(stellar::delete_snapshot(a2), "delete middle snapshot");
         CHECK(!stellar::delete_snapshot(a2), "delete twice fails");
-        CHECK(stellar::live_snapshot_count() == 2 && stellar::snapshot_count() == 3, "tombstone is counted");
-        CHECK(stellar::snapshot() == 2, "freed slot is reused");
-        CHECK(stellar::delete_snapshot(a3) && stellar::delete_snapshot(2), "delete the tail");
-        CHECK(stellar::snapshot_count() == 1 && stellar::live_snapshot_count() == 1, "table shrinks");
+        CHECK(stellar::live_snapshot_count() == 2 && stellar::snapshot_count() == 2, "deleting a snapshot lowers the count");
+        CHECK(stellar::snapshot() == 4, "a deleted id is never handed out again");
+        CHECK(stellar::mount() && stellar::snapshot() == 5, "and the counter survives a remount");
+        CHECK(stellar::delete_snapshot(a3) && stellar::delete_snapshot(4) && stellar::delete_snapshot(5), "delete more");
+        CHECK(stellar::mount() && stellar::snapshot_count() == 1 && stellar::live_snapshot_count() == 1, "the table shrinks and persists");
+        CHECK(stellar::snapshot() == 6, "ids keep counting up after the table shrinks");
         CHECK(!stellar::delete_snapshot(stellar::LIVE) && !stellar::delete_snapshot(99), "invalid ids refused");
     }
 
@@ -455,7 +457,16 @@ int main() {
         for (u32 i = 0; i < stellar::SNAPSHOT_MAX; ++i) stellar::snapshot();
         CHECK(stellar::snapshot() == stellar::INVALID_STAR, "table full");
         CHECK(stellar::delete_snapshot(5), "free one slot");
-        CHECK(stellar::snapshot() == 5, "full table recovers after a delete");
+        CHECK(stellar::snapshot() == stellar::SNAPSHOT_MAX + 1, "a full table recovers after a delete, with a fresh id");
+        CHECK(stellar::snapshot() == stellar::INVALID_STAR, "and is full again");
+        stellar::CheckReport tr{};
+        CHECK(stellar::mount() && stellar::snapshot_count() == stellar::SNAPSHOT_MAX && stellar::check(&tr) && tr.ok() && tr.snapshots == stellar::SNAPSHOT_MAX, "a full table survives a remount and checks clean");
+        bool all_there = true;
+        for (u64 id = 1; id <= stellar::SNAPSHOT_MAX + 1; ++id) {
+            bool should = id != 5;
+            all_there = all_there && (should == (stellar::resolve("/", id) == stellar::ROOT_STAR));
+        }
+        CHECK(all_there, "every id but the deleted one resolves");
     }
 
     {
@@ -688,10 +699,11 @@ int main() {
             {"catalog root inside the bitmap", {40, 3, 8}, {0, 0, 0}},
             {"catalog root past the end", {40, total, 8}, {0, 0, 0}},
             {"epoch zero", {56, 0, 8}, {0, 0, 0}},
-            {"snapshot count over the table", {80, 25, 4}, {0, 0, 0}},
+            {"snapshot count over the table", {80, stellar::SNAPSHOT_MAX + 1, 4}, {0, 0, 0}},
             {"snapshot count huge", {80, 0xFFFFFFFFu, 4}, {0, 0, 0}},
-            {"snapshot root past the end", {80, 1, 4}, {88, total + 5, 8}},
-            {"snapshot root inside the bitmap", {80, 1, 4}, {88, 3, 8}},
+            {"snapshot directory past the end", {88, total + 5, 8}, {0, 0, 0}},
+            {"snapshot directory inside the bitmap", {88, 3, 8}, {0, 0, 0}},
+            {"snapshot id counter zero", {96, 0, 8}, {0, 0, 0}},
         };
         for (const Case& c : cases) {
             __builtin_memcpy(g_disk, good, 1024);
@@ -877,7 +889,7 @@ int main() {
         }
         CHECK(big_first && one_first, "locate the extents on the disk");
 
-        g_disk[(big_first + 2) * 512 + 7] ^= 0x40;
+        g_disk[(big_first + 9) * 512 + 7] ^= 0x40;
         g_disk[one_first * 512 + 4] ^= 0x01;
         CHECK(stellar::mount(), "remount with corrupted extents");
 
@@ -885,12 +897,18 @@ int main() {
         CHECK(stellar::read_file(big, sink, sizeof(sink)) == stellar::READ_ERROR, "read_file refuses a corrupt multi-sector file");
         CHECK(stellar::read_file(one, sink, sizeof(sink)) == stellar::READ_ERROR, "read_file refuses a corrupt single-sector file");
         CHECK(stellar::read_file(big, sink, sizeof(blob)) == stellar::READ_ERROR, "an exact-size buffer is still verified");
-        CHECK(stellar::read_file(big, sink, 100) == 100, "a partial read cannot be verified and still works");
+        CHECK(stellar::read_file(big, sink, 100) == 100, "a partial read inside an undamaged block still works");
+        CHECK(stellar::read_file(big, sink, 4096) == 4096, "as does one that ends exactly on the last good block");
+        CHECK(stellar::read_file(big, sink, 4100) == stellar::READ_ERROR, "a partial read that reaches into the damaged block is refused");
+        g_disk[(big_first + 2) * 512 + 7] ^= 0x40;
+        CHECK(stellar::mount() && stellar::read_file(big, sink, 100) == stellar::READ_ERROR, "damage in the first block refuses even a 100 byte read");
+        g_disk[(big_first + 2) * 512 + 7] ^= 0x40;
+        CHECK(stellar::mount(), "undo the first-block damage");
         CHECK(stellar::read_file(big, sink, sizeof(sink), snap) == stellar::READ_ERROR, "the same bytes seen through a snapshot are refused too");
         CHECK(stellar::read_file(empty, sink, sizeof(sink)) == 0 && stellar::verify_file(empty), "untouched files are unaffected");
         CHECK(eq(stellar::find(stellar::ROOT_STAR, "frozen"), "snapshotted\n"), "files written after the snapshot read clean");
 
-        g_disk[(big_first + 2) * 512 + 7] ^= 0x40;
+        g_disk[(big_first + 9) * 512 + 7] ^= 0x40;
         g_disk[one_first * 512 + 4] ^= 0x01;
         CHECK(stellar::mount(), "remount after repairing the bytes");
         CHECK(stellar::read_file(big, sink, sizeof(sink)) == sizeof(blob) && stellar::verify_file(big), "repaired file reads again");
@@ -1156,7 +1174,7 @@ int main() {
         CHECK(!stellar::mount(&st) && st == Status::NotFormatted, "blank disk reports NotFormatted");
         CHECK(stellar::format(g_sectors, &st) && st == Status::Ok, "format reports Ok");
         u8 sb[1024]; __builtin_memcpy(sb, g_disk, 1024);
-        sb_poke(80, 99, 4);
+        sb_poke(80, 5000, 4);
         CHECK(!stellar::mount(&st) && st == Status::Corrupt, "bad superblock reports Corrupt");
         CHECK(stellar::find(stellar::ROOT_STAR, "x", stellar::LIVE, &st) == stellar::INVALID_STAR && st == Status::NotMounted,
               "operations after a rejected mount report NotMounted");
@@ -1369,6 +1387,174 @@ int main() {
 
     fresh_fs();
     {
+        using stellar::Status;
+        constexpr u64 N = 1500;
+        static u64 gone[N];
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "legacy");
+        for (u64 i = 0; i < 8; ++i) { char nm[32]; name_of(nm, "keep", i); make(d, nm, nm); }
+        stellar::test_set_legacy_unlink(true);
+        bool made = true, removed = true;
+        for (u64 i = 0; i < N; ++i) {
+            char nm[32]; name_of(nm, "old", i);
+            gone[i] = make(d, nm, nm);
+            made = made && gone[i] != stellar::INVALID_STAR;
+        }
+        u64 snap = stellar::snapshot();
+        for (u64 i = 0; i < N; ++i) {
+            char nm[32]; name_of(nm, "old", i);
+            removed = removed && stellar::unlink(d, nm);
+        }
+        stellar::test_set_legacy_unlink(false);
+        CHECK(made && removed && snap != stellar::INVALID_STAR, "1500 files made and removed with the old behaviour, one snapshot in between");
+        stellar::StatInfo si{};
+        Status why = Status::Ok;
+        CHECK(!stellar::stat(gone[0], &si, stellar::LIVE, &why) && why == Status::NotFound, "a legacy dead star reads as not found");
+        stellar::CheckReport cr{};
+        CHECK(stellar::check(&cr) && cr.ok(), "check() accepts a catalog that still holds legacy dead entries");
+        u64 next_id_probe = make(d, "probe", "probe");
+        CHECK(next_id_probe != stellar::INVALID_STAR && next_id_probe > gone[N - 1], "star IDs keep counting past the dead ones");
+        CHECK(stellar::gc() != stellar::INVALID_STAR, "gc runs over a catalog with legacy dead entries");
+        CHECK(!stellar::stat(gone[N - 1], &si, stellar::LIVE, &why) && why == Status::NotFound, "legacy dead stars are still not found after gc");
+        bool snap_ok = true;
+        for (u64 i = 0; i < N; i += 7) {
+            char nm[32]; name_of(nm, "old", i);
+            snap_ok = snap_ok && eq(gone[i], nm, snap) && stellar::verify_file(gone[i], snap);
+        }
+        CHECK(snap_ok, "the snapshot still reads every file that was removed afterwards");
+        bool keep_ok = true;
+        for (u64 i = 0; i < 8; ++i) { char nm[32]; name_of(nm, "keep", i); u64 st = stellar::find(d, nm); keep_ok = keep_ok && eq(st, nm); }
+        CHECK(keep_ok && eq(next_id_probe, "probe"), "live files are untouched by the purge");
+        CHECK(stellar::check(&cr) && cr.ok() && cr.leaked == 0, "check() is clean with nothing leaked after the purge");
+        CHECK(stellar::delete_snapshot(snap) && stellar::gc() != stellar::INVALID_STAR, "deleting the snapshot and running gc again");
+        CHECK(stellar::check(&cr) && cr.ok() && cr.leaked == 0, "still clean");
+    }
+
+    fresh_fs();
+    {
+        constexpr u64 N = 1500;
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "legacy2");
+        stellar::test_set_legacy_unlink(true);
+        bool ok = true;
+        for (u64 i = 0; i < N; ++i) {
+            char nm[32]; name_of(nm, "old", i);
+            ok = ok && make(d, nm, nm) != stellar::INVALID_STAR && stellar::unlink(d, nm);
+        }
+        stellar::test_set_legacy_unlink(false);
+        CHECK(ok, "1500 create/unlink pairs with the old behaviour and no snapshot");
+        u64 before = stellar::free_space_sectors();
+        CHECK(stellar::gc() != stellar::INVALID_STAR, "gc purges them");
+        u64 after = stellar::free_space_sectors();
+        printf("legacy purge: free sectors %lu -> %lu after removing %lu dead catalog entries\n", before, after, N);
+        CHECK(after > before + 200, "the catalog nodes that held the dead entries are returned");
+        stellar::CheckReport cr{};
+        CHECK(stellar::check(&cr) && cr.ok() && cr.leaked == 0, "check() is clean with nothing leaked");
+        CHECK(stellar::mount() && stellar::check(&cr) && cr.ok(), "and so is a remount");
+    }
+
+    fresh_fs();
+    {
+        constexpr u32 MIN_LEAF = 3, MIN_INTERNAL = 14;
+        constexpr u64 N = 3000;
+        static bool present[N];
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "shrink");
+        bool ok = true;
+        for (u64 i = 0; i < N; ++i) {
+            char nm[32]; name_of(nm, "n", i);
+            ok = ok && make(d, nm, nm) != stellar::INVALID_STAR;
+            present[i] = true;
+        }
+        stellar::TreeShape grown{}, cat{};
+        CHECK(ok && stellar::test_dir_shape(d, &grown) && grown.entries == N && grown.uniform && grown.internals > 1, "3000 entries build a multi-level directory tree");
+        CHECK(stellar::test_catalog_shape(&cat) && cat.entries == N + 2 && cat.uniform, "and a multi-level catalog");
+        u64 rng = 0x2545F4914F6CDD1Dull;
+        auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+        u64 remaining = N;
+        bool shapes_ok = true;
+        stellar::TreeShape sh{}, cs{};
+        for (u64 step = 0; remaining > 120; ++step) {
+            u64 i = next() % N;
+            if (!present[i]) continue;
+            char nm[32]; name_of(nm, "n", i);
+            ok = ok && stellar::unlink(d, nm);
+            present[i] = false;
+            --remaining;
+            if (step % 89 == 0) {
+                bool dir_fine = stellar::test_dir_shape(d, &sh) && sh.uniform && sh.entries == remaining && sh.min_leaf >= MIN_LEAF && sh.min_internal_keys >= MIN_INTERNAL;
+                bool cat_fine = stellar::test_catalog_shape(&cs) && cs.uniform && cs.entries == remaining + 2 && cs.min_leaf >= MIN_LEAF && cs.min_internal_keys >= MIN_INTERNAL;
+                shapes_ok = shapes_ok && dir_fine && cat_fine;
+            }
+        }
+        CHECK(ok, "2880 random unlinks all succeed");
+        CHECK(shapes_ok, "throughout, both trees keep uniform depth, the exact entry count, and no non-root node below half full");
+        bool finds_ok = true;
+        for (u64 i = 0; i < N; ++i) {
+            char nm[32]; name_of(nm, "n", i);
+            u64 st = stellar::find(d, nm);
+            finds_ok = finds_ok && (present[i] ? eq(st, nm) : st == stellar::INVALID_STAR);
+        }
+        CHECK(finds_ok, "every surviving name resolves with its content and every removed name is gone");
+        CHECK(stellar::test_dir_shape(d, &sh) && sh.leaves <= remaining / MIN_LEAF + 1, "the directory tree is compact after the shrink");
+        CHECK(stellar::test_catalog_shape(&cs) && cs.leaves <= (remaining + 2) / MIN_LEAF + 1, "and so is the catalog");
+        stellar::CheckReport cr{};
+        CHECK(stellar::check(&cr) && cr.ok() && cr.leaked == 0, "check() is clean with nothing leaked after the shrink");
+        u64 before_gc = stellar::free_space_sectors();
+        CHECK(stellar::gc() == 0 && stellar::free_space_sectors() == before_gc, "gc finds nothing left to reclaim, so merged nodes were all returned");
+        for (u64 i = 0; i < N; ++i) {
+            if (!present[i]) continue;
+            char nm[32]; name_of(nm, "n", i);
+            ok = ok && stellar::unlink(d, nm);
+        }
+        CHECK(ok && stellar::test_dir_shape(d, &sh) && sh.leaves == 1 && sh.internals == 0 && sh.entries == 0, "removing the rest collapses the directory to one empty leaf");
+        CHECK(stellar::test_catalog_shape(&cs) && cs.entries == 2 && cs.internals == 0 && cs.leaves == 1, "and the catalog to a single leaf holding the root and that directory");
+        CHECK(stellar::check(&cr) && cr.ok() && cr.leaked == 0 && stellar::mount() && stellar::check(&cr) && cr.ok(), "clean after a remount as well");
+    }
+
+    static const u64 fuzz_masks[3] = { 0ull, 3ull, 0xFFull };
+    for (u64 mask : fuzz_masks) {
+        fresh_fs();
+        stellar::test_set_hash_mask(mask);
+        constexpr u64 SLOTS = 900;
+        static bool live[SLOTS], frozen[SLOTS];
+        for (u64 i = 0; i < SLOTS; ++i) { live[i] = false; frozen[i] = false; }
+        u64 d = stellar::create_constellation(stellar::ROOT_STAR, "model");
+        u64 rng = 0x9E3779B97F4A7C15ull ^ mask;
+        auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+        bool ok = true, shapes_ok = true, model_ok = true;
+        u64 snap = 0;
+        u64 count = 0;
+        stellar::TreeShape sh{};
+        for (u64 op = 0; op < 5000; ++op) {
+            u64 i = next() % SLOTS;
+            bool grow = (op < 2000) ? (next() % 10) < 8 : (op < 3500 ? (next() % 10) < 5 : (next() % 10) < 2);
+            char nm[32]; name_of(nm, "m", i);
+            if (grow && !live[i]) { ok = ok && make(d, nm, nm) != stellar::INVALID_STAR; live[i] = true; ++count; }
+            else if (!grow && live[i]) { ok = ok && stellar::unlink(d, nm); live[i] = false; --count; }
+            if (op == 2500) {
+                snap = stellar::snapshot();
+                for (u64 k = 0; k < SLOTS; ++k) frozen[k] = live[k];
+            }
+            if (op % 211 == 0) {
+                shapes_ok = shapes_ok && stellar::test_dir_shape(d, &sh) && sh.uniform && sh.entries == count && sh.min_leaf >= 3u && sh.min_internal_keys >= 14u;
+            }
+        }
+        CHECK(ok, "5000 random creates and unlinks, with a snapshot in the middle, all succeed");
+        CHECK(shapes_ok, "the directory tree never loses its shape invariants");
+        for (u64 k = 0; k < SLOTS; ++k) {
+            char nm[32]; name_of(nm, "m", k);
+            u64 st_live = stellar::find(d, nm);
+            u64 st_snap = stellar::find(d, nm, snap);
+            model_ok = model_ok && (live[k] ? eq(st_live, nm) : st_live == stellar::INVALID_STAR);
+            model_ok = model_ok && (frozen[k] ? eq(st_snap, nm, snap) : st_snap == stellar::INVALID_STAR);
+        }
+        CHECK(model_ok, "the live tree and the snapshot's tree each match the model");
+        stellar::CheckReport cr{};
+        CHECK(stellar::check(&cr) && cr.ok(), "check() accepts live and snapshot trees");
+        CHECK(stellar::delete_snapshot(snap) && stellar::gc() != stellar::INVALID_STAR && stellar::check(&cr) && cr.ok() && cr.leaked == 0, "after deleting the snapshot and a gc nothing is leaked");
+        stellar::test_set_hash_mask(0);
+    }
+
+    fresh_fs();
+    {
         stellar::test_set_hash_mask(0);
         u64 d = stellar::create_constellation(stellar::ROOT_STAR, "oom");
         for (u64 i = 0; i < 30; ++i) { char nm[32]; name_of(nm, "a", i); make(d, nm, nm); }
@@ -1516,16 +1702,31 @@ int main() {
         CHECK(g_disk[leaf * 512] == 1, "the catalog root is a single leaf in this small filesystem");
         auto first_of = [&](u32 idx) { u64 v; __builtin_memcpy(&v, g_disk + entry_off(idx) + 16, 8); return v; };
         auto fix = [&](u64 sec) { sb_fix_crc(g_disk + sec * 512); };
+        auto windows_agree = [&](const char* what) {
+            stellar::CheckReport a{}, b{}, c{};
+            stellar::test_set_check_window(0, 0);
+            bool ra = stellar::check(&a, true);
+            stellar::test_set_check_window(37, 2);
+            bool rb = stellar::check(&b, true);
+            stellar::test_set_check_window(1, 1);
+            bool rc = stellar::check(&c, true);
+            stellar::test_set_check_window(0, 0);
+            if (__builtin_memcmp(&a, &b, sizeof(a)) || __builtin_memcmp(&a, &c, sizeof(a))) { auto pr = [](const char* t, bool ok, const stellar::CheckReport& x) { printf("  %s ok=%d snaps=%lu nodes=%lu dirs=%lu files=%lu ents=%lu crc=%lu badf=%lu unm=%lu leak=%lu lnk=%lu str=%lu\n", t, ok, x.snapshots, x.nodes, x.dirs, x.files, x.entries, x.bad_crc, x.bad_files, x.unmarked, x.leaked, x.bad_links, x.bad_structure); }; pr("default", ra, a); pr("37/2", rb, b); pr("1/1", rc, c); }
+            CHECK(ra == rb && ra == rc && __builtin_memcmp(&a, &b, sizeof(a)) == 0 && __builtin_memcmp(&a, &c, sizeof(a)) == 0, what);
+        };
+        windows_agree("a windowed check reports exactly what a single-pass check reports on a clean image");
 
         restore();
         u64 data_sec = first_of(1);
         g_disk[data_sec * 512 + 5] ^= 0x20;
         CHECK(stellar::mount() && stellar::check(&r, false) && r.ok(), "a shallow check does not read file data");
         CHECK(!stellar::check(&r, true, &st) && st == Status::Corrupt && r.bad_files >= 1 && r.bad_crc == 0, "a deep check finds a corrupt file");
+        windows_agree("windowed and single-pass agree: a deep check finds a corrupt file");
 
         restore();
         g_disk[leaf * 512 + 100] ^= 1;
         CHECK(stellar::mount() && !stellar::check(&r) && r.bad_crc >= 1, "a corrupt catalog node is found by checksum");
+        windows_agree("windowed and single-pass agree: a corrupt catalog node is found by checksum");
 
         restore();
         u64 dsec = 0; u32 dslot = 0;
@@ -1537,19 +1738,22 @@ int main() {
         __builtin_memcpy(g_disk + dsec * 512 + 16 + dslot * 68 + 8, &bogus, 8);
         fix(dsec);
         CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "an entry pointing at a star that does not exist is found");
+        windows_agree("windowed and single-pass agree: an entry pointing at a star that does not exist is found");
 
         restore();
-        u32 nl; __builtin_memcpy(&nl, g_disk + entry_off(2) + 36, 4);
+        u32 nl; __builtin_memcpy(&nl, g_disk + entry_off(2) + 52, 4);
         nl += 5;
-        __builtin_memcpy(g_disk + entry_off(2) + 36, &nl, 4);
+        __builtin_memcpy(g_disk + entry_off(2) + 52, &nl, 4);
         fix(leaf);
         CHECK(stellar::mount() && !stellar::check(&r) && r.bad_links >= 1, "a wrong link count is found");
+        windows_agree("windowed and single-pass agree: a wrong link count is found");
 
         restore();
         u64 wrong_parent = 12345;
         __builtin_memcpy(g_disk + entry_off(3) + 8, &wrong_parent, 8);
         fix(leaf);
         CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "a directory whose parent pointer disagrees with the directory that lists it is found");
+        windows_agree("windowed and single-pass agree: a directory whose parent pointer disagrees with the directory that lists it is found");
 
         restore();
         u64 victim = first_of(2);
@@ -1558,6 +1762,7 @@ int main() {
         g_disk[bm_sec * 512 + bm_byte % 508] &= static_cast<u8>(~(1u << (victim % 8)));
         fix(bm_sec);
         CHECK(stellar::mount() && !stellar::check(&r) && r.unmarked >= 1, "a referenced sector marked free in the bitmap is found");
+        windows_agree("windowed and single-pass agree: a referenced sector marked free in the bitmap is found");
 
         restore();
         u64 stray = 3000;
@@ -1566,12 +1771,14 @@ int main() {
         g_disk[sb_sec * 512 + sb_byte % 508] |= static_cast<u8>(1u << (stray % 8));
         fix(sb_sec);
         CHECK(stellar::mount() && stellar::check(&r) && r.leaked >= 1, "a leaked sector is reported but is harmless");
+        windows_agree("windowed and single-pass agree: a leaked sector is reported but is harmless");
 
         restore();
         u64 shared = first_of(1);
         __builtin_memcpy(g_disk + entry_off(2) + 16, &shared, 8);
         fix(leaf);
         CHECK(stellar::mount() && !stellar::check(&r) && r.bad_structure >= 1, "two files sharing sectors are found");
+        windows_agree("windowed and single-pass agree: two files sharing sectors are found");
 
         restore();
         CHECK(stellar::check(&r) && r.ok(), "the restored image is clean again");
@@ -1649,10 +1856,10 @@ int main() {
     // ---------------------------------------------------------------- crash consistency
     {
         using stellar::Status;
-        const u32 SEEDS = 6;
+        const u32 SEEDS = 8;
         u64 grand_states = 0, grand_bad = 0, grand_garbage = 0;
         for (u32 seed = 1; seed <= SEEDS; ++seed) {
-            const u64 sectors = seed == 4 ? 8192 : 1024;
+            const u64 sectors = seed == 4 ? 8192 : seed == 8 ? 2048 : 1024;
             const u64 disk_bytes = sectors * 512;
             fresh_fs(sectors);
             stellar::test_set_bitmap_cache_slots(seed == 4 ? 1 : 64);
@@ -1667,7 +1874,7 @@ int main() {
             struct F { u64 dir; char name[16]; u64 star; bool alive; };
             static F files[96]; u32 nfiles = 0;
             static u64 dirs[10]; u32 ndirs = 1; dirs[0] = stellar::ROOT_STAR;
-            static u64 snaps[8]; u32 nsnap = 0;
+            static u64 snaps[64]; u32 nsnap = 0;
             u32 counter = 0;
             static u8 data[3000];
             auto fill = [&](u32 size) { u32 salt = rnd(); for (u32 i = 0; i < size; ++i) data[i] = static_cast<u8>(i * 31 + salt); };
@@ -1699,13 +1906,30 @@ int main() {
                 for (;; ++n) { char nm[16]; name_of(nm, "z", n); if (stellar::create_file(stellar::ROOT_STAR, nm, "x", 1) == stellar::INVALID_STAR) break; }
                 for (u32 i = 0; i < n; i += 2) { char nm[16]; name_of(nm, "z", i); stellar::unlink(stellar::ROOT_STAR, nm); }
             }
+            static bool zalive[240];
+            if (seed == 7) {
+                for (u32 n = 0; n < 240; ++n) { char nm[16]; name_of(nm, "z", n); zalive[n] = stellar::create_file(stellar::ROOT_STAR, nm, "x", 1) != stellar::INVALID_STAR; }
+            }
+            if (seed == 8) {
+                for (u32 i = 0; i < 45; ++i) { u64 id = stellar::snapshot(); if (id != stellar::INVALID_STAR) snaps[nsnap++] = id; }
+                for (int i = 0; i < 6; ++i) create();
+            }
             __builtin_memcpy(base, g_disk, disk_bytes);
             g_log_n = 0; g_rec = true;
             dg[0] = tree_digest();
             for (int i = 0; i < NOPS; ++i) {
                 pos_start[i] = g_log_n;
                 u32 r = rnd() % 100;
-                if (r < 27) create();
+                if (seed == 8) {
+                    if (r < 40) {
+                        if (nsnap < 64) { u64 id = stellar::snapshot(); if (id != stellar::INVALID_STAR) snaps[nsnap++] = id; }
+                    } else if (r < 80) {
+                        if (nsnap && stellar::delete_snapshot(snaps[0])) { for (u32 q = 1; q < nsnap; ++q) snaps[q - 1] = snaps[q]; --nsnap; }
+                    } else create();
+                } else if (seed == 7 && r >= 20 && r < 75) {
+                    u32 k = rnd() % 240;
+                    if (zalive[k]) { char nm[16]; name_of(nm, "z", k); if (stellar::unlink(stellar::ROOT_STAR, nm)) zalive[k] = false; }
+                } else if (r < 27) create();
                 else if (r < 33 && ndirs < 9) {
                     char nm[16]; name_of(nm, "d", counter++);
                     u64 id = stellar::create_constellation(dirs[rnd() % ndirs], nm);
@@ -1843,6 +2067,214 @@ int main() {
         }
         CHECK(grand_states > 5000 && grand_garbage > 500, "the exploration covered thousands of crash states, hundreds with torn writes");
         (void)grand_bad;
+    }
+
+    // ---------------------------------------------------------------- v8: per-block data checksums
+    {
+        using stellar::Status;
+        const u64 NONE = stellar::INVALID_STAR;
+        stellar::CheckReport r{};
+        fresh_fs(16384);
+        u64 free0 = stellar::free_space_sectors();
+        static u8 big[1500000], buf[1500000];
+        for (u64 i = 0; i < sizeof(big); ++i) big[i] = static_cast<u8>(i * 131 + (i >> 9));
+        u64 f = stellar::create_file(stellar::ROOT_STAR, "big", big, sizeof(big));
+        CHECK(f != NONE, "create a 1.5 MiB file");
+        u64 first = stellar::test_first_sector(f);
+        u64 csum0 = stellar::test_csum_sector(f);
+        CHECK(first != NONE && csum0 != NONE && csum0 != 0, "the entry records where its block checksums start");
+        CHECK(stellar::read_file(f, buf, sizeof(buf)) == sizeof(big) && __builtin_memcmp(buf, big, sizeof(big)) == 0 && stellar::verify_file(f), "the file reads back and verifies");
+        CHECK(stellar::check(&r, true) && r.ok() && r.leaked == 0, "a deep check accepts it and every checksum sector is accounted for");
+        {
+            stellar::CheckReport a{}, b{};
+            stellar::test_set_check_window(1000, 1);
+            bool ok = stellar::check(&a, true);
+            stellar::test_set_check_window(0, 0);
+            bool ok2 = stellar::check(&b, true);
+            CHECK(ok && ok2 && __builtin_memcmp(&a, &b, sizeof(a)) == 0, "a windowed check agrees on a file whose checksum chain spans windows");
+        }
+
+        const u64 victims[] = {0, 1, 120, 121, 122, 242, 243, 366};
+        for (u64 b : victims) {
+            u64 off = b * 4096 + 77;
+            u64 sec = first + off / 512;
+            g_disk[sec * 512 + off % 512] ^= 0x10;
+            Status st = Status::Internal;
+            CHECK(stellar::mount(), "remount with one damaged byte");
+            CHECK(!stellar::verify_file(f, stellar::LIVE, &st) && st == Status::Checksum, "verify_file refuses the damaged block");
+            st = Status::Internal;
+            CHECK(stellar::read_file(f, buf, sizeof(buf), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Checksum, "so does a full read");
+            if (b > 0) CHECK(stellar::read_file(f, buf, b * 4096) == b * 4096 && __builtin_memcmp(buf, big, b * 4096) == 0, "every block before it still reads");
+            CHECK(stellar::read_file(f, buf, b * 4096 + 10) == stellar::READ_ERROR, "a read that reaches into it is refused");
+            CHECK(!stellar::check(&r, true) && r.bad_files == 1 && r.bad_crc == 0, "a deep check reports exactly one bad file");
+            CHECK(stellar::check(&r, false) && r.ok(), "a shallow check does not read file data");
+            g_disk[sec * 512 + off % 512] ^= 0x10;
+        }
+        CHECK(stellar::mount() && stellar::verify_file(f) && stellar::check(&r, true) && r.ok(), "all repaired");
+
+        u64 last_sector_index = (sizeof(big) - 1) / 512;
+        u64 valid_in_last = sizeof(big) - last_sector_index * 512;
+        g_disk[(first + last_sector_index) * 512 + valid_in_last + 20] ^= 0x01;
+        CHECK(stellar::mount() && stellar::verify_file(f) && stellar::read_file(f, buf, sizeof(buf)) == sizeof(big), "bytes past the end of the file in its last sector are not covered");
+        g_disk[(first + last_sector_index) * 512 + valid_in_last + 20] ^= 0x01;
+
+        u64 chain2;
+        __builtin_memcpy(&chain2, g_disk + csum0 * 512, 8);
+        CHECK(chain2 != 0, "367 blocks need a chain of four checksum sectors");
+        u64 chain_len = 1, walk = csum0;
+        while (true) { u64 nx; __builtin_memcpy(&nx, g_disk + walk * 512, 8); if (!nx) break; walk = nx; ++chain_len; }
+        CHECK(chain_len == 4, "the chain has exactly four sectors");
+
+        g_disk[chain2 * 512 + 100] ^= 0x01;
+        Status st = Status::Internal;
+        CHECK(stellar::mount() && !stellar::verify_file(f, stellar::LIVE, &st) && st == Status::Checksum, "a checksum sector failing its own CRC is caught");
+        CHECK(stellar::read_file(f, buf, sizeof(buf)) == stellar::READ_ERROR, "and the data is refused");
+        CHECK(!stellar::check(&r, true) && r.bad_crc >= 1, "check reports the damaged checksum sector");
+        g_disk[chain2 * 512 + 100] ^= 0x01;
+
+        g_disk[chain2 * 512 + 100] ^= 0x01;
+        sb_fix_crc(g_disk + chain2 * 512);
+        CHECK(stellar::mount() && !stellar::verify_file(f) && !stellar::check(&r, true) && r.bad_files == 1 && r.bad_crc == 0, "a wrong stored checksum with a valid sector CRC is a block mismatch");
+        CHECK(stellar::read_file(f, buf, 140 * 4096) == 140 * 4096, "blocks before the one it describes still read");
+        CHECK(stellar::read_file(f, buf, 140 * 4096 + 1) == stellar::READ_ERROR, "the block it describes is refused");
+        g_disk[chain2 * 512 + 100] ^= 0x01;
+        sb_fix_crc(g_disk + chain2 * 512);
+
+        u32 cnt;
+        __builtin_memcpy(&cnt, g_disk + chain2 * 512 + 16, 4);
+        u32 bad_cnt = cnt - 1;
+        __builtin_memcpy(g_disk + chain2 * 512 + 16, &bad_cnt, 4);
+        sb_fix_crc(g_disk + chain2 * 512);
+        st = Status::Internal;
+        CHECK(stellar::mount() && stellar::read_file(f, buf, sizeof(buf), stellar::LIVE, &st) == stellar::READ_ERROR && st == Status::Corrupt, "a checksum sector with the wrong count is corrupt metadata");
+        CHECK(!stellar::check(&r, true) && r.bad_structure >= 1, "and check reports it");
+        __builtin_memcpy(g_disk + chain2 * 512 + 16, &cnt, 4);
+        sb_fix_crc(g_disk + chain2 * 512);
+        CHECK(stellar::mount() && stellar::verify_file(f) && stellar::check(&r, true) && r.ok(), "restored");
+
+        const u64 sizes[] = {1, 511, 512, 513, 4095, 4096, 4097, 8191, 8192, 8193, 12288, 12289};
+        bool sizes_ok = true;
+        for (u64 sz : sizes) {
+            char nm[24]; name_of(nm, "sz", sz);
+            u64 g = stellar::create_file(stellar::ROOT_STAR, nm, big, sz);
+            bool ok = g != NONE && stellar::verify_file(g) && stellar::read_file(g, buf, sizeof(buf)) == sz && __builtin_memcmp(buf, big, sz) == 0;
+            const u64 cuts[] = {1, sz / 2, sz - 1, 4096, 4097};
+            for (u64 c : cuts) {
+                if (c == 0 || c > sz) continue;
+                ok = ok && stellar::read_file(g, buf, c) == c && __builtin_memcmp(buf, big, c) == 0;
+            }
+            sizes_ok = sizes_ok && ok;
+        }
+        CHECK(sizes_ok, "files around every block and sector boundary read, verify and read partially");
+        u64 empty = stellar::create_file(stellar::ROOT_STAR, "empty", nullptr, 0);
+        CHECK(empty != NONE && stellar::test_csum_sector(empty) == 0 && stellar::verify_file(empty) && stellar::read_file(empty, buf, 10) == 0, "an empty file has no checksum chain");
+        CHECK(stellar::check(&r, true) && r.ok() && r.leaked == 0, "the whole set checks clean");
+
+        stellar::test_set_max_extent_sectors(3);
+        static u8 frag[100000];
+        { u64 x = 0x2545F4914F6CDD1Dull; for (u64 i = 0; i < sizeof(frag); ++i) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; frag[i] = static_cast<u8>(x >> 24); } }
+        u64 g = stellar::create_file(stellar::ROOT_STAR, "frag", frag, sizeof(frag));
+        stellar::test_set_max_extent_sectors(0);
+        stellar::StatInfo si{};
+        CHECK(g != NONE && stellar::stat(g, &si) && si.extents > 50, "a file in three-sector extents, so every block spans several");
+        CHECK(stellar::read_file(g, buf, sizeof(frag)) == sizeof(frag) && __builtin_memcmp(buf, frag, sizeof(frag)) == 0 && stellar::verify_file(g) && stellar::check(&r, true) && r.ok(), "it reads, verifies and checks clean");
+        const u64 pick_sectors[] = {5, 20, 150, 190};
+        for (u64 ps : pick_sectors) {
+            u64 found = 0;
+            for (u64 sec = 2; sec < g_sectors && !found; ++sec)
+                if (__builtin_memcmp(g_disk + sec * 512, frag + ps * 512, 512) == 0) found = sec;
+            CHECK(found != 0, "locate a sector of the fragmented file");
+            if (!found) continue;
+            g_disk[found * 512 + 9] ^= 0x08;
+            CHECK(stellar::mount() && !stellar::verify_file(g) && stellar::read_file(g, buf, sizeof(frag)) == stellar::READ_ERROR && !stellar::check(&r, true) && r.bad_files >= 1, "damage in a fragmented file is found");
+            u64 block_start = (ps / 8) * 4096;
+            if (block_start > 0) CHECK(stellar::read_file(g, buf, block_start) == block_start, "the blocks before it still read");
+            g_disk[found * 512 + 9] ^= 0x08;
+        }
+        CHECK(stellar::mount() && stellar::verify_file(g), "repaired");
+
+        u64 cow = stellar::create_file(stellar::ROOT_STAR, "cow", big, 20000);
+        u64 sn = stellar::snapshot();
+        CHECK(stellar::write_file(cow, big + 3, 30000) == cow, "rewrite after a snapshot");
+        CHECK(stellar::verify_file(cow, sn) && stellar::verify_file(cow) && stellar::read_file(cow, buf, sizeof(buf), sn) == 20000 && __builtin_memcmp(buf, big, 20000) == 0, "the snapshot keeps the old data and its own checksum chain");
+        CHECK(stellar::test_csum_sector(cow, sn) != stellar::test_csum_sector(cow), "each version has its own checksum chain");
+        CHECK(stellar::delete_snapshot(sn) && stellar::gc() != NONE && stellar::check(&r, true) && r.ok() && r.leaked == 0, "deleting the snapshot and collecting frees the old chain");
+
+        const char* all[] = {"big", "empty", "frag", "cow"};
+        for (const char* nm : all) CHECK(stellar::unlink(stellar::ROOT_STAR, nm), "unlink");
+        for (u64 sz : sizes) { char nm[24]; name_of(nm, "sz", sz); stellar::unlink(stellar::ROOT_STAR, nm); }
+        CHECK(stellar::gc() != NONE && stellar::check(&r, true) && r.ok() && r.leaked == 0, "after removing everything nothing is leaked");
+        CHECK(stellar::free_space_sectors() + 8 >= free0, "and the data and checksum sectors are all back");
+    }
+
+    // ---------------------------------------------------------------- v8: the snapshot table
+    {
+        using stellar::Status;
+        const u64 NONE = stellar::INVALID_STAR;
+        stellar::CheckReport r{};
+        fresh_fs(4096);
+        u64 keepf = make(stellar::ROOT_STAR, "keep", "kept");
+        (void)keepf;
+        bool ids_ok = true;
+        for (u64 i = 1; i <= 45; ++i) ids_ok = ids_ok && stellar::snapshot() == i;
+        CHECK(ids_ok && stellar::snapshot_count() == 45, "45 snapshots take ids 1 to 45");
+        CHECK(stellar::test_snap_table_sector(0) && stellar::test_snap_table_sector(1) && stellar::test_snap_table_sector(2) && !stellar::test_snap_table_sector(3) && stellar::test_snap_table_sector(0xFFFFFFFFu), "they fill three table pages under one directory");
+        CHECK(stellar::mount() && stellar::snapshot_count() == 45 && stellar::check(&r) && r.ok() && r.snapshots == 45 && r.leaked == 0, "the table survives a remount and checks clean");
+        bool deleted = true;
+        for (u64 id = 1; id <= 20; ++id) deleted = deleted && stellar::delete_snapshot(id);
+        CHECK(deleted && !stellar::test_snap_table_sector(0), "deleting every snapshot of a page releases the page");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "and nothing leaks");
+        CHECK(stellar::mount() && stellar::snapshot_count() == 25 && stellar::resolve("/", 7) == NONE && stellar::resolve("/", 21) == stellar::ROOT_STAR && stellar::resolve("/", 45) == stellar::ROOT_STAR, "after a remount the deleted ids are gone and the rest resolve");
+        CHECK(stellar::snapshot() == 46 && stellar::test_snap_table_sector(0) != 0, "a new snapshot gets a fresh id and reuses the empty page");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "still clean");
+
+        static u8 saved[4096 * 512];
+        __builtin_memcpy(saved, g_disk, sizeof(saved));
+        auto restore = [&]() { __builtin_memcpy(g_disk, saved, sizeof(saved)); CHECK(stellar::mount() && stellar::snapshot_count() == 26, "restore the saved table image"); };
+
+        restore();
+        u64 pg1 = stellar::test_snap_table_sector(1);
+        g_disk[pg1 * 512 + 50] ^= 0x04;
+        CHECK(stellar::mount() && stellar::snapshot_count() == 6, "a table page that fails its checksum drops only its own snapshots");
+        CHECK(stellar::resolve("/", 46) == stellar::ROOT_STAR && stellar::resolve("/", 25) == NONE && stellar::resolve("/", 42) == stellar::ROOT_STAR, "the other pages are intact");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "the mount repaired the table and the bitmap");
+        CHECK(stellar::mount() && stellar::snapshot_count() == 6 && stellar::check(&r) && r.ok(), "and the repair was written back");
+        CHECK(stellar::snapshot() == 47, "ids still never repeat");
+
+        restore();
+        u64 dir = stellar::test_snap_table_sector(0xFFFFFFFFu);
+        g_disk[dir * 512 + 30] ^= 0x40;
+        CHECK(stellar::mount() && stellar::snapshot_count() == 0, "a damaged directory drops every snapshot but keeps the filesystem");
+        CHECK(eq(stellar::find(stellar::ROOT_STAR, "keep"), "kept") && stellar::check(&r) && r.ok() && r.leaked == 0, "the live tree is intact and the bitmap exact");
+        CHECK(stellar::snapshot() == 47, "and the id counter did not move back");
+        CHECK(stellar::mount() && stellar::snapshot_count() == 1 && stellar::check(&r) && r.ok(), "persisted");
+
+        restore();
+        u64 pg2 = stellar::test_snap_table_sector(2);
+        u64 bogus_root = 3;
+        __builtin_memcpy(g_disk + pg2 * 512 + 16 + 8, &bogus_root, 8);
+        sb_fix_crc(g_disk + pg2 * 512);
+        CHECK(stellar::mount() && stellar::snapshot_count() == 25, "a record whose root lies outside the data area is dropped alone");
+        CHECK(stellar::check(&r) && r.ok() && r.leaked == 0, "and the repaired table checks clean");
+
+        restore();
+        pg2 = stellar::test_snap_table_sector(2);
+        u64 dup_id;
+        __builtin_memcpy(&dup_id, g_disk + pg2 * 512 + 16, 8);
+        __builtin_memcpy(g_disk + pg2 * 512 + 16 + 24, &dup_id, 8);
+        sb_fix_crc(g_disk + pg2 * 512);
+        CHECK(stellar::mount() && stellar::snapshot_count() == 25, "a duplicated id is dropped");
+        CHECK(stellar::check(&r) && r.ok(), "and the table checks clean");
+
+        restore();
+        u64 big_id = 1ull << 40;
+        pg2 = stellar::test_snap_table_sector(2);
+        __builtin_memcpy(g_disk + pg2 * 512 + 16, &big_id, 8);
+        sb_fix_crc(g_disk + pg2 * 512);
+        CHECK(stellar::mount() && stellar::snapshot_count() == 25, "an id the counter has not reached yet is dropped");
+
+        restore();
+        CHECK(stellar::mount() && stellar::snapshot_count() == 26 && stellar::check(&r) && r.ok(), "the untouched image still mounts with every snapshot");
     }
 
     // ---------------------------------------------------------------- v6: stat, flags, clock
@@ -2141,6 +2573,7 @@ int main() {
         stellar::CheckReport r{};
         constexpr u64 FILE_BYTES = 40ull << 20;
         constexpr u64 FILE_SECTORS = FILE_BYTES / 512;
+        constexpr u64 CSUM_SECTORS = (FILE_BYTES / 4096 + 120) / 121;
         static u8 payload[40 << 20], readback[40 << 20];
         auto fill = [&](u64 i) {
             __builtin_memset(payload, static_cast<int>(0x41 + i), FILE_BYTES);
@@ -2164,7 +2597,7 @@ int main() {
         CHECK(b.early_writes > a.early_writes, "one transaction touching more than 64 bitmap pages writes some early");
         CHECK(stellar::test_bitmap_summary_ok(), "summary agrees with the bitmap after crossing 100 pages");
         u64 used = free0 - stellar::free_space_sectors();
-        CHECK(used >= 5 * FILE_SECTORS && used < 5 * FILE_SECTORS + 64, "the free count is the five extents plus a few metadata nodes");
+        CHECK(used >= 5 * (FILE_SECTORS + CSUM_SECTORS) && used < 5 * (FILE_SECTORS + CSUM_SECTORS) + 64, "the free count is the five extents plus a few metadata nodes");
 
         u64 free_before = stellar::free_space_sectors();
         CHECK(stellar::mount() && stellar::free_space_sectors() == free_before && stellar::test_bitmap_summary_ok(), "a remount rebuilds the identical summary from 1031 pages");
@@ -2177,7 +2610,7 @@ int main() {
         CHECK(stellar::gc() != stellar::INVALID_STAR, "gc over eleven windows");
         CHECK(stellar::check(&r, false) && r.ok() && r.leaked == 0 && stellar::test_bitmap_summary_ok(), "and the result is exact");
         u64 now_free = stellar::free_space_sectors();
-        CHECK(now_free + 2 * FILE_SECTORS + 64 >= free0 && now_free + 2 * FILE_SECTORS <= free0, "three of the five extents were returned");
+        CHECK(now_free + 2 * (FILE_SECTORS + CSUM_SECTORS) + 64 >= free0 && now_free + 2 * (FILE_SECTORS + CSUM_SECTORS) <= free0, "three of the five extents were returned");
         for (u64 i = 3; i < 5; ++i) { char nm[16]; name_of(nm, "big", i); CHECK(stellar::unlink(stellar::ROOT_STAR, nm), "unlink the rest"); }
         stellar::test_set_gc_window_pages(0);
         CHECK(stellar::gc() != stellar::INVALID_STAR && stellar::check(&r, false) && r.ok() && r.leaked == 0, "everything is returned");
@@ -2377,6 +2810,23 @@ int main() {
             u32 n = 0;
             for (;; ++n) { char nm[16]; name_of(nm, "f", n); stars[n] = stellar::create_file(ROOT, nm, pat, 512); if (stars[n] == NONE) break; }
             for (u32 i = 0; i < n; i += 2) { char nm[16]; name_of(nm, "f", i); stellar::unlink(ROOT, nm); }
+            auto longest_free_run = [&]() {
+                u64 best = 0, run = 0;
+                for (u64 sec = 0; sec < 2048; ++sec) {
+                    u64 pg = sec / 4064, bit = sec % 4064;
+                    bool used = ((g_disk[(2 + pg) * 512 + bit / 8] >> (bit % 8)) & 1) != 0;
+                    if (used) run = 0;
+                    else if (++run > best) best = run;
+                }
+                return best;
+            };
+            for (u32 pad = 0; pad < 64 && longest_free_run() >= 8; ++pad) {
+                char nm[16]; name_of(nm, "pad", pad);
+                u64 len = longest_free_run() - 3;
+                fillp(len * 512, 9);
+                stellar::create_file(ROOT, nm, pat, len * 512);
+            }
+            CHECK(longest_free_run() < 8, "the test disk really is fragmented into short runs");
             u64 free_now = stellar::free_space_sectors();
             printf("fragmented 2048-sector disk: %lu free sectors scattered in short runs\n", free_now);
             u64 entries = count_dir(ROOT);

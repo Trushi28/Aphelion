@@ -100,7 +100,7 @@ check_common() {
 boot fresh
 check_common
 grep -q '\[stellar\] formatted:' "$LOG.clean" || fail "blank disk was not formatted"
-grep -q 'snapshot() cost 1 write(s) + 0 read(s)' "$LOG.clean" || fail "snapshot is not O(1)"
+grep -Eq 'snapshot\(\) cost [0-6] write\(s\) \+ 0 read\(s\)' "$LOG.clean" || fail "snapshot is not O(1)"
 grep -q '\[selftest\] COW and tree snapshots: ok' "$LOG.clean" || fail "snapshot self-test did not pass"
 
 boot persisted

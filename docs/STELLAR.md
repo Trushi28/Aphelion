@@ -5,14 +5,14 @@ B+tree of edges keyed by name hash, so one star can be linked from several direc
 with no hard-link special case.
 
 ```text
-sectors 0 and 1   twin superblocks: magic, version 7, commit number, epoch, catalog root, next star id, snapshot table
+sectors 0 and 1   twin superblocks: magic, version 8, commit number, epoch, catalog root, next star id, snapshot directory
 sectors 2..n      free-sector bitmap
 sectors n+1..     B+tree nodes (1 sector each), directory sectors, file extents
 ```
 
 The **catalog** is a disk-backed B+tree keyed by 64-bit star ID (leaf fanout 7, internal
 fanout 30). A file is one contiguous extent, or an [extent table](#extent-tables) when no single run fits,
-with one CRC32 over the whole file in the catalog entry.
+with a CRC32 per 4 KiB block of its data in a [checksum chain](#block-checksums) the catalog entry points to.
 
 ### O(1) snapshots via epoch copy-on-write
 
@@ -52,7 +52,7 @@ its last edge goes and its catalog entry is removed, and a non-empty directory i
 immediately if they were born in the current epoch, because no snapshot can reference them.
 Anything older stays allocated for the snapshots that may still use it.
 
-`delete_snapshot(id)` tombstones a slot in the snapshot table, and the next `snapshot()` reuses it.
+`delete_snapshot(id)` removes the snapshot's record from the [snapshot table](#the-snapshot-table). Its ID is never handed out again.
 Space is reclaimed by `gc()`, a stop-the-world mark and sweep: it marks the metadata region plus
 every catalog node, directory node and file extent reachable from the live root and from each
 remaining snapshot root, then rewrites the free bitmap to match. Nothing reachable can be freed,
@@ -87,21 +87,65 @@ Measured with the host-side harness (131072-sector disk), old implementation vs 
 - **CRC32 is slice-by-8**, checked against the bitwise reference at every length and alignment.
 - **The cache is 256 slots**, so B+tree interior nodes survive a directory walk.
 
-## On-disk format v7
+## On-disk format v8
 
 ```text
-sectors 0 and 1   twin superblocks: magic, version 7, commit number, epoch, catalog root, next star id,
-                  feature flags, snapshot table, CRC32 in the last 4 bytes
+sectors 0 and 1   twin superblocks: magic, version 8, commit number, epoch, catalog root, next star id,
+                  feature flags, live snapshot count, snapshot directory sector, next snapshot id,
+                  CRC32 in the last 4 bytes
 sectors 2..n      free-sector bitmap, 508 bytes of bits per sector plus a CRC32
-sectors n+1..     catalog nodes, directory nodes (each ending in a CRC32), file extents
+sectors n+1..     catalog nodes, directory nodes, snapshot table, checksum chains, file extents
+                  (every metadata sector ends in a CRC32)
 ```
 
 Every metadata sector ends in a CRC32 of the sector, verified on every read from disk and stamped on every
-write; file data keeps its own CRC32 in the catalog. Catalog entries are 56 bytes (type, checksum, size, extent,
-generation, link count, `mtime`, `flags`, one reserved word), so a leaf holds 7. Feature flags in the superblock
+write. File data is covered by per-block checksums (below). Catalog entries are 56 bytes (type, sector count, size,
+extent, generation, checksum chain, `mtime`, `flags`, link count), so a leaf holds 7. Feature flags in the superblock
 gate future layout additions: an unknown *incompatible* bit refuses to mount (`Unsupported`), compatible bits are
 ignored. Incompatible bit 0 means "this volume has extent-table files" and is set by the first one; `FLAG_EXTENT_TABLE`
-(bit 0 of a star's flags) marks such a file. A v5 disk is reformatted on the next boot, as with earlier bumps.
+(bit 0 of a star's flags) marks such a file.
+
+**v7 volumes are not migrated.** A v7 superblock is not recognised, so the kernel treats the disk as unformatted and
+formats it on the next boot, which destroys its contents. Copy anything you need off a v7 disk first (a v7 build of
+`stellarfs cat` can do that).
+
+### The snapshot table
+
+Snapshots are records of `{id, catalog root, epoch}`. The superblock holds only the sector of the **snapshot
+directory** and the next snapshot ID. The directory is one sector of up to 61 page pointers, and each page is one
+sector of 20 records, so the table holds 1020 snapshots (`SNAPSHOT_MAX`).
+
+- **IDs only go up.** `snapshot()` takes the next ID from a counter in the superblock, so a deleted snapshot's ID is
+  never reused and a stale ID can never name a newer snapshot. The counter is part of every commit.
+- **Updates are copy-on-write.** Taking or deleting a snapshot rewrites one page and the directory to new sectors in the
+  same transaction as everything else, and the old ones are freed after the commit like any replaced node. A page that
+  loses its last record is released. The whole table is kept in RAM (about 24 KiB) and only the touched page is written.
+- **Cost.** A snapshot is still a constant number of sector writes whatever the size of the tree: a page, the
+  directory, a bitmap page and the superblock (measured at 4 to 5 writes and no reads, against 1 write in v7).
+- **Damage.** A directory or page failing its CRC, or holding an implausible record (a root outside the data area, an
+  ID at or above the counter, a duplicate ID, an epoch from the future), does not stop the mount. The affected
+  snapshots are dropped, the table is rewritten, the bitmap is rebuilt from the trees, and the mount logs what it dropped.
+  The live filesystem is never affected. An I/O error, as opposed to a bad checksum, still fails the mount.
+- `check()` reads the table back from disk, verifies every record against the one in RAM, and counts the table's sectors
+  as referenced.
+
+### Block checksums
+
+Each file's data is split into 4 KiB blocks (8 sectors, the last block holds whatever remains), and each block has its
+own CRC32. The CRCs live in a **checksum chain**: sectors holding 121 CRCs each, linked by a `next` pointer, built from
+the last sector to the first like extent tables, with the head in the entry's `csum_sector` (0 for an empty file).
+The chain is allocated with the file, replaced with it, released with it under the same epoch rule, and kept by
+snapshots with the old entry.
+
+- **Reads.** `read_file` verifies every block it returns. A read that ends inside a block reads the rest of that block
+  into a scratch buffer to verify it, so a partial read is checked too and a corrupt block is refused with `Checksum`
+  (the blocks before it still read). Bytes in a file's last sector beyond its size are not covered.
+- **Verification.** `verify_file` and the deep `check` stream the data and compare block by block, across extent
+  boundaries, and name the first bad block in the log.
+- **Chain validation.** The chain must have exactly the number of sectors the size implies, each holding the exact
+  number of CRCs, with no early end and no extra tail, or it is `Corrupt`. `check` claims each chain sector.
+- **Cost.** One extra sector per 484 KiB of file data (0.2 %), written with the file.
+- **Whole-file CRC is gone.** The catalog no longer stores one; a mismatch is now located to a block.
 
 ## Crash consistency
 
@@ -223,10 +267,14 @@ harness, a single-operation create (one commit each) costs 10.5, 13.4 and 13.6 s
 100, 400 and 1000 entries; the chain it replaced cost 25.9, 70.7 and 156.7. Snapshot views use the same lookup, so
 there is no per-snapshot filter and no RAM index, and no directory operation allocates RAM.
 
-**Delete.** An unlink removes the entry from its leaf. A leaf that becomes empty is removed from its parent and
-its sector returned under the usual epoch rule; an internal node left with one child is collapsed at the root.
-Nodes are not merged when they are merely sparse, so a directory that once held many entries keeps a few sparse
-nodes. A completely empty directory is a single empty leaf.
+**Delete.** An unlink removes the entry from its leaf, and the same routine removes catalog entries. Every node
+except the root is kept at least half full: a leaf holds at least 3 entries and an internal node at least 14 keys.
+When a removal leaves a node below that, it is merged into a neighbour if the two fit in one node, otherwise the
+entries are redistributed between them and the separating key is updated; either way it goes through the usual
+copy-on-write and epoch rule, so the sector of a merged-away node is returned immediately or deferred exactly like
+any other replaced node. A merge can leave the parent short in turn, and the root is collapsed when it is left with a
+single child. A completely empty tree is one empty leaf. Trees written by older kernels can contain sparse nodes;
+they are repaired only where a removal touches them.
 
 `check()` walks every directory tree with key bounds (every key must lie between its parent's separators and be
 strictly ascending), verifies each key's prefix against its name's hash, each entry's target, and each
@@ -391,28 +439,32 @@ Stated plainly:
   once per window (and once per snapshot root per window), so cost grows with disks x snapshots x catalog size.
 - Star IDs are never reused, so a snapshot's view of a star can never be confused with a later star. A dead star's
   catalog entry is removed from the live catalog when its last link goes; snapshots keep their own copy for as long as
-  they live. Entries left behind by earlier kernels stay on an existing volume until it is reformatted.
-- A deleted snapshot's ID can be handed out again by a later `snapshot()`. The snapshot table holds 24.
+  they live. Entries left behind by earlier kernels (a catalog entry of type `TYPE_FREE`) are removed by the next `gc()`,
+  which logs how many it purged.
+- The snapshot table holds 1020 snapshots; IDs are never reused, so a long-lived volume that creates and deletes many
+  snapshots keeps counting up (a 64-bit counter, which cannot realistically run out).
 - Snapshots are **whole-filesystem**, not per-subtree.
-- Directory nodes are not merged on delete, only dropped when empty, and a name hash prefix holds at most 65536
-  names. Directory listings are in hash order, not creation order.
-- Catalog nodes are not merged when merely sparse, only dropped when empty, so a catalog that once held many live
-  stars keeps some sparse nodes.
-- `read_file` can only verify the checksum when the whole file is read; partial reads are unchecked.
+- A name hash prefix holds at most 65536 names. Directory listings are in hash order, not creation order.
 - Concurrency is tested on host threads (a four-thread create/find/list/snapshot test and a four-thread `rename` test that
-  checks for lost, duplicated and misplaced entries). The in-kernel SMP stress covers create, find and unlink, not rename.
+  checks for lost, duplicated and misplaced entries) and on the kernel's own scheduler: the boot-time SMP stress has four
+  Satellites create files in one directory, move each to a second directory and back with `RENAME_NOREPLACE`, contend
+  on one shared file by renaming it between the two directories, and then verify every entry, remove everything and run
+  `check()`. The host tests run on real pthreads under ThreadSanitizer (`-fsanitize=thread`); the kernel run has no race
+  detector.
 - Free space is a bitmap, not the Universe/Orbit buddy machinery. Mount reads all of it (in 32-sector commands)
   to build the page summary, so mount time is linear in disk size: about 130 commands per 8 GiB.
-- `check()` still needs two disk-sized bit arrays plus 8 bytes per star in RAM (about 0.5 GiB per TB of disk), so
-  on very large disks run it with the host `stellarfs fsck`, not in the kernel.
+- `check()` runs in windows: each pass covers 32 GiB of data area (two 8 MiB bit arrays) and 2M stars (16 MiB of
+  link counters), and re-walks the trees for every window, so its RAM is fixed and its time grows with the number of
+  windows times the metadata size. The windows are set by `test_set_check_window`, and the host tests require the
+  report to be identical to a single-pass check on clean and on damaged images.
 - A failure to read a bitmap page while freeing sectors leaves them marked used (a leak that `gc()` recovers). If the
   free happens inside the operation, the operation fails with `Io` and is rolled back. If it happens after the commit
   is already durable (the deferred frees of replaced sectors), the operation has succeeded and cannot be undone, so the
   failure is logged on the serial console and counted by `free_failures()`. If the page stays unreadable, the rollback
   itself cannot reload the volume and it is left unmounted.
-- File data has one CRC32 for the whole file, not one per extent, so a partial read cannot be verified and a bad
-  extent is only found by reading the whole file. Metadata sectors, including extent tables, are checksummed.
-- Bumping the superblock version reformats an existing disk on next boot (v3 to v6 images aren't migrated).
+- Block checksums cover file data and the chain that holds them is checksummed per sector, but nothing protects against
+  a block and its checksum being replaced together by an older consistent pair (that needs a hash tree, which this is not).
+- Bumping the superblock version reformats an existing disk on next boot: v7 and earlier volumes are not migrated.
 - The boot self-tests that take snapshots are skipped on a mounted disk to avoid exhausting the table.
 
 ---

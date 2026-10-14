@@ -11,7 +11,7 @@ constexpr u64 ROOT_STAR = 0;
 constexpr u64 INVALID_STAR = 0xFFFFFFFFFFFFFFFFull;
 
 constexpr u64 LIVE = 0;
-constexpr u32 SNAPSHOT_MAX = 24;
+constexpr u32 SNAPSHOT_MAX = 1020;
 constexpr u32 NAME_MAX_LEN = 51;
 
 constexpr u32 RENAME_NOREPLACE = 1u << 0;
@@ -105,9 +105,21 @@ bool set_flags(u64 star, u32 flags, Status* why = nullptr);
 void set_clock(u64 (*fn)());
 
 void test_set_hash_mask(u64 mask);
+void test_set_legacy_unlink(bool on);
+
+struct TreeShape {
+    u64 leaves, internals, entries;
+    u32 min_leaf, min_internal_keys, depth;
+    bool uniform;
+};
+bool test_dir_shape(u64 dir_star, TreeShape* out);
+bool test_catalog_shape(TreeShape* out);
+void test_set_check_window(u64 sectors, u64 stars);
 void test_set_bitmap_cache_slots(u32 n);
 void test_set_max_extent_sectors(u64 n);
 u64 test_first_sector(u64 star, u64 snap = LIVE);
+u64 test_csum_sector(u64 star, u64 snap = LIVE);
+u64 test_snap_table_sector(u32 page);
 void test_set_gc_window_pages(u64 pages);
 bool test_bitmap_summary_ok();
 
