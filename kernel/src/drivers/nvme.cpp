@@ -8,6 +8,7 @@
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/orbital.hpp>
+#include <cosmos/dma.hpp>
 
 namespace nvme {
 
@@ -141,15 +142,8 @@ static void map_region(u64 phys_base) {
                                constellation::WRITABLE | constellation::NO_CACHE);
 }
 
-static void* alloc_pages(u64 bytes) {
-    int order = 0;
-    while ((universe::PAGE_SIZE << order) < bytes) ++order;
-    u64 phys = universe::alloc(order);
-    void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
-    return v;
-}
-static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
+static void* alloc_pages(u64 bytes) { return dma::alloc(bytes).virt; }
+static u64 virt_to_phys(void* v, u64 len = 1) { return dma::phys(v, len); }
 static u8* io_bounce_for(u32 slot) { return g_io_bounce_pool + static_cast<u64>(slot) * 4096; }
 
 static void scan_cb(const pci::Device& d, void*) {
@@ -480,6 +474,10 @@ bool init(u64 hhdm_offset) {
     g_ident = static_cast<u8*>(alloc_pages(4096));
     g_admin_bounce = static_cast<u8*>(alloc_pages(4096));
     g_io_bounce_pool = static_cast<u8*>(alloc_pages(4096ull * MAX_INFLIGHT));
+    if (!asq || !acq || !isq || !icq || !g_ident || !g_admin_bounce || !g_io_bounce_pool) {
+        serial::writeln("[nvme] out of DMA memory");
+        return false;
+    }
     for (auto& d : g_slot_done) d = false;
     for (auto& s : g_slot_status) s = 0;
 

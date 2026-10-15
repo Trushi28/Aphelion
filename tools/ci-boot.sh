@@ -92,6 +92,8 @@ check_common() {
     grep -q '\[selftest\] smp-fs: ok' "$LOG.clean" || fail "concurrent filesystem stress did not pass"
     grep -q '\[smp-blockdev\] FAIL' "$LOG.clean" && fail "concurrent block-device stress reported a failure"
     grep -q '\[selftest\] smp-blockdev: ok' "$LOG.clean" || fail "concurrent block-device stress did not pass"
+    grep -q '\[selftest\] pmm: ok' "$LOG.clean" || fail "physical allocator self-test did not pass"
+    grep -q '\[universe\] reclaimed' "$LOG.clean" || fail "bootloader memory was never reclaimed"
     if [ "$CORES" -gt 1 ]; then
         grep -q 'stealing confirmed' "$LOG.clean" || fail "no cross-core work-stealing observed"
     fi

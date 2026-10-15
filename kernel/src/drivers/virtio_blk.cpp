@@ -8,6 +8,7 @@
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/orbital.hpp>
+#include <cosmos/dma.hpp>
 
 namespace virtioblk {
 
@@ -106,15 +107,8 @@ static void map_bar_region(u64 phys_base) {
                                constellation::WRITABLE | constellation::NO_CACHE);
 }
 
-static void* alloc_pages(u64 bytes) {
-    int order = 0;
-    while ((universe::PAGE_SIZE << order) < bytes) ++order;
-    u64 phys = universe::alloc(order);
-    void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
-    return v;
-}
-static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
+static void* alloc_pages(u64 bytes) { return dma::alloc(bytes).virt; }
+static u64 virt_to_phys(void* v, u64 len = 1) { return dma::phys(v, len); }
 static u8* bounce_for(u32 slot) { return g_bounce_pool + static_cast<u64>(slot) * 512; }
 
 static pci::Device g_found{};
@@ -325,7 +319,7 @@ bool init(u64 hhdm_offset) {
     g_desc = static_cast<VringDesc*>(alloc_pages(sizeof(VringDesc) * QSIZE));
     g_avail = static_cast<VringAvail*>(alloc_pages(sizeof(VringAvail)));
     g_used = static_cast<VringUsed*>(alloc_pages(sizeof(VringUsed)));
-
+    if (!g_desc || !g_avail || !g_used) { serial::writeln("[virtio-blk] out of DMA memory"); return false; }
     g_common->queue_size = qsize;
     g_common->queue_desc = virt_to_phys(g_desc);
     g_common->queue_driver = virt_to_phys(g_avail);

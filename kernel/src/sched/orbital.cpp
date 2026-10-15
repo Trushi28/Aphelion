@@ -29,6 +29,20 @@ static Satellite* g_zombies = nullptr;
 static cpu::Spinlock g_zombie_lock;
 static cpu::Spinlock g_pool_lock;
 
+static Satellite* g_dying[MAX_CORES] = {};
+static volatile u32 g_cores_on_kstack = 0;
+
+static void retire_dying() {
+    u32 me = apic::id();
+    Satellite* d = g_dying[me];
+    if (!d) return;
+    g_dying[me] = nullptr;
+    g_zombie_lock.lock();
+    d->next = g_zombies;
+    g_zombies = d;
+    g_zombie_lock.unlock();
+}
+
 static u32 ticks_for_ring(int ring) {
 
     static const u32 slice[NUM_RINGS] = {2, 4, 8, 16};
@@ -73,9 +87,10 @@ static Satellite* try_steal(u32 me) {
     return nullptr;
 }
 
-static void build_satellite(Satellite* s, const char* name, EntryFn entry, void* arg,
+static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void* arg,
                              int ring, void (*trampoline)()) {
     u64 phys = universe::alloc(STACK_ORDER);
+    if (!phys) return false;
     u8* stack_virt = reinterpret_cast<u8*>(g_hhdm + phys);
     s->stack_base = stack_virt;
     s->stack_size = universe::PAGE_SIZE << STACK_ORDER;
@@ -96,11 +111,13 @@ static void build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     *(--sp) = 0;
     *(--sp) = 0;
     s->rsp = reinterpret_cast<u64>(sp);
+    return true;
 }
 
 extern "C" void satellite_trampoline() {
 
     g_lock[apic::id()].unlock();
+    retire_dying();
     Satellite* self = g_current[apic::id()];
     cpu::sti();
     self->entry(self->arg);
@@ -109,10 +126,12 @@ extern "C" void satellite_trampoline() {
 }
 
 static void reap_zombies() {
+    u64 f = cpu::irq_save();
     g_zombie_lock.lock();
     Satellite* z = g_zombies;
     g_zombies = nullptr;
     g_zombie_lock.unlock();
+    cpu::irq_restore(f);
 
     while (z) {
         Satellite* next_z = z->next;
@@ -126,6 +145,7 @@ static void reap_zombies() {
 }
 
 static void idle_entry(void*) {
+    __atomic_add_fetch(&g_cores_on_kstack, 1u, __ATOMIC_SEQ_CST);
     cpu::sti();
     for (;;) {
         reap_zombies();
@@ -148,10 +168,11 @@ static void reschedule_locked(u32 me, Satellite* old_to_enqueue) {
 
     Satellite* old = g_current[me];
     if (next == old) { g_lock[me].unlock(); return; }
-
+    if (!old_to_enqueue && old != &g_idle[me]) g_dying[me] = old;
     g_current[me] = next;
     switch_context(&old->rsp, next->rsp);
     g_lock[apic::id()].unlock();
+    retire_dying();
 }
 
 NORETURN void exit_current() {
@@ -162,11 +183,6 @@ NORETURN void exit_current() {
         cpu::sti();
         for (;;) cpu::halt();
     }
-
-    g_zombie_lock.lock();
-    cur->next = g_zombies;
-    g_zombies = cur;
-    g_zombie_lock.unlock();
 
     g_lock[me].lock();
     reschedule_locked(me, nullptr);
@@ -253,6 +269,8 @@ u64 self_token() {
     cpu::irq_restore(flags);
     return cur ? reinterpret_cast<u64>(cur) : 1;
 }
+
+u32 cores_on_kernel_stacks() { return g_cores_on_kstack; }
 
 NORETURN void start_core() {
     u32 me = apic::id();

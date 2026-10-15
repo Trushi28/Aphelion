@@ -34,7 +34,7 @@ NORETURN void exit_current();
 NORETURN void start_core();
 
 u64 self_token();
-
+u32 cores_on_kernel_stacks();
 class Mutex {
 public:
     void lock() {

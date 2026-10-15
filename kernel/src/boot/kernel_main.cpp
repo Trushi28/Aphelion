@@ -61,6 +61,11 @@ static volatile u64 g_cpus_online = 0;
 static volatile u64 g_next_core_idx = 1;
 static u64 g_hhdm_offset = 0;
 
+static universe::MemmapEntry g_entries[512];   
+static u64 g_n_entries = 0;                    
+static u64 g_expected_cores = 1;               
+
+
 static constexpr u64 TEST_TAIL_SECTORS = 64;
 static constexpr const char* HELLO_REWRITTEN = "Aphelion Stellar FS -- rewritten after snapshot.\n";
 
@@ -480,6 +485,19 @@ static bool selftest_extents() {
     return ok && stellar::check(&rep, false) && rep.ok();
 }
 
+static void reclaim_task(void*) {
+    u64 start = clock::uptime_ms();
+    while (orbital::cores_on_kernel_stacks() < g_expected_cores) {
+        if (clock::uptime_ms() - start > 3000) {
+            serial::writeln("[universe] some core never left its bootloader stack, leaving bootloader memory alone");
+            orbital::exit_current();
+        }
+        orbital::yield();
+    }
+    universe::reclaim_bootloader_regions(g_entries, g_n_entries);
+    orbital::exit_current();
+}
+
 extern "C" NORETURN void kernel_main() {
     serial::init();
     serial::writeln("\n=== Aphelion booting ===");
@@ -523,8 +541,9 @@ extern "C" NORETURN void kernel_main() {
         cpu::hang();
     }
     auto* mm_resp = memmap_request.response;
-    static universe::MemmapEntry entries[512];
+    universe::MemmapEntry* entries = g_entries;
     u64 n_entries = mm_resp->entry_count < 512 ? mm_resp->entry_count : 512;
+    g_n_entries = n_entries;
     u64 max_phys = 0;
     for (u64 i = 0; i < n_entries; ++i) {
         entries[i] = { mm_resp->entries[i]->base, mm_resp->entries[i]->length, mm_resp->entries[i]->type };
@@ -534,6 +553,8 @@ extern "C" NORETURN void kernel_main() {
         if (!huge_high_reserved && top > max_phys) max_phys = top;
     }
     universe::init(entries, n_entries, g_hhdm_offset);
+    bool pmm_ok = universe::selftest();
+    serial::printf("[selftest] pmm: %s\n", pmm_ok ? "ok" : "MISMATCH");
     fb::printf(0xC0FFC0, "[ok] Universe online: %lu galaxies, %lu MiB free\n",
                static_cast<u64>(universe::galaxy_count()), universe::free_bytes() / (1024 * 1024));
 
@@ -888,9 +909,7 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xB0B0C0, "[--] No block device found\n");
     }
 
-    universe::reclaim_bootloader_regions(entries, n_entries);
-    fb::printf(0xC0FFC0, "[ok] Bootloader-owned memory reclaimed: %lu MiB free\n",
-               universe::free_bytes() / (1024 * 1024));
+    
 
     orbital::init(g_hhdm_offset);
 
@@ -941,6 +960,7 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
                WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");
-
+    g_expected_cores = smp_request.response ? smp_request.response->cpu_count : 1;
+    orbital::spawn("reclaim", &reclaim_task, nullptr);
     orbital::start_core();
 }

@@ -8,6 +8,7 @@
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/orbital.hpp>
+#include <cosmos/dma.hpp>
 
 namespace ahci {
 
@@ -155,15 +156,8 @@ static void map_region(u64 phys_base) {
                                constellation::WRITABLE | constellation::NO_CACHE);
 }
 
-static void* alloc_pages(u64 bytes) {
-    int order = 0;
-    while ((universe::PAGE_SIZE << order) < bytes) ++order;
-    u64 phys = universe::alloc(order);
-    void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
-    return v;
-}
-static u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hhdm; }
+static void* alloc_pages(u64 bytes) { return dma::alloc(bytes).virt; }
+static u64 virt_to_phys(void* v, u64 len = 1) { return dma::phys(v, len); }
 static HbaCmdTable* table_for(u32 slot) {
     return reinterpret_cast<HbaCmdTable*>(g_cmd_table + static_cast<u64>(slot) * CMD_TABLE_STRIDE);
 }
@@ -428,7 +422,7 @@ static bool rebase_port() {
     g_cmd_list = static_cast<HbaCmdHeader*>(alloc_pages(1024));
     void* fis_base = alloc_pages(256);
     g_cmd_table = static_cast<u8*>(alloc_pages(CMD_TABLE_STRIDE * MAX_INFLIGHT));
-
+    if (!g_cmd_list || !fis_base || !g_cmd_table) return false;
     u64 clb_phys = virt_to_phys(g_cmd_list);
     g_port->clb = static_cast<u32>(clb_phys);
     g_port->clbu = static_cast<u32>(clb_phys >> 32);
@@ -525,12 +519,13 @@ bool init(u64 hhdm_offset) {
 
     g_bounce = static_cast<u8*>(alloc_pages(512));
     g_bounce_pool = static_cast<u8*>(alloc_pages(512ull * MAX_INFLIGHT));
-
+    if (!g_bounce || !g_bounce_pool) { serial::writeln("[ahci] out of DMA memory"); return false; }
     u8 id_buf[512];
-    if (!identify(id_buf)) {
+    if (!identify(g_bounce)) {
         serial::writeln("[ahci] IDENTIFY DEVICE failed");
         return false;
     }
+    __builtin_memcpy(id_buf, g_bounce, 512);
     auto* words = reinterpret_cast<u16*>(id_buf);
     bool lba48 = (words[83] & (1u << 10)) != 0;
     if (lba48) {
