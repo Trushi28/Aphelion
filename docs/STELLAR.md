@@ -32,9 +32,11 @@ flowchart LR
   before -->|"snapshot: save root, epoch++"| after
 ```
 
-`snapshot()` is three steps: record `{catalog_root, epoch}` in the snapshot table, `epoch++`,
-write the superblock. **One sector write, no reads, regardless of tree size**: everything that
-existed is now older than the current epoch and becomes copy-on-write on its next change.
+`snapshot()` is three steps: record `{id, catalog_root, epoch}` in the snapshot table, `epoch++`,
+write the table page, the directory and the superblock. **A constant handful of sector writes, no reads, regardless of
+tree size**: everything that existed is now older than the current epoch and becomes copy-on-write on its next change.
+The `epoch++` happens immediately and not just at the commit, so a snapshot taken in the middle of a batch still protects
+files created earlier in that same batch: a later rewrite in the batch sees their extents as older than the epoch and keeps them.
 
 A snapshot is a *view*: `find`, `list`, `read_file` and `verify_file` take an optional snapshot
 ID (`stellar::LIVE` = 0 is the default), and star IDs are stable across views.
@@ -111,15 +113,15 @@ formats it on the next boot, which destroys its contents. Copy anything you need
 
 ### The snapshot table
 
-Snapshots are records of `{id, catalog root, epoch}`. The superblock holds only the sector of the **snapshot
+Snapshots are records of `{id, catalog root, epoch, scope}` (32 bytes). The superblock holds only the sector of the **snapshot
 directory** and the next snapshot ID. The directory is one sector of up to 61 page pointers, and each page is one
-sector of 20 records, so the table holds 1020 snapshots (`SNAPSHOT_MAX`).
+sector of 15 records, so the table holds 915 snapshots (`SNAPSHOT_MAX`).
 
 - **IDs only go up.** `snapshot()` takes the next ID from a counter in the superblock, so a deleted snapshot's ID is
   never reused and a stale ID can never name a newer snapshot. The counter is part of every commit.
 - **Updates are copy-on-write.** Taking or deleting a snapshot rewrites one page and the directory to new sectors in the
   same transaction as everything else, and the old ones are freed after the commit like any replaced node. A page that
-  loses its last record is released. The whole table is kept in RAM (about 24 KiB) and only the touched page is written.
+  loses its last record is released. The whole table is kept in RAM (about 29 KiB) and only the touched page is written.
 - **Cost.** A snapshot is still a constant number of sector writes whatever the size of the tree: a page, the
   directory, a bitmap page and the superblock (measured at 4 to 5 writes and no reads, against 1 write in v7).
 - **Damage.** A directory or page failing its CRC, or holding an implausible record (a root outside the data area, an
@@ -128,6 +130,29 @@ sector of 20 records, so the table holds 1020 snapshots (`SNAPSHOT_MAX`).
   The live filesystem is never affected. An I/O error, as opposed to a bad checksum, still fails the mount.
 - `check()` reads the table back from disk, verifies every record against the one in RAM, and counts the table's sectors
   as referenced.
+
+### Per-subtree snapshots
+
+`snapshot_subtree(dir)` records one directory and everything below it. Instead of pinning the whole catalog root it
+builds a **reduced catalog**: a new private B+tree holding a copy of the catalog entry of `dir` and of every star
+reachable from it, found by walking the directories iteratively with a bounded stack. The snapshot record stores the
+reduced tree's root and the directory's star ID as its `scope`. `snapshot_subtree(ROOT_STAR)` is an ordinary
+whole-filesystem snapshot.
+
+- **Views.** Reading through a subtree snapshot treats the scope directory as `/`: `ROOT_STAR` in a snapshot view is
+  mapped to the scope, so `resolve`, `find`, `list`, `stat`, `read_file` and `verify_file` work unchanged. A star
+  outside the scope does not exist in that view and returns `NotFound`. `snapshot_scope(id)` reports the scope, and
+  `ROOT_STAR` for a whole-filesystem snapshot.
+- **Retention.** The snapshot keeps only the extents, checksum chains and directory trees of stars in the subtree.
+  Rewriting or deleting a file outside the subtree frees its old version immediately, which a whole-filesystem snapshot
+  would have pinned. A hard link from outside the scope to a file inside it keeps that file's data alive through the
+  snapshot, because the file itself is in the scope.
+- **Cost.** One catalog insert per star in the subtree plus the same table, bitmap and superblock writes as a whole
+  snapshot, so it scales with the subtree, not the filesystem.
+- **Garbage collection and check.** `gc()` marks the reduced tree like any snapshot root, and `check()` verifies that
+  the scope still exists in it and is a directory. Deleting the snapshot releases the reduced tree.
+- **Format.** Still v8: a whole-filesystem snapshot has `scope = INVALID_STAR`. A kernel older than this change
+  would misread the record, so the v8 patch series must be applied together.
 
 ### Block checksums
 
@@ -162,11 +187,13 @@ Every commit starts a new epoch, so a node that has been durable is never modifi
 old copy is freed according to when it was born. Born in the current epoch (never durable) means free it now;
 born earlier, with no snapshot taken since, means free it after the next commit succeeds; otherwise a snapshot may
 still see it and it is kept until `gc()`. The on-disk bitmap is therefore always a superset of what the durable
-superblock references, so a crash can leak space (which `gc()` or a damaged-mount rebuild reclaims) but can never
+superblock references, so a crash can leak space (which `gc()` or a bitmap rebuild reclaims) but can never
 hand out a sector that is still in use.
 
-Mount takes the valid superblock with the higher commit number. If a superblock slot or a bitmap sector fails its
-checksum, the bitmap is rebuilt from the trees before the filesystem is used. A failed operation that changed
+Mount takes the valid superblock with the higher commit number. It reads the two superblocks and the snapshot table
+and nothing else; the bitmap is not read (see the summary below). If a superblock slot or the snapshot table fails
+its checksum, the bitmap is rebuilt from the trees before the filesystem is used. A bitmap page that fails its
+checksum is found when it is first read and rebuilt then. A failed operation that changed
 anything is **rolled back** by reloading the durable state, so it leaves no partial result; a failure inside a
 `begin_batch`/`end_batch` group rolls the whole group back, and `end_batch` reports it. A group that only contained
 validation failures (`Exists`, `NotFound`, ...) is not affected.
@@ -370,17 +397,32 @@ sectors of disk each). What changed is that it is no longer held in RAM.
   deferred), so any page image is a superset of what is durable and the worst outcome of a crash is a leak that
   `gc()` recovers. Early writes need a group commit or a very large file; a single create dirties about as many
   pages as the extent spans (a 40 MiB file: 20 pages). The commit flushes the device if any early write happened.
-- **Summary.** A 16-bit count of free data sectors per page, built while mounting and kept exact by every
-  allocate and free. Allocation skips full pages without reading them and takes a completely free page without
-  reading it either, so a fresh disk is searched without touching the bitmap. `free_space_sectors()` sums the
-  counts. RAM is 3 bytes per page, 1.5 MiB per TB.
-- **Batched I/O.** Mount and `format` move the bitmap 32 sectors per device command, with a fallback to single
-  reads. `gc()` and `check()` read it through a streaming reader that prefers a cached (possibly dirty) page and
+- **Summary.** A 16-bit count of free data sectors per page, kept exact by every allocate and free. It is **not**
+  built at mount: every page starts unknown, and a page's count is learned the first time the allocator needs it,
+  reading 32 pages per device command (single reads if the batched read fails). A page already loaded into the cache
+  is learned as it loads. Allocation skips full pages without reading them and takes a completely free page without
+  reading it either, so a fresh disk is searched without touching the bitmap. `free_space_sectors()` learns every
+  page that is still unknown and then returns the exact total, so the first call on a large volume reads the whole
+  bitmap once; `bitmap_summary()` reports how many pages are known without any I/O. RAM is 3 bytes per page, 1.5 MiB
+  per TB.
+- **Allocation hint.** The superblock records where the allocator should start (the lower of its position and the
+  first sector of anything freed in that commit), so after a remount allocation continues where it left off instead
+  of learning every full page below the free area. The hint is only a starting point: if nothing fits above it the
+  allocator wraps to the start of the data area. Volumes written by earlier v8 builds have a zero there, which
+  means "start at the beginning of the data area".
+- **Batched I/O.** `format` moves the bitmap 32 sectors per device command, and so does learning the summary,
+  with a fallback to single reads. `gc()` and `check()` read it through a streaming reader that prefers a cached (possibly dirty) page and
   does not disturb the cache.
 - **Windowed gc.** The mark bitmap covers at most 16 MiB at a time (64 GiB of disk); a larger disk is processed in
   windows, re-walking the trees for each one. A disk of up to 64 GiB is one window, as before.
-- **Damaged pages.** A page failing its checksum at mount is flagged, counted as free, and rebuilt by the gc that
-  mount runs; it is rewritten even when its rebuilt contents are all zero.
+- **Damaged pages.** A page that fails its checksum is not trusted and not zero-filled. The operation that met it
+  fails with `Checksum` and changes nothing, and as soon as the call returns (outside a batch) the bitmap is rebuilt
+  from the trees by the same collector `gc()` uses, with the damaged pages flagged and rewritten even when their
+  rebuilt contents are all zero. The retry then works. `check()` reports such a page as `bad_bitmap` (not as a
+  metadata checksum failure), fails once, and has repaired it by the time it returns, so the next `check()` is
+  clean. Inside a batch the repair waits for the first call after `end_batch`. A read error (as opposed to a bad
+  checksum) is reported as `Io` and nothing is rebuilt. Before lazy mount a damaged page was repaired during mount,
+  so a volume could never be in this state while mounted; now one operation can fail where mount used to absorb it.
 
 Measured with `make bench-stellar` on sparse virtual disks (host RAM disk, so device commands are the figure that
 carries over; before is the fully resident bitmap):
@@ -389,8 +431,8 @@ carries over; before is the fully resident bitmap):
 |---|---:|---:|
 | Bitmap RAM | 2,068 KiB | 61 KiB |
 | `format` device commands | 4,137 | 140 |
-| `mount` device commands | 4,131 | 132 |
-| `free_space_sectors()` (one call) | 16 ms | a few microseconds |
+| `mount` device commands | 4,131 | 132 with a summary built at mount, **2** with lazy mount (the two superblocks) |
+| `free_space_sectors()` (first call after a mount) | 16 ms | 130 device commands to learn every page, then a few microseconds |
 | `gc()` device commands | 96 | 229 |
 | `check()` device commands | 22 | 151 |
 
@@ -403,8 +445,11 @@ a gc mark; now it is 1.5 MiB plus the 32 KiB cache.
 cache, and a 2-slot cache with 1-page gc windows, produces byte-identical disk images. The crash exploration has a
 fourth configuration (a 3-page disk with a 1-slot cache, 2,650 crash states) in which early writes really happen.
 A 2 GiB disk takes five 40 MiB files in one group commit (38 early writes), remounts, and windowed gc runs over
-eleven windows. Mount is tested against an unreadable bitmap sector, failing batched reads, and a damaged page that
-holds only free space. Every one of five mutations (dropping a dirty page on eviction, a wrong free-page shortcut, a
+eleven windows. The bitmap is tested against an unreadable sector (which no longer stops mount but fails
+`check()`, `gc()` and the summary with `Io`), failing batched reads, a damaged page found by `check()`, and a damaged
+page found by an allocation. Lazy mount is tested for a constant number of device reads at mount on a volume with
+dozens of bitmap pages, for the first allocation learning one batch only, for the same allocation learning more
+pages when the hint is cleared, and for a hole freed in the last commit being reused after a remount. Every one of five mutations (dropping a dirty page on eviction, a wrong free-page shortcut, a
 summary that forgets frees, a gc window offset error, and a damaged page that is not forced to rewrite) fails the
 suite.
 
@@ -441,9 +486,10 @@ Stated plainly:
   catalog entry is removed from the live catalog when its last link goes; snapshots keep their own copy for as long as
   they live. Entries left behind by earlier kernels (a catalog entry of type `TYPE_FREE`) are removed by the next `gc()`,
   which logs how many it purged.
-- The snapshot table holds 1020 snapshots; IDs are never reused, so a long-lived volume that creates and deletes many
+- The snapshot table holds 915 snapshots; IDs are never reused, so a long-lived volume that creates and deletes many
   snapshots keeps counting up (a 64-bit counter, which cannot realistically run out).
-- Snapshots are **whole-filesystem**, not per-subtree.
+- A per-subtree snapshot copies the subtree's catalog entries, so its cost grows with the size of the subtree, and it
+  protects only what that subtree references (see above). Directory structure outside the scope is not recorded.
 - A name hash prefix holds at most 65536 names. Directory listings are in hash order, not creation order.
 - Concurrency is tested on host threads (a four-thread create/find/list/snapshot test and a four-thread `rename` test that
   checks for lost, duplicated and misplaced entries) and on the kernel's own scheduler: the boot-time SMP stress has four
@@ -451,8 +497,11 @@ Stated plainly:
   on one shared file by renaming it between the two directories, and then verify every entry, remove everything and run
   `check()`. The host tests run on real pthreads under ThreadSanitizer (`-fsanitize=thread`); the kernel run has no race
   detector.
-- Free space is a bitmap, not the Universe/Orbit buddy machinery. Mount reads all of it (in 32-sector commands)
-  to build the page summary, so mount time is linear in disk size: about 130 commands per 8 GiB.
+- Free space is a bitmap, not the Universe/Orbit buddy machinery. Mount does not read it, so mount time is constant
+  in disk size, but the cost moves: the first allocation reads the pages between the hint and the first page with
+  room, and the first `free_space_sectors()` reads the rest (about 130 commands per 8 GiB, once). A volume whose
+  free space is only far below the hint pays that scan on the first allocation that wraps.
+- A damaged bitmap page now fails one operation instead of being absorbed at mount (see Damaged pages).
 - `check()` runs in windows: each pass covers 32 GiB of data area (two 8 MiB bit arrays) and 2M stars (16 MiB of
   link counters), and re-walks the trees for every window, so its RAM is fixed and its time grows with the number of
   windows times the metadata size. The windows are set by `test_set_check_window`, and the host tests require the

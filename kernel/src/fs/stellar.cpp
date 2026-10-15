@@ -20,7 +20,7 @@ constexpr u32 SB_SLOTS = 2;
 constexpr u32 FEAT_EXTENT_TABLES = 1u << 0;
 constexpr u32 FEATURES_INCOMPAT_KNOWN = FEAT_EXTENT_TABLES;
 
-constexpr u32 SNAP_PER_PAGE = 20;
+constexpr u32 SNAP_PER_PAGE = 15;
 constexpr u32 SNAP_DIR_PTRS = 61;
 constexpr u32 SNAP_PAGES = (SNAPSHOT_MAX + SNAP_PER_PAGE - 1) / SNAP_PER_PAGE;
 static_assert(SNAP_PAGES * SNAP_PER_PAGE == SNAPSHOT_MAX, "the snapshot table must be a whole number of pages");
@@ -35,8 +35,9 @@ struct PACKED SnapRec {
     u64 id;
     u64 catalog_root;
     u64 epoch;
+    u64 scope;
 };
-static_assert(sizeof(SnapRec) == 24, "SnapRec must be 24 bytes");
+static_assert(sizeof(SnapRec) == 32, "SnapRec must be 32 bytes");
 
 struct PACKED SnapPage {
     u8 kind;
@@ -77,7 +78,8 @@ struct PACKED Superblock {
     u32 reserved;
     u64 snap_dir;
     u64 snap_next_id;
-    u8 padding[CRC_OFF - 104];
+    u64 alloc_hint;
+    u8 padding[CRC_OFF - 112];
     u32 crc;
 };
 static_assert(sizeof(Superblock) == SECTOR_SIZE, "superblock must fill one sector");
@@ -193,6 +195,7 @@ constexpr u32 BM_SLOTS = 64;
 constexpr u32 BM_BATCH = 32;
 constexpr u64 PAGE_BITS = BM_PAYLOAD * 8;
 constexpr u8 BM_BAD = 1;
+constexpr u16 BM_UNKNOWN = 0xFFFF;
 
 struct BmSlot {
     u64 page;
@@ -209,11 +212,26 @@ static u16* g_bm_free = nullptr;
 static u8* g_bm_flags = nullptr;
 static u8* g_bm_scratch = nullptr;
 static u64 g_bm_pages = 0;
+static u64 g_bm_unknown = 0;
+static u64 g_free_known = 0;
+static bool g_bm_repair = false;
+static bool g_bm_tolerate = false;
 static u64 g_bm_page_reads = 0, g_bm_page_writes = 0, g_bm_early_writes = 0;
+static void bm_set_free(u64 p, u64 v) {
+    u16 old = g_bm_free[p];
+    if (old == BM_UNKNOWN) --g_bm_unknown;
+    else g_free_known -= old;
+    g_bm_free[p] = static_cast<u16>(v);
+    g_free_known += v;
+}
 static bool g_sb_dirty = false;
 static u64 g_mut = 0;
 static void touch_sb() { g_sb_dirty = true; ++g_mut; }
 static u64 g_alloc_hint = 0;
+constexpr u32 DEFER_MAX = 8192;
+struct DeferRange { u64 first, count; };
+static DeferRange g_defer[DEFER_MAX];
+static u32 g_defer_n = 0;
 
 static orbital::Mutex g_lock;
 
@@ -234,6 +252,8 @@ static u64 fail_id(Status s) {
     return INVALID_STAR;
 }
 
+static void bm_repair();
+
 struct Api {
     Status* why;
     explicit Api(Status* w) : why(w) {
@@ -241,7 +261,7 @@ struct Api {
         if (g_api_depth++ == 0) g_err = Status::Ok;
     }
     ~Api() {
-        --g_api_depth;
+        if (--g_api_depth == 0 && g_bm_repair) bm_repair();
         g_lock.unlock();
     }
     void report(bool good) {
@@ -398,6 +418,8 @@ static void release_runtime() {
     g_bm_scratch = nullptr;
     g_verify_scratch = nullptr;
     g_bm_pages = 0;
+    g_bm_unknown = 0;
+    g_free_known = 0;
     bm_reset_slots();
 }
 
@@ -412,6 +434,9 @@ static bool alloc_runtime(u64 bitmap_sectors) {
         serial::writeln("[stellar] out of memory for the free-space summary");
         return false;
     }
+    for (u64 p = 0; p < bitmap_sectors; ++p) g_bm_free[p] = BM_UNKNOWN;
+    g_bm_unknown = bitmap_sectors;
+    g_free_known = 0;
     return true;
 }
 
@@ -609,10 +634,12 @@ static BmSlot* bm_slot(u64 page) {
         }
         if (!crc_ok(buf)) {
             serial::printf("[stellar] bitmap sector %lu failed its checksum\n", g_sb.bitmap_start + page);
+            g_bm_repair = true;
             fail(Status::Checksum);
             return nullptr;
         }
         __builtin_memcpy(victim->data, buf, BM_PAYLOAD);
+        if (g_bm_free[page] == BM_UNKNOWN) bm_set_free(page, page_zero_bits(page, victim->data));
     }
     victim->page = page;
     victim->valid = true;
@@ -650,6 +677,11 @@ static const u8* bm_peek(BmStream& st, u64 p) {
     const u8* pg = g_bm_scratch + (p - st.base) * SECTOR_SIZE;
     if (!crc_ok(pg)) {
         serial::printf("[stellar] bitmap sector %lu failed its checksum\n", g_sb.bitmap_start + p);
+        if (g_bm_tolerate) {
+            g_bm_flags[p] |= BM_BAD;
+            return g_zero_page;
+        }
+        g_bm_repair = true;
         fail(Status::Checksum);
         return nullptr;
     }
@@ -690,7 +722,7 @@ static bool bm_set_range(u64 first, u64 count, bool used) {
         u32 changed = bm_apply(sl->data, in_page, n, used);
         if (changed) {
             bm_mark_dirty(sl);
-            g_bm_free[page] = static_cast<u16>(used ? g_bm_free[page] - changed : g_bm_free[page] + changed);
+            bm_set_free(page, used ? g_bm_free[page] - changed : g_bm_free[page] + changed);
         }
         first += n;
         count -= n;
@@ -709,7 +741,7 @@ static bool format_bitmap() {
         if (!blockdev::write_sectors(g_sb.bitmap_start + p, n, g_bm_scratch)) return fail(Status::Io);
     }
     for (u64 p = 0; p < g_bm_pages; ++p) {
-        g_bm_free[p] = static_cast<u16>(page_capacity(p));
+        bm_set_free(p, page_capacity(p));
         g_bm_flags[p] = 0;
     }
     return true;
@@ -748,6 +780,10 @@ static bool commit() {
     if (ok) g_bm_early = false;
     if (ok && g_bm_ndirty > 0) ok = write_dirty_bitmap() && flush_dev();
     if (ok && g_sb_dirty) {
+        u64 hint = g_alloc_hint;
+        for (u32 i = 0; i < g_defer_n; ++i)
+            if (g_defer[i].first < hint) hint = g_defer[i].first;
+        g_sb.alloc_hint = hint;
         ++g_sb.seq;
         ++g_sb.epoch;
         if (sb_write_slot(static_cast<u32>(g_sb.seq & 1))) {
@@ -834,6 +870,46 @@ bool end_batch(Status* why) {
     return ok;
 }
 
+enum class Learn { Ok, Damaged, IoError };
+
+static Learn bm_learn(u64 first) {
+    u64 n = g_bm_pages - first < BM_BATCH ? g_bm_pages - first : BM_BATCH;
+    g_io_reads += n;
+    g_bm_page_reads += n;
+    bool batched = blockdev::read_sectors(g_sb.bitmap_start + first, n, g_bm_scratch);
+    Learn result = Learn::Ok;
+    for (u64 j = 0; j < n; ++j) {
+        u64 p = first + j;
+        if (g_bm_free[p] != BM_UNKNOWN) continue;
+        u8 single[SECTOR_SIZE];
+        const u8* pg = g_bm_scratch + j * SECTOR_SIZE;
+        if (!batched) {
+            if (!blockdev::read_sector(g_sb.bitmap_start + p, single)) {
+                fail(Status::Io);
+                return Learn::IoError;
+            }
+            pg = single;
+        }
+        if (!crc_ok(pg)) {
+            serial::printf("[stellar] bitmap sector %lu failed its checksum\n", g_sb.bitmap_start + p);
+            g_bm_repair = true;
+            if (j == 0) result = Learn::Damaged;
+            continue;
+        }
+        bm_set_free(p, page_zero_bits(p, pg));
+    }
+    if (result == Learn::Damaged) fail(Status::Checksum);
+    return result;
+}
+
+static bool bm_learn_all() {
+    for (u64 p = 0; p < g_bm_pages; ++p) {
+        if (g_bm_free[p] != BM_UNKNOWN) continue;
+        if (bm_learn(p) == Learn::IoError) return false;
+    }
+    return true;
+}
+
 static bool find_run(u64 from, u64 to, u64 count, u64* out) {
     *out = 0;
     u64 run = 0, run_start = 0;
@@ -843,6 +919,7 @@ static bool find_run(u64 from, u64 to, u64 count, u64* out) {
         u64 page_end = (page + 1) * PAGE_BITS;
         if (page_end > to) page_end = to;
         u64 whole_hi = page_hi(page);
+        if (g_bm_free[page] == BM_UNKNOWN && bm_learn(page) != Learn::Ok) return false;
         if (g_bm_free[page] == 0) { run = 0; s = page_end; continue; }
         if (s == page_lo && page_end == whole_hi && g_bm_free[page] == whole_hi - page_lo) {
             if (run == 0) run_start = s;
@@ -912,10 +989,6 @@ static void release_sectors(u64 first, u64 count) {
     if (first < g_alloc_hint) g_alloc_hint = first;
 }
 
-constexpr u32 DEFER_MAX = 8192;
-struct DeferRange { u64 first, count; };
-static DeferRange g_defer[DEFER_MAX];
-static u32 g_defer_n = 0;
 
 static SnapRec g_snaps[SNAPSHOT_MAX];
 static u64 g_snap_page_sector[SNAP_PAGES];
@@ -973,11 +1046,16 @@ u64 bitmap_ram_bytes() {
 }
 
 u64 free_space_sectors() {
-    Guard guard;
+    Api api(nullptr);
     if (!g_mounted) return 0;
-    u64 n = 0;
-    for (u64 p = 0; p < g_bm_pages; ++p) n += g_bm_free[p];
-    return n;
+    bm_learn_all();
+    return g_free_known;
+}
+
+BitmapSummary bitmap_summary() {
+    Guard guard;
+    if (!g_mounted) return { 0, 0, 0 };
+    return { g_bm_pages, g_bm_pages - g_bm_unknown, g_free_known };
 }
 
 BitmapStats bitmap_stats() {
@@ -1008,11 +1086,17 @@ bool test_bitmap_summary_ok() {
     if (!g_mounted) return false;
     BmStream stream;
     for (u64 p = 0; p < g_bm_pages; ++p) {
+        if (g_bm_free[p] == BM_UNKNOWN) continue;
         const u8* bits = bm_peek(stream, p);
         if (!bits) return false;
         if (page_zero_bits(p, bits) != g_bm_free[p]) return false;
     }
-    return true;
+    u64 sum = 0, unknown = 0;
+    for (u64 p = 0; p < g_bm_pages; ++p) {
+        if (g_bm_free[p] == BM_UNKNOWN) ++unknown;
+        else sum += g_bm_free[p];
+    }
+    return unknown == g_bm_unknown && sum == g_free_known;
 }
 
 static u64 place_meta(u64 sector, u64 old_gen, u8* buf) {
@@ -1171,12 +1255,19 @@ static u64 alloc_star_id() {
     return id;
 }
 
-static bool view_root(u64 snap, u64* root) {
+static bool view_open(u64 snap, u64* root, u64* top) {
+    *top = ROOT_STAR;
     if (snap == LIVE) { *root = g_sb.catalog_root; return true; }
     int slot = snap_find(snap);
     if (slot < 0) return fail(Status::NoSuchSnapshot);
     *root = g_snaps[slot].catalog_root;
+    if (g_snaps[slot].scope != INVALID_STAR) *top = g_snaps[slot].scope;
     return true;
+}
+
+static bool view_root(u64 snap, u64* root) {
+    u64 top;
+    return view_open(snap, root, &top);
 }
 
 static bool bt_search(u64 root, u64 key, StarEntry* out) {
@@ -1962,10 +2053,10 @@ static bool read_visit(u64 start, u64 count, bool is_table, void* c) {
 
 static u64 g_max_extent = 0;
 
-static u64 free_sectors_locked() {
-    u64 n = 0;
-    for (u64 p = 0; p < g_bm_pages; ++p) n += g_bm_free[p];
-    return n;
+static bool free_sectors_locked(u64* out) {
+    if (!bm_learn_all()) return false;
+    *out = g_free_known;
+    return true;
 }
 
 struct RunBuf {
@@ -1995,7 +2086,9 @@ struct RunBuf {
 };
 
 static bool place_fragmented(u64 nsec, const void* data, u64 size, StarEntry& e) {
-    if (free_sectors_locked() < nsec) return fail(Status::NoSpace);
+    u64 free_now;
+    if (!free_sectors_locked(&free_now)) return false;
+    if (free_now < nsec) return fail(Status::NoSpace);
     u64 cap = g_max_extent ? g_max_extent : nsec;
     RunBuf rb;
     u64 remaining = nsec;
@@ -2167,6 +2260,7 @@ static bool format_impl(u64 total_sectors) {
     g_sb.snap_next_id = 1;
     snap_clear_ram();
 
+    g_bm_repair = false;
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
     if (!write_format_markers()) { release_runtime(); return false; }
     if (!format_bitmap()) { release_runtime(); return false; }
@@ -2255,34 +2349,8 @@ static bool load_durable() {
     }
     g_sb = best;
     if (!alloc_runtime(g_sb.bitmap_sectors)) return false;
-    bool bitmap_damaged = false;
-    for (u64 p0 = 0; p0 < g_bm_pages; p0 += BM_BATCH) {
-        u64 n = g_bm_pages - p0 < BM_BATCH ? g_bm_pages - p0 : BM_BATCH;
-        g_io_reads += n;
-        bool batched = blockdev::read_sectors(g_sb.bitmap_start + p0, n, g_bm_scratch);
-        for (u64 j = 0; j < n; ++j) {
-            u64 p = p0 + j;
-            u8 single[SECTOR_SIZE];
-            const u8* pg = g_bm_scratch + j * SECTOR_SIZE;
-            if (!batched) {
-                if (!blockdev::read_sector(g_sb.bitmap_start + p, single)) {
-                    serial::printf("[stellar] mount: could not read bitmap sector %lu\n", g_sb.bitmap_start + p);
-                    release_runtime();
-                    return fail(Status::Io);
-                }
-                pg = single;
-            }
-            if (!crc_ok(pg)) {
-                serial::printf("[stellar] mount: bitmap sector %lu failed its checksum, it will be rebuilt\n", g_sb.bitmap_start + p);
-                bitmap_damaged = true;
-                g_bm_flags[p] |= BM_BAD;
-                g_bm_free[p] = static_cast<u16>(page_capacity(p));
-                continue;
-            }
-            g_bm_free[p] = static_cast<u16>(page_zero_bits(p, pg));
-        }
-    }
-    g_alloc_hint = g_sb.bitmap_start + g_sb.bitmap_sectors;
+    u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
+    g_alloc_hint = g_sb.alloc_hint >= data_start && g_sb.alloc_hint < g_sb.total_sectors ? g_sb.alloc_hint : data_start;
     g_sb_dirty = false;
     bool snap_damaged = false;
     if (!snap_load(&snap_damaged)) {
@@ -2291,7 +2359,7 @@ static bool load_durable() {
     }
     g_mounted = true;
     reset_runtime_state();
-    if (invalid || bitmap_damaged || snap_damaged) {
+    if (invalid || snap_damaged) {
         serial::writeln("[stellar] mount: rebuilding the free-space bitmap from the trees");
         bool rebuilt = gc_core() != INVALID_STAR;
         if (rebuilt && snap_damaged) {
@@ -2310,6 +2378,7 @@ static bool load_durable() {
 
 static bool mount_impl() {
     if (g_txn_depth != 0) return fail(Status::Busy);
+    g_bm_repair = false;
     if (!load_durable()) return false;
     serial::printf("[stellar] mounted: %lu sectors, catalog root at sector %lu, epoch %lu, commit %lu, %u snapshot(s), next star id %lu\n",
                     g_sb.total_sectors, g_sb.catalog_root, g_sb.epoch, g_sb.seq, g_sb.snap_count, g_sb.next_star_id);
@@ -2443,9 +2512,10 @@ static u64 snapshot_impl() {
     if (slot < 0) return fail_id(Status::TooManySnapshots);
     Txn txn;
     u64 id = g_sb.snap_next_id++;
-    g_snaps[slot] = { id, g_sb.catalog_root, g_sb.epoch };
+    g_snaps[slot] = { id, g_sb.catalog_root, g_sb.epoch, INVALID_STAR };
     g_snap_page_dirty[slot / SNAP_PER_PAGE] = true;
     snap_recount();
+    ++g_sb.epoch;
     touch_sb();
     if (!snap_flush()) return INVALID_STAR;
     return txn.finish(true) ? id : INVALID_STAR;
@@ -2454,6 +2524,117 @@ static u64 snapshot_impl() {
 u64 snapshot(Status* why) {
     Api api(why);
     return api.val(snapshot_impl());
+}
+
+struct StarStack {
+    u64* v = nullptr;
+    u32 n = 0, cap = 0;
+    ~StarStack() { free_ram(v, static_cast<u64>(cap) * sizeof(u64)); }
+    bool push(u64 star) {
+        if (n == cap) {
+            u32 nc = cap ? cap * 2 : 256;
+            u64* nv = static_cast<u64*>(alloc_ram(static_cast<u64>(nc) * sizeof(u64)));
+            if (!nv) return false;
+            if (v) {
+                __builtin_memcpy(nv, v, static_cast<u64>(n) * sizeof(u64));
+                free_ram(v, static_cast<u64>(cap) * sizeof(u64));
+            }
+            v = nv;
+            cap = nc;
+        }
+        v[n++] = star;
+        return true;
+    }
+    bool pop(u64* star) {
+        if (n == 0) return false;
+        *star = v[--n];
+        return true;
+    }
+};
+
+struct SubCtx {
+    u64 root;
+    StarStack* stack;
+};
+
+static bool sub_put(SubCtx* sc, u64 star, const StarEntry& e) {
+    LeafEntry le;
+    le.star_id = star;
+    le.entry = e;
+    u64 nr;
+    if (!tree_upsert<LeafNode>(sc->root, le, &nr)) return false;
+    sc->root = nr;
+    return true;
+}
+
+static bool sub_visit(u64, const u8* node, void* c) {
+    if (!node[0]) return true;
+    auto* sc = static_cast<SubCtx*>(c);
+    auto* leaf = reinterpret_cast<const DirLeaf*>(node);
+    if (leaf->count > LEAF_MAX) return fail(Status::Corrupt);
+    for (u32 i = 0; i < leaf->count; ++i) {
+        u64 star = leaf->entries[i].star;
+        StarEntry ce;
+        if (!catalog_find(star, &ce) || ce.type == TYPE_FREE) return fail(Status::Corrupt);
+        if (!sub_put(sc, star, ce)) return false;
+        if (ce.type == TYPE_CONSTELLATION && !sc->stack->push(star)) return false;
+    }
+    return true;
+}
+
+static u64 snapshot_subtree_impl(u64 dir_star) {
+    if (!g_mounted) return fail_id(Status::NotMounted);
+    if (dir_star == ROOT_STAR) return snapshot_impl();
+    int slot = -1;
+    for (u32 i = 0; i < SNAPSHOT_MAX; ++i) {
+        if (g_snaps[i].id == 0) { slot = static_cast<int>(i); break; }
+    }
+    if (slot < 0) return fail_id(Status::TooManySnapshots);
+    Txn txn;
+    StarEntry top;
+    if (!catalog_find(dir_star, &top) || top.type == TYPE_FREE) return fail_id(Status::NotFound);
+    if (top.type != TYPE_CONSTELLATION) return fail_id(Status::NotADirectory);
+
+    u8 buf[SECTOR_SIZE];
+    for (auto& b : buf) b = 0;
+    reinterpret_cast<LeafNode*>(buf)->is_leaf = 1;
+    u64 root = place_node(0, buf);
+    if (!root) return INVALID_STAR;
+
+    StarStack stack;
+    SubCtx sc{ root, &stack };
+    if (!sub_put(&sc, dir_star, top) || !stack.push(dir_star)) return INVALID_STAR;
+    u64 budget = g_sb.next_star_id + 1;
+    u64 dir;
+    while (stack.pop(&dir)) {
+        if (budget-- == 0) return fail_id(Status::Corrupt);
+        StarEntry d;
+        if (!catalog_find(dir, &d) || d.type != TYPE_CONSTELLATION) return fail_id(Status::Corrupt);
+        if (!dt_walk(d.first_sector, &sub_visit, &sc)) return INVALID_STAR;
+    }
+
+    u64 id = g_sb.snap_next_id++;
+    g_snaps[slot] = { id, sc.root, g_sb.epoch, dir_star };
+    g_snap_page_dirty[slot / SNAP_PER_PAGE] = true;
+    snap_recount();
+    ++g_sb.epoch;
+    touch_sb();
+    if (!snap_flush()) return INVALID_STAR;
+    return txn.finish(true) ? id : INVALID_STAR;
+}
+
+u64 snapshot_subtree(u64 dir_star, Status* why) {
+    Api api(why);
+    return api.val(snapshot_subtree_impl(dir_star));
+}
+
+u64 snapshot_scope(u64 snap, Status* why) {
+    Api api(why);
+    if (!g_mounted) return api.val(fail_id(Status::NotMounted));
+    int slot = snap_find(snap);
+    if (slot < 0) return api.val(fail_id(Status::NoSuchSnapshot));
+    u64 scope = g_snaps[slot].scope;
+    return api.val(scope == INVALID_STAR ? ROOT_STAR : scope);
 }
 
 static bool link_impl(u64 dir_star, const char* name, u64 target) {
@@ -2659,7 +2840,17 @@ static bool mark_tree(u64 sector, u32 depth) {
     return true;
 }
 
+static u64 gc_core_inner();
+
 static u64 gc_core() {
+    bool saved = g_bm_tolerate;
+    g_bm_tolerate = true;
+    u64 r = gc_core_inner();
+    g_bm_tolerate = saved;
+    return r;
+}
+
+static u64 gc_core_inner() {
     u64 data_start = g_sb.bitmap_start + g_sb.bitmap_sectors;
     u64 wp = g_gc_window_pages ? g_gc_window_pages : GC_WINDOW_PAGES;
     if (wp > g_bm_pages) wp = g_bm_pages;
@@ -2699,7 +2890,7 @@ static u64 gc_core() {
                 bm_mark_dirty(sl);
                 ++g_mut;
             }
-            g_bm_free[p] = static_cast<u16>(page_zero_bits(p, want));
+            bm_set_free(p, page_zero_bits(p, want));
         }
     }
     if (ok) g_alloc_hint = data_start;
@@ -2709,6 +2900,18 @@ static u64 gc_core() {
     g_mark_base = g_mark_limit = 0;
     if (!ok) return fail_id(Status::Corrupt);
     return freed;
+}
+
+static void bm_repair() {
+    if (!g_mounted || g_txn_depth != 0) return;
+    g_bm_repair = false;
+    serial::writeln("[stellar] a free-space bitmap page failed its checksum, rebuilding the bitmap from the trees");
+    Status saved = g_err;
+    Txn txn;
+    u64 r = gc_core();
+    bool ok = txn.finish(r != INVALID_STAR);
+    if (!ok) serial::writeln("[stellar] the bitmap rebuild did not complete, it will be retried when the damage is next seen");
+    if (saved != Status::Ok) g_err = saved;
 }
 
 constexpr u32 PURGE_BATCH = 512;
@@ -2763,8 +2966,9 @@ u64 gc(Status* why) {
 
 static bool verify_file_impl(u64 star, u64 snap) {
     if (!g_mounted) return fail(Status::NotMounted);
-    u64 root;
-    if (!view_root(snap, &root)) return false;
+    u64 root, top;
+    if (!view_open(snap, &root, &top)) return false;
+    if (star == ROOT_STAR) star = top;
     StarEntry e;
     if (!bt_search(root, star, &e)) return fail(Status::NotFound);
     if (e.type == TYPE_CONSTELLATION) return fail(Status::IsADirectory);
@@ -2822,8 +3026,9 @@ static bool verify_read(const StarEntry& e, const u8* dst, u64 to_read) {
 
 static u64 read_file_impl(u64 star, void* buf, u64 max_size, u64 snap) {
     if (!g_mounted) { fail(Status::NotMounted); return READ_ERROR; }
-    u64 root;
-    if (!view_root(snap, &root)) return READ_ERROR;
+    u64 root, top;
+    if (!view_open(snap, &root, &top)) return READ_ERROR;
+    if (star == ROOT_STAR) star = top;
     StarEntry e;
     if (!bt_search(root, star, &e)) { fail(Status::NotFound); return READ_ERROR; }
     if (e.type == TYPE_CONSTELLATION) { fail(Status::IsADirectory); return READ_ERROR; }
@@ -2846,8 +3051,9 @@ u64 read_file(u64 star, void* buf, u64 max_size, u64 snap, Status* why) {
 static u64 find_impl(u64 dir_star, const char* name, u64 snap) {
     if (!g_mounted) return fail_id(Status::NotMounted);
     if (!valid_name(name)) return fail_id(Status::InvalidName);
-    u64 root;
-    if (!view_root(snap, &root)) return INVALID_STAR;
+    u64 root, top;
+    if (!view_open(snap, &root, &top)) return INVALID_STAR;
+    if (dir_star == ROOT_STAR) dir_star = top;
     StarEntry e;
     if (!bt_search(root, dir_star, &e)) return fail_id(Status::NotFound);
     if (e.type != TYPE_CONSTELLATION) return fail_id(Status::NotADirectory);
@@ -2884,8 +3090,9 @@ static bool list_visit(u64, const u8* node, void* c) {
 
 static void list_impl(u64 dir_star, ListCallback cb, void* ctx, u64 snap) {
     if (!g_mounted) { fail(Status::NotMounted); return; }
-    u64 root;
-    if (!view_root(snap, &root)) return;
+    u64 root, top;
+    if (!view_open(snap, &root, &top)) return;
+    if (dir_star == ROOT_STAR) dir_star = top;
     StarEntry e;
     if (!bt_search(root, dir_star, &e)) { fail(Status::NotFound); return; }
     if (e.type != TYPE_CONSTELLATION) { fail(Status::NotADirectory); return; }
@@ -3343,6 +3550,10 @@ static bool check_impl(CheckReport* out, bool deep) {
                 if (g_ck.first) ++out->snapshots;
                 __builtin_memset(g_ck.seen, 0, bit_bytes);
                 g_ck.root = g_snaps[i].catalog_root;
+                if (g_ck.first && g_snaps[i].scope != INVALID_STAR) {
+                    StarEntry se;
+                    if (!bt_search(g_ck.root, g_snaps[i].scope, &se) || se.type != TYPE_CONSTELLATION) ++out->bad_structure;
+                }
                 ck_node(g_ck.root, 0);
             }
             BmStream bstream;
@@ -3352,7 +3563,11 @@ static bool check_impl(CheckReport* out, bool deep) {
                 if (hi > g_ck.win_hi) hi = g_ck.win_hi;
                 if (hi <= lo) continue;
                 const u8* bits = bm_peek(bstream, pg);
-                if (!bits) { g_ck.io_error = true; break; }
+                if (!bits) {
+                    if (g_err != Status::Checksum) { g_ck.io_error = true; break; }
+                    if (lo == page_data_lo(pg)) ++out->bad_bitmap;
+                    continue;
+                }
                 for (u64 sec = lo; sec < hi; ++sec) {
                     u64 bit = sec - pg * PAGE_BITS;
                     bool used = ((bits[bit >> 3] >> (bit & 7)) & 1u) != 0, refd = ck_bit(g_ck.ref, sec - g_ck.win_lo);
@@ -3393,8 +3608,9 @@ static bool count_visit(u64, u64, bool is_table, void* c) {
 static bool stat_impl(u64 star, StatInfo* out, u64 snap) {
     if (!g_mounted) return fail(Status::NotMounted);
     if (!out) return fail(Status::InvalidArgument);
-    u64 root;
-    if (!view_root(snap, &root)) return false;
+    u64 root, top;
+    if (!view_open(snap, &root, &top)) return false;
+    if (star == ROOT_STAR) star = top;
     StarEntry e;
     if (!bt_search(root, star, &e) || e.type == TYPE_FREE) return fail(Status::NotFound);
     u32 extents = 0;

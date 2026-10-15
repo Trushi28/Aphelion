@@ -11,7 +11,7 @@ constexpr u64 ROOT_STAR = 0;
 constexpr u64 INVALID_STAR = 0xFFFFFFFFFFFFFFFFull;
 
 constexpr u64 LIVE = 0;
-constexpr u32 SNAPSHOT_MAX = 1020;
+constexpr u32 SNAPSHOT_MAX = 915;
 constexpr u32 NAME_MAX_LEN = 51;
 
 constexpr u32 RENAME_NOREPLACE = 1u << 0;
@@ -72,6 +72,8 @@ void list(u64 dir_star, ListCallback cb, void* ctx, u64 snap = LIVE, Status* why
 
 u64 write_file(u64 star, const void* data, u64 size, Status* why = nullptr);
 u64 snapshot(Status* why = nullptr);
+u64 snapshot_subtree(u64 dir_star, Status* why = nullptr);
+u64 snapshot_scope(u64 snap, Status* why = nullptr);
 u32 snapshot_count();
 bool link(u64 dir_star, const char* name, u64 target, Status* why = nullptr);
 bool unlink(u64 dir_star, const char* name, Status* why = nullptr);
@@ -87,8 +89,8 @@ bool verify_file(u64 star, u64 snap = LIVE, Status* why = nullptr);
 
 struct CheckReport {
     u64 snapshots, nodes, dirs, files, entries;
-    u64 bad_crc, bad_files, unmarked, leaked, bad_links, bad_structure;
-    bool ok() const { return !bad_crc && !bad_files && !unmarked && !bad_links && !bad_structure; }
+    u64 bad_crc, bad_files, unmarked, leaked, bad_links, bad_structure, bad_bitmap;
+    bool ok() const { return !bad_crc && !bad_files && !unmarked && !bad_links && !bad_structure && !bad_bitmap; }
 };
 bool check(CheckReport* out, bool deep = true, Status* why = nullptr);
 
@@ -98,6 +100,8 @@ u64 bitmap_ram_bytes();
 
 struct BitmapStats { u64 page_reads, page_writes, early_writes; };
 BitmapStats bitmap_stats();
+struct BitmapSummary { u64 pages, known_pages, known_free_sectors; };
+BitmapSummary bitmap_summary();
 u64 free_failures();
 u64 total_sectors();
 bool stat(u64 star, StatInfo* out, u64 snap = LIVE, Status* why = nullptr);
