@@ -15,13 +15,16 @@ struct Satellite {
     int ring = 0;
     u32 ticks_left = 0;
     bool in_use = false;
+    bool guarded = false;
     EntryFn entry = nullptr;
     void* arg = nullptr;
     const char* name = "?";
     Satellite* next = nullptr;
 };
 
-void init(u64 hhdm_offset);
+void init(u64 hhdm_offset, const u32* lapic_ids, u32 core_count);
+
+bool selftest();
 
 void init_core();
 

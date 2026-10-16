@@ -94,6 +94,13 @@ check_common() {
     grep -q '\[selftest\] smp-blockdev: ok' "$LOG.clean" || fail "concurrent block-device stress did not pass"
     grep -q '\[selftest\] pmm: ok' "$LOG.clean" || fail "physical allocator self-test did not pass"
     grep -q '\[selftest\] vmm: ok' "$LOG.clean" || fail "virtual memory self-test did not pass"
+    grep -q '\[selftest\] stack guards: ok' "$LOG.clean" || fail "kernel stack guard self-test did not pass"
+    if grep -q '\[fpu\] [0-9]* core' "$LOG.clean"; then
+        grep -q '\[selftest\] fpu: ok' "$LOG.clean" || fail "FPU/SSE/AVX self-test did not pass"
+        grep -q "\[fpu\] $CORES core(s) verified" "$LOG.clean" || fail "not every core enabled the FPU"
+    fi
+    grep -q '\[selftest\] percore: ok' "$LOG.clean" || fail "per-core NX/WP/PAT self-test did not pass"
+    grep -q "\[percore\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported its NX/WP/PAT setup"
     grep -q '\[selftest\] per-core gdt: ok' "$LOG.clean" || fail "per-core GDT/TSS self-test did not pass"
     grep -q "\[gdt\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported a private GDT and TSS"
     grep -q '\[universe\] reclaimed' "$LOG.clean" || fail "bootloader memory was never reclaimed"

@@ -6,6 +6,7 @@ namespace cpu {
 
 inline void invlpg(u64) {}
 inline void write_cr3(u64) {}
+inline u64 read_cr3() { return 0; }
 inline u64 irq_save() { return 0; }
 inline void irq_restore(u64) {}
 [[noreturn]] inline void hang() { abort(); }

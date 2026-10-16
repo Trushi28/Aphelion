@@ -51,9 +51,15 @@ preemption comes off the APIC timer, calibrated against the PIT at boot.
 others (never holding its own lock) and steals the highest-priority ready Satellite.
 `spawn()` enqueues locally, so new work starts local and idle Suns pull it away.
 
-Finished Satellites (entry returns, or `exit_current()`) go on a global zombie list and have
-their stacks freed by whichever Sun idles next, so a Sun pinned by a CPU-bound Satellite
-doesn't block reaping.
+Finished Satellites (entry returns, or `exit_current()`) go on a global zombie list and are
+reaped by whichever Sun idles next, so a Sun pinned by a CPU-bound Satellite doesn't block
+reaping.
+
+**Stacks are guarded.** Every pool Satellite and every Sun's idle Satellite owns a fixed
+64 KiB slot in a dedicated virtual region: an unmapped guard page, 32 KiB of stack, then
+unmapped space. The slots are mapped once, before the secondary cores start, and are reused
+rather than freed, so no TLB shootdown is ever needed. An overflow faults into the guard
+page and ends in a double fault on the IST stack, whose panic message names the overflow.
 
 ### Storage: one HAL, three drivers
 

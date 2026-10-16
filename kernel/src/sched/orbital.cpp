@@ -5,6 +5,7 @@
 #include <cosmos/cpu.hpp>
 #include <cosmos/serial.hpp>
 #include <cosmos/clock.hpp>
+#include <cosmos/vmm.hpp>
 
 extern "C" void switch_context(u64* old_rsp_out, u64 new_rsp);
 
@@ -13,12 +14,17 @@ namespace orbital {
 constexpr int MAX_SATELLITES = 32;
 constexpr int STACK_ORDER = 3;
 constexpr u32 MAX_CORES = 256;
+constexpr u32 IDLE_SLOT_BASE = MAX_SATELLITES;
+
+static_assert((universe::PAGE_SIZE << STACK_ORDER) == constellation::STACK_BYTES, "stack size must match the guarded slot layout");
+static_assert(IDLE_SLOT_BASE + MAX_CORES <= constellation::STACK_SLOTS, "not enough guarded stack slots");
 
 static u64 g_hhdm = 0;
 static u32 g_ticks_per_period = 0;
 
 static Satellite g_pool[MAX_SATELLITES];
 static Satellite g_idle[MAX_CORES];
+static bool g_slot_ready[IDLE_SLOT_BASE + MAX_CORES];
 static Satellite* g_current[MAX_CORES] = {};
 
 static Satellite* g_ring_head[MAX_CORES][NUM_RINGS] = {};
@@ -87,11 +93,36 @@ static Satellite* try_steal(u32 me) {
     return nullptr;
 }
 
-static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void* arg,
-                             int ring, void (*trampoline)()) {
+static u32 slot_of(const Satellite* s) {
+    if (s >= g_pool && s < g_pool + MAX_SATELLITES) return static_cast<u32>(s - g_pool);
+    return IDLE_SLOT_BASE + static_cast<u32>(s - g_idle);
+}
+
+static bool premap_slot(u32 slot) {
     u64 phys = universe::alloc(STACK_ORDER);
     if (!phys) return false;
-    u8* stack_virt = reinterpret_cast<u8*>(g_hhdm + phys);
+    if (!constellation::map_range(constellation::stack_slot_bottom(slot), phys, constellation::STACK_BYTES,
+                                  constellation::WRITABLE | constellation::NO_EXECUTE)) {
+        universe::free(phys, STACK_ORDER);
+        return false;
+    }
+    g_slot_ready[slot] = true;
+    return true;
+}
+
+static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void* arg,
+                             int ring, void (*trampoline)()) {
+    u32 slot = slot_of(s);
+    u8* stack_virt;
+    if (g_slot_ready[slot]) {
+        stack_virt = reinterpret_cast<u8*>(constellation::stack_slot_bottom(slot));
+        s->guarded = true;
+    } else {
+        u64 phys = universe::alloc(STACK_ORDER);
+        if (!phys) return false;
+        stack_virt = reinterpret_cast<u8*>(g_hhdm + phys);
+        s->guarded = false;
+    }
     s->stack_base = stack_virt;
     s->stack_size = universe::PAGE_SIZE << STACK_ORDER;
     s->name = name;
@@ -135,8 +166,9 @@ static void reap_zombies() {
 
     while (z) {
         Satellite* next_z = z->next;
-        serial::printf("[orbital] reaping satellite '%s' (freeing its stack)\n", z->name);
-        universe::free(reinterpret_cast<u64>(z->stack_base) - g_hhdm, STACK_ORDER);
+        serial::printf("[orbital] reaping satellite '%s' (%s)\n", z->name,
+                        z->guarded ? "stack slot returned" : "freeing its stack");
+        if (!z->guarded) universe::free(reinterpret_cast<u64>(z->stack_base) - g_hhdm, STACK_ORDER);
         g_pool_lock.lock();
         z->in_use = false;
         g_pool_lock.unlock();
@@ -205,12 +237,37 @@ static void timer_tick_handler(idt::Frame*) {
     }
 }
 
-void init(u64 hhdm_offset) {
+void init(u64 hhdm_offset, const u32* lapic_ids, u32 core_count) {
     g_hhdm = hhdm_offset;
+
+    u32 mapped = 0, missing = 0;
+    for (u32 i = 0; i < MAX_SATELLITES; ++i) (premap_slot(i) ? mapped : missing) += 1;
+    for (u32 i = 0; i < core_count; ++i) {
+        if (lapic_ids[i] >= MAX_CORES) { ++missing; continue; }
+        (premap_slot(IDLE_SLOT_BASE + lapic_ids[i]) ? mapped : missing) += 1;
+    }
+    serial::printf("[orbital] %u guarded stack slot(s) mapped, %u without a guard\n", mapped, missing);
 
     g_ticks_per_period = pit::calibrate_apic_ticks(clock::TICK_MS, 4);
     serial::printf("[orbital] APIC timer calibrated: %u ticks per %ums (divide/16)\n",
                     g_ticks_per_period, clock::TICK_MS);
+}
+
+bool selftest() {
+    bool ok = true;
+    constellation::Mapping m{};
+    for (u32 slot = 0; slot < IDLE_SLOT_BASE + MAX_CORES; ++slot) {
+        if (!g_slot_ready[slot]) continue;
+        u64 bottom = constellation::stack_slot_bottom(slot);
+        u64 top = constellation::stack_slot_top(slot);
+        ok = ok && !constellation::translate(constellation::stack_slot_base(slot), &m);
+        ok = ok && !constellation::translate(top, &m);
+        ok = ok && constellation::translate(bottom, &m) && (m.flags & constellation::WRITABLE);
+        ok = ok && constellation::translate(top - universe::PAGE_SIZE, &m) && (m.flags & constellation::WRITABLE);
+        ok = ok && constellation::in_stack_guard(constellation::stack_slot_base(slot) + 8);
+        ok = ok && !constellation::in_stack_guard(bottom);
+    }
+    return ok;
 }
 
 void init_core() {

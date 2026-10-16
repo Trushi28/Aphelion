@@ -88,6 +88,11 @@ static void pmm_tests(u64 hhdm, const universe::MemmapEntry* map, u64 count) {
     expect(WIFSIGNALED(st), "pmm: a double free is fatal");
 }
 
+namespace percore {
+bool nx_enabled() { return true; }
+bool wc_enabled() { return true; }
+}
+
 int main() {
     void* arena = mmap(nullptr, ARENA, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     u64 hhdm = reinterpret_cast<u64>(arena);
@@ -102,8 +107,39 @@ int main() {
     universe::init(map, 6, hhdm);
     pmm_tests(hhdm, map, 6);
 
-    constellation::init(hhdm, 0x100000, 0xffffffff80000000ull, 0x4000, 0x3000000);
-    expect(constellation::selftest(), "vmm: translate, PAT-preserving split, argument checks");
+    constellation::KernelImage image{
+        0x200000, 0xffffffff80000000ull,
+        0xffffffff80000000ull, 0xffffffff80001000ull,
+        0xffffffff80001000ull, 0xffffffff80004000ull,
+        0xffffffff80004000ull, 0xffffffff80005000ull,
+        0xffffffff80005000ull, 0xffffffff80008000ull
+    };
+    universe::MemmapEntry vmap[] = {
+        { 0x0,       0x9F000,   0 },
+        { 0x100000,  0x100000,  0 },
+        { 0x200000,  0x8000,    6 },
+        { 0x208000,  0x1F8000,  0 },
+        { 0x400000,  0x300000,  2 },
+        { 0x800000,  0x200000,  1 },
+        { 0xC00000,  0x400000,  4 },
+        { 0x1000000, 0x1000000, 0 },
+        { 0x2200000, 0x400000,  7 },
+        { 0x100000000ull, 0x100000, 1 },
+    };
+    constellation::init(hhdm, vmap, 10, image);
+    expect(constellation::selftest(), "vmm: layout, W^X sections, PAT-preserving split");
+    expect(constellation::map_range(hhdm + 0x2200000, 0x2200000, 0x400000, constellation::WRITABLE | constellation::NO_EXECUTE),
+           "vmm: explicit range over an unmapped hole");
+    constellation::Mapping mp{};
+    expect(constellation::translate(hhdm + 0x2201000, &mp) && mp.size == 0x200000, "vmm: hole mapped with a 2 MiB page");
+    expect(!constellation::translate(hhdm + 0xC00000, &mp), "vmm: bad memory stays unmapped");
+    expect(!constellation::translate(hhdm + 0x100000000ull, &mp), "vmm: reserved memory above 4 GiB stays unmapped");
+    expect(!constellation::translate(hhdm + 0x200000, &mp), "vmm: kernel image has no direct-map alias");
+    expect(constellation::translate(hhdm + 0x400000, &mp) && !(mp.flags & constellation::NO_CACHE), "vmm: ACPI memory is mapped");
+    expect(constellation::translate(0xffffffff80001000ull, &mp) && !(mp.flags & constellation::WRITABLE) && !(mp.flags & constellation::NO_EXECUTE),
+           "vmm: .text is read-only and executable");
+    expect(constellation::map_range(hhdm + 0x300000, 0x300000, 0x1000, constellation::WRITABLE | constellation::NO_EXECUTE),
+           "vmm: remap inside a split page");
     constellation::seal();
     return g_failures ? 1 : 0;
 }

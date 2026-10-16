@@ -26,6 +26,11 @@ CXXFLAGS := -std=c++20 $(OPT) -Wall -Wextra \
             -mcmodel=kernel -m64 -Wa,--noexecstack \
             -MMD -MP -I$(KDIR)/include -I$(LIMINE)
 
+FPU ?= 1
+ifeq ($(FPU),1)
+CXXFLAGS += -DAPHELION_FPU=1
+endif
+
 FLAGS_STAMP := $(BUILD)/.cxxflags
 
 ASMFLAGS := -f elf64
@@ -154,6 +159,8 @@ test-mm:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/mm_host_test.cpp -o $(BUILD)/mm_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/mm_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/fb_host_test.cpp -o $(BUILD)/fb_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/fb_host_test
 
 test-stellar-thread:
 	@mkdir -p $(BUILD)

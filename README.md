@@ -81,6 +81,7 @@ sudo apt install build-essential git nasm xorriso mtools qemu-system-x86 qemu-ut
 ```sh
 make iso            # build the kernel and build/aphelion.iso (-O2)
 make iso OPT=-O0    # unoptimized build for debugging; objects rebuild when OPT changes
+make iso FPU=1      # enable x87/SSE2/AVX state on every core (kernel code itself stays general-register only)
 make run            # boot in QEMU
 make run-smp        # boot with 4 cores
 make run-nvme       # boot with an NVMe disk (SMP=4 for multi-core)

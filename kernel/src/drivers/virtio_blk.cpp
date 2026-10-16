@@ -104,7 +104,7 @@ static bool map_bar_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
     for (u64 off = 0; off < 0x10000; off += 0x1000)
         if (!constellation::map_4k(g_hhdm + page_base + off, page_base + off,
-                                   constellation::WRITABLE | constellation::NO_CACHE))
+                                   constellation::WRITABLE | constellation::NO_CACHE | constellation::NO_EXECUTE))
             return false;
     return true;
 }

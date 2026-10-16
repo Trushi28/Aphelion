@@ -55,6 +55,26 @@ ALWAYS_INLINE u64 read_cr3() {
 ALWAYS_INLINE void write_cr3(u64 v) {
     asm volatile("mov %0, %%cr3" :: "r"(v) : "memory");
 }
+ALWAYS_INLINE u64 read_cr0() {
+    u64 v; asm volatile("mov %%cr0, %0" : "=r"(v)); return v;
+}
+ALWAYS_INLINE void write_cr0(u64 v) {
+    asm volatile("mov %0, %%cr0" :: "r"(v) : "memory");
+}
+ALWAYS_INLINE u64 read_cr4() {
+    u64 v; asm volatile("mov %%cr4, %0" : "=r"(v)); return v;
+}
+ALWAYS_INLINE void write_cr4(u64 v) {
+    asm volatile("mov %0, %%cr4" :: "r"(v) : "memory");
+}
+ALWAYS_INLINE u64 xgetbv(u32 index) {
+    u32 lo, hi;
+    asm volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(index));
+    return (static_cast<u64>(hi) << 32) | lo;
+}
+ALWAYS_INLINE void xsetbv(u32 index, u64 v) {
+    asm volatile("xsetbv" :: "c"(index), "a"(static_cast<u32>(v)), "d"(static_cast<u32>(v >> 32)) : "memory");
+}
 ALWAYS_INLINE void invlpg(u64 addr) {
     asm volatile("invlpg (%0)" :: "r"(addr) : "memory");
 }

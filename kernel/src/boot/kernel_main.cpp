@@ -3,6 +3,8 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/framebuffer.hpp>
 #include <cosmos/gdt.hpp>
+#include <cosmos/percore.hpp>
+#include <cosmos/fpu.hpp>
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/acpi.hpp>
@@ -23,6 +25,14 @@
 
 extern "C" char __kernel_start[];
 extern "C" char __kernel_end[];
+extern "C" char __requests_start[];
+extern "C" char __requests_end[];
+extern "C" char __text_start[];
+extern "C" char __text_end[];
+extern "C" char __rodata_start[];
+extern "C" char __rodata_end[];
+extern "C" char __data_start[];
+extern "C" char __data_end[];
 
 __attribute__((used, section(".requests")))
 static volatile LIMINE_BASE_REVISION(3);
@@ -69,11 +79,11 @@ static u64 g_expected_cores = 1;
 static constexpr u64 TEST_TAIL_SECTORS = 64;
 static constexpr const char* HELLO_REWRITTEN = "Aphelion Stellar FS -- rewritten after snapshot.\n";
 
-static void map_device_window_or_die(u64 phys, const char* what) {
-    u64 base = phys & ~0x1FFFFFull;
-    if (!constellation::map_2m(g_hhdm_offset + base, base,
-                               constellation::WRITABLE | constellation::NO_CACHE)) {
-        serial::printf("[boot] FATAL: could not map the %s window at %p\n", what, base);
+static void map_device_page_or_die(u64 phys, const char* what) {
+    u64 base = phys & ~0xFFFull;
+    if (!constellation::map_4k(g_hhdm_offset + base, base,
+                               constellation::WRITABLE | constellation::NO_CACHE | constellation::NO_EXECUTE)) {
+        serial::printf("[boot] FATAL: could not map the %s page at %p\n", what, base);
         cpu::hang();
     }
 }
@@ -91,7 +101,8 @@ static void bring_up_core(bool is_bsp) {
 }
 
 extern "C" void ap_entry(limine_smp_info* info) {
-
+    percore::early_init();
+    fpu::init_core();
     cpu::write_cr3(constellation::core_pml4_phys());
     bring_up_core(false);
     orbital::init_core();
@@ -534,6 +545,8 @@ extern "C" NORETURN void kernel_main() {
     }
     g_hhdm_offset = hhdm_request.response->offset;
 
+    percore::early_init();
+    fpu::init_core();
     init_gdt_idt(true);
     fb::printf(0xC0FFC0, "[ok] GDT + TSS installed (per-core IST stacks for #DF/NMI)\n");
     fb::printf(0xC0FFC0, "[ok] IDT installed (256 vectors, no legacy PIC in the picture)\n");
@@ -547,14 +560,8 @@ extern "C" NORETURN void kernel_main() {
     universe::MemmapEntry* entries = g_entries;
     u64 n_entries = mm_resp->entry_count < 512 ? mm_resp->entry_count : 512;
     g_n_entries = n_entries;
-    u64 max_phys = 0;
-    for (u64 i = 0; i < n_entries; ++i) {
+    for (u64 i = 0; i < n_entries; ++i)
         entries[i] = { mm_resp->entries[i]->base, mm_resp->entries[i]->length, mm_resp->entries[i]->type };
-        u64 top = entries[i].base + entries[i].length;
-
-        bool huge_high_reserved = (entries[i].type == 1) && (entries[i].base >= 0x100000000ull);
-        if (!huge_high_reserved && top > max_phys) max_phys = top;
-    }
     universe::init(entries, n_entries, g_hhdm_offset);
     bool pmm_ok = universe::selftest();
     serial::printf("[selftest] pmm: %s\n", pmm_ok ? "ok" : "MISMATCH");
@@ -567,11 +574,26 @@ extern "C" NORETURN void kernel_main() {
     }
     u64 kphys = kaddr_request.response->physical_base;
     u64 kvirt = kaddr_request.response->virtual_base;
-    u64 ksize = static_cast<u64>(__kernel_end - __kernel_start);
-    constellation::init(g_hhdm_offset, kphys, kvirt, ksize, max_phys);
+    constellation::KernelImage image{
+        kphys, kvirt,
+        reinterpret_cast<u64>(__requests_start), reinterpret_cast<u64>(__requests_end),
+        reinterpret_cast<u64>(__text_start), reinterpret_cast<u64>(__text_end),
+        reinterpret_cast<u64>(__rodata_start), reinterpret_cast<u64>(__rodata_end),
+        reinterpret_cast<u64>(__data_start), reinterpret_cast<u64>(__data_end)
+    };
+    constellation::init(g_hhdm_offset, entries, n_entries, image);
+
+    u64 fb_phys = (reinterpret_cast<u64>(lfb->address) - g_hhdm_offset) & ~0xFFFull;
+    u64 fb_end = (reinterpret_cast<u64>(lfb->address) - g_hhdm_offset + lfb->pitch * lfb->height + 0xFFF) & ~0xFFFull;
+    u64 fb_flags = constellation::WRITABLE | constellation::NO_EXECUTE;
+    if (percore::wc_enabled()) fb_flags |= constellation::WRITE_COMBINING;
+    if (!constellation::map_range(g_hhdm_offset + fb_phys, fb_phys, fb_end - fb_phys, fb_flags)) {
+        serial::writeln("[boot] FATAL: could not map the framebuffer");
+        cpu::hang();
+    }
     fb::printf(0xC0FFC0, "[ok] The Core constellation is live (own page tables, CR3 switched)\n");
 
-    map_device_window_or_die(early_apic_phys, "local APIC");
+    map_device_page_or_die(early_apic_phys, "local APIC");
     bool vmm_ok = constellation::selftest();
     serial::printf("[selftest] vmm: %s\n", vmm_ok ? "ok" : "MISMATCH");
 
@@ -602,7 +624,7 @@ extern "C" NORETURN void kernel_main() {
 
     constexpr u8 VEC_KEYBOARD = 0x21;
     if (acpi::info().ioapic_found) {
-        map_device_window_or_die(acpi::info().ioapic_base, "IOAPIC");
+        map_device_page_or_die(acpi::info().ioapic_base, "IOAPIC");
         ioapic::init(g_hhdm_offset, acpi::info().ioapic_base, acpi::info().ioapic_gsi_base);
         keyboard::init(VEC_KEYBOARD);
         acpi::Redirection kbd_irq = acpi::resolve_isa_irq(1);
@@ -913,7 +935,17 @@ extern "C" NORETURN void kernel_main() {
 
     
 
-    orbital::init(g_hhdm_offset);
+    static u32 core_ids[gdt::MAX_CORES];
+    u32 core_id_count = 0;
+    if (smp_request.response) {
+        for (u64 i = 0; i < smp_request.response->cpu_count && core_id_count < gdt::MAX_CORES; ++i)
+            core_ids[core_id_count++] = smp_request.response->cpus[i]->lapic_id;
+    } else {
+        core_ids[core_id_count++] = apic::id();
+    }
+    orbital::init(g_hhdm_offset, core_ids, core_id_count);
+    bool guards_ok = orbital::selftest();
+    serial::printf("[selftest] stack guards: %s\n", guards_ok ? "ok" : "MISMATCH");
     constellation::seal();
 
     g_cpus_online = 1;
@@ -940,6 +972,12 @@ extern "C" NORETURN void kernel_main() {
     } else {
         fb::printf(0xB0B0C0, "[--] SMP: single core reported, nothing else to wake\n");
     }
+
+    fpu::report();
+    bool percore_ok = percore::selftest() && percore::cores_seen() >= g_cpus_online;
+    serial::printf("[percore] %u core(s) verified: NX %s, WP on, WC PAT %s\n", percore::cores_seen(),
+                    percore::nx_enabled() ? "on" : "off", percore::wc_enabled() ? "on" : "off");
+    serial::printf("[selftest] percore: %s\n", percore_ok ? "ok" : "MISMATCH");
 
     bool gdt_ok = gdt::selftest() && gdt::cores_seen() >= g_cpus_online;
     serial::printf("[gdt] %u core(s) verified on private GDT, TSS and IST stacks\n", gdt::cores_seen());

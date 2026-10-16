@@ -3,21 +3,29 @@
 
 namespace fb {
 
+struct Cell { u8 ch; u8 fg; u8 bg; };
+
+static constexpr u64 GLYPH_W = 8, GLYPH_H = 8;
+static constexpr u64 MAX_COLS = 512, MAX_ROWS = 300;
+static constexpr u32 PALETTE_MAX = 64;
+static constexpr u32 DEFAULT_FG = 0xE0E0E0, DEFAULT_BG = 0x0A0A14;
+
 static Info g_info{};
 static u64 g_col = 0, g_row = 0;
 static u64 g_cols = 0, g_rows = 0;
 static bool g_ready = false;
-
-static constexpr u64 GLYPH_W = 8, GLYPH_H = 8;
+static Cell g_grid[MAX_ROWS * MAX_COLS];
+static u32 g_palette[PALETTE_MAX];
+static u32 g_palette_n = 0;
 
 bool ready() { return g_ready; }
 
-void init(const Info& info) {
-    g_info = info;
-    g_cols = g_info.width / GLYPH_W;
-    g_rows = g_info.height / GLYPH_H;
-    g_col = g_row = 0;
-    g_ready = true;
+static inline void flush_writes() { asm volatile("sfence" ::: "memory"); }
+
+static u8 color_index(u32 rgb) {
+    for (u32 i = 0; i < g_palette_n; ++i) if (g_palette[i] == rgb) return static_cast<u8>(i);
+    if (g_palette_n < PALETTE_MAX) { g_palette[g_palette_n] = rgb; return static_cast<u8>(g_palette_n++); }
+    return static_cast<u8>(PALETTE_MAX - 1);
 }
 
 static u32 pack(u32 rgb) {
@@ -29,6 +37,39 @@ static u32 pack(u32 rgb) {
 
 static volatile u32* row_ptr(u64 y, u64 x) {
     return reinterpret_cast<volatile u32*>(g_info.base + y * g_info.pitch + x * (g_info.bpp / 8));
+}
+
+static Cell& cell(u64 col, u64 row) { return g_grid[row * g_cols + col]; }
+
+static void draw_cell(u64 col, u64 row) {
+    const Cell& c = cell(col, row);
+    const u8* rows = font8x8::glyphs[c.ch & 0x7F];
+    u64 ox = col * GLYPH_W, oy = row * GLYPH_H;
+    u32 pf = pack(g_palette[c.fg]), pb = pack(g_palette[c.bg]);
+    for (u64 gy = 0; gy < GLYPH_H; ++gy) {
+        volatile u32* line = row_ptr(oy + gy, ox);
+        u8 bits = rows[gy];
+        for (u64 gx = 0; gx < GLYPH_W; ++gx) line[gx] = ((bits >> gx) & 1) ? pf : pb;
+    }
+}
+
+static void redraw_all() {
+    for (u64 r = 0; r < g_rows; ++r)
+        for (u64 c = 0; c < g_cols; ++c) draw_cell(c, r);
+    flush_writes();
+}
+
+void init(const Info& info) {
+    g_info = info;
+    g_cols = g_info.width / GLYPH_W;
+    g_rows = g_info.height / GLYPH_H;
+    if (g_cols > MAX_COLS) g_cols = MAX_COLS;
+    if (g_rows > MAX_ROWS) g_rows = MAX_ROWS;
+    g_col = g_row = 0;
+    g_palette_n = 0;
+    u8 fg = color_index(DEFAULT_FG), bg = color_index(DEFAULT_BG);
+    for (u64 i = 0; i < g_cols * g_rows; ++i) g_grid[i] = { ' ', fg, bg };
+    g_ready = true;
 }
 
 void put_pixel(u64 x, u64 y, u32 rgb) {
@@ -45,30 +86,24 @@ static void fill_rows(u64 first, u64 count, u32 packed) {
 }
 
 void clear(u32 rgb) {
+    u8 fg = color_index(DEFAULT_FG), bg = color_index(rgb);
+    for (u64 i = 0; i < g_cols * g_rows; ++i) g_grid[i] = { ' ', fg, bg };
     fill_rows(0, g_info.height, pack(rgb));
+    flush_writes();
     g_col = g_row = 0;
 }
 
-static void scroll(u32 bg) {
-    u64 keep = g_info.height - GLYPH_H;
-    for (u64 y = 0; y < keep; ++y) {
-        void* d = const_cast<u32*>(row_ptr(y, 0));
-        const void* s = const_cast<u32*>(row_ptr(y + GLYPH_H, 0));
-        u64 n = g_info.width;
-        asm volatile("rep movsl" : "+D"(d), "+S"(s), "+c"(n) :: "memory");
-    }
-    fill_rows(keep, GLYPH_H, pack(bg));
+static void scroll(u32 bg_rgb) {
+    u64 keep = (g_rows - 1) * g_cols;
+    memmove(&g_grid[0], &g_grid[g_cols], keep * sizeof(Cell));
+    u8 fg = color_index(DEFAULT_FG), bg = color_index(bg_rgb);
+    for (u64 c = 0; c < g_cols; ++c) g_grid[keep + c] = { ' ', fg, bg };
+    redraw_all();
 }
 
-static void draw_glyph(char c, u64 col, u64 row, u32 fg, u32 bg) {
-    const u8* rows = font8x8::glyphs[static_cast<u8>(c) & 0x7F];
-    u64 ox = col * GLYPH_W, oy = row * GLYPH_H;
-    u32 pf = pack(fg), pb = pack(bg);
-    for (u64 gy = 0; gy < GLYPH_H; ++gy) {
-        volatile u32* line = row_ptr(oy + gy, ox);
-        u8 bits = rows[gy];
-        for (u64 gx = 0; gx < GLYPH_W; ++gx) line[gx] = ((bits >> gx) & 1) ? pf : pb;
-    }
+static void put_cell(char ch, u64 col, u64 row, u32 fg, u32 bg) {
+    cell(col, row) = { static_cast<u8>(ch), color_index(fg), color_index(bg) };
+    draw_cell(col, row);
 }
 
 void putc(char c, u32 fg, u32 bg) {
@@ -80,14 +115,16 @@ void putc(char c, u32 fg, u32 bg) {
     } else if (c == '\b') {
         if (g_col > 0) --g_col;
         else if (g_row > 0) { --g_row; g_col = g_cols - 1; }
-        draw_glyph(' ', g_col, g_row, fg, bg);
+        put_cell(' ', g_col, g_row, fg, bg);
     } else {
-        draw_glyph(c, g_col, g_row, fg, bg);
+        put_cell(c, g_col, g_row, fg, bg);
         if (++g_col >= g_cols) { g_col = 0; ++g_row; }
     }
     if (g_row >= g_rows) {
         scroll(bg);
         g_row = g_rows - 1;
+    } else {
+        flush_writes();
     }
 }
 

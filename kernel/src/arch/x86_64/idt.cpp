@@ -3,6 +3,7 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/framebuffer.hpp>
 #include <cosmos/cpu.hpp>
+#include <cosmos/vmm.hpp>
 
 extern "C" u64 isr_stub_table[41];
 
@@ -53,6 +54,8 @@ static void default_panic(Frame* f) {
                     exception_name(f->vector), f->vector, f->error_code);
     serial::printf("    rip=%p cs=%lx rflags=%lx rsp=%p cr2=%p\n",
                     f->rip, f->cs, f->rflags, f->rsp, cr2);
+    if (constellation::in_stack_guard(cr2) || constellation::in_stack_guard(f->rsp))
+        serial::writeln("    the faulting address is in a kernel stack guard page: kernel stack overflow");
     if (fb::ready()) {
         fb::printf(0xFF4040, "\n!!! KERNEL PANIC: %s (vec %d)\n",
                     exception_name(f->vector), static_cast<int>(f->vector));

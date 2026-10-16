@@ -14,26 +14,34 @@ SECTIONS
     . = 0xffffffff80000000;
 
     __kernel_start = .;
+    __requests_start = .;
 
     .requests_start_marker : { KEEP(*(.requests_start_marker)) } :requests
     .requests               : { KEEP(*(.requests)) }             :requests
     .requests_end_marker    : { KEEP(*(.requests_end_marker)) }  :requests
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __requests_end = .;
 
+    __text_start = .;
     .text : { *(.text .text.*) } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_end = .;
 
+    __rodata_start = .;
     .rodata : { *(.rodata .rodata.*) } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_end = .;
 
+    __data_start = .;
     .data : { *(.data .data.*) } :data
 
     .bss : { *(COMMON) *(.bss .bss.*) } :data
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __data_end = .;
     __kernel_end = .;
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
