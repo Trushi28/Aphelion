@@ -1,7 +1,3 @@
-/* Aphelion linker script. Higher-half kernel per the Limine convention
-   (top 2GB of the address space); Limine's kernel_address_request tells us
-   at runtime what physical address this actually got loaded at. */
-
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(kernel_main)
 

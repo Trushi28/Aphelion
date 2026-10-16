@@ -93,7 +93,11 @@ check_common() {
     grep -q '\[smp-blockdev\] FAIL' "$LOG.clean" && fail "concurrent block-device stress reported a failure"
     grep -q '\[selftest\] smp-blockdev: ok' "$LOG.clean" || fail "concurrent block-device stress did not pass"
     grep -q '\[selftest\] pmm: ok' "$LOG.clean" || fail "physical allocator self-test did not pass"
+    grep -q '\[selftest\] vmm: ok' "$LOG.clean" || fail "virtual memory self-test did not pass"
+    grep -q '\[selftest\] per-core gdt: ok' "$LOG.clean" || fail "per-core GDT/TSS self-test did not pass"
+    grep -q "\[gdt\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported a private GDT and TSS"
     grep -q '\[universe\] reclaimed' "$LOG.clean" || fail "bootloader memory was never reclaimed"
+    grep -q 'free lists consistent' "$LOG.clean" || fail "physical allocator free lists were inconsistent after reclaim"
     if [ "$CORES" -gt 1 ]; then
         grep -q 'stealing confirmed' "$LOG.clean" || fail "no cross-core work-stealing observed"
     fi

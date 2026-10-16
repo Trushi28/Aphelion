@@ -1,10 +1,4 @@
 #!/bin/sh
-# Boots the kernel under QEMU and kills it with SIGKILL at random instants, then checks the crashed disk image with
-# the host-side fsck and, every few rounds, boots it to completion. This exercises the real kernel, drivers and block
-# layer, but a killed emulator only produces crashes that are an in-order prefix of the guest's writes: nothing is
-# reordered, torn or lost from a device cache. See docs/STELLAR.md ("Crash testing").
-#
-# usage: tools/crash-fuzz.sh [nvme|ahci|virtio] [cores] [rounds] [seed]
 set -eu
 
 DISK_KIND="${1:-nvme}"

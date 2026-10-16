@@ -42,6 +42,11 @@ constexpr u16 TSS_SEL   = 0x28;
 constexpr int IST_DOUBLE_FAULT = 1;
 constexpr int IST_NMI          = 2;
 
-void init(u64 double_fault_stack_top, u64 nmi_stack_top);
+constexpr u32 MAX_CORES = 64;
+constexpr u64 IST_STACK_BYTES = 4096;
+
+void init(u32 core_index);
+u32 cores_seen();
+bool selftest();
 
 }

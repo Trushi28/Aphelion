@@ -100,11 +100,13 @@ struct DevGuard {
     ~DevGuard() { g_dev_lock.unlock(); }
 };
 
-static void map_bar_region(u64 phys_base) {
+static bool map_bar_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
     for (u64 off = 0; off < 0x10000; off += 0x1000)
-        constellation::map_4k(g_hhdm + page_base + off, page_base + off,
-                               constellation::WRITABLE | constellation::NO_CACHE);
+        if (!constellation::map_4k(g_hhdm + page_base + off, page_base + off,
+                                   constellation::WRITABLE | constellation::NO_CACHE))
+            return false;
+    return true;
 }
 
 static void* alloc_pages(u64 bytes) { return dma::alloc(bytes).virt; }
@@ -249,7 +251,10 @@ bool init(u64 hhdm_offset) {
             u8 bar = pci::read8(g_addr, static_cast<u8>(cap_ptr + 4));
             u32 off = pci::read32(g_addr, static_cast<u8>(cap_ptr + 8));
             u64 bar_phys = pci::bar_address(g_addr, bar);
-            map_bar_region(bar_phys);
+            if (!map_bar_region(bar_phys)) {
+                serial::writeln("[virtio-blk] could not map a device region");
+                return false;
+            }
             u64 region_virt = g_hhdm + bar_phys + off;
 
             if (cfg_type == CAP_COMMON) {
@@ -266,7 +271,10 @@ bool init(u64 hhdm_offset) {
             u8 bir = static_cast<u8>(table_reg & 0x7);
             u32 table_off = table_reg & ~0x7u;
             u64 bar_phys = pci::bar_address(g_addr, bir);
-            map_bar_region(bar_phys);
+            if (!map_bar_region(bar_phys)) {
+                serial::writeln("[virtio-blk] could not map a device region");
+                return false;
+            }
             g_msix_table = reinterpret_cast<volatile u32*>(g_hhdm + bar_phys + table_off);
 
             idt::set_handler(idt::VEC_VIRTIO_BLK, &completion_isr);

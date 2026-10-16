@@ -1,5 +1,3 @@
-// Scaling benchmark for Stellar FS: formats, mounts, scans and collects on sparse virtual disks of growing size and
-// reports host time, device commands and the RAM the free-space bitmap needs. It links the filesystem's own source.
 #include <cosmos/types.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/pmm.hpp>

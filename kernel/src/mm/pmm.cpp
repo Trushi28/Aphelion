@@ -4,7 +4,7 @@
 
 namespace universe {
 
-struct FreeNode { FreeNode* next; };
+struct FreeNode { FreeNode* next; FreeNode* prev; };
 
 constexpr u64 MEM_USABLE = 0;
 constexpr u64 MEM_BOOTLOADER_RECLAIMABLE = 5;
@@ -20,6 +20,7 @@ static u32 g_galaxy_count = 0;
 static u64 g_pages = 0;
 static u64* g_owned = nullptr;
 static u64* g_free = nullptr;
+static u8* g_tag = nullptr;
 
 static cpu::Spinlock g_lock;
 
@@ -60,19 +61,32 @@ void* to_virt(u64 phys) { return phys_to_virt(phys); }
 
 static void orbit_push(int order, u64 phys) {
     auto* n = static_cast<FreeNode*>(phys_to_virt(phys));
-    int z = zone_of(phys);
-    n->next = g_orbits[z][order];
-    g_orbits[z][order] = n;
+    FreeNode*& head = g_orbits[zone_of(phys)][order];
+    n->prev = nullptr;
+    n->next = head;
+    if (head) head->prev = n;
+    head = n;
+    g_tag[phys >> 12] = static_cast<u8>(order + 1);
 }
 
-static bool orbit_remove(int order, u64 phys) {
-    void* target = phys_to_virt(phys);
-    FreeNode** pp = &g_orbits[zone_of(phys)][order];
-    while (*pp) {
-        if (*pp == target) { *pp = (*pp)->next; return true; }
-        pp = &(*pp)->next;
+static void orbit_unlink(int order, u64 phys) {
+    if (g_tag[phys >> 12] != order + 1) fatal("free list corrupt: block is not a free head of this order", phys, order);
+    auto* n = static_cast<FreeNode*>(phys_to_virt(phys));
+    if (n->prev) n->prev->next = n->next;
+    else g_orbits[zone_of(phys)][order] = n->next;
+    if (n->next) n->next->prev = n->prev;
+    g_tag[phys >> 12] = 0;
+}
+
+static void insert_coalescing(u64 phys, int order) {
+    while (order < MAX_ORDER) {
+        u64 buddy = phys ^ (PAGE_SIZE << order);
+        if ((buddy >> 12) >= g_pages || g_tag[buddy >> 12] != order + 1) break;
+        orbit_unlink(order, buddy);
+        phys = phys < buddy ? phys : buddy;
+        ++order;
     }
-    return false;
+    orbit_push(order, phys);
 }
 
 static void seed_region(u64 base, u64 length) {
@@ -99,7 +113,7 @@ static void seed_region(u64 base, u64 length) {
             ++order;
         }
         u64 block_size = PAGE_SIZE << order;
-        orbit_push(order, addr);
+        insert_coalescing(addr, order);
         g_free_bytes += block_size;
         addr += block_size;
         remaining -= block_size;
@@ -118,7 +132,7 @@ void init(const MemmapEntry* entries, u64 count, u64 hhdm_offset) {
     }
     g_pages = top >> 12;
     u64 words = (g_pages + 63) / 64;
-    u64 map_bytes = ((words * 16 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    u64 map_bytes = ((words * 16 + g_pages + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
     u64 carve = 0, carve_idx = ~0ull;
     for (u64 i = 0; i < count && carve_idx == ~0ull; ++i) {
@@ -134,6 +148,7 @@ void init(const MemmapEntry* entries, u64 count, u64 hhdm_offset) {
     }
     g_owned = static_cast<u64*>(phys_to_virt(carve));
     g_free = g_owned + words;
+    g_tag = reinterpret_cast<u8*>(g_free + words);
     __builtin_memset(g_owned, 0, map_bytes);
 
     for (u64 i = 0; i < count; ++i) {
@@ -146,25 +161,62 @@ void init(const MemmapEntry* entries, u64 count, u64 hhdm_offset) {
                     g_galaxy_count, g_galaxy_count == 1 ? "y" : "ies", g_free_bytes / 1024, map_bytes / 1024);
 }
 
+static u64 popcount64(u64 v) {
+    u64 n = 0;
+    while (v) { v &= v - 1; ++n; }
+    return n;
+}
+
+static bool check_invariants() {
+    u64 listed = 0, bytes = 0;
+    for (int z = 0; z < ZONES; ++z) {
+        for (int o = 0; o <= MAX_ORDER; ++o) {
+            u64 size = PAGE_SIZE << o;
+            FreeNode* prev = nullptr;
+            for (FreeNode* n = g_orbits[z][o]; n; prev = n, n = n->next) {
+                u64 phys = virt_to_phys(n);
+                if (n->prev != prev) return false;
+                if ((phys & (size - 1)) || (phys >> 12) + (1ull << o) > g_pages) return false;
+                if (zone_of(phys) != z) return false;
+                if (g_tag[phys >> 12] != o + 1) return false;
+                if (!bits_all(g_free, phys >> 12, 1ull << o, true)) return false;
+                if (o < MAX_ORDER) {
+                    u64 buddy = phys ^ size;
+                    if ((buddy >> 12) < g_pages && g_tag[buddy >> 12] == o + 1) return false;
+                }
+                bytes += size;
+                if (++listed > g_pages) return false;
+            }
+        }
+    }
+    u64 tags = 0;
+    for (u64 i = 0; i < g_pages; ++i) if (g_tag[i]) ++tags;
+    u64 free_pages = 0;
+    for (u64 w = 0; w < (g_pages + 63) / 64; ++w) free_pages += popcount64(g_free[w]);
+    return tags == listed && bytes == g_free_bytes && free_pages == (g_free_bytes >> 12);
+}
+
 void reclaim_bootloader_regions(const MemmapEntry* entries, u64 count) {
     u64 reclaimed;
+    bool consistent;
     {
         LockGuard g;
         u64 before = g_free_bytes;
         for (u64 i = 0; i < count; ++i)
             if (entries[i].type == MEM_BOOTLOADER_RECLAIMABLE) seed_region(entries[i].base, entries[i].length);
         reclaimed = g_free_bytes - before;
+        consistent = check_invariants();
     }
-    serial::printf("[universe] reclaimed %lu KiB of bootloader-owned memory\n", reclaimed / 1024);
+    serial::printf("[universe] reclaimed %lu KiB of bootloader-owned memory, free lists %s\n",
+                    reclaimed / 1024, consistent ? "consistent" : "CORRUPT (MISMATCH)");
 }
 
 static u64 alloc_from(int zone, int order) {
     int o = order;
     while (o <= MAX_ORDER && !g_orbits[zone][o]) ++o;
     if (o > MAX_ORDER) return 0;
-    FreeNode* n = g_orbits[zone][o];
-    g_orbits[zone][o] = n->next;
-    u64 addr = virt_to_phys(n);
+    u64 addr = virt_to_phys(g_orbits[zone][o]);
+    orbit_unlink(o, addr);
     while (o > order) {
         --o;
         orbit_push(o, addr + (PAGE_SIZE << o));
@@ -207,24 +259,34 @@ void free(u64 phys, int order) {
 
     bits_fill(g_free, phys >> 12, pages, true);
     g_free_bytes += size;
-    while (order < MAX_ORDER) {
-        u64 buddy = phys ^ (PAGE_SIZE << order);
-        if ((buddy >> 12) >= g_pages || !bit_get(g_free, buddy >> 12)) break;
-        if (!orbit_remove(order, buddy)) break;
-        phys = phys < buddy ? phys : buddy;
-        ++order;
-    }
-    orbit_push(order, phys);
+    insert_coalescing(phys, order);
 }
 
 u64 free_bytes() { return g_free_bytes; }
 u64 total_bytes() { return g_total_bytes; }
 u32 galaxy_count() { return g_galaxy_count; }
 
+static bool locked_check() {
+    LockGuard g;
+    return check_invariants();
+}
+
+static void count_blocks(u64* out) {
+    LockGuard g;
+    for (int o = 0; o <= MAX_ORDER; ++o) {
+        out[o] = 0;
+        for (int z = 0; z < ZONES; ++z)
+            for (FreeNode* n = g_orbits[z][o]; n; n = n->next) ++out[o];
+    }
+}
+
 bool selftest() {
     static u64 held[512];
+    u64 shape_before[MAX_ORDER + 1];
+    u64 shape_after[MAX_ORDER + 1];
     u64 before = free_bytes();
-    bool ok = true;
+    bool ok = locked_check();
+    count_blocks(shape_before);
 
     for (int o = 0; o <= 6 && ok; ++o) {
         u64 size = PAGE_SIZE << o;
@@ -244,7 +306,10 @@ bool selftest() {
     u64 big = alloc(7);
     ok = ok && big != 0;
     if (big) free(big, 7);
-    return ok && free_bytes() == before;
+
+    count_blocks(shape_after);
+    for (int o = 0; o <= MAX_ORDER; ++o) if (shape_before[o] != shape_after[o]) ok = false;
+    return ok && locked_check() && free_bytes() == before;
 }
 
 }

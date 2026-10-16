@@ -69,15 +69,18 @@ static u64 g_expected_cores = 1;
 static constexpr u64 TEST_TAIL_SECTORS = 64;
 static constexpr const char* HELLO_REWRITTEN = "Aphelion Stellar FS -- rewritten after snapshot.\n";
 
+static void map_device_window_or_die(u64 phys, const char* what) {
+    u64 base = phys & ~0x1FFFFFull;
+    if (!constellation::map_2m(g_hhdm_offset + base, base,
+                               constellation::WRITABLE | constellation::NO_CACHE)) {
+        serial::printf("[boot] FATAL: could not map the %s window at %p\n", what, base);
+        cpu::hang();
+    }
+}
+
 static u32 init_gdt_idt(bool is_bsp) {
-    static u8 df_stack[8][4096] __attribute__((aligned(16)));
-    static u8 nmi_stack[8][4096] __attribute__((aligned(16)));
-
     u32 core_idx = is_bsp ? 0 : static_cast<u32>(__atomic_fetch_add(&g_next_core_idx, 1, __ATOMIC_SEQ_CST));
-    if (core_idx >= 8) core_idx = 7;
-
-    gdt::init(reinterpret_cast<u64>(&df_stack[core_idx][4096]),
-              reinterpret_cast<u64>(&nmi_stack[core_idx][4096]));
+    gdt::init(core_idx);
     idt::init();
     return core_idx;
 }
@@ -568,9 +571,9 @@ extern "C" NORETURN void kernel_main() {
     constellation::init(g_hhdm_offset, kphys, kvirt, ksize, max_phys);
     fb::printf(0xC0FFC0, "[ok] The Core constellation is live (own page tables, CR3 switched)\n");
 
-    u64 lapic_2m = early_apic_phys & ~0x1FFFFFull;
-    constellation::map_2m(g_hhdm_offset + lapic_2m, lapic_2m,
-                           constellation::WRITABLE | constellation::NO_CACHE);
+    map_device_window_or_die(early_apic_phys, "local APIC");
+    bool vmm_ok = constellation::selftest();
+    serial::printf("[selftest] vmm: %s\n", vmm_ok ? "ok" : "MISMATCH");
 
     apic::init(g_hhdm_offset);
     if (apic::using_x2apic()) {
@@ -599,9 +602,7 @@ extern "C" NORETURN void kernel_main() {
 
     constexpr u8 VEC_KEYBOARD = 0x21;
     if (acpi::info().ioapic_found) {
-        u64 ioapic_2m = acpi::info().ioapic_base & ~0x1FFFFFull;
-        constellation::map_2m(g_hhdm_offset + ioapic_2m, ioapic_2m,
-                               constellation::WRITABLE | constellation::NO_CACHE);
+        map_device_window_or_die(acpi::info().ioapic_base, "IOAPIC");
         ioapic::init(g_hhdm_offset, acpi::info().ioapic_base, acpi::info().ioapic_gsi_base);
         keyboard::init(VEC_KEYBOARD);
         acpi::Redirection kbd_irq = acpi::resolve_isa_irq(1);
@@ -913,23 +914,36 @@ extern "C" NORETURN void kernel_main() {
     
 
     orbital::init(g_hhdm_offset);
+    constellation::seal();
 
     g_cpus_online = 1;
     if (smp_request.response && smp_request.response->cpu_count > 1) {
         u64 total = smp_request.response->cpu_count;
-        for (u64 i = 0; i < total; ++i) {
+        if (total > gdt::MAX_CORES) {
+            serial::printf("[smp] %lu cores reported, waking only %u (the per-core GDT/TSS limit)\n",
+                            total, static_cast<u32>(gdt::MAX_CORES));
+            total = gdt::MAX_CORES;
+        }
+        g_expected_cores = total;
+        u64 woken = 0;
+        for (u64 i = 0; i < smp_request.response->cpu_count && woken + 1 < total; ++i) {
             limine_smp_info* c = smp_request.response->cpus[i];
             if (c->lapic_id == smp_request.response->bsp_lapic_id) continue;
             c->extra_argument = 0;
             c->goto_address = ap_entry;
+            ++woken;
         }
-        fb::printf(0xC0FFC0, "[ok] SMP: waking %lu additional core(s)...\n", total - 1);
+        fb::printf(0xC0FFC0, "[ok] SMP: waking %lu additional core(s)...\n", woken);
 
         for (u64 i = 0; i < 300000000ull && g_cpus_online < total; ++i) asm volatile("pause" ::: "memory");
         fb::printf(0xC0FFC0, "[ok] SMP: %lu Sun(s) online in total\n", g_cpus_online);
     } else {
         fb::printf(0xB0B0C0, "[--] SMP: single core reported, nothing else to wake\n");
     }
+
+    bool gdt_ok = gdt::selftest() && gdt::cores_seen() >= g_cpus_online;
+    serial::printf("[gdt] %u core(s) verified on private GDT, TSS and IST stacks\n", gdt::cores_seen());
+    serial::printf("[selftest] per-core gdt: %s\n", gdt_ok ? "ok" : "MISMATCH");
 
     fb::printf(0x8FD3FF, "\nOrbital scheduler: bringing up this core...\n");
     clock::sync();
@@ -961,7 +975,6 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
                WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");
-    g_expected_cores = smp_request.response ? smp_request.response->cpu_count : 1;
     orbital::spawn("reclaim", &reclaim_task, nullptr);
     orbital::start_core();
 }

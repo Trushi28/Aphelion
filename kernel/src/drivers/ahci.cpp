@@ -149,11 +149,13 @@ struct DevGuard {
     ~DevGuard() { g_dev_lock.unlock(); }
 };
 
-static void map_region(u64 phys_base) {
+static bool map_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
     for (u64 off = 0; off < 0x10000; off += 0x1000)
-        constellation::map_4k(g_hhdm + page_base + off, page_base + off,
-                               constellation::WRITABLE | constellation::NO_CACHE);
+        if (!constellation::map_4k(g_hhdm + page_base + off, page_base + off,
+                                   constellation::WRITABLE | constellation::NO_CACHE))
+            return false;
+    return true;
 }
 
 static void* alloc_pages(u64 bytes) { return dma::alloc(bytes).virt; }
@@ -486,7 +488,10 @@ bool init(u64 hhdm_offset) {
     }
 
     u64 abar_phys = pci::bar_address(g_found.addr, 5);
-    map_region(abar_phys);
+    if (!map_region(abar_phys)) {
+        serial::writeln("[ahci] could not map the HBA registers");
+        return false;
+    }
     g_hba = reinterpret_cast<volatile HbaMem*>(g_hhdm + abar_phys);
 
     g_hba->ghc |= GHC_AE;

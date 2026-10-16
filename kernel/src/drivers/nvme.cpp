@@ -135,11 +135,13 @@ struct DevGuard {
     ~DevGuard() { g_dev_lock.unlock(); }
 };
 
-static void map_region(u64 phys_base) {
+static bool map_region(u64 phys_base) {
     u64 page_base = phys_base & ~0xFFFull;
     for (u64 off = 0; off < MAP_BYTES; off += 0x1000)
-        constellation::map_4k(g_hhdm + page_base + off, page_base + off,
-                               constellation::WRITABLE | constellation::NO_CACHE);
+        if (!constellation::map_4k(g_hhdm + page_base + off, page_base + off,
+                                   constellation::WRITABLE | constellation::NO_CACHE))
+            return false;
+    return true;
 }
 
 static void* alloc_pages(u64 bytes) { return dma::alloc(bytes).virt; }
@@ -317,7 +319,7 @@ static bool enable_msix(u8 cap) {
     u32 table_off = table_reg & ~0x7u;
     u64 table_bar = pci::bar_address(g_addr, static_cast<int>(bir));
     if (table_bar == 0) return false;
-    map_region(table_bar);
+    if (!map_region(table_bar)) return false;
 
     ctrl = static_cast<u16>(ctrl | (1u << 15) | (1u << 14));
     pci::write16(g_addr, static_cast<u8>(cap + 2), ctrl);
@@ -423,7 +425,10 @@ bool init(u64 hhdm_offset) {
         serial::writeln("[nvme] BAR0 is unassigned");
         return false;
     }
-    map_region(bar_phys);
+    if (!map_region(bar_phys)) {
+        serial::writeln("[nvme] could not map the controller registers");
+        return false;
+    }
     g_regs = reinterpret_cast<volatile u8*>(g_hhdm + bar_phys);
 
     u32 vs = reg32(REG_VS);

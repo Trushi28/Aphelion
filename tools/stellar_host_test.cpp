@@ -1092,7 +1092,6 @@ int main() {
         CHECK(stellar::mount(), "mount works again once the batch is closed");
     }
 
-    // ---------------------------------------------------------------- status codes
     fresh_fs();
     {
         using stellar::Status;
@@ -1237,7 +1236,6 @@ int main() {
         fresh_fs();
     }
 
-    // ---------------------------------------------------------------- directory tree
     fresh_fs();
     {
         stellar::test_set_hash_mask(0);
@@ -1598,7 +1596,6 @@ int main() {
         CHECK(stellar::check(&oc) && oc.ok(), "and the filesystem checks clean");
     }
 
-    // ---------------------------------------------------------------- v6: checksums on every metadata sector
     fresh_fs();
     {
         using stellar::Status;
@@ -1672,7 +1669,6 @@ int main() {
         CHECK((t0 > s0 || t1 > s1) && t0 != t1, "a commit advances exactly one slot's commit number");
     }
 
-    // ---------------------------------------------------------------- check(): the fsck oracle
     {
         using stellar::Status;
         Status st = Status::Internal;
@@ -1792,7 +1788,6 @@ int main() {
         (void)f1; (void)f2;
     }
 
-    // ---------------------------------------------------------------- v6: failed operations roll back
     fresh_fs(4096);
     {
         using stellar::Status;
@@ -1840,7 +1835,6 @@ int main() {
         CHECK(stellar::check(&r) && r.ok() && make(stellar::ROOT_STAR, "p1", "again") != NONE, "the filesystem is intact and usable");
     }
 
-    // ---------------------------------------------------------------- v6: the older superblock is a consistent commit
     fresh_fs(4096);
     {
         using stellar::Status;
@@ -1860,7 +1854,6 @@ int main() {
         CHECK(stellar::mount() && eq(stellar::find(stellar::ROOT_STAR, "d"), "D") && stellar::find(stellar::ROOT_STAR, "c") == stellar::INVALID_STAR && stellar::check(&r) && r.ok(), "and it persists");
     }
 
-    // ---------------------------------------------------------------- crash consistency
     {
         using stellar::Status;
         const u32 SEEDS = 8;
@@ -2084,7 +2077,6 @@ int main() {
         (void)grand_bad;
     }
 
-    // ---------------------------------------------------------------- v8: per-block data checksums
     {
         using stellar::Status;
         const u64 NONE = stellar::INVALID_STAR;
@@ -2222,7 +2214,6 @@ int main() {
         CHECK(stellar::free_space_sectors() + 8 >= free0, "and the data and checksum sectors are all back");
     }
 
-    // ---------------------------------------------------------------- v8: the snapshot table
     {
         using stellar::Status;
         const u64 NONE = stellar::INVALID_STAR;
@@ -2292,7 +2283,6 @@ int main() {
         CHECK(stellar::mount() && stellar::snapshot_count() == 26 && stellar::check(&r) && r.ok(), "the untouched image still mounts with every snapshot");
     }
 
-    // ---------------------------------------------------------------- per-subtree snapshots
     {
         using stellar::Status;
         const u64 NONE = stellar::INVALID_STAR;
@@ -2385,7 +2375,6 @@ int main() {
         CHECK(mounted_ && stellar::snapshot_count() == 1 && !clean_ && r.bad_structure == 1, "check reports a scope that is not in the snapshot's own catalog");
     }
 
-    // ---------------------------------------------------------------- snapshot inside a batch
     {
         const u64 NONE = stellar::INVALID_STAR;
         stellar::CheckReport r{};
@@ -2407,7 +2396,6 @@ int main() {
         CHECK(stellar::mount() && stellar::read_file(f, rb, sizeof(rb), sn) == sizeof(old_data) && __builtin_memcmp(rb, old_data, sizeof(old_data)) == 0, "also after a remount");
     }
 
-    // ---------------------------------------------------------------- v6: stat, flags, clock
     fresh_fs();
     {
         using stellar::Status;
@@ -2442,7 +2430,6 @@ int main() {
         stellar::set_clock(nullptr);
     }
 
-    // ---------------------------------------------------------------- snapshot lookups
     fresh_fs();
     {
         stellar::test_set_hash_mask(0);
@@ -2478,7 +2465,6 @@ int main() {
         CHECK(stellar::check(&sc) && sc.ok(), "check() walks the live tree and the snapshot cleanly");
     }
 
-    // ---------------------------------------------------------------- tree shape: emptying, collisions, parents
     fresh_fs();
     {
         stellar::test_set_hash_mask(0);
@@ -2519,7 +2505,6 @@ int main() {
         stellar::test_set_hash_mask(0);
     }
 
-    // ---------------------------------------------------------------- path resolution
     fresh_fs();
     {
         using stellar::Status;
@@ -2584,7 +2569,6 @@ int main() {
         (void)x;
     }
 
-    // ---------------------------------------------------------------- paged bitmap
     {
         using stellar::Status;
         stellar::CheckReport r{};
@@ -2626,7 +2610,6 @@ int main() {
         stellar::test_set_gc_window_pages(0);
     }
 
-    // ---------------------------------------------------------------- lazy mount
     {
         using stellar::Status;
         const u64 NONE = stellar::INVALID_STAR;
@@ -2729,7 +2712,6 @@ int main() {
         CHECK(stellar::mount() && stellar::check(&r) && r.ok() && stellar::find(stellar::ROOT_STAR, "meets-damage") == g, "the repair and the retry are both durable");
     }
 
-    // ---------------------------------------------------------------- bitmap I/O faults and damage
     fresh_fs(40000);
     {
         using stellar::Status;
@@ -2806,7 +2788,6 @@ int main() {
         stellar::test_set_bitmap_cache_slots(64);
     }
 
-    // ---------------------------------------------------------------- a 2 GiB disk
     {
         using stellar::Status;
         stellar::CheckReport r{};
@@ -2856,7 +2837,6 @@ int main() {
         CHECK(stellar::free_space_sectors() + 64 >= free0, "free space is back to where it started, less a few catalog nodes");
     }
 
-    // ---------------------------------------------------------------- extent-table files
     {
         using stellar::Status;
         Status st = Status::Internal;
@@ -3090,7 +3070,6 @@ int main() {
         }
     }
 
-    // ---------------------------------------------------------------- extent fuzz
     {
         struct Cfg { u64 sectors, cap, filler, steps; };
         const Cfg cfgs[2] = { {4096, 3, 0, 2500}, {1500, 0, 900, 1500} };
@@ -3170,7 +3149,6 @@ int main() {
         }
     }
 
-    // ---------------------------------------------------------------- rename
     fresh_fs();
     {
         using stellar::Status;
@@ -3275,7 +3253,6 @@ int main() {
         CHECK(r.leaked == 0, "and nothing leaked");
     }
 
-    // ---------------------------------------------------------------- directory scaling
     {
         const u64 sizes[] = {100, 400, 1000};
         double base_w = 0, base_l = 0;
@@ -3299,7 +3276,6 @@ int main() {
         }
     }
 
-    // ---------------------------------------------------------------- civil time and RTC decoding
     {
         struct Ref { u32 y, mo, d, h, mi, s; u64 unix_s; };
         static const Ref refs[] = {
@@ -3363,7 +3339,6 @@ int main() {
         CHECK(strcmp_(iso, "1970-01-01T00:00:00Z"), "ISO formatting of the epoch");
     }
 
-    // ---------------------------------------------------------------- crash during format
     {
         using stellar::Status;
         const u64 SECT = 4096;
@@ -3418,7 +3393,6 @@ int main() {
         CHECK(damaged == 0, "and checks clean");
     }
 
-    // ---------------------------------------------------------------- auto-format guard
     {
         using stellar::Status;
         Status st = Status::Internal;

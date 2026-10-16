@@ -1,6 +1,3 @@
-// Host-side mkfs / fsck / ls / cat for Stellar FS images. It links the filesystem's own source
-// (kernel/src/fs/stellar.cpp) against a file-backed block device, so fsck runs exactly the verifier
-// the kernel has.
 #include <cosmos/types.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/pmm.hpp>
@@ -80,7 +77,7 @@ int main(int argc, char** argv) {
     const char* cmd = argv[1];
     const char* img = argv[2];
     bool mk = strcmp(cmd, "mkfs") == 0;
-    g_fd = open(img, mk ? (2 | 0100) : 2, 0644);   // O_RDWR (| O_CREAT for mkfs)
+    g_fd = open(img, mk ? (2 | 0100) : 2, 0644);
     if (g_fd < 0) { printf("cannot open %s\n", img); return 2; }
     long size = lseek(g_fd, 0, 2);
     if (mk && argc > 3 && parse_u64(argv[3]) * 512 > static_cast<u64>(size)) { ftruncate(g_fd, static_cast<long>(parse_u64(argv[3]) * 512)); size = lseek(g_fd, 0, 2); }
