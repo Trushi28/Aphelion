@@ -1,5 +1,6 @@
 #include <cosmos/acpi.hpp>
 #include <cosmos/serial.hpp>
+#include <cosmos/vmm.hpp>
 
 namespace acpi {
 
@@ -65,10 +66,18 @@ struct PACKED MadtIso {
 };
 
 static Info g_info;
-static u64 g_hhdm = 0;
+constexpr u32 MAX_TABLE_BYTES = 16u << 20;
 
-template <typename T> static T* phys(u64 addr) {
-    return reinterpret_cast<T*>(g_hhdm + addr);
+template <typename T> static T* map(u64 addr, u64 bytes) {
+    return reinterpret_cast<T*>(constellation::map_firmware(addr, bytes));
+}
+
+static SdtHeader* map_sdt(u64 addr) {
+    auto* head = map<SdtHeader>(addr, sizeof(SdtHeader));
+    if (!head) return nullptr;
+    u32 length = head->length;
+    if (length < sizeof(SdtHeader) || length > MAX_TABLE_BYTES) return nullptr;
+    return map<SdtHeader>(addr, length);
 }
 
 static bool sig_matches(const char* a, const char* b, int n) {
@@ -120,15 +129,21 @@ static void parse_madt(SdtHeader* madt) {
     }
 }
 
-void init(u64 rsdp_phys, u64 hhdm_offset) {
-    g_hhdm = hhdm_offset;
+void init(u64 rsdp_phys) {
     g_info = Info{};
 
-    auto* rsdp = phys<Rsdp>(rsdp_phys);
+    auto* rsdp = map<Rsdp>(rsdp_phys, sizeof(Rsdp));
+    if (!rsdp) {
+        serial::writeln("[acpi] could not map the RSDP");
+        return;
+    }
     bool use_xsdt = rsdp->revision >= 2 && rsdp->xsdt_addr != 0;
 
-    SdtHeader* root = use_xsdt ? phys<SdtHeader>(rsdp->xsdt_addr)
-                                : phys<SdtHeader>(rsdp->rsdt_addr);
+    SdtHeader* root = map_sdt(use_xsdt ? rsdp->xsdt_addr : rsdp->rsdt_addr);
+    if (!root) {
+        serial::writeln("[acpi] could not map the root table");
+        return;
+    }
 
     u32 entry_count = (root->length - sizeof(SdtHeader)) / (use_xsdt ? 8 : 4);
     u8* entries = reinterpret_cast<u8*>(root) + sizeof(SdtHeader);
@@ -137,9 +152,15 @@ void init(u64 rsdp_phys, u64 hhdm_offset) {
         u64 table_phys = use_xsdt
             ? reinterpret_cast<u64*>(entries)[i]
             : reinterpret_cast<u32*>(entries)[i];
-        auto* hdr = phys<SdtHeader>(table_phys);
+        auto* hdr = map<SdtHeader>(table_phys, sizeof(SdtHeader));
+        if (!hdr) continue;
         if (sig_matches(hdr->sig, "APIC", 4)) {
-            parse_madt(hdr);
+            auto* madt = map_sdt(table_phys);
+            if (!madt) {
+                serial::writeln("[acpi] could not map the MADT");
+                continue;
+            }
+            parse_madt(madt);
             serial::printf("[acpi] MADT: %u usable CPU(s), IOAPIC %s, %u interrupt override(s)\n",
                             g_info.cpu_count, g_info.ioapic_found ? "found" : "absent",
                             g_info.iso_count);

@@ -1,10 +1,33 @@
 #include <cosmos/types.hpp>
+#include <cosmos/tlb.hpp>
 #include "../kernel/src/mm/pmm.cpp"
 #include "../kernel/src/mm/vmm.cpp"
+#include "../kernel/src/mm/dma.cpp"
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdio.h>
+
+namespace constellation { bool translate(u64, Mapping*); }
+
+static u64 g_hhdm_for_probe = 0;
+static u32 g_tlb_calls = 0;
+static u64 g_tlb_mask = 0, g_tlb_addr = 0, g_tlb_bytes = 0;
+static u64 g_fake_online = 1;
+
+namespace tlb {
+void poll() {}
+u32 core_index() { return 0; }
+u64 online_mask() { return g_fake_online; }
+u32 online_count() { return 1; }
+void flush(u64 mask, u64 addr, u64 bytes) { ++g_tlb_calls; g_tlb_mask = mask; g_tlb_addr = addr; g_tlb_bytes = bytes; }
+bool selftest_probe(u64 addr, u64* out, u32 slots) {
+    constellation::Mapping m{};
+    if (slots < 1 || !constellation::translate(addr, &m)) return false;
+    out[0] = *reinterpret_cast<u64*>(g_hhdm_for_probe + m.phys);
+    return true;
+}
+}
 
 static constexpr u64 ARENA = 64ull << 20;
 
@@ -88,14 +111,128 @@ static void pmm_tests(u64 hhdm, const universe::MemmapEntry* map, u64 count) {
     expect(WIFSIGNALED(st), "pmm: a double free is fatal");
 }
 
+static void shootdown_tests(u64 hhdm) {
+    using namespace constellation;
+    constexpr u64 VA = 0xFFFFE00000000000ull + 0x20000000ull;
+    u64 f = universe::alloc_zeroed(0);
+    u32 c0 = g_tlb_calls;
+    expect(map_4k(VA, f, WRITABLE | NO_EXECUTE) && g_tlb_calls == c0, "tlb: mapping a fresh page needs no shootdown");
+    g_fake_online = 0x7;
+    expect(map_4k(VA, f, WRITABLE | NO_EXECUTE) && g_tlb_calls == c0 + 1 && g_tlb_mask == 0x7 && g_tlb_addr == VA && g_tlb_bytes == 0x1000,
+           "tlb: remapping a present page shoots down every online core");
+    expect(protect(VA, 0x1000, NO_EXECUTE) && g_tlb_calls == c0 + 2 && g_tlb_bytes == 0x1000, "tlb: protect shoots down");
+    expect(unmap(VA, 0x1000) && g_tlb_calls == c0 + 3 && g_tlb_addr == VA, "tlb: unmap shoots down");
+    u32 before = g_tlb_calls;
+    expect(!unmap(VA, 0x1000) && g_tlb_calls == before, "tlb: unmapping nothing does nothing");
+
+    expect(map_2m(VA & ~0x1FFFFFull, 0x1000000, WRITABLE | NO_EXECUTE), "tlb: 2 MiB page installed");
+    u32 c1 = g_tlb_calls;
+    expect(map_4k((VA & ~0x1FFFFFull) + 0x3000, f, WRITABLE | NO_EXECUTE) && g_tlb_calls == c1 + 1,
+           "tlb: splitting and overwriting inside a huge page shoots down");
+    u64 free_before = universe::free_bytes();
+    expect(map_2m(VA & ~0x1FFFFFull, 0x1200000, WRITABLE | NO_EXECUTE) && g_tlb_bytes == tlb::ALL_ADDRESSES && universe::free_bytes() == free_before + 4096,
+           "tlb: replacing a page table flushes everything, then frees it");
+    expect(unmap(VA & ~0x1FFFFFull, 0x200000), "tlb: a whole huge page unmaps in one step");
+
+    Space* sp = create_space();
+    u64 uf = universe::alloc_zeroed(0);
+    expect(space_map(sp, 0x400000, uf, 0x1000, WRITABLE | NO_EXECUTE), "tlb: user page mapped");
+    u32 c2 = g_tlb_calls;
+    space_protect(sp, 0x400000, 0x1000, NO_EXECUTE);
+    expect(g_tlb_calls == c2 + 1 && g_tlb_mask == 0, "tlb: a space nobody has loaded shoots down no core");
+    destroy_space(sp);
+    universe::free(uf, 0);
+    universe::free(f, 0);
+    g_fake_online = 1;
+    (void)hhdm;
+}
+
+static void dma_tests(u64 hhdm) {
+    constexpr u32 N = 256;
+    static dma::Buffer bufs[N];
+    Rng rng;
+    u32 got = 0;
+    bool all_ok = true;
+    for (u32 i = 0; i < N; ++i) {
+        u64 bytes = 1 + rng() % (3 * 4096);
+        bufs[i] = dma::alloc(bytes);
+        if (!bufs[i].ok()) { all_ok = false; break; }
+        ++got;
+    }
+    expect(all_ok && got == N, "dma: the table fills to its capacity");
+    dma::Buffer extra = dma::alloc(4096);
+    expect(!extra.ok(), "dma: allocation beyond the table is refused");
+
+    bool lookups = true;
+    for (u32 i = 0; i < N; ++i) {
+        const auto& b = bufs[i];
+        u64 off = rng() % b.bytes;
+        u64 len = 1 + rng() % (b.bytes - off);
+        if (dma::phys(static_cast<char*>(b.virt) + off, len) != b.phys + off) lookups = false;
+        if (dma::phys(b.virt) != b.phys) lookups = false;
+        if (dma::phys(static_cast<char*>(b.virt) + b.bytes - 1, 1) != b.phys + b.bytes - 1) lookups = false;
+        if (reinterpret_cast<u64>(b.virt) != hhdm + b.phys) lookups = false;
+    }
+    expect(lookups, "dma: every offset resolves to the right physical address");
+
+    u32 live = N;
+    for (u32 round = 0; round < 3000; ++round) {
+        u32 i = rng() % N;
+        if (bufs[i].ok()) {
+            dma::release(bufs[i]);
+            --live;
+        } else {
+            bufs[i] = dma::alloc(1 + rng() % 8192);
+            if (bufs[i].ok()) ++live;
+        }
+    }
+    bool churn = true;
+    for (u32 i = 0; i < N; ++i) {
+        if (!bufs[i].ok()) continue;
+        if (dma::phys(bufs[i].virt, bufs[i].bytes) != bufs[i].phys) churn = false;
+    }
+    expect(churn, "dma: lookups stay correct through allocate/release churn");
+
+    u64 before = universe::free_bytes();
+    for (u32 i = 0; i < N; ++i) if (bufs[i].ok()) dma::release(bufs[i]);
+    expect(universe::free_bytes() > before, "dma: releasing returns memory to the buddy allocator");
+
+    auto dies = [](auto fn) {
+        pid_t pid = fork();
+        if (pid == 0) { fn(); _exit(0); }
+        int st = 0;
+        waitpid(pid, &st, 0);
+        return WIFSIGNALED(st);
+    };
+    dma::Buffer a = dma::alloc(4096);
+    u64 va = reinterpret_cast<u64>(a.virt);
+    expect(dies([&] { dma::phys(reinterpret_cast<void*>(va + 4096), 1); }), "dma: a pointer just past a buffer is refused");
+    expect(dies([&] { dma::phys(reinterpret_cast<void*>(va + 4000), 200); }), "dma: a range running off a buffer is refused");
+    expect(dies([&] { dma::phys(reinterpret_cast<void*>(va - 1), 1); }), "dma: a pointer just below a buffer is refused");
+    expect(dies([&] { dma::phys(reinterpret_cast<void*>(8), 1); }), "dma: a foreign pointer is refused");
+    expect(dies([&] { dma::Buffer c = a; dma::release(c); dma::Buffer d = a; dma::release(d); }), "dma: releasing a buffer twice is fatal");
+    dma::Buffer b = dma::alloc(8192);
+    expect(dma::phys(a.virt, a.bytes) == a.phys && dma::phys(b.virt, b.bytes) == b.phys, "dma: neighbouring buffers do not shadow each other");
+    dma::release(a);
+    dma::release(b);
+}
+
 namespace percore {
 bool nx_enabled() { return true; }
 bool wc_enabled() { return true; }
 }
 
+static u64 host_read_u64(u64 va) {
+    constellation::Mapping m{};
+    if (!constellation::translate(va, &m)) abort();
+    return *reinterpret_cast<u64*>(g_hhdm_for_probe + m.phys);
+}
+
 int main() {
+    cpu::g_read_u64 = &host_read_u64;
     void* arena = mmap(nullptr, ARENA, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     u64 hhdm = reinterpret_cast<u64>(arena);
+    g_hhdm_for_probe = hhdm;
     universe::MemmapEntry map[] = {
         { 0x0,       0x100000,  2 },
         { 0x100000,  0x700000,  0 },
@@ -140,6 +277,9 @@ int main() {
            "vmm: .text is read-only and executable");
     expect(constellation::map_range(hhdm + 0x300000, 0x300000, 0x1000, constellation::WRITABLE | constellation::NO_EXECUTE),
            "vmm: remap inside a split page");
-    constellation::seal();
+    g_hhdm_for_probe = hhdm;
+    shootdown_tests(hhdm);
+    expect(constellation::smp_selftest(), "vmm: shootdown probe, remap, protect, unmap, space switch");
+    dma_tests(hhdm);
     return g_failures ? 1 : 0;
 }

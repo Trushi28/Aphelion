@@ -6,6 +6,7 @@
 #include <cosmos/percore.hpp>
 #include <cosmos/fpu.hpp>
 #include <cosmos/idt.hpp>
+#include <cosmos/tlb.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/acpi.hpp>
 #include <cosmos/pmm.hpp>
@@ -105,6 +106,7 @@ extern "C" void ap_entry(limine_smp_info* info) {
     fpu::init_core();
     cpu::write_cr3(constellation::core_pml4_phys());
     bring_up_core(false);
+    tlb::init_core();
     orbital::init_core();
 
     u64 n = __atomic_add_fetch(&g_cpus_online, 1, __ATOMIC_SEQ_CST);
@@ -608,7 +610,8 @@ extern "C" NORETURN void kernel_main() {
                         static_cast<int>(apic::id()));
     }
 
-    acpi::init(reinterpret_cast<u64>(rsdp_request.response->address), g_hhdm_offset);
+    tlb::init_core();
+    acpi::init(reinterpret_cast<u64>(rsdp_request.response->address));
     fb::printf(0xC0FFC0, "[ok] ACPI/MADT parsed: %d CPU(s) reported\n",
                static_cast<int>(acpi::info().cpu_count));
 
@@ -946,7 +949,6 @@ extern "C" NORETURN void kernel_main() {
     orbital::init(g_hhdm_offset, core_ids, core_id_count);
     bool guards_ok = orbital::selftest();
     serial::printf("[selftest] stack guards: %s\n", guards_ok ? "ok" : "MISMATCH");
-    constellation::seal();
 
     g_cpus_online = 1;
     if (smp_request.response && smp_request.response->cpu_count > 1) {
@@ -974,9 +976,13 @@ extern "C" NORETURN void kernel_main() {
     }
 
     fpu::report();
+    bool tlb_ok = constellation::smp_selftest() && tlb::online_count() >= g_cpus_online;
+    serial::printf("[tlb] %u core(s) take TLB shootdowns\n", tlb::online_count());
+    serial::printf("[selftest] tlb shootdown: %s\n", tlb_ok ? "ok" : "MISMATCH");
     bool percore_ok = percore::selftest() && percore::cores_seen() >= g_cpus_online;
-    serial::printf("[percore] %u core(s) verified: NX %s, WP on, WC PAT %s\n", percore::cores_seen(),
-                    percore::nx_enabled() ? "on" : "off", percore::wc_enabled() ? "on" : "off");
+    serial::printf("[percore] %u core(s) verified: NX %s, WP on, WC PAT %s, SMEP %s, SMAP %s\n", percore::cores_seen(),
+                    percore::nx_enabled() ? "on" : "off", percore::wc_enabled() ? "on" : "off",
+                    percore::smep_enabled() ? "on" : "off", percore::smap_enabled() ? "on" : "off");
     serial::printf("[selftest] percore: %s\n", percore_ok ? "ok" : "MISMATCH");
 
     bool gdt_ok = gdt::selftest() && gdt::cores_seen() >= g_cpus_online;

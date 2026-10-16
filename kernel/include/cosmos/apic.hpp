@@ -17,7 +17,8 @@ void start_timer_stopwatch(u8 divide_pow2);
 u32  read_timer_current();
 
 void send_init_ipi(u32 target_apic_id);
-void send_startup_ipi(u32 target_apic_id, u8 vector  );
+void send_startup_ipi(u32 target_apic_id, u8 vector);
+void send_ipi(u32 target_apic_id, u8 vector);
 
 u64 xapic_mmio_phys_base();
 

@@ -28,7 +28,7 @@ struct Redirection {
     bool level_triggered;
 };
 
-void init(u64 rsdp_phys, u64 hhdm_offset);
+void init(u64 rsdp_phys);
 const Info& info();
 Redirection resolve_isa_irq(u8 isa_irq);
 

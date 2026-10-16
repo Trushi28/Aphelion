@@ -10,6 +10,8 @@ void early_init();
 
 bool nx_enabled();
 bool wc_enabled();
+bool smep_enabled();
+bool smap_enabled();
 
 u32 cores_seen();
 bool selftest();

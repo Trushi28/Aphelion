@@ -102,6 +102,8 @@ check_common() {
     grep -q '\[selftest\] percore: ok' "$LOG.clean" || fail "per-core NX/WP/PAT self-test did not pass"
     grep -q "\[percore\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported its NX/WP/PAT setup"
     grep -q '\[selftest\] per-core gdt: ok' "$LOG.clean" || fail "per-core GDT/TSS self-test did not pass"
+    grep -q '\[selftest\] tlb shootdown: ok' "$LOG.clean" || fail "TLB shootdown self-test did not pass"
+    grep -q "\[tlb\] $CORES core(s) take TLB shootdowns" "$LOG.clean" || fail "not every core joined the TLB shootdown set"
     grep -q "\[gdt\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported a private GDT and TSS"
     grep -q '\[universe\] reclaimed' "$LOG.clean" || fail "bootloader memory was never reclaimed"
     grep -q 'free lists consistent' "$LOG.clean" || fail "physical allocator free lists were inconsistent after reclaim"

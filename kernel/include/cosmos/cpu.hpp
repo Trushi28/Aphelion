@@ -75,6 +75,10 @@ ALWAYS_INLINE u64 xgetbv(u32 index) {
 ALWAYS_INLINE void xsetbv(u32 index, u64 v) {
     asm volatile("xsetbv" :: "c"(index), "a"(static_cast<u32>(v)), "d"(static_cast<u32>(v >> 32)) : "memory");
 }
+ALWAYS_INLINE u64 read_u64(u64 va) { return *reinterpret_cast<volatile u64*>(va); }
+ALWAYS_INLINE void clflush(const void* p) {
+    asm volatile("clflush (%0)" :: "r"(p) : "memory");
+}
 ALWAYS_INLINE void invlpg(u64 addr) {
     asm volatile("invlpg (%0)" :: "r"(addr) : "memory");
 }

@@ -5,8 +5,12 @@
 namespace cpu {
 
 inline void invlpg(u64) {}
-inline void write_cr3(u64) {}
-inline u64 read_cr3() { return 0; }
+inline u64 (*g_read_u64)(u64) = nullptr;
+inline u64 read_u64(u64 va) { return g_read_u64(va); }
+inline void clflush(const void*) {}
+inline u64 g_cr3 = 0;
+inline void write_cr3(u64 v) { g_cr3 = v; }
+inline u64 read_cr3() { return g_cr3; }
 inline u64 irq_save() { return 0; }
 inline void irq_restore(u64) {}
 [[noreturn]] inline void hang() { abort(); }

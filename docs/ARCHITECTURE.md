@@ -35,11 +35,34 @@ flowchart LR
 ### Memory
 
 **Physical (`Universe`).** Real buddy split and coalesce, spinlock-protected so every core
-can allocate concurrently.
+can allocate concurrently. DMA buffers are tracked in a table sorted by address, so turning a pointer back into a
+physical address is a binary search and a foreign pointer is refused.
 
 **Virtual (`Constellation`).** The Core is built fresh instead of continuing on Limine's
 tables (`mm/vmm.cpp`): reusing bootloader-reclaimable memory before replacing the tables that
 point into it is a real use-after-free.
+
+**Everything after boot is SMP-safe.** One lock covers all page-table edits. Changing or removing an existing
+mapping (`map_*` over a present entry, `unmap`, `protect`, replacing a page table) ends in a TLB shootdown
+(`arch/x86_64/tlb.cpp`): the editing core publishes the range, sends a fixed IPI (vector `0x30`) to every other
+core that can hold the translation, and waits for each to acknowledge before it frees anything. Adding a mapping
+where there was none needs no shootdown. Cores that spin on either lock keep servicing pending shootdowns, so two
+cores can never wait on each other with interrupts off. A core joins the set once its IDT and APIC are up
+(`tlb::init_core()`), and the boot self-test proves the protocol: every core reads a page, the page is remapped,
+protected and unmapped, and every core must see the change at once.
+
+**Address spaces.** `constellation::Space` is one PML4. All 256 kernel-half slots are populated at boot and copied
+into every new space, so a later kernel mapping is visible in all of them without touching any space. User spaces
+(`create_space`, `space_map`, `space_unmap`, `space_protect`, `activate`, `destroy_space`) only accept addresses
+below `USER_LIMIT`, set the U/S bit at every level, and refuse writable+executable mappings. A user-space change
+only shoots down the cores that currently have that space loaded. Nothing runs in ring 3 yet; this is the groundwork.
+
+**Firmware tables.** The direct map no longer aliases reserved memory above 4 GiB. `map_firmware()` hands out a
+pointer for any physical range: the direct-map address when it is already covered, otherwise an uncached,
+read-only, non-executable window at `FIRMWARE_REGION_BASE`. ACPI parsing goes through it.
+
+**Per-core protections.** Besides NX, WP and PAT, each core turns on SMEP and SMAP when the CPU has them. SMAP is
+safe today because the kernel never touches user addresses; the copy-from-user path will need `stac`/`clac`.
 
 ### Scheduler (Orbital)
 

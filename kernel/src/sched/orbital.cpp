@@ -273,6 +273,10 @@ bool selftest() {
 void init_core() {
     idt::set_handler(idt::VEC_APIC_TIMER, &timer_tick_handler);
     u32 me = apic::id();
+    if (me >= MAX_CORES) {
+        serial::printf("[orbital] FATAL: local APIC id %u is beyond the %u cores the scheduler tracks\n", me, MAX_CORES);
+        cpu::hang();
+    }
     build_satellite(&g_idle[me], "idle", &idle_entry, nullptr, NUM_RINGS - 1, &satellite_trampoline);
     apic::start_timer_periodic(idt::VEC_APIC_TIMER, g_ticks_per_period, 4);
 }

@@ -5,7 +5,7 @@
 #include <cosmos/cpu.hpp>
 #include <cosmos/vmm.hpp>
 
-extern "C" u64 isr_stub_table[41];
+extern "C" u64 isr_stub_table[42];
 
 namespace idt {
 
@@ -100,6 +100,7 @@ void init() {
     for (int v = 32; v < 40; ++v)
         set_gate(static_cast<u8>(v), isr_stub_table[v], gdt::KCODE_SEL, 0, TYPE_INTR64);
     set_gate(0xFF, isr_stub_table[40], gdt::KCODE_SEL, 0, TYPE_INTR64);
+    set_gate(VEC_TLB_SHOOTDOWN, isr_stub_table[41], gdt::KCODE_SEL, 0, TYPE_INTR64);
 
     load_idtr();
 }
