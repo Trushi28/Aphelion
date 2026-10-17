@@ -56,6 +56,8 @@ static void default_panic(Frame* f) {
                     f->rip, f->cs, f->rflags, f->rsp, cr2);
     if (constellation::in_stack_guard(cr2) || constellation::in_stack_guard(f->rsp))
         serial::writeln("    the faulting address is in a kernel stack guard page: kernel stack overflow");
+    if (gdt::in_ist_guard(cr2) || gdt::in_ist_guard(f->rsp))
+        serial::writeln("    the faulting address is in an IST stack guard page: fault-handler stack overflow");
     if (fb::ready()) {
         fb::printf(0xFF4040, "\n!!! KERNEL PANIC: %s (vec %d)\n",
                     exception_name(f->vector), static_cast<int>(f->vector));

@@ -78,11 +78,29 @@ Finished Satellites (entry returns, or `exit_current()`) go on a global zombie l
 reaped by whichever Sun idles next, so a Sun pinned by a CPU-bound Satellite doesn't block
 reaping.
 
+**Every Satellite owns its CPU state.** Each carries a private x87/SSE/AVX save area (XSAVE when the CPU has it,
+FXSAVE otherwise), saved and restored eagerly on every context switch, so one Satellite's registers can never reach
+another's and there is no lazy-FPU window to attack. A new Satellite starts from the architectural reset state
+(control word `0x37F`, MXCSR `0x1F80`). The same switch point points the core's TSS `rsp0` at the incoming
+Satellite's kernel stack and loads its address space when it differs from the outgoing one, so a Satellite can later
+enter ring 3 and trap back onto its own kernel stack. The kernel itself is still built without SSE (an interrupt
+handler would otherwise clobber the interrupted Satellite's registers), which is why `-mgeneral-regs-only` stays.
+
+**Sleeping and waiting.** `sleep_ms()` parks a Satellite until the tick clock reaches its deadline. `WaitQueue`
+parks Satellites until a predicate holds and wakes one or all. The queue's lock is released only after the parked
+Satellite's context is saved, so a waker on another core can never run it while it is still on the old core.
+Woken Satellites go straight to the top ring.
+
+**No starvation.** Every 50 ticks each core moves everything in its lower rings back to the top ring, so a
+CPU-bound Satellite that was demoted cannot be starved forever by a stream of short ones.
+
 **Stacks are guarded.** Every pool Satellite and every Sun's idle Satellite owns a fixed
 64 KiB slot in a dedicated virtual region: an unmapped guard page, 32 KiB of stack, then
 unmapped space. The slots are mapped once, before the secondary cores start, and are reused
 rather than freed, so no TLB shootdown is ever needed. An overflow faults into the guard
-page and ends in a double fault on the IST stack, whose panic message names the overflow.
+page and ends in a double fault on the IST stack, whose panic message names the overflow. The double-fault and NMI
+stacks have guard pages of their own, so overflowing one of those resets the machine instead of silently corrupting
+the neighbouring core's stack.
 
 ### Storage: one HAL, three drivers
 
@@ -112,7 +130,8 @@ polling if no interrupt arrives.
 `orbital::Mutex` is recursive and owned by the Satellite. A contended waiter calls `yield_contended()`, which
 puts it in the lowest ring: plain `yield()` promotes a Satellite, so waiters used to climb above the lock holder
 and starve it (see [Engineering notes](ENGINEERING.md), item 20). Stellar has one mutex and each block driver has
-its own around every request, always acquired in that order. There is no sleeping lock or wait queue yet.
+its own around every request, always acquired in that order. `Mutex` still yields rather than sleeps; `WaitQueue`
+exists for new code, such as blocking on keyboard input.
 
 ### Clock
 

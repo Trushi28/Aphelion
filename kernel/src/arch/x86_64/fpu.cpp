@@ -3,6 +3,10 @@
 #include <cosmos/serial.hpp>
 
 extern "C" u64 fpu_probe(u64 test_avx);
+extern "C" void fpu_load_regs(const void* buf, u64 avx);
+extern "C" void fpu_store_regs(void* buf, u64 avx);
+extern "C" void fpu_set_modes(u64 control_word, u64 mxcsr);
+extern "C" void fpu_get_modes(u16* control_word, u32* mxcsr);
 
 namespace fpu {
 
@@ -32,6 +36,10 @@ struct Seen {
 };
 
 static Seen g_seen[MAX_CORES];
+static u32 g_state_bytes = 0;
+static bool g_xsave = false;
+static bool g_avx_state = false;
+static u64 g_xcr0 = 0;
 static volatile u32 g_next_slot = 0;
 static volatile u64 g_done_mask = 0;
 
@@ -78,12 +86,68 @@ void init_core() {
         }
 
         bool avx_on = (s.xcr0 & (XCR0_SSE | XCR0_AVX)) == (XCR0_SSE | XCR0_AVX);
+        if (slot == 0) {
+            g_xsave = xsave && s.xcr0 != 0;
+            g_avx_state = avx_on;
+            g_xcr0 = s.xcr0;
+            u32 bytes = 512;
+            if (g_xsave) {
+                cpu::cpuid(0xD, 0, &a, &b, &c, &d);
+                bytes = b;
+            }
+            g_state_bytes = bytes <= STATE_MAX_BYTES ? bytes : 0;
+        }
         u64 flags = cpu::irq_save();
         s.probe = fpu_probe(avx_on ? 1 : 0);
         cpu::irq_restore(flags);
     }
     __atomic_or_fetch(&g_done_mask, 1ull << slot, __ATOMIC_SEQ_CST);
 }
+
+bool usable() { return ENABLED && g_state_bytes != 0; }
+bool avx_state() { return g_avx_state; }
+u32 state_bytes() { return g_state_bytes; }
+
+void init_state(void* area) {
+    auto* p = static_cast<u8*>(area);
+    for (u32 i = 0; i < STATE_MAX_BYTES; ++i) p[i] = 0;
+    if (!usable()) return;
+    Modes m = default_modes();
+    *reinterpret_cast<u16*>(p) = m.control_word;
+    *reinterpret_cast<u32*>(p + 24) = m.mxcsr;
+}
+
+void save(void* area) {
+    if (g_state_bytes == 0) return;
+    if (g_xsave) {
+        asm volatile("xsave64 (%0)" :: "r"(area), "a"(static_cast<u32>(g_xcr0)), "d"(static_cast<u32>(g_xcr0 >> 32)) : "memory");
+    } else {
+        asm volatile("fxsave64 (%0)" :: "r"(area) : "memory");
+    }
+}
+
+void restore(const void* area) {
+    if (g_state_bytes == 0) return;
+    if (g_xsave) {
+        asm volatile("xrstor64 (%0)" :: "r"(area), "a"(static_cast<u32>(g_xcr0)), "d"(static_cast<u32>(g_xcr0 >> 32)) : "memory");
+    } else {
+        asm volatile("fxrstor64 (%0)" :: "r"(area) : "memory");
+    }
+}
+
+Modes default_modes() { return { 0x037F, 0x1F80 }; }
+
+void set_modes(const Modes& m) { fpu_set_modes(m.control_word, m.mxcsr); }
+
+Modes get_modes() {
+    Modes m{};
+    fpu_get_modes(&m.control_word, &m.mxcsr);
+    return m;
+}
+
+u32 register_bytes() { return g_avx_state ? 16 * 32 : 16 * 16; }
+void load_registers(const void* buf) { fpu_load_regs(buf, g_avx_state ? 1 : 0); }
+void store_registers(void* buf) { fpu_store_regs(buf, g_avx_state ? 1 : 0); }
 
 u32 cores_seen() {
     u64 m = __atomic_load_n(&g_done_mask, __ATOMIC_SEQ_CST);

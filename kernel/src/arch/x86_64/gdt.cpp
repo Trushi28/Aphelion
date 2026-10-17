@@ -1,5 +1,6 @@
 #include <cosmos/gdt.hpp>
 #include <cosmos/cpu.hpp>
+#include <cosmos/vmm.hpp>
 
 namespace gdt {
 
@@ -20,8 +21,8 @@ struct alignas(16) CoreState {
 struct Seen { u64 gdt_base, tss_base, ist1, ist2; };
 
 alignas(16) static CoreState g_core[MAX_CORES];
-alignas(16) static u8 g_df_stack[MAX_CORES][IST_STACK_BYTES];
-alignas(16) static u8 g_nmi_stack[MAX_CORES][IST_STACK_BYTES];
+alignas(4096) static u8 g_df_stack[MAX_CORES][IST_STRIDE];
+alignas(4096) static u8 g_nmi_stack[MAX_CORES][IST_STRIDE];
 static Seen g_seen[MAX_CORES];
 static volatile u64 g_seen_mask = 0;
 
@@ -39,8 +40,10 @@ static void set_entry(Entry& e, u32 base, u32 limit, u8 access, u8 gran) {
     e.base_high   = (base >> 24) & 0xFF;
 }
 
-static u64 df_top(u32 core) { return reinterpret_cast<u64>(&g_df_stack[core][IST_STACK_BYTES]); }
-static u64 nmi_top(u32 core) { return reinterpret_cast<u64>(&g_nmi_stack[core][IST_STACK_BYTES]); }
+static u64 df_top(u32 core) { return reinterpret_cast<u64>(&g_df_stack[core][IST_STRIDE]); }
+static u64 nmi_top(u32 core) { return reinterpret_cast<u64>(&g_nmi_stack[core][IST_STRIDE]); }
+static u64 df_guard(u32 core) { return reinterpret_cast<u64>(&g_df_stack[core][0]); }
+static u64 nmi_guard(u32 core) { return reinterpret_cast<u64>(&g_nmi_stack[core][0]); }
 
 static void record_loaded_state(u32 core) {
     Descriptor loaded{};
@@ -117,6 +120,46 @@ bool selftest() {
         }
     }
     return true;
+}
+
+static Tss* current_tss() {
+    Descriptor loaded{};
+    asm volatile("sgdt %0" : "=m"(loaded));
+    const auto* e = reinterpret_cast<const TssEntry*>(loaded.base + TSS_SEL);
+    u64 base = static_cast<u64>(e->base_low) | (static_cast<u64>(e->base_mid) << 16) |
+               (static_cast<u64>(e->base_high) << 24) | (static_cast<u64>(e->base_upper) << 32);
+    return reinterpret_cast<Tss*>(base);
+}
+
+void set_kernel_stack(u64 top) { current_tss()->rsp0 = top; }
+u64 kernel_stack() { return current_tss()->rsp0; }
+
+bool guard_ist_stacks() {
+    bool ok = true;
+    for (u32 c = 0; c < MAX_CORES; ++c) {
+        ok = ok && constellation::unmap(df_guard(c), IST_GUARD_BYTES);
+        ok = ok && constellation::unmap(nmi_guard(c), IST_GUARD_BYTES);
+    }
+    return ok;
+}
+
+bool ist_guards_ok() {
+    constellation::Mapping m{};
+    for (u32 c = 0; c < MAX_CORES; ++c) {
+        if (constellation::translate(df_guard(c), &m) || constellation::translate(nmi_guard(c), &m)) return false;
+        if (!constellation::translate(df_top(c) - 8, &m) || !(m.flags & constellation::WRITABLE)) return false;
+        if (!constellation::translate(nmi_top(c) - 8, &m) || !(m.flags & constellation::WRITABLE)) return false;
+        if (!constellation::translate(df_guard(c) + IST_GUARD_BYTES, &m)) return false;
+    }
+    return true;
+}
+
+bool in_ist_guard(u64 addr) {
+    for (u32 c = 0; c < MAX_CORES; ++c) {
+        if (addr >= df_guard(c) && addr < df_guard(c) + IST_GUARD_BYTES) return true;
+        if (addr >= nmi_guard(c) && addr < nmi_guard(c) + IST_GUARD_BYTES) return true;
+    }
+    return false;
 }
 
 }

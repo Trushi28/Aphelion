@@ -596,6 +596,8 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] The Core constellation is live (own page tables, CR3 switched)\n");
 
     map_device_page_or_die(early_apic_phys, "local APIC");
+    bool ist_ok = gdt::guard_ist_stacks() && gdt::ist_guards_ok();
+    serial::printf("[selftest] ist guards: %s\n", ist_ok ? "ok" : "MISMATCH");
     bool vmm_ok = constellation::selftest();
     serial::printf("[selftest] vmm: %s\n", vmm_ok ? "ok" : "MISMATCH");
 
@@ -1020,5 +1022,6 @@ extern "C" NORETURN void kernel_main() {
                WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");
     orbital::spawn("reclaim", &reclaim_task, nullptr);
+    orbital::spawn_selftest();
     orbital::start_core();
 }

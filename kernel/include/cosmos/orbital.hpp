@@ -1,6 +1,10 @@
 #pragma once
 #include <cosmos/types.hpp>
 #include <cosmos/idt.hpp>
+#include <cosmos/fpu.hpp>
+#include <cosmos/cpu.hpp>
+
+namespace constellation { struct Space; }
 
 namespace orbital {
 
@@ -8,8 +12,17 @@ constexpr int NUM_RINGS = 4;
 
 using EntryFn = void (*)(void* arg);
 
+enum class State : u32 { Ready, Running, Sleeping, Blocked };
+
 struct Satellite {
+    alignas(64) u8 fpu[fpu::STATE_MAX_BYTES];
     u64 rsp = 0;
+    u64 kstack_top = 0;
+    constellation::Space* space = nullptr;
+    State state = State::Ready;
+    u64 wake_at = 0;
+    u64 switches = 0;
+    Satellite* wait_next = nullptr;
     u8* stack_base = nullptr;
     u64 stack_size = 0;
     int ring = 0;
@@ -29,6 +42,27 @@ bool selftest();
 void init_core();
 
 Satellite* spawn(const char* name, EntryFn entry, void* arg);
+Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space);
+
+Satellite* current();
+int current_ring();
+u64 boosts();
+void sleep_ms(u32 ms);
+
+class WaitQueue {
+public:
+    void wait_until(bool (*ready)(void*), void* arg);
+    u32 wake_one();
+    u32 wake_all();
+    u32 waiters();
+
+private:
+    cpu::Spinlock lock_;
+    Satellite* head_ = nullptr;
+    Satellite* tail_ = nullptr;
+};
+
+void spawn_selftest();
 
 void yield();
 void yield_contended();

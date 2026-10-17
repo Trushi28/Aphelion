@@ -44,8 +44,15 @@ constexpr int IST_NMI          = 2;
 
 constexpr u32 MAX_CORES = 64;
 constexpr u64 IST_STACK_BYTES = 4096;
+constexpr u64 IST_GUARD_BYTES = 4096;
+constexpr u64 IST_STRIDE = IST_GUARD_BYTES + IST_STACK_BYTES;
 
 void init(u32 core_index);
+void set_kernel_stack(u64 top);
+u64 kernel_stack();
+bool guard_ist_stacks();
+bool ist_guards_ok();
+bool in_ist_guard(u64 addr);
 u32 cores_seen();
 bool selftest();
 

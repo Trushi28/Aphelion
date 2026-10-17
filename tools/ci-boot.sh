@@ -41,6 +41,8 @@ finished() {
     grep -q -e '\[selftest\] smp-fs:' "$LOG" || return 1
     grep -q -e '\[selftest\] smp-blockdev:' "$LOG" || return 1
     grep -q -e '\[selftest\] clock ticks:' "$LOG" || return 1
+    grep -q -e '\[selftest\] sched:' "$LOG" || return 1
+    grep -q -e '\[selftest\] sched:' "$LOG" || return 1
     if [ "$CORES" -gt 1 ]; then
         grep -q -e 'stealing confirmed' -e 'no migration observed' "$LOG"
     else
@@ -102,6 +104,20 @@ check_common() {
     grep -q '\[selftest\] percore: ok' "$LOG.clean" || fail "per-core NX/WP/PAT self-test did not pass"
     grep -q "\[percore\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported its NX/WP/PAT setup"
     grep -q '\[selftest\] per-core gdt: ok' "$LOG.clean" || fail "per-core GDT/TSS self-test did not pass"
+    grep -q '\[selftest\] sched: ok' "$LOG.clean" || fail "scheduler self-test (sleep, wait queues, boost) did not pass"
+    grep -q '\[selftest\] tss rsp0: ok' "$LOG.clean" || fail "per-core TSS kernel stack did not follow the running Satellite"
+    grep -q '\[selftest\] address space switch: ok' "$LOG.clean" || fail "address space was not switched with the Satellite"
+    grep -q '\[selftest\] ist guards: ok' "$LOG.clean" || fail "IST stack guard pages were not set up"
+    if grep -q '\[fpu\] [0-9]* core' "$LOG.clean"; then
+        grep -q '\[selftest\] fpu state isolation: ok' "$LOG.clean" || fail "per-Satellite FPU state was not isolated"
+    fi
+    grep -q '\[selftest\] ist guards: ok' "$LOG.clean" || fail "IST stack guard self-test did not pass"
+    grep -q '\[selftest\] sched: ok' "$LOG.clean" || fail "scheduler self-test did not pass"
+    grep -q '\[selftest\] tss rsp0: ok' "$LOG.clean" || fail "per-core TSS rsp0 self-test did not pass"
+    grep -q '\[selftest\] address space switch: ok' "$LOG.clean" || fail "address space switch self-test did not pass"
+    if grep -q '\[fpu\] [0-9]* core' "$LOG.clean"; then
+        grep -q '\[selftest\] fpu state isolation: ok' "$LOG.clean" || fail "per-Satellite FPU state isolation self-test did not pass"
+    fi
     grep -q '\[selftest\] tlb shootdown: ok' "$LOG.clean" || fail "TLB shootdown self-test did not pass"
     grep -q "\[tlb\] $CORES core(s) take TLB shootdowns" "$LOG.clean" || fail "not every core joined the TLB shootdown set"
     grep -q "\[gdt\] $CORES core(s) verified" "$LOG.clean" || fail "not every core reported a private GDT and TSS"

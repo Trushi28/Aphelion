@@ -6,12 +6,14 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/clock.hpp>
 #include <cosmos/vmm.hpp>
+#include <cosmos/gdt.hpp>
+#include <cosmos/fpu.hpp>
 
 extern "C" void switch_context(u64* old_rsp_out, u64 new_rsp);
 
 namespace orbital {
 
-constexpr int MAX_SATELLITES = 32;
+constexpr int MAX_SATELLITES = 64;
 constexpr int STACK_ORDER = 3;
 constexpr u32 MAX_CORES = 256;
 constexpr u32 IDLE_SLOT_BASE = MAX_SATELLITES;
@@ -36,17 +38,39 @@ static cpu::Spinlock g_zombie_lock;
 static cpu::Spinlock g_pool_lock;
 
 static Satellite* g_dying[MAX_CORES] = {};
+static cpu::Spinlock* g_release_after[MAX_CORES] = {};
 static volatile u32 g_cores_on_kstack = 0;
+
+constexpr u32 BOOST_TICKS = 50;
+static u32 g_boost_clock[MAX_CORES] = {};
+static volatile u64 g_boosts = 0;
+
+static Satellite* g_sleepers = nullptr;
+static cpu::Spinlock g_sleep_lock;
+static volatile u64 g_next_wake = ~0ull;
+
+enum class Leave { Requeue, Die, Park };
 
 static void retire_dying() {
     u32 me = apic::id();
     Satellite* d = g_dying[me];
-    if (!d) return;
-    g_dying[me] = nullptr;
-    g_zombie_lock.lock();
-    d->next = g_zombies;
-    g_zombies = d;
-    g_zombie_lock.unlock();
+    if (d) {
+        g_dying[me] = nullptr;
+        g_zombie_lock.lock();
+        d->next = g_zombies;
+        g_zombies = d;
+        g_zombie_lock.unlock();
+    }
+    cpu::Spinlock* hold = g_release_after[me];
+    if (hold) {
+        g_release_after[me] = nullptr;
+        hold->unlock();
+    }
+}
+
+static void finish_switch() {
+    g_lock[apic::id()].unlock();
+    retire_dying();
 }
 
 static u32 ticks_for_ring(int ring) {
@@ -76,6 +100,18 @@ static bool any_ready(u32 core) {
     for (int r = 0; r < NUM_RINGS; ++r) if (g_ring_head[core][r]) return true;
     return false;
 }
+static void boost_locked(u32 core) {
+    for (int r = 1; r < NUM_RINGS; ++r) {
+        Satellite* head = g_ring_head[core][r];
+        if (!head) continue;
+        for (Satellite* it = head; it; it = it->next) it->ring = 0;
+        if (!g_ring_head[core][0]) g_ring_head[core][0] = head;
+        else g_ring_tail[core][0]->next = head;
+        g_ring_tail[core][0] = g_ring_tail[core][r];
+        g_ring_head[core][r] = g_ring_tail[core][r] = nullptr;
+    }
+}
+
 static bool any_stealable() {
     for (u32 c = 0; c < MAX_CORES; ++c) if (any_ready(c)) return true;
     return false;
@@ -125,6 +161,13 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     }
     s->stack_base = stack_virt;
     s->stack_size = universe::PAGE_SIZE << STACK_ORDER;
+    s->kstack_top = reinterpret_cast<u64>(stack_virt) + s->stack_size;
+    s->space = nullptr;
+    s->state = State::Ready;
+    s->wake_at = 0;
+    s->switches = 0;
+    s->wait_next = nullptr;
+    fpu::init_state(s->fpu);
     s->name = name;
     s->entry = entry;
     s->arg = arg;
@@ -146,9 +189,7 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
 }
 
 extern "C" void satellite_trampoline() {
-
-    g_lock[apic::id()].unlock();
-    retire_dying();
+    finish_switch();
     Satellite* self = g_current[apic::id()];
     cpu::sti();
     self->entry(self->arg);
@@ -185,26 +226,59 @@ static void idle_entry(void*) {
     }
 }
 
-static void reschedule_locked(u32 me, Satellite* old_to_enqueue) {
+static void arrive(Satellite* old, Satellite* next) {
+    if (fpu::usable()) {
+        fpu::save(old->fpu);
+        fpu::restore(next->fpu);
+    }
+    gdt::set_kernel_stack(next->kstack_top);
+    if (next->space != old->space) constellation::activate(next->space);
+    ++old->switches;
+    old->state = old->state == State::Running ? State::Ready : old->state;
+    next->state = State::Running;
+}
+
+static void reschedule_locked(u32 me, Leave how) {
+    Satellite* old = g_current[me];
+    Satellite* requeue = (how == Leave::Requeue && old != &g_idle[me]) ? old : nullptr;
+
     Satellite* next = dequeue_highest_locked(me);
     if (!next) {
         g_lock[me].unlock();
         next = try_steal(me);
         g_lock[me].lock();
     }
-    if (!next) next = old_to_enqueue ? old_to_enqueue : &g_idle[me];
+    if (!next) next = requeue ? requeue : &g_idle[me];
 
-    if (old_to_enqueue && next != old_to_enqueue) enqueue_locked(me, old_to_enqueue);
+    if (requeue && next != requeue) enqueue_locked(me, requeue);
 
     next->ticks_left = ticks_for_ring(next->ring);
 
-    Satellite* old = g_current[me];
     if (next == old) { g_lock[me].unlock(); return; }
-    if (!old_to_enqueue && old != &g_idle[me]) g_dying[me] = old;
+    if (how == Leave::Die && old != &g_idle[me]) g_dying[me] = old;
     g_current[me] = next;
+    arrive(old, next);
     switch_context(&old->rsp, next->rsp);
-    g_lock[apic::id()].unlock();
-    retire_dying();
+    finish_switch();
+}
+
+static void make_ready(Satellite* s) {
+    u64 f = cpu::irq_save();
+    u32 me = apic::id();
+    s->state = State::Ready;
+    s->ring = 0;
+    s->ticks_left = ticks_for_ring(0);
+    g_lock[me].lock();
+    enqueue_locked(me, s);
+    g_lock[me].unlock();
+    cpu::irq_restore(f);
+}
+
+static void park_current(cpu::Spinlock* hold) {
+    u32 me = apic::id();
+    g_lock[me].lock();
+    g_release_after[me] = hold;
+    reschedule_locked(me, Leave::Park);
 }
 
 NORETURN void exit_current() {
@@ -217,8 +291,29 @@ NORETURN void exit_current() {
     }
 
     g_lock[me].lock();
-    reschedule_locked(me, nullptr);
+    reschedule_locked(me, Leave::Die);
     cpu::hang();
+}
+
+static void wake_due_sleepers() {
+    if (__atomic_load_n(&g_next_wake, __ATOMIC_ACQUIRE) > clock::uptime_ms()) return;
+    Satellite* due = nullptr;
+    g_sleep_lock.lock();
+    u64 now = clock::uptime_ms();
+    while (g_sleepers && g_sleepers->wake_at <= now) {
+        Satellite* s = g_sleepers;
+        g_sleepers = s->wait_next;
+        s->wait_next = due;
+        due = s;
+    }
+    __atomic_store_n(&g_next_wake, g_sleepers ? g_sleepers->wake_at : ~0ull, __ATOMIC_RELEASE);
+    g_sleep_lock.unlock();
+    while (due) {
+        Satellite* next_due = due->wait_next;
+        due->wait_next = nullptr;
+        make_ready(due);
+        due = next_due;
+    }
 }
 
 static void timer_tick_handler(idt::Frame*) {
@@ -228,12 +323,23 @@ static void timer_tick_handler(idt::Frame*) {
     Satellite* cur = g_current[me];
     if (!cur) return;
 
+    wake_due_sleepers();
+
+    if (++g_boost_clock[me] >= BOOST_TICKS) {
+        g_boost_clock[me] = 0;
+        g_lock[me].lock();
+        boost_locked(me);
+        g_lock[me].unlock();
+        if (cur != &g_idle[me]) cur->ring = 0;
+        __atomic_add_fetch(&g_boosts, 1, __ATOMIC_RELAXED);
+    }
+
     if (cur == &g_idle[me]) {
-        if (any_ready(me) || any_stealable()) { g_lock[me].lock(); reschedule_locked(me, nullptr); }
+        if (any_ready(me) || any_stealable()) { g_lock[me].lock(); reschedule_locked(me, Leave::Requeue); }
     } else if (cur->ticks_left > 0 && --cur->ticks_left == 0) {
         if (cur->ring < NUM_RINGS - 1) ++cur->ring;
         g_lock[me].lock();
-        reschedule_locked(me, cur);
+        reschedule_locked(me, Leave::Requeue);
     }
 }
 
@@ -282,6 +388,10 @@ void init_core() {
 }
 
 Satellite* spawn(const char* name, EntryFn entry, void* arg) {
+    return spawn_in(name, entry, arg, nullptr);
+}
+
+Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space) {
     g_pool_lock.lock();
     Satellite* s = nullptr;
     for (auto& cand : g_pool) if (!cand.in_use) { s = &cand; break; }
@@ -289,9 +399,17 @@ Satellite* spawn(const char* name, EntryFn entry, void* arg) {
     s->in_use = true;
     g_pool_lock.unlock();
 
-    build_satellite(s, name, entry, arg, 0, &satellite_trampoline);
+    if (!build_satellite(s, name, entry, arg, 0, &satellite_trampoline)) {
+        g_pool_lock.lock();
+        s->in_use = false;
+        g_pool_lock.unlock();
+        return nullptr;
+    }
+    s->space = space;
+    u64 f = cpu::irq_save();
     u32 me = apic::id();
     g_lock[me].lock(); enqueue_locked(me, s); g_lock[me].unlock();
+    cpu::irq_restore(f);
     return s;
 }
 
@@ -306,7 +424,7 @@ void yield() {
     }
     if (cur->ring > 0) --cur->ring;
     g_lock[me].lock();
-    reschedule_locked(me, cur);
+    reschedule_locked(me, Leave::Requeue);
     cpu::sti();
 }
 
@@ -320,7 +438,7 @@ void yield_contended() {
     }
     cur->ring = NUM_RINGS - 1;
     g_lock[me].lock();
-    reschedule_locked(me, cur);
+    reschedule_locked(me, Leave::Requeue);
     cpu::sti();
 }
 
@@ -333,9 +451,114 @@ u64 self_token() {
 
 u32 cores_on_kernel_stacks() { return g_cores_on_kstack; }
 
+Satellite* current() {
+    u64 f = cpu::irq_save();
+    Satellite* cur = g_current[apic::id()];
+    cpu::irq_restore(f);
+    return cur;
+}
+
+int current_ring() {
+    Satellite* cur = current();
+    return cur ? cur->ring : -1;
+}
+
+u64 boosts() { return __atomic_load_n(&g_boosts, __ATOMIC_RELAXED); }
+
+void sleep_ms(u32 ms) {
+    u64 f = cpu::irq_save();
+    Satellite* cur = g_current[apic::id()];
+    if (!cur || cur == &g_idle[apic::id()] || ms == 0) {
+        cpu::irq_restore(f);
+        if (ms == 0) yield();
+        return;
+    }
+    g_sleep_lock.lock();
+    cur->wake_at = clock::uptime_ms() + ms + clock::TICK_MS;
+    cur->state = State::Sleeping;
+    Satellite** link = &g_sleepers;
+    while (*link && (*link)->wake_at <= cur->wake_at) link = &(*link)->wait_next;
+    cur->wait_next = *link;
+    *link = cur;
+    __atomic_store_n(&g_next_wake, g_sleepers->wake_at, __ATOMIC_RELEASE);
+    park_current(&g_sleep_lock);
+    cpu::irq_restore(f);
+}
+
+void WaitQueue::wait_until(bool (*ready)(void*), void* arg) {
+    for (;;) {
+        u64 f = cpu::irq_save();
+        lock_.lock();
+        if (ready(arg)) {
+            lock_.unlock();
+            cpu::irq_restore(f);
+            return;
+        }
+        Satellite* cur = g_current[apic::id()];
+        if (!cur || cur == &g_idle[apic::id()]) {
+            lock_.unlock();
+            cpu::irq_restore(f);
+            asm volatile("pause" ::: "memory");
+            continue;
+        }
+        cur->state = State::Blocked;
+        cur->wait_next = nullptr;
+        if (tail_) tail_->wait_next = cur; else head_ = cur;
+        tail_ = cur;
+        park_current(&lock_);
+        cpu::irq_restore(f);
+    }
+}
+
+u32 WaitQueue::wake_one() {
+    u64 f = cpu::irq_save();
+    lock_.lock();
+    Satellite* s = head_;
+    if (s) {
+        head_ = s->wait_next;
+        if (!head_) tail_ = nullptr;
+        s->wait_next = nullptr;
+    }
+    lock_.unlock();
+    cpu::irq_restore(f);
+    if (s) make_ready(s);
+    return s ? 1 : 0;
+}
+
+u32 WaitQueue::wake_all() {
+    u64 f = cpu::irq_save();
+    lock_.lock();
+    Satellite* list = head_;
+    head_ = tail_ = nullptr;
+    lock_.unlock();
+    cpu::irq_restore(f);
+    u32 n = 0;
+    while (list) {
+        Satellite* next = list->wait_next;
+        list->wait_next = nullptr;
+        make_ready(list);
+        list = next;
+        ++n;
+    }
+    return n;
+}
+
+u32 WaitQueue::waiters() {
+    u64 f = cpu::irq_save();
+    lock_.lock();
+    u32 n = 0;
+    for (Satellite* it = head_; it; it = it->wait_next) ++n;
+    lock_.unlock();
+    cpu::irq_restore(f);
+    return n;
+}
+
 NORETURN void start_core() {
     u32 me = apic::id();
     g_current[me] = &g_idle[me];
+    g_idle[me].state = State::Running;
+    if (fpu::usable()) fpu::restore(g_idle[me].fpu);
+    gdt::set_kernel_stack(g_idle[me].kstack_top);
     u64 scratch_rsp;
     switch_context(&scratch_rsp, g_idle[me].rsp);
     cpu::hang();
