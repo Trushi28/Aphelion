@@ -97,6 +97,8 @@ check_common() {
     grep -q '\[selftest\] smp-blockdev: ok' "$LOG.clean" || fail "concurrent block-device stress did not pass"
     grep -q '\[selftest\] pmm: ok' "$LOG.clean" || fail "physical allocator self-test did not pass"
     grep -q '\[selftest\] kheap: ok' "$LOG.clean" || fail "kernel heap self-test did not pass"
+    grep -q '\[selftest\] timer: ok' "$LOG.clean" || fail "timer calibration self-test did not pass"
+    grep -q '\[bootcfg\] mode=test storage=auto timer=auto$' "$LOG.clean" || fail "boot configuration was not parsed as expected"
     grep -q '\[smp-mm\] FAIL' "$LOG.clean" && fail "concurrent allocator stress reported a failure"
     grep -q '\[selftest\] smp-mm: ok' "$LOG.clean" || fail "concurrent allocator stress did not pass"
     grep -q '\[selftest\] vmm: ok' "$LOG.clean" || fail "virtual memory self-test did not pass"
@@ -110,6 +112,14 @@ check_common() {
     grep -q '\[selftest\] per-core gdt: ok' "$LOG.clean" || fail "per-core GDT/TSS self-test did not pass"
     grep -q '\[selftest\] sched: ok' "$LOG.clean" || fail "scheduler self-test (sleep, wait queues, boost) did not pass"
     grep -q '\[selftest\] tss rsp0: ok' "$LOG.clean" || fail "per-core TSS kernel stack did not follow the running Satellite"
+    grep -q '\[selftest\] timed wait: ok' "$LOG.clean" || fail "timed wait self-test did not pass"
+    grep -q '\[selftest\] semaphore: ok' "$LOG.clean" || fail "semaphore self-test did not pass"
+    grep -q '\[selftest\] sleeplock: ok' "$LOG.clean" || fail "sleep lock self-test did not pass"
+    grep -q '\[selftest\] join: ok' "$LOG.clean" || fail "join and exit status self-test did not pass"
+    grep -q '\[selftest\] sched introspection: ok' "$LOG.clean" || fail "scheduler introspection self-test did not pass"
+    if [ "$CORES" -gt 1 ]; then
+        grep -q '\[selftest\] wake latency: ok' "$LOG.clean" || fail "cross-core wake latency exceeded the limit (reschedule IPI path)"
+    fi
     grep -q '\[selftest\] address space switch: ok' "$LOG.clean" || fail "address space was not switched with the Satellite"
     grep -q '\[selftest\] ist guards: ok' "$LOG.clean" || fail "IST stack guard pages were not set up"
     if grep -q '\[fpu\] [0-9]* core' "$LOG.clean"; then

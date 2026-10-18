@@ -91,17 +91,28 @@ safe today because the kernel never touches user addresses; the copy-from-user p
 
 ### Scheduler (Orbital)
 
-A Satellite that burns its whole timeslice is demoted one ring; one that yields early is
-promoted one ring. Context switching lives in `sched/context_switch.asm` + `orbital.cpp`;
-preemption comes off the APIC timer, calibrated against the PIT at boot.
+Four rings with growing slices (2, 4, 8, 16 ticks of 10 ms) and a CPU allotment per ring (8, 16, 32 ticks; the last
+ring has none). A Satellite is demoted when it has used its ring's allotment, whether or not it yielded in between,
+so a task cannot stay in the top ring by yielding just before its slice ends. `yield()` no longer promotes anything.
+A Satellite that slept for at least five ticks moves up one ring on wake; short sleeps change nothing. Every 50 ticks
+each core boots everything back to the top ring. The policy is pure code in `mlfq.hpp` and the queues are in
+`runq.hpp`, both of which `make test-sched` exercises on the host, including a task that tries to game the policy.
+Context switching lives in `sched/context_switch.asm` + `orbital.cpp`; preemption comes off the APIC timer.
 
-**Each Sun has its own four-ring run queue and lock.** A Sun with nothing local scans the
-others (never holding its own lock) and steals the highest-priority ready Satellite.
-`spawn()` enqueues locally, so new work starts local and idle Suns pull it away.
+**Each Sun has its own four-ring run queue and lock.** A Sun with nothing local scans the others through a registry
+of started cores (never holding its own lock) and steals the highest-priority ready Satellite. A new or woken
+Satellite is placed on an idle core when there is one, otherwise locally.
 
-Finished Satellites (entry returns, or `exit_current()`) go on a global zombie list and are
-reaped by whichever Sun idles next, so a Sun pinned by a CPU-bound Satellite doesn't block
-reaping.
+**Idle Suns sleep until told.** The idle loop is `cli`, publish the idle flag, re-check the queues, `sti; hlt`, so a
+wake-up cannot slip between the check and the halt. Placing work on another core sends it a reschedule IPI
+(vector `0x31`). The handler re-checks that there is something to run, so a stale IPI costs a few cycles. A woken
+Satellite in a higher ring than the one running on its core preempts it the same way (a self-IPI when the target is
+the sending core), instead of waiting for the next 10 ms tick.
+
+Finished Satellites (entry returns, `exit_current()` or `exit_with(status)`) go on a global zombie list and are
+reaped by whichever Sun idles next. Each Satellite has an id, and a ring of the last 32 exit records lets
+`join(id, &status, timeout_ms)` return `Exited`, `TimedOut`, `Unknown` (never existed, or evicted from the ring) or
+`Self`.
 
 **Every Satellite owns its CPU state.** Each carries a private x87/SSE/AVX save area (XSAVE when the CPU has it,
 FXSAVE otherwise), saved and restored eagerly on every context switch, so one Satellite's registers can never reach
@@ -112,9 +123,13 @@ enter ring 3 and trap back onto its own kernel stack. The kernel itself is still
 handler would otherwise clobber the interrupted Satellite's registers), which is why `-mgeneral-regs-only` stays.
 
 **Sleeping and waiting.** `sleep_ms()` parks a Satellite until the tick clock reaches its deadline. `WaitQueue`
-parks Satellites until a predicate holds and wakes one or all. The queue's lock is released only after the parked
-Satellite's context is saved, so a waker on another core can never run it while it is still on the old core.
-Woken Satellites go straight to the top ring.
+parks Satellites until a predicate holds and wakes one or all; `wait_until_for()` adds a timeout. The queue's lock is
+released only after the parked Satellite's context is saved, so a waker on another core can never run it while it is
+still on the old core. A timed wait can be ended by two parties, the waker and the tick that notices the deadline.
+Each wait carries an epoch and whoever advances `claimed_epoch` to it with a compare-and-swap wins, so a Satellite
+is woken exactly once per wait even when both fire together. `Semaphore` and `SleepLock` are built on this; a
+`SleepLock` is owned by a Satellite, is not recursive (locking twice halts with a message), and a zeroed one is a
+valid unlocked lock. No global constructors run in this kernel, so every global must work as all-zero memory.
 
 **No starvation.** Every 50 ticks each core moves everything in its lower rings back to the top ring, so a
 CPU-bound Satellite that was demoted cannot be starved forever by a stream of short ones.
@@ -155,8 +170,22 @@ polling if no interrupt arrives.
 `orbital::Mutex` is recursive and owned by the Satellite. A contended waiter calls `yield_contended()`, which
 puts it in the lowest ring: plain `yield()` promotes a Satellite, so waiters used to climb above the lock holder
 and starve it (see [Engineering notes](ENGINEERING.md), item 20). Stellar has one mutex and each block driver has
-its own around every request, always acquired in that order. `Mutex` still yields rather than sleeps; `WaitQueue`
-exists for new code, such as blocking on keyboard input.
+its own around every request, always acquired in that order. `Mutex` still yields rather than sleeps; `WaitQueue`,
+`Semaphore` and `SleepLock` exist for new code, such as blocking on keyboard input.
+
+### Boot words and the timer
+
+Limine passes the kernel command line; `bootcfg` reads three space-separated words from it, `mode=shell|test`,
+`storage=auto|off` and `timer=auto|hpet|pm|pit`. An unknown word is reported and ignored. `storage` defaults to
+`off` in shell mode and `auto` in test mode. With `storage=off` no virtio, AHCI or NVMe driver is started and no
+filesystem is mounted, so nothing on the machine can write to a disk. **Until the Limine configuration carries
+these words, a boot with no command line is test mode with storage on**; the configuration shipped for USB
+sticks will always name both words explicitly.
+
+The APIC timer is calibrated against the first working reference of HPET, ACPI PM timer (3.579545 MHz, 24 or 32
+bit as the FADT says) and the PIT, with a TSC-based timeout on every wait so a reference that does not count can no
+longer hang the boot (the old PIT-only loop could). In test mode all references are measured and must agree within
+25%. The TSC frequency measured at the same time is available as `timesrc::tsc_khz()`.
 
 ### Clock
 

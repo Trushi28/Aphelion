@@ -21,6 +21,7 @@ constexpr u8 VEC_VIRTIO_BLK = 0x22;
 constexpr u8 VEC_AHCI       = 0x23;
 constexpr u8 VEC_NVME       = 0x24;
 constexpr u8 VEC_TLB_SHOOTDOWN = 0x30;
+constexpr u8 VEC_RESCHED    = 0x31;
 constexpr u8 VEC_SPURIOUS   = 0xFF;
 
 }

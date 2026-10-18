@@ -25,6 +25,9 @@ jobs:
       - name: Memory tests
         run: make test-mm
 
+      - name: Scheduler and boot configuration tests
+        run: make test-sched
+
       - name: Boot on NVMe, 1 core
         run: tools/ci-boot.sh nvme 1
 

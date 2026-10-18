@@ -20,6 +20,11 @@ struct Info {
     bool ioapic_found = false;
     IsoEntry iso[MAX_ISO];
     u32 iso_count = 0;
+    bool hpet_found = false;
+    u64 hpet_base = 0;
+    bool pm_timer_found = false;
+    u16 pm_timer_port = 0;
+    bool pm_timer_32bit = false;
 };
 
 struct Redirection {

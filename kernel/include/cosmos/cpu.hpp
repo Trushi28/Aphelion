@@ -29,6 +29,12 @@ ALWAYS_INLINE void wrmsr(u32 msr, u64 val) {
     asm volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(msr) : "memory");
 }
 
+ALWAYS_INLINE u64 rdtsc() {
+    u32 lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (static_cast<u64>(hi) << 32) | lo;
+}
+
 ALWAYS_INLINE void cpuid(u32 leaf, u32 subleaf, u32* a, u32* b, u32* c, u32* d) {
     asm volatile("cpuid"
                  : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)

@@ -164,3 +164,16 @@ Thirty real bugs and design flaws found while building Aphelion, kept because th
     buddy allocator and the heap, checking that no page is ever handed to two owners. Separately, `kernel_main` used to copy
     `min(entries, 512)` memory-map entries and carry on, so a machine with a longer map would have lost memory silently; it
     now stops with a message.
+31. **Nothing ever runs global constructors, and the scheduler's defaults quietly assumed it did.** The linker script
+    has no `.init_array` and nothing calls constructors, so a global is only valid if all-zero bytes are a valid state.
+    The scheduler's `Satellite` carried non-zero defaults (`slice_left`, `allot_left`, a `"?"` name) that the compiler
+    turned into a start-up function that was never called; it was harmless only because every Satellite goes through
+    `build_satellite` before use. The new `Semaphore` and `SleepLock` store "taken" rather than "available" so that a
+    zeroed one is a valid, empty one, and the defaults in `mlfq::Account` and `Satellite` are now zero.
+32. **A calibration loop with no timeout can hang a boot on hardware, not just in a test.** The old APIC calibration
+    spun on the PIT counter forever; a laptop without a legacy PIT would have stopped there with nothing on screen.
+    Every reference timer wait is now bounded by the TSC, and HPET or the ACPI PM timer is preferred.
+33. **A timed wait has two ways to end, and the sleeper list read the epoch after dropping its lock.** The first design
+    of `wake_due_sleepers` released the sleep lock and then read the Satellite's epoch, so a Satellite that had been
+    woken by a waker, run, and started a new wait could be woken again by the stale deadline. The sleeper list now
+    captures `{Satellite, epoch}` under the lock and only a compare-and-swap on `claimed_epoch` can win a wake.

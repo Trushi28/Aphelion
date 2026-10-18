@@ -45,7 +45,7 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
 
-.PHONY: test-mm all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+.PHONY: test-mm test-sched all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -161,6 +161,11 @@ test-mm:
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/mm_host_test
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/fb_host_test.cpp -o $(BUILD)/fb_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/fb_host_test
+
+test-sched:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/sched_host_test.cpp -o $(BUILD)/sched_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/sched_host_test
 
 test-stellar-thread:
 	@mkdir -p $(BUILD)

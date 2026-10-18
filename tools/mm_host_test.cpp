@@ -462,6 +462,7 @@ int main() {
         { 0x2200000, 0x400000,  7 },
         { 0x100000000ull, 0x100000, 1 },
     };
+    universe::init(vmap, 10, hhdm);
     constellation::init(hhdm, vmap, 10, image);
     expect(constellation::selftest(), "vmm: layout, W^X sections, PAT-preserving split");
     expect(constellation::map_range(hhdm + 0x2200000, 0x2200000, 0x400000, constellation::WRITABLE | constellation::NO_EXECUTE),

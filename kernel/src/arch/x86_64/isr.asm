@@ -59,6 +59,7 @@ ISR_NOERR 37
 ISR_NOERR 38
 ISR_NOERR 39
 ISR_NOERR 48
+ISR_NOERR 49
 ISR_NOERR 255
 
 isr_common:
@@ -118,5 +119,6 @@ isr_stub_table:
     dq isr39
     dq isr255
     dq isr48
+    dq isr49
 
 section .note.GNU-stack noalloc noexec nowrite

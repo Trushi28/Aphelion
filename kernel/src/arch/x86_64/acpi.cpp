@@ -65,6 +65,30 @@ struct PACKED MadtIso {
     u16 flags;
 };
 
+struct PACKED GenericAddress {
+    u8 space_id;
+    u8 bit_width;
+    u8 bit_offset;
+    u8 access_size;
+    u64 address;
+};
+
+struct PACKED HpetTable {
+    SdtHeader hdr;
+    u32 event_timer_block_id;
+    GenericAddress base;
+    u8 hpet_number;
+    u16 minimum_tick;
+    u8 page_protection;
+};
+
+constexpr u32 FADT_PM_TMR_BLK = 76;
+constexpr u32 FADT_FLAGS = 112;
+constexpr u32 FADT_X_PM_TMR_BLK = 208;
+constexpr u32 FADT_FLAG_TMR_VAL_EXT = 1u << 8;
+constexpr u8 SPACE_SYSTEM_MEMORY = 0;
+constexpr u8 SPACE_SYSTEM_IO = 1;
+
 static Info g_info;
 constexpr u32 MAX_TABLE_BYTES = 16u << 20;
 
@@ -129,6 +153,34 @@ static void parse_madt(SdtHeader* madt) {
     }
 }
 
+static void parse_hpet(SdtHeader* t) {
+    if (t->length < sizeof(HpetTable)) return;
+    auto* h = reinterpret_cast<HpetTable*>(t);
+    if (h->base.space_id != SPACE_SYSTEM_MEMORY || h->base.address == 0) return;
+    g_info.hpet_found = true;
+    g_info.hpet_base = h->base.address;
+}
+
+template <typename T> static T field(const SdtHeader* t, u32 offset) {
+    T v;
+    __builtin_memcpy(&v, reinterpret_cast<const u8*>(t) + offset, sizeof(T));
+    return v;
+}
+
+static void parse_fadt(SdtHeader* t) {
+    u64 port = 0;
+    if (t->length >= FADT_PM_TMR_BLK + 4) port = field<u32>(t, FADT_PM_TMR_BLK);
+    if (t->length >= FADT_X_PM_TMR_BLK + sizeof(GenericAddress)) {
+        auto gas = field<GenericAddress>(t, FADT_X_PM_TMR_BLK);
+        if (gas.space_id == SPACE_SYSTEM_IO && gas.address != 0) port = gas.address;
+    }
+    if (port == 0 || port > 0xFFFC) return;
+    g_info.pm_timer_found = true;
+    g_info.pm_timer_port = static_cast<u16>(port);
+    u32 flags = t->length >= FADT_FLAGS + 4 ? field<u32>(t, FADT_FLAGS) : 0;
+    g_info.pm_timer_32bit = (flags & FADT_FLAG_TMR_VAL_EXT) != 0;
+}
+
 void init(u64 rsdp_phys) {
     g_info = Info{};
 
@@ -164,8 +216,16 @@ void init(u64 rsdp_phys) {
             serial::printf("[acpi] MADT: %u usable CPU(s), IOAPIC %s, %u interrupt override(s)\n",
                             g_info.cpu_count, g_info.ioapic_found ? "found" : "absent",
                             g_info.iso_count);
+        } else if (sig_matches(hdr->sig, "HPET", 4)) {
+            auto* t = map_sdt(table_phys);
+            if (t) parse_hpet(t);
+        } else if (sig_matches(hdr->sig, "FACP", 4)) {
+            auto* t = map_sdt(table_phys);
+            if (t) parse_fadt(t);
         }
     }
+    serial::printf("[acpi] timers: HPET %s, PM timer %s\n", g_info.hpet_found ? "present" : "absent",
+                    g_info.pm_timer_found ? "present" : "absent");
 }
 
 const Info& info() { return g_info; }

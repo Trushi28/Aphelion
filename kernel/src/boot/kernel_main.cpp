@@ -11,6 +11,8 @@
 #include <cosmos/acpi.hpp>
 #include <cosmos/pmm.hpp>
 #include <cosmos/kheap.hpp>
+#include <cosmos/bootcfg.hpp>
+#include <cosmos/timesrc.hpp>
 #include <cosmos/vmm.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/orbital.hpp>
@@ -50,6 +52,10 @@ static volatile limine_memmap_request memmap_request = {
 __attribute__((used, section(".requests")))
 static volatile limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST, .revision = 0, .response = nullptr
+};
+__attribute__((used, section(".requests")))
+static volatile limine_executable_cmdline_request cmdline_request = {
+    .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST, .revision = 0, .response = nullptr
 };
 __attribute__((used, section(".requests")))
 static volatile limine_rsdp_request rsdp_request = {
@@ -671,6 +677,14 @@ extern "C" NORETURN void kernel_main() {
     }
     g_hhdm_offset = hhdm_request.response->offset;
 
+    {
+        const char* cmdline = cmdline_request.response ? cmdline_request.response->cmdline : nullptr;
+        bootcfg::set(bootcfg::parse(cmdline));
+        const bootcfg::Config& cfg = bootcfg::get();
+        serial::printf("[bootcfg] mode=%s storage=%s timer=%s%s\n", bootcfg::name(cfg.mode), bootcfg::name(cfg.storage),
+                        bootcfg::name(cfg.timer), cfg.rejected ? " (some words were ignored)" : "");
+    }
+
     percore::early_init();
     fpu::init_core();
     init_gdt_idt(true);
@@ -752,6 +766,7 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] ACPI/MADT parsed: %d CPU(s) reported\n",
                static_cast<int>(acpi::info().cpu_count));
 
+    timesrc::init(acpi::info(), g_hhdm_offset, bootcfg::get().timer);
     clock::init(apic::id());
     stellar::set_clock(&clock::now_ms);
     if (clock::wall_valid()) {
@@ -776,9 +791,14 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xE0D080, "[--] No IOAPIC reported; keyboard unavailable\n");
     }
 
-    virtioblk::init(g_hhdm_offset);
-    ahci::init(g_hhdm_offset);
-    nvme::init(g_hhdm_offset);
+    if (bootcfg::get().storage == bootcfg::Storage::Auto) {
+        virtioblk::init(g_hhdm_offset);
+        ahci::init(g_hhdm_offset);
+        nvme::init(g_hhdm_offset);
+    } else {
+        serial::writeln("[storage] disabled by the boot configuration: no disk driver is started and no disk is touched");
+        fb::printf(0xE0D080, "[--] Storage disabled by the boot configuration: no disk is initialised or touched\n");
+    }
     if (blockdev::present()) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
@@ -1084,6 +1104,8 @@ extern "C" NORETURN void kernel_main() {
         core_ids[core_id_count++] = apic::id();
     }
     orbital::init(g_hhdm_offset, core_ids, core_id_count);
+    bool timer_ok = timesrc::selftest();
+    serial::printf("[selftest] timer: %s\n", timer_ok ? "ok" : "MISMATCH");
     bool guards_ok = orbital::selftest();
     serial::printf("[selftest] stack guards: %s\n", guards_ok ? "ok" : "MISMATCH");
 
