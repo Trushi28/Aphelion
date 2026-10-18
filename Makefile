@@ -157,7 +157,7 @@ test-stellar:
 
 test-mm:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/mm_host_test.cpp -o $(BUILD)/mm_host_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/mm_host_test.cpp -o $(BUILD)/mm_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/mm_host_test
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/fb_host_test.cpp -o $(BUILD)/fb_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/fb_host_test

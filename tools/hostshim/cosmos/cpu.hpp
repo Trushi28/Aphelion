@@ -1,6 +1,7 @@
 #pragma once
 #include <cosmos/types.hpp>
 #include <stdlib.h>
+#include <sched.h>
 
 namespace cpu {
 
@@ -17,7 +18,10 @@ inline void irq_restore(u64) {}
 
 struct Spinlock {
     volatile int locked = 0;
-    void lock() { if (__atomic_exchange_n(&locked, 1, __ATOMIC_ACQUIRE)) abort(); }
+    void lock() {
+        while (__atomic_exchange_n(&locked, 1, __ATOMIC_ACQUIRE))
+            while (__atomic_load_n(&locked, __ATOMIC_RELAXED)) sched_yield();
+    }
     void unlock() { __atomic_store_n(&locked, 0, __ATOMIC_RELEASE); }
 };
 

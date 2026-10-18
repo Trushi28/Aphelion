@@ -10,6 +10,7 @@ metaphor maps onto the real mechanics:
 | Subsystem | Term | Meaning |
 |---|---|---|
 | Physical memory | **Universe** | Buddy allocator (`mm/pmm.cpp`) |
+| Kernel allocations | **Kernel heap** | Slab classes over Universe (`mm/kheap.cpp`), backs `new` and `delete` |
 | | Galaxy / Orbit / Planet | A firmware-reported region / one buddy free list / one allocated block |
 | Virtual memory | **Constellation** | An address space (one PML4); *The Core* is the kernel's own |
 | Scheduler | **Orbital** | MLFQ scheduler (`sched/orbital.cpp`) |
@@ -24,7 +25,8 @@ flowchart LR
   A["Limine hands off"] --> B["GDT / TSS / IDT"]
   B --> C["Universe: buddy allocator"]
   C --> D["The Core: own page tables, CR3 switch"]
-  D --> E["x2APIC or xAPIC"]
+  D --> D2["Kernel heap"]
+  D2 --> E["x2APIC or xAPIC"]
   E --> F["ACPI MADT, IOAPIC, keyboard"]
   F --> G["Block drivers and Stellar FS"]
   G --> H["Reclaim bootloader memory"]
@@ -37,6 +39,22 @@ flowchart LR
 **Physical (`Universe`).** Real buddy split and coalesce, spinlock-protected so every core
 can allocate concurrently. DMA buffers are tracked in a table sorted by address, so turning a pointer back into a
 physical address is a binary search and a foreign pointer is refused.
+
+**Kernel heap (`kheap`).** `kheap::alloc` and `kheap::free` sit on top of Universe, and `operator new` and
+`operator delete` (`mm/new.cpp`) call them. Requests up to 2048 bytes come from 14 size classes (16, 32, 48, 64, 96, 128,
+192, 256, 384, 512, 768, 1024, 1536, 2048). Each class has its own lock and a list of slabs that still have free
+objects; a slab is 1 to 4 pages taken from Universe, carries a 64-byte header, and holds at least four objects.
+Larger requests take exactly the pages they need straight from Universe: the buddy block is rounded up to a power of
+two, and the unused tail is handed back at once. A one-`u32`-per-page map records which pages belong to a slab class
+and where a large block starts, so `free` needs no size argument and rejects anything it never handed out. Freed
+objects are filled with `0xDD`; the next allocation of that object checks the fill, so a write to freed memory stops
+the kernel with a message instead of corrupting something later. Freeing an object twice, freeing the middle of an
+object, freeing a large block twice and freeing a pointer the heap does not own are all fatal. Every pointer is
+16-byte aligned; larger alignments are not supported and `operator new` has no aligned form, so asking for one fails to
+link instead of misbehaving. `operator new` stops the kernel when memory runs out (there are no exceptions), while
+`kheap::alloc` returns `nullptr`. A slab that becomes empty goes back to Universe unless it is the only one with free
+space in its class. `kheap::stats()` reports live objects and bytes, slab and large-block pages, call counts and
+failed allocations. Nothing in the kernel allocates from it yet except its own tests; the Nebula VFS and the shell will.
 
 **Virtual (`Constellation`).** The Core is built fresh instead of continuing on Limine's
 tables (`mm/vmm.cpp`): reusing bootloader-reclaimable memory before replacing the tables that
@@ -60,6 +78,13 @@ only shoots down the cores that currently have that space loaded. Nothing runs i
 **Firmware tables.** The direct map no longer aliases reserved memory above 4 GiB. `map_firmware()` hands out a
 pointer for any physical range: the direct-map address when it is already covered, otherwise an uncached,
 read-only, non-executable window at `FIRMWARE_REGION_BASE`. ACPI parsing goes through it.
+
+**Memory map size.** The kernel copies at most 512 memory-map entries from the bootloader. If the firmware reports more, the
+boot stops with a message instead of quietly dropping the rest.
+
+**Known limits.** Firmware windows made by `map_firmware()` are never unmapped, and the window has a fixed budget. Page tables
+emptied by `unmap` are not freed. There is no page-fault handler yet, so any fault is a panic. Physical frames have no
+reference counts, so nothing can be shared copy-on-write. The DMA table holds at most 256 live buffers.
 
 **Per-core protections.** Besides NX, WP and PAT, each core turns on SMEP and SMAP when the CPU has them. SMAP is
 safe today because the kernel never touches user addresses; the copy-from-user path will need `stac`/`clac`.

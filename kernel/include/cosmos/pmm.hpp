@@ -17,6 +17,8 @@ u64 alloc_dma32(int order);
 u64 alloc_zeroed(int order, bool dma32 = false);
 void free(u64 phys_addr, int order);
 void* to_virt(u64 phys);
+u64 to_phys(const void* virt);
+u64 page_count();
 
 u64 free_bytes();
 u64 total_bytes();

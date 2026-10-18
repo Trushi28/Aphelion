@@ -10,6 +10,7 @@
 #include <cosmos/apic.hpp>
 #include <cosmos/acpi.hpp>
 #include <cosmos/pmm.hpp>
+#include <cosmos/kheap.hpp>
 #include <cosmos/vmm.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/orbital.hpp>
@@ -72,7 +73,8 @@ static volatile u64 g_cpus_online = 0;
 static volatile u64 g_next_core_idx = 1;
 static u64 g_hhdm_offset = 0;
 
-static universe::MemmapEntry g_entries[512];   
+static constexpr u64 MAX_MEMMAP_ENTRIES = 512;
+static universe::MemmapEntry g_entries[MAX_MEMMAP_ENTRIES];
 static u64 g_n_entries = 0;                    
 static u64 g_expected_cores = 1;               
 
@@ -361,6 +363,128 @@ static void demo_fs_stress(void* arg) {
     orbital::exit_current();
 }
 
+constexpr u64 MM_WORKERS = 4;
+constexpr u32 MM_OPERATIONS = 20000;
+constexpr u32 MM_LIVE = 24;
+constexpr u32 MM_PAGE_BLOCKS = 8;
+static volatile u32 g_mm_remaining = MM_WORKERS;
+static volatile u32 g_mm_errors = 0;
+static volatile u64 g_mm_operations = 0;
+static u64 g_mm_baseline_objects = 0;
+
+struct MmLive { u8* p; u32 size; u8 tag; };
+struct MmPages { u64 phys; int order; u8 tag; };
+
+static u64 mm_next(u64& s) {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    return s;
+}
+
+static void mm_fail(const char* why, u64 w, u32 op) {
+    __atomic_fetch_add(&g_mm_errors, 1u, __ATOMIC_SEQ_CST);
+    serial::printf("[smp-mm] FAIL: %s (worker %lu, operation %u)\n", why, w, op);
+}
+
+static u32 mm_size(u64& rng) {
+    u64 r = mm_next(rng) % 1000;
+    if (r < 600) return 1 + static_cast<u32>(mm_next(rng) % 128);
+    if (r < 900) return 129 + static_cast<u32>(mm_next(rng) % 1920);
+    if (r < 980) return 2049 + static_cast<u32>(mm_next(rng) % 18000);
+    return 20001 + static_cast<u32>(mm_next(rng) % 110000);
+}
+
+static void mm_fill(const MmLive& l) {
+    u32 n = l.size < 192 ? l.size : 192;
+    for (u32 i = 0; i < n; ++i) l.p[i] = static_cast<u8>(l.tag + i);
+    if (l.size > 192) l.p[l.size - 1] = l.tag;
+}
+
+static bool mm_intact(const MmLive& l) {
+    u32 n = l.size < 192 ? l.size : 192;
+    for (u32 i = 0; i < n; ++i) if (l.p[i] != static_cast<u8>(l.tag + i)) return false;
+    return l.size <= 192 || l.p[l.size - 1] == l.tag;
+}
+
+static void mm_stamp(const MmPages& b) {
+    u64 pages = 1ull << b.order;
+    for (u64 i = 0; i < pages; ++i) {
+        auto* page = static_cast<volatile u8*>(universe::to_virt(b.phys + i * universe::PAGE_SIZE));
+        for (u32 k = 0; k < 64; ++k) page[k] = static_cast<u8>(b.tag + k + i);
+    }
+}
+
+static bool mm_stamp_intact(const MmPages& b) {
+    u64 pages = 1ull << b.order;
+    for (u64 i = 0; i < pages; ++i) {
+        auto* page = static_cast<volatile u8*>(universe::to_virt(b.phys + i * universe::PAGE_SIZE));
+        for (u32 k = 0; k < 64; ++k) if (page[k] != static_cast<u8>(b.tag + k + i)) return false;
+    }
+    return true;
+}
+
+static void demo_mm_stress(void* arg) {
+    u64 w = reinterpret_cast<u64>(arg);
+    u64 rng = 0x9E3779B97F4A7C15ull * (w + 1);
+    MmLive live[MM_LIVE];
+    MmPages blocks[MM_PAGE_BLOCKS];
+    u32 n = 0, pn = 0;
+    for (u32 op = 0; op < MM_OPERATIONS; ++op) {
+        u64 r = mm_next(rng) % 100;
+        if (r < 12) {
+            if (pn < MM_PAGE_BLOCKS) {
+                int order = static_cast<int>(mm_next(rng) % 4);
+                u64 phys = universe::alloc(order);
+                if (phys) {
+                    MmPages b{ phys, order, static_cast<u8>(w * 67 + op) };
+                    mm_stamp(b);
+                    blocks[pn++] = b;
+                }
+            }
+        } else if (r < 24) {
+            if (pn) {
+                u32 j = static_cast<u32>(mm_next(rng) % pn);
+                if (!mm_stamp_intact(blocks[j])) mm_fail("a physical block was overwritten by another owner", w, op);
+                universe::free(blocks[j].phys, blocks[j].order);
+                blocks[j] = blocks[--pn];
+            }
+        } else if (n == 0 || (n < MM_LIVE && r < 62)) {
+            MmLive l;
+            l.size = mm_size(rng);
+            l.p = static_cast<u8*>(kheap::alloc(l.size));
+            if (l.p) {
+                l.tag = static_cast<u8>(w * 91 + op);
+                if (reinterpret_cast<u64>(l.p) % kheap::GUARANTEED_ALIGNMENT) mm_fail("misaligned heap pointer", w, op);
+                mm_fill(l);
+                live[n++] = l;
+            }
+        } else {
+            u32 j = static_cast<u32>(mm_next(rng) % n);
+            if (!mm_intact(live[j])) mm_fail("a heap object was overwritten by another owner", w, op);
+            kheap::free(live[j].p);
+            live[j] = live[--n];
+        }
+        if ((op & 63) == 0) orbital::yield();
+    }
+    for (u32 i = 0; i < n; ++i) {
+        if (!mm_intact(live[i])) mm_fail("a heap object was overwritten before release", w, MM_OPERATIONS);
+        kheap::free(live[i].p);
+    }
+    for (u32 i = 0; i < pn; ++i) {
+        if (!mm_stamp_intact(blocks[i])) mm_fail("a physical block was overwritten before release", w, MM_OPERATIONS);
+        universe::free(blocks[i].phys, blocks[i].order);
+    }
+    __atomic_fetch_add(&g_mm_operations, static_cast<u64>(MM_OPERATIONS), __ATOMIC_SEQ_CST);
+    if (__atomic_sub_fetch(&g_mm_remaining, 1u, __ATOMIC_SEQ_CST) == 0) {
+        bool balanced = kheap::stats().live_objects == g_mm_baseline_objects && kheap::check();
+        if (!balanced) __atomic_fetch_add(&g_mm_errors, 1u, __ATOMIC_SEQ_CST);
+        u32 errors = g_mm_errors;
+        serial::printf("[smp-mm] %lu workers ran %lu heap and page operations concurrently, heap %s: %u error(s)\n",
+                        MM_WORKERS, g_mm_operations, balanced ? "balanced" : "UNBALANCED", errors);
+        serial::printf("[selftest] smp-mm: %s\n", errors == 0 ? "ok" : "MISMATCH");
+    }
+    orbital::exit_current();
+}
+
 constexpr u64 BD_WORKERS = 4;
 constexpr u64 BD_SECTORS = 4;
 constexpr u32 BD_ROUNDS = 40;
@@ -560,7 +684,12 @@ extern "C" NORETURN void kernel_main() {
     }
     auto* mm_resp = memmap_request.response;
     universe::MemmapEntry* entries = g_entries;
-    u64 n_entries = mm_resp->entry_count < 512 ? mm_resp->entry_count : 512;
+    if (mm_resp->entry_count > MAX_MEMMAP_ENTRIES) {
+        serial::printf("[boot] FATAL: the bootloader reported %lu memory map entries, this kernel keeps at most %lu\n",
+                        static_cast<u64>(mm_resp->entry_count), MAX_MEMMAP_ENTRIES);
+        cpu::hang();
+    }
+    u64 n_entries = mm_resp->entry_count;
     g_n_entries = n_entries;
     for (u64 i = 0; i < n_entries; ++i)
         entries[i] = { mm_resp->entries[i]->base, mm_resp->entries[i]->length, mm_resp->entries[i]->type };
@@ -600,6 +729,12 @@ extern "C" NORETURN void kernel_main() {
     serial::printf("[selftest] ist guards: %s\n", ist_ok ? "ok" : "MISMATCH");
     bool vmm_ok = constellation::selftest();
     serial::printf("[selftest] vmm: %s\n", vmm_ok ? "ok" : "MISMATCH");
+
+    kheap::init();
+    bool heap_ok = kheap::selftest();
+    serial::printf("[selftest] kheap: %s\n", heap_ok ? "ok" : "MISMATCH");
+    fb::printf(0xC0FFC0, "[ok] Kernel heap online: slab classes 16..%lu B, large blocks from Universe\n",
+               static_cast<u64>(kheap::MAX_SMALL));
 
     apic::init(g_hhdm_offset);
     if (apic::using_x2apic()) {
@@ -1021,6 +1156,9 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
                WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");
+    g_mm_baseline_objects = kheap::stats().live_objects;
+    for (u64 i = 0; i < MM_WORKERS; ++i)
+        orbital::spawn("mm-stress", &demo_mm_stress, reinterpret_cast<void*>(i));
     orbital::spawn("reclaim", &reclaim_task, nullptr);
     orbital::spawn_selftest();
     orbital::start_core();

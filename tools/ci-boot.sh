@@ -40,6 +40,7 @@ finished() {
     fi
     grep -q -e '\[selftest\] smp-fs:' "$LOG" || return 1
     grep -q -e '\[selftest\] smp-blockdev:' "$LOG" || return 1
+    grep -q -e '\[selftest\] smp-mm:' "$LOG" || return 1
     grep -q -e '\[selftest\] clock ticks:' "$LOG" || return 1
     grep -q -e '\[selftest\] sched:' "$LOG" || return 1
     grep -q -e '\[selftest\] sched:' "$LOG" || return 1
@@ -95,6 +96,9 @@ check_common() {
     grep -q '\[smp-blockdev\] FAIL' "$LOG.clean" && fail "concurrent block-device stress reported a failure"
     grep -q '\[selftest\] smp-blockdev: ok' "$LOG.clean" || fail "concurrent block-device stress did not pass"
     grep -q '\[selftest\] pmm: ok' "$LOG.clean" || fail "physical allocator self-test did not pass"
+    grep -q '\[selftest\] kheap: ok' "$LOG.clean" || fail "kernel heap self-test did not pass"
+    grep -q '\[smp-mm\] FAIL' "$LOG.clean" && fail "concurrent allocator stress reported a failure"
+    grep -q '\[selftest\] smp-mm: ok' "$LOG.clean" || fail "concurrent allocator stress did not pass"
     grep -q '\[selftest\] vmm: ok' "$LOG.clean" || fail "virtual memory self-test did not pass"
     grep -q '\[selftest\] stack guards: ok' "$LOG.clean" || fail "kernel stack guard self-test did not pass"
     if grep -q '\[fpu\] [0-9]* core' "$LOG.clean"; then

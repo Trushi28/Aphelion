@@ -58,6 +58,8 @@ static inline u64 virt_to_phys(void* v) { return reinterpret_cast<u64>(v) - g_hh
 static inline int zone_of(u64 phys) { return phys < DMA32_LIMIT ? ZONE_DMA32 : ZONE_HIGH; }
 
 void* to_virt(u64 phys) { return phys_to_virt(phys); }
+u64 to_phys(const void* virt) { return reinterpret_cast<u64>(virt) - g_hhdm; }
+u64 page_count() { return g_pages; }
 
 static void orbit_push(int order, u64 phys) {
     auto* n = static_cast<FreeNode*>(phys_to_virt(phys));

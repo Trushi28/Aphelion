@@ -1,12 +1,14 @@
 #include <cosmos/types.hpp>
 #include <cosmos/tlb.hpp>
 #include "../kernel/src/mm/pmm.cpp"
+#include "../kernel/src/mm/kheap.cpp"
 #include "../kernel/src/mm/vmm.cpp"
 #include "../kernel/src/mm/dma.cpp"
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <pthread.h>
 
 namespace constellation { bool translate(u64, Mapping*); }
 
@@ -109,6 +111,200 @@ static void pmm_tests(u64 hhdm, const universe::MemmapEntry* map, u64 count) {
     int st = 0;
     waitpid(pid, &st, 0);
     expect(WIFSIGNALED(st), "pmm: a double free is fatal");
+}
+
+
+static bool dies_in_child(void (*fn)()) {
+    pid_t pid = fork();
+    if (pid == 0) { fn(); _exit(0); }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFSIGNALED(st);
+}
+
+static void die_small_double_free() { void* p = kheap::alloc(64); kheap::free(p); kheap::free(p); }
+static void die_large_double_free() { void* p = kheap::alloc(100000); kheap::free(p); kheap::free(p); }
+static void die_interior_small() { u8* p = static_cast<u8*>(kheap::alloc(64)); kheap::free(p + 8); }
+static void die_interior_large() { u8* p = static_cast<u8*>(kheap::alloc(100000)); kheap::free(p + 4096); }
+static void die_wild() { kheap::free(reinterpret_cast<void*>(0x1234)); }
+static void die_unowned_page() { u64 p = universe::alloc(0); kheap::free(universe::to_virt(p)); }
+static void die_write_after_free() {
+    u8* p = static_cast<u8*>(kheap::alloc(100));
+    kheap::free(p);
+    p[40] = 0;
+    for (int i = 0; i < 5000; ++i) kheap::alloc(100);
+}
+static void die_outside_direct_map() { kheap::free(reinterpret_cast<void*>(g_hhdm_for_probe + (200ull << 20))); }
+
+struct Live { u8* p; u32 size; u8 tag; };
+
+static bool fill_ok(const Live& l) {
+    u32 n = l.size < 192 ? l.size : 192;
+    for (u32 i = 0; i < n; ++i) if (l.p[i] != static_cast<u8>(l.tag + i)) return false;
+    if (l.size > 192 && l.p[l.size - 1] != l.tag) return false;
+    return true;
+}
+
+static void fill(Live& l) {
+    u32 n = l.size < 192 ? l.size : 192;
+    for (u32 i = 0; i < n; ++i) l.p[i] = static_cast<u8>(l.tag + i);
+    if (l.size > 192) l.p[l.size - 1] = l.tag;
+}
+
+static u32 pick_size(Rng& rng) {
+    u64 r = rng() % 1000;
+    if (r < 600) return 1 + rng() % 128;
+    if (r < 900) return 129 + rng() % 1920;
+    if (r < 990) return 2049 + rng() % 30000;
+    return 32768 + rng() % 200000;
+}
+
+static void heap_tests() {
+    kheap::init();
+    expect(kheap::ready(), "kheap: initialised");
+    expect(kheap::selftest(), "kheap: boot self-test");
+    kheap::Stats base = kheap::stats();
+
+    static Live live[4096];
+    u32 n = 0;
+    Rng rng;
+    bool corrupt = false, overlap = false, aligned = true;
+    for (int i = 0; i < 300000; ++i) {
+        if (n == 0 || (n < 4096 && rng() % 100 < 52)) {
+            Live l;
+            l.size = pick_size(rng);
+            l.p = static_cast<u8*>(kheap::alloc(l.size));
+            if (!l.p) continue;
+            l.tag = static_cast<u8>(rng());
+            if (reinterpret_cast<u64>(l.p) % 16) aligned = false;
+            if (kheap::usable_size(l.p) < l.size) corrupt = true;
+            fill(l);
+            live[n++] = l;
+        } else {
+            u32 j = rng() % n;
+            if (!fill_ok(live[j])) corrupt = true;
+            kheap::free(live[j].p);
+            live[j] = live[--n];
+        }
+        if (i % 50000 == 0 && !kheap::check()) corrupt = true;
+    }
+    for (u32 a = 0; a < n && !overlap; a += 7) {
+        for (u32 b = a + 1; b < n && b < a + 64; ++b) {
+            u64 pa = reinterpret_cast<u64>(live[a].p), pb = reinterpret_cast<u64>(live[b].p);
+            if (pa < pb + live[b].size && pb < pa + live[a].size) { overlap = true; break; }
+        }
+    }
+    for (u32 i = 0; i < n; ++i) {
+        if (!fill_ok(live[i])) corrupt = true;
+        kheap::free(live[i].p);
+    }
+    kheap::Stats end = kheap::stats();
+    expect(!corrupt, "kheap: contents survive a randomized stress");
+    expect(!overlap, "kheap: live objects never overlap");
+    expect(aligned, "kheap: every pointer is 16-byte aligned");
+    expect(kheap::check(), "kheap: slab lists consistent after the stress");
+    expect(end.live_objects == base.live_objects && end.live_bytes == base.live_bytes && end.large_pages == base.large_pages,
+           "kheap: every object returned");
+    expect(end.slab_pages <= base.slab_pages + kheap::CLASS_COUNT * 4, "kheap: empty slabs are handed back to the buddy allocator");
+
+    u64 free_before = universe::free_bytes();
+    void* huge = kheap::alloc(5u << 20);
+    expect(huge && kheap::usable_size(huge) == (5u << 20) && universe::free_bytes() == free_before - (5u << 20),
+           "kheap: a 5 MiB block takes exactly 5 MiB, not the next power of two");
+    kheap::free(huge);
+    expect(universe::free_bytes() == free_before && universe::locked_check(), "kheap: the block returns whole and coalesces");
+    expect(kheap::alloc(universe::PAGE_SIZE << universe::MAX_ORDER << 1) == nullptr, "kheap: an impossible size fails cleanly");
+    expect(kheap::alloc(~0ull) == nullptr, "kheap: a size near the address-space limit fails cleanly");
+    expect(kheap::stats().failed_allocs >= 2, "kheap: failed allocations are counted");
+
+    expect(dies_in_child(die_small_double_free), "kheap: a small double free is fatal");
+    expect(dies_in_child(die_large_double_free), "kheap: a large double free is fatal");
+    expect(dies_in_child(die_interior_small), "kheap: freeing inside a small object is fatal");
+    expect(dies_in_child(die_interior_large), "kheap: freeing inside a large block is fatal");
+    expect(dies_in_child(die_wild), "kheap: freeing a wild pointer is fatal");
+    expect(dies_in_child(die_unowned_page), "kheap: freeing a page the heap does not own is fatal");
+    expect(dies_in_child(die_write_after_free), "kheap: a write to freed memory is caught on reuse");
+    expect(dies_in_child(die_outside_direct_map), "kheap: freeing never-allocated direct-map memory is fatal");
+}
+
+static volatile u32 g_mt_errors = 0;
+static volatile u32 g_mt_overlap = 0;
+static u8 g_mt_mark[ARENA >> 12];
+
+static void* mt_worker(void* arg) {
+    u64 id = reinterpret_cast<u64>(arg);
+    Rng rng;
+    rng.s ^= (id + 1) * 0x9E3779B97F4A7C15ull;
+    static thread_local Live live[256];
+    u32 n = 0;
+    struct Page { u64 phys; int order; };
+    Page pages[32];
+    u32 pn = 0;
+    for (int i = 0; i < 60000; ++i) {
+        u64 r = rng() % 100;
+        if (r < 30) {
+            if (pn < 32) {
+                int o = static_cast<int>(rng() % 4);
+                u64 p = universe::alloc(o);
+                if (p) {
+                    for (u64 k = 0; k < (1ull << o); ++k)
+                        if (__atomic_exchange_n(&g_mt_mark[(p >> 12) + k], static_cast<u8>(id + 1), __ATOMIC_ACQ_REL))
+                            __atomic_fetch_add(&g_mt_overlap, 1u, __ATOMIC_RELAXED);
+                    pages[pn++] = { p, o };
+                }
+            }
+        } else if (r < 45) {
+            if (pn) {
+                Page pg = pages[--pn];
+                for (u64 k = 0; k < (1ull << pg.order); ++k) {
+                    if (__atomic_load_n(&g_mt_mark[(pg.phys >> 12) + k], __ATOMIC_ACQUIRE) != static_cast<u8>(id + 1))
+                        __atomic_fetch_add(&g_mt_errors, 1u, __ATOMIC_RELAXED);
+                    __atomic_store_n(&g_mt_mark[(pg.phys >> 12) + k], 0, __ATOMIC_RELEASE);
+                }
+                universe::free(pg.phys, pg.order);
+            }
+        } else if (n == 0 || (n < 256 && r < 75)) {
+            Live l;
+            l.size = pick_size(rng);
+            if (l.size > 40000) l.size = 1 + l.size % 5000;
+            l.p = static_cast<u8*>(kheap::alloc(l.size));
+            if (!l.p) continue;
+            l.tag = static_cast<u8>(id * 61 + i);
+            fill(l);
+            live[n++] = l;
+        } else {
+            u32 j = rng() % n;
+            if (!fill_ok(live[j])) __atomic_fetch_add(&g_mt_errors, 1u, __ATOMIC_RELAXED);
+            kheap::free(live[j].p);
+            live[j] = live[--n];
+        }
+    }
+    for (u32 i = 0; i < n; ++i) {
+        if (!fill_ok(live[i])) __atomic_fetch_add(&g_mt_errors, 1u, __ATOMIC_RELAXED);
+        kheap::free(live[i].p);
+    }
+    for (u32 i = 0; i < pn; ++i) {
+        for (u64 k = 0; k < (1ull << pages[i].order); ++k) __atomic_store_n(&g_mt_mark[(pages[i].phys >> 12) + k], 0, __ATOMIC_RELEASE);
+        universe::free(pages[i].phys, pages[i].order);
+    }
+    return nullptr;
+}
+
+static void thread_tests() {
+    constexpr int T = 4;
+    u64 free_before = universe::free_bytes();
+    kheap::Stats base = kheap::stats();
+    pthread_t th[T];
+    for (int i = 0; i < T; ++i) pthread_create(&th[i], nullptr, mt_worker, reinterpret_cast<void*>(static_cast<u64>(i)));
+    for (int i = 0; i < T; ++i) pthread_join(th[i], nullptr);
+    kheap::Stats end = kheap::stats();
+    expect(g_mt_errors == 0, "threads: 4 workers never see foreign writes in their memory");
+    expect(g_mt_overlap == 0, "threads: the buddy allocator never hands one page to two threads");
+    expect(universe::locked_check(), "threads: buddy invariants hold after contention");
+    expect(kheap::check(), "threads: heap invariants hold after contention");
+    expect(end.live_objects == base.live_objects && end.live_bytes == base.live_bytes, "threads: the heap is balanced");
+    u64 slab_growth = (end.slab_pages - base.slab_pages) * universe::PAGE_SIZE;
+    expect(universe::free_bytes() + slab_growth == free_before, "threads: the buddy allocator is balanced");
 }
 
 static void shootdown_tests(u64 hhdm) {
@@ -229,6 +425,7 @@ static u64 host_read_u64(u64 va) {
 }
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     cpu::g_read_u64 = &host_read_u64;
     void* arena = mmap(nullptr, ARENA, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     u64 hhdm = reinterpret_cast<u64>(arena);
@@ -243,6 +440,8 @@ int main() {
     };
     universe::init(map, 6, hhdm);
     pmm_tests(hhdm, map, 6);
+    heap_tests();
+    thread_tests();
 
     constellation::KernelImage image{
         0x200000, 0xffffffff80000000ull,

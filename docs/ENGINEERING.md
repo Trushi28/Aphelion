@@ -1,6 +1,6 @@
 # Engineering notes
 
-Twenty-nine real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
+Thirty real bugs and design flaws found while building Aphelion, kept because they are the kind of thing worth not re-learning.
 
 1. **2MB huge pages silently break when virt/phys alignment don't match.**
    The kernel's physical load address (from Limine) is *not* 2MB-aligned,
@@ -158,4 +158,9 @@ Twenty-nine real bugs and design flaws found while building Aphelion, kept becau
     was the kernel's own stress self-test failing after a boot that had been killed mid-run, because it hard-coded how
     many entries the root directory should hold. A fuzzer is only as good as the window it can reach, and a test that
     only passes on a clean disk will fail for the wrong reason the first time anything crashes.
-
+30. **The host test's spinlock aborted on contention, so the allocator was never tested from two threads.** The shim used to
+    make `lock()` call `abort()` if the lock was already held, which was enough to catch a recursive lock in a single-threaded
+    test and made any second thread impossible. It is now a real spinlock, and `make test-mm` runs four threads against the
+    buddy allocator and the heap, checking that no page is ever handed to two owners. Separately, `kernel_main` used to copy
+    `min(entries, 512)` memory-map entries and carry on, so a machine with a longer map would have lost memory silently; it
+    now stops with a message.
