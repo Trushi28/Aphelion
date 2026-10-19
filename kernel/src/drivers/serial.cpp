@@ -1,11 +1,31 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/cpu.hpp>
+#include <cosmos/klog.hpp>
+#include <cosmos/input.hpp>
+#include <cosmos/idt.hpp>
+#include <cosmos/apic.hpp>
 
 namespace serial {
 
 static constexpr u16 COM1 = 0x3F8;
+static constexpr u32 TX_SPINS = 100000;
+static constexpr u32 RX_DRAIN_LIMIT = 64;
+static constexpr u32 ISR_ROUNDS = 8;
+
+static bool g_present = false;
+static bool g_rx_irq = false;
+static u64 g_rx_bytes = 0;
+static u64 g_tx_drops = 0;
+static cpu::Spinlock g_rx_lock;
 
 void init() {
+    cpu::out8(COM1 + 7, 0xA5);
+    u8 a = cpu::in8(COM1 + 7);
+    cpu::out8(COM1 + 7, 0x5A);
+    u8 b = cpu::in8(COM1 + 7);
+    g_present = a == 0xA5 && b == 0x5A && cpu::in8(COM1 + 5) != 0xFF;
+    if (!g_present) return;
+
     cpu::out8(COM1 + 1, 0x00);
     cpu::out8(COM1 + 3, 0x80);
     cpu::out8(COM1 + 0, 0x01);
@@ -13,18 +33,85 @@ void init() {
     cpu::out8(COM1 + 3, 0x03);
     cpu::out8(COM1 + 2, 0xC7);
     cpu::out8(COM1 + 4, 0x0B);
+    for (u32 i = 0; i < RX_DRAIN_LIMIT && (cpu::in8(COM1 + 5) & 0x01); ++i) cpu::in8(COM1);
 }
 
-static bool tx_ready() { return cpu::in8(COM1 + 5) & 0x20; }
+bool present() { return g_present; }
+bool rx_irq_enabled() { return g_rx_irq; }
+u64 rx_bytes() { return g_rx_bytes; }
+u64 tx_drops() { return g_tx_drops; }
+
+static bool wait_tx() {
+    for (u32 spins = 0; spins < TX_SPINS; ++spins) {
+        if (cpu::in8(COM1 + 5) & 0x20) return true;
+        cpu::io_wait();
+    }
+    ++g_tx_drops;
+    return false;
+}
+
+static void emit(char c) {
+    if (!g_present) return;
+    if (c == '\n') {
+        if (!wait_tx()) return;
+        cpu::out8(COM1, '\r');
+    }
+    if (!wait_tx()) return;
+    cpu::out8(COM1, static_cast<u8>(c));
+}
 
 void putc(char c) {
-    if (c == '\n') putc('\r');
-    while (!tx_ready()) cpu::io_wait();
-    cpu::out8(COM1, static_cast<u8>(c));
+    klog::put(c);
+    emit(c);
+}
+
+void console_write(const char* s, u32 n) {
+    for (u32 i = 0; i < n; ++i) emit(s[i]);
 }
 
 void write(const char* s) { while (*s) putc(*s++); }
 void writeln(const char* s) { write(s); putc('\n'); }
+
+static void drain_rx() {
+    for (u32 n = 0; n < RX_DRAIN_LIMIT; ++n) {
+        u8 lsr = cpu::in8(COM1 + 5);
+        if (lsr == 0xFF || !(lsr & 0x01)) return;
+        u8 byte = cpu::in8(COM1);
+        if (lsr & 0x0E) continue;
+        ++g_rx_bytes;
+        input::feed_serial(byte);
+    }
+}
+
+static void rx_isr(idt::Frame*) {
+    g_rx_lock.lock();
+    for (u32 i = 0; i < ISR_ROUNDS; ++i) {
+        u8 iir = cpu::in8(COM1 + 2);
+        if (iir & 0x01) break;
+        cpu::in8(COM1 + 6);
+        drain_rx();
+    }
+    g_rx_lock.unlock();
+    apic::eoi();
+}
+
+bool enable_rx_irq(u8 vector) {
+    if (!g_present) return false;
+    idt::set_handler(vector, &rx_isr);
+    cpu::out8(COM1 + 4, 0x0B);
+    cpu::out8(COM1 + 1, 0x01);
+    g_rx_irq = true;
+    return true;
+}
+
+void poll_rx() {
+    if (!g_present) return;
+    u64 flags = cpu::irq_save();
+    g_rx_lock.lock();
+    drain_rx();
+    g_rx_lock.unlock();
+    cpu::irq_restore(flags);
+}
 
 static void put_uint(u64 v, u32 base, bool upper) {
     char buf[32];

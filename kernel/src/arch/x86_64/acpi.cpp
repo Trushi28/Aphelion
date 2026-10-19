@@ -83,7 +83,11 @@ struct PACKED HpetTable {
 };
 
 constexpr u32 FADT_PM_TMR_BLK = 76;
+constexpr u32 FADT_IAPC_BOOT_ARCH = 109;
 constexpr u32 FADT_FLAGS = 112;
+constexpr u32 FADT_RESET_REG = 116;
+constexpr u32 FADT_RESET_VALUE = 128;
+constexpr u32 FADT_FLAG_RESET_REG_SUP = 1u << 10;
 constexpr u32 FADT_X_PM_TMR_BLK = 208;
 constexpr u32 FADT_FLAG_TMR_VAL_EXT = 1u << 8;
 constexpr u8 SPACE_SYSTEM_MEMORY = 0;
@@ -168,6 +172,27 @@ template <typename T> static T field(const SdtHeader* t, u32 offset) {
 }
 
 static void parse_fadt(SdtHeader* t) {
+    g_info.fadt_found = true;
+    g_info.fadt_revision = t->revision;
+    u32 flags = t->length >= FADT_FLAGS + 4 ? field<u32>(t, FADT_FLAGS) : 0;
+
+    if (t->revision >= 2 && t->length >= FADT_IAPC_BOOT_ARCH + 2) {
+        g_info.iapc_known = true;
+        g_info.iapc_boot_arch = field<u16>(t, FADT_IAPC_BOOT_ARCH);
+    }
+
+    if ((flags & FADT_FLAG_RESET_REG_SUP) && t->length >= FADT_RESET_VALUE + 1) {
+        auto gas = field<GenericAddress>(t, FADT_RESET_REG);
+        bool usable = (gas.space_id == SPACE_SYSTEM_IO && gas.address <= 0xFFFF) ||
+                      (gas.space_id == SPACE_SYSTEM_MEMORY && gas.address != 0);
+        if (usable) {
+            g_info.reset_supported = true;
+            g_info.reset_space = gas.space_id;
+            g_info.reset_address = gas.address;
+            g_info.reset_value = field<u8>(t, FADT_RESET_VALUE);
+        }
+    }
+
     u64 port = 0;
     if (t->length >= FADT_PM_TMR_BLK + 4) port = field<u32>(t, FADT_PM_TMR_BLK);
     if (t->length >= FADT_X_PM_TMR_BLK + sizeof(GenericAddress)) {
@@ -177,7 +202,6 @@ static void parse_fadt(SdtHeader* t) {
     if (port == 0 || port > 0xFFFC) return;
     g_info.pm_timer_found = true;
     g_info.pm_timer_port = static_cast<u16>(port);
-    u32 flags = t->length >= FADT_FLAGS + 4 ? field<u32>(t, FADT_FLAGS) : 0;
     g_info.pm_timer_32bit = (flags & FADT_FLAG_TMR_VAL_EXT) != 0;
 }
 

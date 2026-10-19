@@ -25,7 +25,22 @@ struct Info {
     bool pm_timer_found = false;
     u16 pm_timer_port = 0;
     bool pm_timer_32bit = false;
+    bool fadt_found = false;
+    u8 fadt_revision = 0;
+    bool iapc_known = false;
+    u16 iapc_boot_arch = 0;
+    bool reset_supported = false;
+    u8 reset_space = 0;
+    u64 reset_address = 0;
+    u8 reset_value = 0;
 };
+
+constexpr u16 IAPC_LEGACY_DEVICES = 1u << 0;
+constexpr u16 IAPC_8042 = 1u << 1;
+constexpr u16 IAPC_NO_VGA = 1u << 2;
+constexpr u16 IAPC_NO_MSI = 1u << 3;
+constexpr u16 IAPC_NO_ASPM = 1u << 4;
+constexpr u16 IAPC_NO_CMOS_RTC = 1u << 5;
 
 struct Redirection {
     u32 gsi;

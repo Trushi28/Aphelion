@@ -42,7 +42,10 @@ built in, described under [Goals](#goals).
 - Stellar FS, a copy-on-write filesystem with a B+tree catalog, CRC32 checksums, O(1) snapshots, B+tree directories,
   extent-table files for fragmented disks, path resolution, atomic rename, typed status codes,
   twin checksummed superblocks, flush-ordered crash-consistent commits and an fsck-style `check()`
-- PS/2 keyboard with extended keys, framebuffer console
+- Corona, a Unicode terminal console on the framebuffer: JetBrains Mono at three sizes, 24-bit colour, box drawing and
+  braille, a RAM backbuffer with pixel scrolling
+- PS/2 keyboard and serial input through one key-event queue, a kernel log ring and ACPI/keyboard-controller reboot
+- Two boot entries from one ISO: a shell and a test suite
 - RTC wall clock plus a tick counter, so files carry real modification times
 
 ## Goals
@@ -89,6 +92,8 @@ make run-ahci       # boot with an AHCI/SATA disk
 make run-headless   # serial output only
 make test-stellar   # run the filesystem tests on the host, without QEMU
 make test-sched     # boot words, timer maths, run queues and the MLFQ policy on the host
+make test-console   # UTF-8, terminal emulator, font blob and incremental rendering on the host
+make test-input     # scancode and ANSI key decoders and the kernel log ring on the host
 make test-mm        # buddy allocator, kernel heap (including 4 threads), page tables and DMA table on the host
 make bench-stellar  # filesystem scaling benchmark on sparse virtual disks up to 8 GiB
 make crash-fuzz     # kill QEMU at random instants, fsck the crashed disk, boot it again (FUZZ_KIND, FUZZ_CORES, FUZZ_ROUNDS)
@@ -98,11 +103,17 @@ make reset-disk     # delete disk.img so the next run formats a fresh filesystem
 The first run creates `disk.img`, a 64 MB raw disk. The filesystem on it is independent of the
 block driver, so switching between virtio-blk, AHCI and NVMe keeps the same files. Run
 `make reset-disk` to start with a fresh filesystem.
-The ISO can also be written to a USB stick to boot real hardware:
+`make iso` generates a Limine menu with two entries, **Aphelion Shell** and **Aphelion Test**.
+`make iso PROFILE=usb` builds the variant meant for real hardware: both entries pass `storage=off`, so no disk
+driver starts and nothing on the machine's own drives can be touched, and the shell is the default.
+`BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` change the selection.
 
 ```sh
-dd if=build/aphelion.iso of=/dev/sdX
+make iso PROFILE=usb
 ```
+
+Then write `build/aphelion.iso` to the stick. With Rufus choose **DD Image mode** when asked; `dd if=build/aphelion.iso
+of=/dev/sdX` does the same. Check the device name twice: that command overwrites whatever it names.
 
 ## Tested on
 
@@ -119,10 +130,11 @@ kernel/
     arch/       GDT, IDT, APIC, ACPI, IOAPIC, PCI
     mm/         physical and virtual memory
     sched/      scheduler and context switching
-    drivers/    framebuffer, serial, keyboard, virtio-blk, AHCI, NVMe
+    console/    Corona terminal, font and UTF-8
+    drivers/    framebuffer, serial, keyboard, input queue, klog, virtio-blk, AHCI, NVMe
     fs/         Stellar FS
   include/cosmos/
-tools/          host-side filesystem tests and the CI boot check
+tools/          host-side tests, the font baker, the CI boot and shell checks
 docs/
 ```
 

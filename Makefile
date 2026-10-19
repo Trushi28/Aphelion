@@ -18,6 +18,39 @@ LIMINE_BRANCH := v9.x-binary
 
 OPT ?= -O2
 
+PROFILE      ?= dev
+BOOT_DEFAULT ?= $(if $(filter usb,$(PROFILE)),shell,test)
+MENU_TIMEOUT ?= $(if $(filter usb,$(PROFILE)),5,3)
+
+ifeq ($(filter $(PROFILE),dev usb),)
+$(error PROFILE must be dev or usb)
+endif
+ifeq ($(filter $(BOOT_DEFAULT),shell test),)
+$(error BOOT_DEFAULT must be shell or test)
+endif
+
+LIMINE_CONF := $(BUILD)/limine.conf
+DEFAULT_INDEX := $(if $(filter shell,$(BOOT_DEFAULT)),1,2)
+STORAGE_WORD := $(if $(filter usb,$(PROFILE)),off,auto)
+SHELL_CMDLINE := mode=shell storage=$(STORAGE_WORD)
+TEST_CMDLINE := mode=test storage=$(STORAGE_WORD)
+
+define LIMINE_CONF_TEXT
+timeout: $(MENU_TIMEOUT)
+default_entry: $(DEFAULT_INDEX)
+interface_branding: Aphelion
+
+/Aphelion Shell
+    protocol: limine
+    kernel_path: boot():/boot/kernel.elf
+    cmdline: $(SHELL_CMDLINE)
+
+/Aphelion Test
+    protocol: limine
+    kernel_path: boot():/boot/kernel.elf
+    cmdline: $(TEST_CMDLINE)
+endef
+
 CXXFLAGS := -std=c++20 $(OPT) -Wall -Wextra \
             -fno-strict-aliasing -fno-tree-loop-distribute-patterns \
             -ffreestanding -fno-stack-protector -fno-stack-check \
@@ -33,7 +66,7 @@ endif
 
 FLAGS_STAMP := $(BUILD)/.cxxflags
 
-ASMFLAGS := -f elf64
+ASMFLAGS := -f elf64 -I $(KDIR)/data/
 
 LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 \
            -T $(KDIR)/linker.ld
@@ -45,7 +78,9 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
 
-.PHONY: test-mm test-sched all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
+
+.PHONY: test-mm test-sched test-console test-input all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -64,6 +99,8 @@ $(BUILD)/%.o: %.cpp $(LIMINE)/limine.h $(FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_ASM_DEPS): $(KDIR)/data/corona-fonts.bin
+
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(ASM) $(ASMFLAGS) $< -o $@
@@ -73,10 +110,15 @@ $(BUILD)/%.o: %.asm
 $(KERNEL_ELF): $(OBJECTS) $(KDIR)/linker.ld
 	$(LD) $(LDFLAGS) $(OBJECTS) -o $@
 
-iso: $(KERNEL_ELF) $(LIMINE)/limine.h
+$(LIMINE_CONF): FORCE
+	@mkdir -p $(BUILD)
+	$(file >$@.new,$(LIMINE_CONF_TEXT))
+	@cmp -s $@.new $@ && rm -f $@.new || mv $@.new $@
+
+iso: $(KERNEL_ELF) $(LIMINE)/limine.h $(LIMINE_CONF)
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL_ELF) $(ISO_ROOT)/boot/kernel.elf
-	cp $(KDIR)/limine.conf $(ISO_ROOT)/boot/limine/limine.conf
+	cp $(LIMINE_CONF) $(ISO_ROOT)/boot/limine/limine.conf
 	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin $(LIMINE)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/
 	cp $(LIMINE)/BOOTIA32.EFI $(ISO_ROOT)/EFI/BOOT/
@@ -159,8 +201,16 @@ test-mm:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/mm_host_test.cpp -o $(BUILD)/mm_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/mm_host_test
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/fb_host_test.cpp -o $(BUILD)/fb_host_test
-	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/fb_host_test
+
+test-console:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/console_host_test.cpp -o $(BUILD)/console_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/console_host_test
+
+test-input:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/input_host_test.cpp -o $(BUILD)/input_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/input_host_test
 
 test-sched:
 	@mkdir -p $(BUILD)

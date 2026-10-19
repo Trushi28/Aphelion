@@ -1,146 +1,164 @@
 #include <cosmos/keyboard.hpp>
+#include <cosmos/input.hpp>
 #include <cosmos/idt.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/serial.hpp>
-#include <cosmos/framebuffer.hpp>
 
 namespace keyboard {
+
+namespace {
 
 constexpr u16 PORT_DATA = 0x60;
 constexpr u16 PORT_STATUS_CMD = 0x64;
 
-constexpr u8 SC_LSHIFT = 0x2A;
-constexpr u8 SC_RSHIFT = 0x36;
-constexpr u8 SC_LCTRL = 0x1D;
-constexpr u8 SC_LALT = 0x38;
+constexpr u8 ST_OUTPUT_FULL = 0x01;
+constexpr u8 ST_INPUT_FULL = 0x02;
+constexpr u8 ST_AUX = 0x20;
+constexpr u8 ST_ERRORS = 0xC0;
 
-static void wait_input_clear() { while (cpu::in8(PORT_STATUS_CMD) & 0x02) cpu::io_wait(); }
-static void wait_output_full() { while (!(cpu::in8(PORT_STATUS_CMD) & 0x01)) cpu::io_wait(); }
+constexpr u32 SPINS = 200000;
+constexpr u32 FLUSH_LIMIT = 256;
+constexpr u32 DRAIN_LIMIT = 32;
 
-static void controller_cmd(u8 cmd) { wait_input_clear(); cpu::out8(PORT_STATUS_CMD, cmd); }
-static void controller_write_data(u8 data) { wait_input_clear(); cpu::out8(PORT_DATA, data); }
+Status g_status = Status::NotStarted;
+bool g_irq_routed = false;
+u64 g_irq_count = 0;
+u64 g_polled = 0;
+u8 g_config = 0;
+cpu::Spinlock g_lock;
 
-static char g_set1_to_ascii[128];
-static char g_set1_to_ascii_shifted[128];
-
-static volatile bool g_shift = false;
-static volatile bool g_ctrl = false;
-static volatile bool g_alt = false;
-static volatile bool g_rctrl = false;
-static volatile bool g_ralt = false;
-static volatile bool g_extended = false;
-
-bool shift_down() { return g_shift; }
-bool ctrl_down() { return g_ctrl || g_rctrl; }
-bool alt_down() { return g_alt || g_ralt; }
-
-static void emit_char(char c) {
-    serial::putc(c);
-    if (fb::ready()) fb::putc(c, 0xE8E8E8, 0x0A0A14);
+bool wait_input_clear() {
+    for (u32 i = 0; i < SPINS; ++i) {
+        if (!(cpu::in8(PORT_STATUS_CMD) & ST_INPUT_FULL)) return true;
+        cpu::io_wait();
+    }
+    return false;
 }
 
-static void emit_seq(const char* s) {
-    while (*s) emit_char(*s++);
+bool wait_output_full() {
+    for (u32 i = 0; i < SPINS; ++i) {
+        if (cpu::in8(PORT_STATUS_CMD) & ST_OUTPUT_FULL) return true;
+        cpu::io_wait();
+    }
+    return false;
 }
 
-static const char* extended_sequence(u8 code) {
-    switch (code) {
-        case 0x48: return "\x1b[A";
-        case 0x50: return "\x1b[B";
-        case 0x4D: return "\x1b[C";
-        case 0x4B: return "\x1b[D";
-        case 0x47: return "\x1b[H";
-        case 0x4F: return "\x1b[F";
-        case 0x52: return "\x1b[2~";
-        case 0x53: return "\x1b[3~";
-        case 0x49: return "\x1b[5~";
-        case 0x51: return "\x1b[6~";
-        default: return nullptr;
+bool controller_cmd(u8 cmd) {
+    if (!wait_input_clear()) return false;
+    cpu::out8(PORT_STATUS_CMD, cmd);
+    return true;
+}
+
+bool controller_data(u8 data) {
+    if (!wait_input_clear()) return false;
+    cpu::out8(PORT_DATA, data);
+    return true;
+}
+
+void flush_output() {
+    for (u32 i = 0; i < FLUSH_LIMIT; ++i) {
+        if (!(cpu::in8(PORT_STATUS_CMD) & ST_OUTPUT_FULL)) return;
+        cpu::in8(PORT_DATA);
+        cpu::io_wait();
     }
 }
 
-static void fill_row(char* table, u8 start, const char* chars) {
-    for (int i = 0; chars[i]; ++i) table[start + i] = chars[i];
+u32 drain_locked(bool from_poll) {
+    u32 n = 0;
+    while (n < DRAIN_LIMIT) {
+        u8 st = cpu::in8(PORT_STATUS_CMD);
+        if (st == 0xFF || !(st & ST_OUTPUT_FULL)) break;
+        u8 b = cpu::in8(PORT_DATA);
+        ++n;
+        if (st & (ST_AUX | ST_ERRORS)) continue;
+        if (from_poll) ++g_polled;
+        input::feed_scancode(b);
+    }
+    return n;
 }
 
-static void build_scancode_tables() {
-    for (auto& c : g_set1_to_ascii) c = 0;
-    for (auto& c : g_set1_to_ascii_shifted) c = 0;
-
-    fill_row(g_set1_to_ascii, 0x02, "1234567890-=");
-    fill_row(g_set1_to_ascii_shifted, 0x02, "!@#$%^&*()_+");
-    g_set1_to_ascii[0x0E] = g_set1_to_ascii_shifted[0x0E] = '\b';
-    g_set1_to_ascii[0x0F] = g_set1_to_ascii_shifted[0x0F] = '\t';
-
-    fill_row(g_set1_to_ascii, 0x10, "qwertyuiop[]");
-    fill_row(g_set1_to_ascii_shifted, 0x10, "QWERTYUIOP{}");
-    g_set1_to_ascii[0x1C] = g_set1_to_ascii_shifted[0x1C] = '\n';
-
-    fill_row(g_set1_to_ascii, 0x1E, "asdfghjkl;'`");
-    fill_row(g_set1_to_ascii_shifted, 0x1E, "ASDFGHJKL:\"~");
-
-    g_set1_to_ascii[0x2B] = '\\';
-    g_set1_to_ascii_shifted[0x2B] = '|';
-
-    fill_row(g_set1_to_ascii, 0x2C, "zxcvbnm,./");
-    fill_row(g_set1_to_ascii_shifted, 0x2C, "ZXCVBNM<>?");
-
-    g_set1_to_ascii[0x39] = g_set1_to_ascii_shifted[0x39] = ' ';
-}
-
-static void keyboard_isr(idt::Frame*) {
+void keyboard_isr(idt::Frame*) {
+    g_lock.lock();
+    ++g_irq_count;
+    drain_locked(false);
+    g_lock.unlock();
     apic::eoi();
-    u8 sc = cpu::in8(PORT_DATA);
-
-    if (sc == 0xE0) { g_extended = true; return; }
-
-    bool release = sc & 0x80;
-    u8 code = sc & 0x7F;
-    bool extended = g_extended;
-    g_extended = false;
-
-    if (extended) {
-        if (code == SC_LCTRL) { g_rctrl = !release; return; }
-        if (code == SC_LALT) { g_ralt = !release; return; }
-        if (release) return;
-        if (code == 0x1C) { emit_char('\n'); return; }
-        if (code == 0x35) { emit_char('/'); return; }
-        const char* seq = extended_sequence(code);
-        if (seq) emit_seq(seq);
-        return;
-    }
-
-    if (code == SC_LSHIFT || code == SC_RSHIFT) { g_shift = !release; return; }
-    if (code == SC_LCTRL) { g_ctrl = !release; return; }
-    if (code == SC_LALT) { g_alt = !release; return; }
-
-    if (release) return;
-
-    char c = (g_shift ? g_set1_to_ascii_shifted : g_set1_to_ascii)[code];
-    if (!c) return;
-    emit_char(c);
 }
 
-void init(u8 vector) {
-    build_scancode_tables();
+}
 
-    controller_cmd(0xAD);
-    controller_cmd(0xA7);
+Status init(u8 vector) {
+    g_status = Status::NotStarted;
 
-    while (cpu::in8(PORT_STATUS_CMD) & 0x01) cpu::in8(PORT_DATA);
+    u8 first = cpu::in8(PORT_STATUS_CMD);
+    if (first == 0xFF) {
+        g_status = Status::Absent;
+        return g_status;
+    }
 
-    controller_cmd(0x20);
-    wait_output_full();
+    if (!controller_cmd(0xAD) || !controller_cmd(0xA7)) {
+        g_status = Status::Unresponsive;
+        return g_status;
+    }
+    flush_output();
+
+    if (!controller_cmd(0x20) || !wait_output_full()) {
+        g_status = Status::Unresponsive;
+        return g_status;
+    }
     u8 config = cpu::in8(PORT_DATA);
-    config |= 0x01;
-    config &= ~0x10;
-    controller_cmd(0x60);
-    controller_write_data(config);
+    config = static_cast<u8>((config | 0x01 | 0x40) & ~0x02 & ~0x10);
+    if (!controller_cmd(0x60) || !controller_data(config)) {
+        g_status = Status::Unresponsive;
+        return g_status;
+    }
 
-    controller_cmd(0xAE);
+    if (controller_cmd(0x20) && wait_output_full()) g_config = cpu::in8(PORT_DATA);
+    else g_config = config;
 
     idt::set_handler(vector, &keyboard_isr);
+
+    if (!controller_cmd(0xAE)) {
+        g_status = Status::Unresponsive;
+        return g_status;
+    }
+
+    if (controller_data(0xF4)) wait_output_full();
+    g_lock.lock();
+    drain_locked(false);
+    g_lock.unlock();
+
+    g_status = Status::Ready;
+    return g_status;
 }
+
+Status status() { return g_status; }
+
+const char* status_name(Status s) {
+    switch (s) {
+        case Status::NotStarted: return "not started";
+        case Status::Absent: return "absent (no i8042 answers on ports 0x60/0x64)";
+        case Status::Unresponsive: return "unresponsive (i8042 never became ready)";
+        case Status::Ready: return "ready";
+    }
+    return "?";
+}
+
+void set_irq_routed(bool routed) { g_irq_routed = routed; }
+bool irq_routed() { return g_irq_routed; }
+
+void poll() {
+    if (g_status != Status::Ready) return;
+    u64 flags = cpu::irq_save();
+    g_lock.lock();
+    drain_locked(true);
+    g_lock.unlock();
+    cpu::irq_restore(flags);
+}
+
+u64 irq_count() { return g_irq_count; }
+u64 polled_bytes() { return g_polled; }
+u8 config_byte() { return g_config; }
 
 }

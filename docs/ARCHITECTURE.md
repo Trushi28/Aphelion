@@ -178,9 +178,16 @@ its own around every request, always acquired in that order. `Mutex` still yield
 Limine passes the kernel command line; `bootcfg` reads three space-separated words from it, `mode=shell|test`,
 `storage=auto|off` and `timer=auto|hpet|pm|pit`. An unknown word is reported and ignored. `storage` defaults to
 `off` in shell mode and `auto` in test mode. With `storage=off` no virtio, AHCI or NVMe driver is started and no
-filesystem is mounted, so nothing on the machine can write to a disk. **Until the Limine configuration carries
-these words, a boot with no command line is test mode with storage on**; the configuration shipped for USB
-sticks will always name both words explicitly.
+filesystem is mounted, so nothing on the machine can write to a disk. **A boot with no command line is still test
+mode with storage on**, so every configuration the Makefile generates names both words explicitly.
+
+`make iso` writes `build/limine.conf` with two entries, `Aphelion Shell` (`mode=shell`) and `Aphelion Test`
+(`mode=test`). `PROFILE=dev` (the default) passes `storage=auto` and boots the test entry after 3 seconds;
+`PROFILE=usb` passes `storage=off` on both entries and boots the shell after 5 seconds, so an ISO written to a
+stick can never initialise a disk driver. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` override either
+profile; CI builds with `MENU_TIMEOUT=0`. In shell mode `kernel_main` skips the demo Satellites, the stress
+workers, the filesystem test suite and the scheduler self-test, keeps the bootloader-memory reclaim task and starts
+the console probe.
 
 The APIC timer is calibrated against the first working reference of HPET, ACPI PM timer (3.579545 MHz, 24 or 32
 bit as the FADT says) and the PIT, with a TSC-based timeout on every wait so a reference that does not count can no
@@ -200,11 +207,75 @@ Resolution is one second until the scheduler starts and 10 ms after. Ticks are l
 bounds the error. A TSC-based clock would not lose ticks, but APs do not necessarily start with synchronised
 counters and Satellites migrate between cores, so it is not used.
 
+### Console (Corona)
+
+`framebuffer.hpp` is now a thin compatibility layer over `corona`. Corona is a character-cell terminal drawn
+into the Limine framebuffer. The emulator (`term.cpp`) is pure and host-tested: UTF-8 in, a grid of
+`{glyph + attributes, fg, bg}` cells out, with SGR (16 colours, 256-colour and 24-bit), cursor movement, erase,
+insert and delete for characters and lines, scroll regions, save/restore cursor, autowrap and OSC swallowing. It
+keeps a dirty-row bitset and a record of how far the screen scrolled so the renderer can move pixels instead of
+repainting.
+
+The renderer draws into a RAM backbuffer and copies finished rows to the framebuffer in sequential runs, because
+the framebuffer is mapped write-combining and reading it back is very slow. A scroll is one `memmove` in RAM plus a
+row copy to the screen. If the backbuffer allocation fails (or the screen needs more than 96 MiB) it draws straight
+to the framebuffer and says so on the serial log. The grid is centred, with the leftover pixels filled in the
+background colour.
+
+The font is JetBrains Mono (SIL OFL 1.1, notice in `kernel/data/JetBrainsMono-OFL.txt`) baked by
+`tools/bakefont.py` into `kernel/data/corona-fonts.bin` at 9x20, 11x24 and 14x31 (4-bit coverage, regular and
+bold), picked by screen size. Box drawing, block elements, braille, arrows, geometric shapes, a few mathematical
+symbols and the rupee sign are drawn by the baker rather than taken from the font so that lines join across cells.
+The blob is linked with `incbin`. Regenerate it with
+`python3 tools/bakefont.py <dir of fontsource jetbrains-mono woff files> kernel/data/corona-fonts.bin`
+(needs `fonttools` and `pillow`).
+
+Unicode scope: Latin (including extended and Vietnamese), Greek, Cyrillic, symbols, box drawing and braille.
+CJK and emoji are treated as two cells wide and draw the replacement glyph. Combining marks are dropped without
+moving the cursor. Indic and Arabic scripts need shaping and are not supported. Invalid UTF-8 prints U+FFFD.
+
+The console lock is an `orbital::Mutex`, taken only after `corona::enable_locking()` (called once the boot core's
+scheduler is up; before that the boot is single-threaded and the mutex cannot work, see ENGINEERING 40). The panic handler calls `enter_panic()` first, which makes the console
+skip the lock, because the panicking Satellite may be interrupted code that held it.
+
+### Input
+
+`keymap.hpp` holds two pure decoders that emit `input::Key {codepoint, Sym, modifiers}`: a scancode set 1 decoder
+for the PS/2 keyboard (the i8042 is told to translate, so set 2 keyboards arrive as set 1) with Shift, Ctrl, Alt,
+AltGr, Caps Lock, Num Lock, the keypad, F1 to F12, the extended keys and the Pause sequence; and an ANSI decoder for
+the serial port (CSI and SS3 arrows, Home/End, function keys, modifier parameters, Alt+key, UTF-8). A lone ESC is
+released by a 40 ms idle timeout. The layout is US only.
+
+Interrupt handlers do nothing but decode and push into a 256-entry queue; they never print. `input::read` blocks
+on a `WaitQueue` with a lock-free predicate and wakes every 25 ms to poll both devices, so a keyboard whose
+interrupt never arrives still works. The i8042 driver bounds every wait, treats a status of 0xFF as "no
+controller", ignores auxiliary-port bytes and leaves the mouse port disabled. The 16550 driver probes the scratch
+register and treats a UART that does not answer as absent (output is then dropped rather than spun on) and bounds
+every transmit wait. USB keyboards are not supported until an xHCI HID driver exists.
+
+### Kernel log and power
+
+`klog` is a 16 KiB ring fed by `serial::putc` with a try-lock, so a contended or interrupt-time write is dropped
+rather than blocking. Output sent to the console by the probe bypasses it. `power::reboot` tries the ACPI FADT
+reset register, the keyboard controller pulse, the PCI reset register at 0xCF9 and finally a triple fault.
+`power::poweroff` only works under a hypervisor (it writes the QEMU, Bochs and VirtualBox ports, and only after
+CPUID reports a hypervisor); real ACPI power-off needs the `_S5` sleep type from the AML tables and arrives with
+uACPI.
+
+### Console probe
+
+Shell mode starts `helm-probe`, a stand-in for the real shell: a splash, an information panel and a line editor
+(history, cursor keys, Ctrl+A/E/U/K/L/C) with `help`, `about`, `clear`, `echo`, `unicode`, `colors`, `ps`, `cores`,
+`mem`, `uptime`, `klog`, `keys`, `reboot` and `poweroff`. It exists to exercise the console and both input paths on
+real hardware before the filesystem and shell land.
+
 ### Hardware and interrupts
 
 x2APIC with xAPIC fallback. ACPI/MADT parsing for CPUs, IOAPIC and Interrupt Source
 Overrides. The PS/2 keyboard on IRQ1 is resolved to its real GSI and polarity/trigger flags;
-Shift/Ctrl/Alt are tracked on both sides and E0-prefixed keys (arrows, Home/End, Insert/Delete,
-Page Up/Down) are emitted as ANSI CSI sequences.
+the decoder in the Input section turns scancodes into key events. The FADT's IAPC boot flags and reset register
+are logged at boot (`[acpi] FADT ...`), including whether the firmware declares an 8042 present. Vectors:
+0x20 APIC timer, 0x21 keyboard, 0x22 virtio-blk, 0x23 AHCI, 0x24 NVMe, 0x25 serial, 0x30 TLB shootdown,
+0x31 reschedule.
 
 ---

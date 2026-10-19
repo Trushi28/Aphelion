@@ -177,3 +177,33 @@ Thirty real bugs and design flaws found while building Aphelion, kept because th
     of `wake_due_sleepers` released the sleep lock and then read the Satellite's epoch, so a Satellite that had been
     woken by a waker, run, and started a new wait could be woken again by the stale deadline. The sleeper list now
     captures `{Satellite, epoch}` under the lock and only a compare-and-swap on `claimed_epoch` can win a wake.
+34. **Every i8042 wait was unbounded, so a machine without a controller would hang the boot.** The old driver
+    spun on the status register for "input buffer clear" and "output buffer full". On hardware that has no 8042 the
+    bus floats and reads 0xFF, which says "input full" forever. Every wait is now bounded, a first status of 0xFF
+    means absent, and the driver reports `absent`, `unresponsive` or `ready` instead of hanging. The auxiliary port is
+    left disabled and its bytes are discarded.
+35. **A UART that is not there reads as always ready, and one that is stuck blocks forever.** `serial::putc` waited
+    for the transmit-empty bit with no limit. The driver now probes the scratch register at start-up, treats an absent
+    UART as a sink and drops a byte after 100,000 failed polls instead of spinning. Receive interrupts are only
+    enabled when the probe succeeded.
+36. **A lone Escape and the start of an arrow key are the same byte.** The serial decoder cannot tell them apart
+    without time, so the blocking read polls every 25 ms and releases a pending ESC after 40 ms. Interrupt handlers
+    never print: the console lock is a yielding `Mutex`, and a handler that waits on a lock held by the code it
+    interrupted on the same core would hang.
+37. **The panic handler could hang on the console lock.** If a Satellite was interrupted while drawing, the lock was
+    still owned when the exception handler tried to print. The handler now switches the console into a lock-free
+    mode first; the output may be interleaved if another core is drawing, which is better than printing nothing.
+38. **The framebuffer is write-combined, so reads from it are slow and scrolling it in place was the slowest thing the
+    kernel did.** The console renders into a RAM backbuffer, scrolls it with `memmove` and writes finished rows to the
+    screen in sequential runs. A host test replays 40 random escape-sequence streams plus a 400-line scroll and checks
+    that the incrementally updated screen is identical to a full redraw, with and without a padded pitch.
+39. **The font blob was refused by its own loader.** The loader requires U+FFFD as the fallback glyph, the JetBrains
+    Mono web subsets do not contain it, and the first test run caught it (the later tests had been passing against
+    stale state, which is why the load check is its own test). The baker now draws the replacement glyph itself.
+40. **The first Corona build locked the console with a scheduler mutex before the scheduler existed, and the machine reset
+    after the first line of output.** `orbital::Mutex::lock` asks the scheduler who the caller is, which reads the local
+    APIC id; at the first `fb::init` the APIC is not initialised, so that read faults, and the IDT is not installed
+    yet, so the fault is a triple fault. QEMU with `-no-reboot -no-shutdown` shows exactly that: a black window and a
+    serial log that ends at `=== Aphelion booting ===`. The host tests could not see it because their lock is a stub.
+    The console now takes no lock until `corona::enable_locking()` runs on the boot core after `orbital::init_core()`.
+    Nothing prints from other cores before that point.

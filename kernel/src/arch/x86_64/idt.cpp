@@ -59,6 +59,7 @@ static void default_panic(Frame* f) {
     if (gdt::in_ist_guard(cr2) || gdt::in_ist_guard(f->rsp))
         serial::writeln("    the faulting address is in an IST stack guard page: fault-handler stack overflow");
     if (fb::ready()) {
+        fb::enter_panic();
         fb::printf(0xFF4040, "\n!!! KERNEL PANIC: %s (vec %d)\n",
                     exception_name(f->vector), static_cast<int>(f->vector));
         fb::printf(0xFF4040, "    rip=%x cr2=%x\n",

@@ -18,6 +18,10 @@
 #include <cosmos/orbital.hpp>
 #include <cosmos/ioapic.hpp>
 #include <cosmos/keyboard.hpp>
+#include <cosmos/input.hpp>
+#include <cosmos/power.hpp>
+#include <cosmos/probe.hpp>
+#include <cosmos/corona.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
 #include <cosmos/ahci.hpp>
@@ -664,10 +668,12 @@ extern "C" NORETURN void kernel_main() {
     info.red_shift = lfb->red_mask_shift;
     info.green_shift = lfb->green_mask_shift;
     info.blue_shift = lfb->blue_mask_shift;
-    fb::init(info);
+    bool console_started = fb::init(info);
+    if (!console_started)
+        serial::writeln("[boot] the Corona console could not start (the framebuffer is not 32 bits per pixel with an aligned pitch); continuing on serial only");
     fb::clear(0x0A0A14);
     fb::printf(0x8FD3FF, "Aphelion\n");
-    fb::printf(0xB0B0C0, "non-POSIX x86_64 kernel -- framebuffer console online\n\n");
+    fb::printf(0xB0B0C0, "non-POSIX x86_64 kernel -- Corona console online\n\n");
 
     serial::printf("[boot] framebuffer %lux%lu @ %u bpp\n", info.width, info.height, info.bpp);
 
@@ -750,6 +756,17 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0xC0FFC0, "[ok] Kernel heap online: slab classes 16..%lu B, large blocks from Universe\n",
                static_cast<u64>(kheap::MAX_SMALL));
 
+    if (console_started) {
+        bool buffered = fb::enable_backbuffer();
+        corona::Metrics cm = corona::metrics();
+        serial::printf("[console] Corona %lux%lu cells of %lux%lu px on a %lux%lu framebuffer, %s\n",
+                        static_cast<u64>(cm.cols), static_cast<u64>(cm.rows), static_cast<u64>(cm.cell_w), static_cast<u64>(cm.cell_h),
+                        cm.fb_width, cm.fb_height,
+                        buffered ? "RAM backbuffer on (the write-combined framebuffer is only ever written)" : "no backbuffer, drawing straight to the framebuffer");
+        bool console_ok = corona::selftest();
+        serial::printf("[selftest] console: %s\n", console_ok ? "ok" : "MISMATCH");
+    }
+
     apic::init(g_hhdm_offset);
     if (apic::using_x2apic()) {
         fb::printf(0xC0FFC0, "[ok] x2APIC online (MSR-based), id=%d\n", static_cast<int>(apic::id()));
@@ -765,6 +782,22 @@ extern "C" NORETURN void kernel_main() {
     acpi::init(reinterpret_cast<u64>(rsdp_request.response->address));
     fb::printf(0xC0FFC0, "[ok] ACPI/MADT parsed: %d CPU(s) reported\n",
                static_cast<int>(acpi::info().cpu_count));
+    {
+        const acpi::Info& ai = acpi::info();
+        if (!ai.fadt_found) {
+            serial::writeln("[acpi] no FADT found: no reset register and no IAPC boot flags");
+        } else {
+            serial::printf("[acpi] FADT revision %u, reset register %s", static_cast<unsigned>(ai.fadt_revision),
+                            ai.reset_supported ? "present" : "absent");
+            if (ai.iapc_known)
+                serial::printf(", IAPC boot flags %x: 8042 %s, legacy devices %s, CMOS RTC %s\n", static_cast<unsigned>(ai.iapc_boot_arch),
+                                (ai.iapc_boot_arch & acpi::IAPC_8042) ? "present" : "declared absent",
+                                (ai.iapc_boot_arch & acpi::IAPC_LEGACY_DEVICES) ? "present" : "declared absent",
+                                (ai.iapc_boot_arch & acpi::IAPC_NO_CMOS_RTC) ? "absent" : "present");
+            else
+                serial::writeln(", IAPC boot flags not provided by this FADT revision");
+        }
+    }
 
     timesrc::init(acpi::info(), g_hhdm_offset, bootcfg::get().timer);
     clock::init(apic::id());
@@ -777,19 +810,43 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xE0D080, "[--] RTC unreadable; file mtimes stay 0\n");
     }
 
-    constexpr u8 VEC_KEYBOARD = 0x21;
+    input::init();
+    bool input_ok = input::selftest();
+    serial::printf("[selftest] input: %s\n", input_ok ? "ok" : "MISMATCH");
+
+    keyboard::Status kb_status = keyboard::init(idt::VEC_KEYBOARD);
+    serial::printf("[keyboard] i8042: %s, controller config %x\n", keyboard::status_name(kb_status),
+                    static_cast<unsigned>(keyboard::config_byte()));
+    bool kb_irq = false;
+    bool serial_irq = false;
     if (acpi::info().ioapic_found) {
         map_device_page_or_die(acpi::info().ioapic_base, "IOAPIC");
         ioapic::init(g_hhdm_offset, acpi::info().ioapic_base, acpi::info().ioapic_gsi_base);
-        keyboard::init(VEC_KEYBOARD);
-        acpi::Redirection kbd_irq = acpi::resolve_isa_irq(1);
-        ioapic::set_redirection(kbd_irq.gsi, VEC_KEYBOARD, apic::id(), false,
-                                 kbd_irq.active_low, kbd_irq.level_triggered);
-        fb::printf(0xC0FFC0, "[ok] IOAPIC online (%d redirection entries), PS/2 keyboard on IRQ1 -> GSI%u -- try typing\n",
-                   static_cast<int>(ioapic::max_redirection_entries()), kbd_irq.gsi);
+        if (kb_status == keyboard::Status::Ready) {
+            acpi::Redirection kbd_irq = acpi::resolve_isa_irq(1);
+            ioapic::set_redirection(kbd_irq.gsi, idt::VEC_KEYBOARD, apic::id(), false,
+                                     kbd_irq.active_low, kbd_irq.level_triggered);
+            keyboard::set_irq_routed(true);
+            kb_irq = true;
+        }
+        if (serial::present() && serial::enable_rx_irq(idt::VEC_SERIAL)) {
+            acpi::Redirection com1_irq = acpi::resolve_isa_irq(4);
+            ioapic::set_redirection(com1_irq.gsi, idt::VEC_SERIAL, apic::id(), false,
+                                     com1_irq.active_low, com1_irq.level_triggered);
+            serial_irq = true;
+        }
+        fb::printf(0xC0FFC0, "[ok] IOAPIC online (%d redirection entries)\n", static_cast<int>(ioapic::max_redirection_entries()));
     } else {
-        fb::printf(0xE0D080, "[--] No IOAPIC reported; keyboard unavailable\n");
+        fb::printf(0xE0D080, "[--] No IOAPIC reported; keyboard and serial input fall back to polling\n");
     }
+    if (kb_status == keyboard::Status::Ready)
+        fb::printf(0xC0FFC0, "[ok] PS/2 keyboard %s\n", kb_irq ? "on IRQ1 -- try typing" : "polled (no IOAPIC)");
+    else
+        fb::printf(0xE0D080, "[--] No PS/2 keyboard controller: %s\n", keyboard::status_name(kb_status));
+    serial::printf("[input] keyboard %s, serial %s\n", kb_irq ? "interrupt-driven" : (kb_status == keyboard::Status::Ready ? "polled" : "unavailable"),
+                    serial::present() ? (serial_irq ? "interrupt-driven" : "polled") : "absent (no UART answered)");
+
+    const bool test_mode = bootcfg::get().mode == bootcfg::Mode::Test;
 
     if (bootcfg::get().storage == bootcfg::Storage::Auto) {
         virtioblk::init(g_hhdm_offset);
@@ -799,7 +856,10 @@ extern "C" NORETURN void kernel_main() {
         serial::writeln("[storage] disabled by the boot configuration: no disk driver is started and no disk is touched");
         fb::printf(0xE0D080, "[--] Storage disabled by the boot configuration: no disk is initialised or touched\n");
     }
-    if (blockdev::present()) {
+    if (blockdev::present() && !test_mode) {
+        fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n", blockdev::active()->name(), blockdev::capacity_sectors());
+        serial::printf("[storage] %s found; the filesystem test suite is skipped in shell mode\n", blockdev::active()->name());
+    } else if (blockdev::present()) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
 
@@ -1151,37 +1211,53 @@ extern "C" NORETURN void kernel_main() {
     fb::printf(0x8FD3FF, "\nOrbital scheduler: bringing up this core...\n");
     clock::sync();
     orbital::init_core();
-    orbital::spawn("alpha", &demo_cooperative, const_cast<char*>("alpha"));
-    orbital::spawn("beta", &demo_cooperative_explicit_exit, const_cast<char*>("beta"));
-    orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
-    orbital::spawn("clock-test", &demo_clock, nullptr);
-    for (u64 i = 0; i < WORKER_COUNT; ++i)
-        orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
-    u64 fs_total = stellar::total_sectors();
-    if (blockdev::present() && fs_total == 0) {
-        serial::writeln("[boot] block-device stress skipped: no mounted Stellar volume, so the disk tail is not ours to write");
-    } else if (blockdev::present() && blockdev::capacity_sectors() > 256) {
-        if (fs_total + TEST_TAIL_SECTORS <= blockdev::capacity_sectors()) {
-            g_bd_base = blockdev::capacity_sectors() - TEST_TAIL_SECTORS;
-            g_bd_enabled = true;
-            for (u64 i = 0; i < BD_WORKERS; ++i)
-                orbital::spawn("bd-stress", &demo_blockdev_stress, reinterpret_cast<void*>(i));
-        } else {
-            serial::writeln("[boot] block-device stress skipped: the filesystem covers the last 64 sectors; run make reset-disk");
+    corona::enable_locking();
+    if (test_mode) {
+        orbital::spawn("alpha", &demo_cooperative, const_cast<char*>("alpha"));
+        orbital::spawn("beta", &demo_cooperative_explicit_exit, const_cast<char*>("beta"));
+        orbital::spawn("gamma-spinner", &demo_spinner, const_cast<char*>("gamma-spinner"));
+        orbital::spawn("clock-test", &demo_clock, nullptr);
+        for (u64 i = 0; i < WORKER_COUNT; ++i)
+            orbital::spawn("worker", &demo_worker, reinterpret_cast<void*>(i));
+        u64 fs_total = stellar::total_sectors();
+        if (blockdev::present() && fs_total == 0) {
+            serial::writeln("[boot] block-device stress skipped: no mounted Stellar volume, so the disk tail is not ours to write");
+        } else if (blockdev::present() && blockdev::capacity_sectors() > 256) {
+            if (fs_total + TEST_TAIL_SECTORS <= blockdev::capacity_sectors()) {
+                g_bd_base = blockdev::capacity_sectors() - TEST_TAIL_SECTORS;
+                g_bd_enabled = true;
+                for (u64 i = 0; i < BD_WORKERS; ++i)
+                    orbital::spawn("bd-stress", &demo_blockdev_stress, reinterpret_cast<void*>(i));
+            } else {
+                serial::writeln("[boot] block-device stress skipped: the filesystem covers the last 64 sectors; run make reset-disk");
+            }
         }
+        if (g_fs_stress_enabled) {
+            for (u64 i = 0; i < FS_STRESS_WORKERS; ++i)
+                orbital::spawn("fs-stress", &demo_fs_stress, reinterpret_cast<void*>(i));
+            fb::printf(0xC0FFC0, "[ok] %lu Satellites will hammer Stellar FS concurrently\n", FS_STRESS_WORKERS);
+        }
+        fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
+                   WORKER_COUNT);
     }
-    if (g_fs_stress_enabled) {
-        for (u64 i = 0; i < FS_STRESS_WORKERS; ++i)
-            orbital::spawn("fs-stress", &demo_fs_stress, reinterpret_cast<void*>(i));
-        fb::printf(0xC0FFC0, "[ok] %lu Satellites will hammer Stellar FS concurrently\n", FS_STRESS_WORKERS);
-    }
-    fb::printf(0xC0FFC0, "[ok] Orbital scheduler online -- 3 demo Satellites + %lu work-stealing workers spawned\n",
-               WORKER_COUNT);
     serial::writeln("[boot] === Aphelion is up. Handing off to the Orbital scheduler. ===");
-    g_mm_baseline_objects = kheap::stats().live_objects;
-    for (u64 i = 0; i < MM_WORKERS; ++i)
-        orbital::spawn("mm-stress", &demo_mm_stress, reinterpret_cast<void*>(i));
+    if (test_mode) {
+        g_mm_baseline_objects = kheap::stats().live_objects;
+        for (u64 i = 0; i < MM_WORKERS; ++i)
+            orbital::spawn("mm-stress", &demo_mm_stress, reinterpret_cast<void*>(i));
+    } else {
+        probe::Facts facts{};
+        facts.suns = static_cast<u32>(g_cpus_online);
+        facts.storage = blockdev::present() ? blockdev::active()->name()
+                        : (bootcfg::get().storage == bootcfg::Storage::Off ? "disabled by the boot configuration" : "no block device found");
+        facts.keyboard_ready = kb_status == keyboard::Status::Ready;
+        facts.keyboard_irq = kb_irq;
+        facts.serial_present = serial::present();
+        facts.serial_irq = serial_irq;
+        probe::set_facts(facts);
+        if (!probe::spawn()) serial::writeln("[boot] FATAL: could not start the console probe");
+    }
     orbital::spawn("reclaim", &reclaim_task, nullptr);
-    orbital::spawn_selftest();
+    if (test_mode) orbital::spawn_selftest();
     orbital::start_core();
 }
