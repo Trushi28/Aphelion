@@ -207,3 +207,68 @@ Thirty real bugs and design flaws found while building Aphelion, kept because th
     serial log that ends at `=== Aphelion booting ===`. The host tests could not see it because their lock is a stub.
     The console now takes no lock until `corona::enable_locking()` runs on the boot core after `orbital::init_core()`.
     Nothing prints from other cores before that point.
+41. **The serial driver dropped characters after 100000 polls, and the CI log lost lines when the runner was busy.** The
+    old unbounded wait was replaced in series C by a bounded one so that a stuck UART could not hang the boot, but the
+    bound was a spin count: when QEMU's serial timer thread is slow to run (four emulated cores on a two-core CI runner),
+    100000 polls can pass before the transmitter reports ready, the character is dropped, and a line such as
+    `[universe] reclaimed` no longer matches the CI grep. The first wait on a character is now 4 million polls, and once a
+    wait has timed out the following characters wait only 2000 polls until the UART answers again, so a dead UART costs
+    one long wait instead of one per character. The bootloader-memory reclaim task also waited only 3 seconds for every
+    core to leave its bootloader stack and then silently gave up; it now waits 20 seconds and prints how many cores had
+    arrived. I could not run QEMU here, so this is the most likely cause rather than a reproduced one: if the CI still
+    fails, the new message in the log says which case it is.
+42. **The shell test could never have matched its own prompt.** `ci-shell.sh` waited for the literal string
+    `aphelion ▸`, but the console writes ANSI colour sequences between the name and the arrow and the serial port
+    passes them through unchanged. The check now waits for the arrow alone and every later check allows escapes in
+    between. Because a command's own echo also ends in a newline, the checks type commands whose output differs from
+    what was typed (a redirect followed by `cat`) so that a match proves the output and not the echo.
+43. **A line-by-line review of the first Nebula and Helm build found six defects before any of it ran on a machine.**
+    A failed `create` or `open` left an empty file behind; the recursive tree copy kept large path buffers in its stack
+    frame, which a 32 KiB Satellite stack cannot afford at sixteen levels, so they moved to the kernel heap; a `sys` file
+    whose rendered size differs from its `stat` size failed the size check on read, so dynamic files now accept short and
+    long reads; the directory sort carried a half-finished comparison; the option parser tested `c < -1`, which can never
+    be true, so a bad option was silently accepted (it now sets an explicit flag); and `echo` rejected any argument that
+    began with a dash instead of treating only `-n` as an option. The host tests exercise each of these paths. No global
+    constructors run in the kernel, so realms and registries are `constinit` and get anything non-constant when they
+    register; the shared kernel and host builds compile the same files, so a constructor that does real work fails to
+    compile instead of failing at boot.
+44. **`mkfs erase` is deliberately blunt about what it accepts.** `stellar::can_auto_format` answers true for a blank
+    disk and also for a disk that carries a Stellar superblock, because the boot path uses it to recover a volume whose
+    metadata is damaged. The shell command therefore also formats a damaged Stellar volume when asked, but only when the
+    word `erase` is typed, only when no volume is mounted and never on a disk that holds anything else in its first 32 KiB.
+45. **A STALL on the control pipe halts endpoint 0, and the first xHCI draft never recovered it.** Bulk stalls were
+    handled, but a device that stalls GET_MAX_LUN (many cheap sticks do) would leave EP0 halted and every later control
+    request would time out and kill the device. Control stalls now run Reset Endpoint and Set TR Dequeue Pointer for
+    DCI 1 as well. Found by re-reading the driver before writing the layer above it, not by a test, because no test can
+    produce a stall without the fake device.
+46. **A short transfer is not a successful transfer.** The first `usbstor` returned success whenever the CSW said
+    "passed", so a read that stalled and moved no data, or a write the device only partly took, would have reported
+    success with garbage or a hole. The transport now computes the accounted bytes from the residue and the bytes that
+    actually moved, and reads and writes must match exactly. `tools/usbstor_host_test.cpp` fails if that check is removed
+    (verified by removing it).
+47. **Identifying the boot stick is a safety property, so every ambiguous case refuses.** A stick that does not match,
+    a GPT that fails its CRC, two sticks written from the same ISO, a stick with no free space and a Rufus ISO-mode
+    stick all end with no window and no write. The kernel cannot tell two copies of the same image apart, which is a
+    real limit: it asks you to unplug the other one rather than guess.
+48. **The ISO volume id has to match the kernel that is running, so both come from one hash.** The Makefile hashes
+    all kernel objects, writes the first 12 hex digits (upper case, because ISO 9660 volume ids are) into
+    `buildid.cpp`, which is linked into the kernel, and into the `-V` label of the ISO. A kernel booted from a stick
+    always sits next to its own ISO label, so the ids agree; the stamp matters when Limine reports no GPT disk GUID
+    (the fallback) and when another stick was written from a different build, which then does not match.
+49. **What the USB tests do and do not prove.** The host tests drive the real `usbstor.cpp` against a fake BOT device
+    and the real parsing code, so the protocol sequencing, stall and residue handling, identification and the write
+    confinement are checked. They cannot check the xHCI register programming, DMA, the event ring or real devices'
+    quirks, and QEMU's xHCI is far more forgiving than a laptop's. `tools/ci-usb.sh` covers QEMU; physical hardware is
+    still untested.
+50. **The first xHCI draft timed everything against a TSC frequency that did not exist yet.** `timesrc::tsc_khz()` is
+    measured by the scheduler's APIC calibration, which runs after the storage drivers, so at xHCI start it was 0 and
+    the driver fell back to an assumed 2 GHz: on a 4.5 GHz Ryzen every delay and timeout would have been 2.25 times too
+    short, including the reset and power-on settling times. `storage=usb` now calibrates first (a 10 ms window, repeated
+    later by the scheduler) and refuses to start USB if no time source can be measured. A review by a separate reader
+    of the driver found this and four more: an error completion other than STALL leaves EP0 halted (now reset, and a
+    reset of an endpoint that is not halted counts as success), a failed Evaluate Context was ignored, SuperSpeed ports
+    still training were hot-reset instead of waited for (now they are given 400 ms to reach U0 on each scan and warm
+    reset only from Inactive or Compliance), and Enable Slot always used slot type 0 instead of the one from the
+    Supported Protocol capability. Port speed IDs above 5 (controllers with custom speed tables) are still unsupported
+    and such a port is listed as "unknown port speed".
+

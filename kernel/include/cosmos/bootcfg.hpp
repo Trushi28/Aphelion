@@ -4,7 +4,7 @@
 namespace bootcfg {
 
 enum class Mode : u8 { Test, Shell };
-enum class Storage : u8 { Auto, Off };
+enum class Storage : u8 { Auto, Off, Usb };
 enum class TimerPref : u8 { Auto, Hpet, Pm, Pit };
 
 struct Config {

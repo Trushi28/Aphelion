@@ -42,7 +42,8 @@ void apply(Span word, Config& c, bool& storage_set) {
     } else if (equals(key, "storage")) {
         if (equals(value, "auto")) { c.storage = Storage::Auto; storage_set = true; }
         else if (equals(value, "off")) { c.storage = Storage::Off; storage_set = true; }
-        else reject(word, c, "storage is auto or off");
+        else if (equals(value, "usb")) { c.storage = Storage::Usb; storage_set = true; }
+        else reject(word, c, "storage is auto, off or usb");
     } else if (equals(key, "timer")) {
         if (equals(value, "auto")) c.timer = TimerPref::Auto;
         else if (equals(value, "hpet")) c.timer = TimerPref::Hpet;
@@ -79,7 +80,13 @@ void set(const Config& c) { g_config = c; }
 const Config& get() { return g_config; }
 
 const char* name(Mode m) { return m == Mode::Shell ? "shell" : "test"; }
-const char* name(Storage s) { return s == Storage::Off ? "off" : "auto"; }
+const char* name(Storage s) {
+    switch (s) {
+        case Storage::Off: return "off";
+        case Storage::Usb: return "usb";
+        default: return "auto";
+    }
+}
 
 const char* name(TimerPref t) {
     switch (t) {

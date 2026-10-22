@@ -75,6 +75,7 @@ u64 snapshot(Status* why = nullptr);
 u64 snapshot_subtree(u64 dir_star, Status* why = nullptr);
 u64 snapshot_scope(u64 snap, Status* why = nullptr);
 u32 snapshot_count();
+u32 snapshot_ids(u64* out, u32 max);
 bool link(u64 dir_star, const char* name, u64 target, Status* why = nullptr);
 bool unlink(u64 dir_star, const char* name, Status* why = nullptr);
 bool rename(u64 src_dir, const char* src_name, u64 dst_dir, const char* dst_name, u32 flags = 0, Status* why = nullptr);

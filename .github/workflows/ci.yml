@@ -34,6 +34,15 @@ jobs:
       - name: Input tests
         run: make test-input
 
+      - name: Nebula namespace tests
+        run: make test-nebula
+
+      - name: Helm shell tests
+        run: make test-helm
+
+      - name: USB protocol and storage tests
+        run: make test-usb test-usbstor
+
       - name: Boot on NVMe, 1 core
         run: tools/ci-boot.sh nvme 1
 
@@ -50,6 +59,11 @@ jobs:
         run: |
           make iso BOOT_DEFAULT=shell MENU_TIMEOUT=0 ISO=build/aphelion-shell.iso
           tools/ci-shell.sh 2
+
+      - name: Boot from a USB stick
+        run: |
+          make iso PROFILE=usb MENU_TIMEOUT=0 ISO=build/aphelion-usb.iso
+          tools/ci-usb.sh
 
       - name: Build host filesystem tools
         run: make stellarfs

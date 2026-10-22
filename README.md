@@ -45,6 +45,10 @@ built in, described under [Goals](#goals).
 - Corona, a Unicode terminal console on the framebuffer: JetBrains Mono at three sizes, 24-bit colour, box drawing and
   braille, a RAM backbuffer with pixel scrolling
 - PS/2 keyboard and serial input through one key-event queue, a kernel log ring and ACPI/keyboard-controller reboot
+- Nebula, a non-POSIX namespace: `realm:/path` names over RAM, the Stellar disk, read-only snapshots and live kernel
+  state, with Unicode names, partial I/O over whole-file Stellar handles and cross-realm copy
+- Helm, the shell: pipes, redirection, globs, variables, scripts, tab completion, history, Ctrl-C, Unicode editing and
+  about fifty commands for files, text, snapshots and the system
 - Two boot entries from one ISO: a shell and a test suite
 - RTC wall clock plus a tick counter, so files carry real modification times
 
@@ -94,6 +98,8 @@ make test-stellar   # run the filesystem tests on the host, without QEMU
 make test-sched     # boot words, timer maths, run queues and the MLFQ policy on the host
 make test-console   # UTF-8, terminal emulator, font blob and incremental rendering on the host
 make test-input     # scancode and ANSI key decoders and the kernel log ring on the host
+make test-usb       # USB descriptor walker, BOT and SCSI builders, boot-stick identification and free-space rules
+make test-usbstor   # the real USB storage layer against a fake stick: only the boot stick is ever written
 make test-mm        # buddy allocator, kernel heap (including 4 threads), page tables and DMA table on the host
 make bench-stellar  # filesystem scaling benchmark on sparse virtual disks up to 8 GiB
 make crash-fuzz     # kill QEMU at random instants, fsck the crashed disk, boot it again (FUZZ_KIND, FUZZ_CORES, FUZZ_ROUNDS)
@@ -104,21 +110,76 @@ The first run creates `disk.img`, a 64 MB raw disk. The filesystem on it is inde
 block driver, so switching between virtio-blk, AHCI and NVMe keeps the same files. Run
 `make reset-disk` to start with a fresh filesystem.
 `make iso` generates a Limine menu with two entries, **Aphelion Shell** and **Aphelion Test**.
-`make iso PROFILE=usb` builds the variant meant for real hardware: both entries pass `storage=off`, so no disk
-driver starts and nothing on the machine's own drives can be touched, and the shell is the default.
-`BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` change the selection.
+`make iso PROFILE=usb` builds the variant meant for real hardware: the shell entry passes `storage=usb` and the
+test entry `storage=off`, so no AHCI, NVMe or virtio driver ever starts and nothing on the machine's own drives can be
+touched; the shell is the default. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` change the selection.
 
 ```sh
 make iso PROFILE=usb
 ```
 
-Then write `build/aphelion.iso` to the stick. With Rufus choose **DD Image mode** when asked; `dd if=build/aphelion.iso
+Then write `build/aphelion.iso` to the whole stick. With Rufus choose **DD Image mode** when asked; `dd if=build/aphelion.iso
 of=/dev/sdX` does the same. Check the device name twice: that command overwrites whatever it names.
+
+### Using the stick as storage
+
+With `storage=usb` the kernel starts the xHCI controller, finds the USB mass-storage drives and decides which one it
+booted from: first by the GPT disk GUID that Limine reports, then by the ISO volume id (`APH` plus a hash of the
+build). Only a drive that matches is ever written, and only in the free space after the image: the kernel keeps a
+1 MiB gap behind the image and the backup partition table and needs at least 16 MiB. That free space is the
+"window". `usb` lists the drives and what was decided for each, `storage` shows the window, and `storage init erase`
+formats it after you type the size back to confirm. The window is mounted automatically on later boots.
+
+What this means in practice:
+
+- Use a stick larger than the image and write it in **DD mode**. Rufus's ISO/FAT32 mode makes one partition covering
+  the whole stick, which leaves no provable free space, so the kernel refuses to use it.
+- Two sticks written from the same ISO cannot be told apart, so with both plugged in neither gets a window.
+- Hubs, UAS-only drives, 4096-byte-sector drives and USB keyboards are not supported yet. Use the laptop's own
+  keyboard (PS/2 or the serial console) for the shell.
+- Real ACPI power-off arrives with the uACPI series; until then `poweroff` is safe but only works under a hypervisor.
+
+`make run-usb` and `make run-uefi-usb` boot the usb profile in QEMU from an emulated xHCI stick (`build/usb.img`,
+the ISO padded to `USB_IMG_SIZE`, 256M by default).
+
+## The shell
+
+The shell boots as `aphelion <location> ▸`. Locations look like `ram:/notes`, `disk:/proj/src`, `snap:/3/proj` and
+`sys:/memory`; a colon before the first slash names a realm, and `./a:b` spells a file whose name contains a colon.
+
+| Realm | What it is |
+| --- | --- |
+| `ram` | memory-backed, writable, 2048 items and 48 MiB |
+| `disk` | the live Stellar volume |
+| `snap` | read-only Stellar snapshots, `snap:/<id>/...` |
+| `sys` | read-only text files: `version uptime memory cpus tasks realms storage log` |
+
+```
+echo café ₹ Ω > ram:/greeting
+cat ram:/greeting | grep -i CAFÉ
+cp -r snap:/1/proj disk:/restored
+mkfs erase
+snapshot
+find disk:/ -name '*.txt'
+help
+```
+
+The disk is mounted in shell mode when it already holds a Stellar volume and is never formatted automatically.
+`mkfs erase` creates an empty volume, and only on a disk that is blank or already carries a Stellar superblock, so a
+disk with someone else's data is refused. `help syntax` lists the pipe, redirect, glob and variable rules.
+
+Limits worth knowing: files are capped at 16 MiB and partial writes are buffered in memory until `sync`, close or
+exit; a pipe stage's output is capped at 8 MiB; globs work in the last path component only; variables are never word
+split; `grep` is a plain substring match with ASCII case folding; `touch` only creates; a single `&` is rejected; keys
+typed while a command runs are discarded; the Corona console draws Latin, Greek, Cyrillic, symbols and box drawing but
+not CJK or Indic scripts, which the editor still stores and writes correctly to a file or the serial line.
 
 ## Tested on
 
 - QEMU q35 with a BIOS boot, using virtio-blk, AHCI and NVMe disks, on 1 to 4 cores. CI runs this
   matrix on every push.
+- The USB stack is covered by host tests and by `tools/ci-usb.sh` (QEMU xHCI with a decoy stick). It has not been run
+  on a physical xHCI controller yet.
 - x2APIC mode checked on a physical machine. Under QEMU without KVM the kernel falls back to xAPIC.
 
 ## Project layout
@@ -131,8 +192,9 @@ kernel/
     mm/         physical and virtual memory
     sched/      scheduler and context switching
     console/    Corona terminal, font and UTF-8
-    drivers/    framebuffer, serial, keyboard, input queue, klog, virtio-blk, AHCI, NVMe
-    fs/         Stellar FS
+    drivers/    framebuffer, serial, keyboard, input queue, klog, virtio-blk, AHCI, NVMe, xHCI, USB storage
+    fs/         Stellar FS, the Nebula namespace and its realms
+    shell/      Helm: parser, line editor, commands
   include/cosmos/
 tools/          host-side tests, the font baker, the CI boot and shell checks
 docs/

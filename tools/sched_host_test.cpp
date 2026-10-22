@@ -30,6 +30,14 @@ static void bootcfg_tests() {
     c = parse("  mode=shell \t storage=off\ttimer=pit \n");
     expect(c.mode == Mode::Shell && c.storage == Storage::Off && c.timer == TimerPref::Pit && c.rejected == 0,
            "bootcfg: any run of blanks separates words");
+    c = parse("mode=shell storage=usb");
+    expect(c.mode == Mode::Shell && c.storage == Storage::Usb && c.rejected == 0, "bootcfg: storage=usb selects the boot-stick window");
+    c = parse("storage=usb mode=test");
+    expect(c.mode == Mode::Test && c.storage == Storage::Usb, "bootcfg: storage=usb is accepted in either mode");
+    c = parse("mode=shell storage=usbx");
+    expect(c.storage == Storage::Off && c.rejected == 1, "bootcfg: usb must match exactly and falls back to the safe default");
+    expect(__builtin_strcmp(name(Storage::Usb), "usb") == 0 && __builtin_strcmp(name(Storage::Off), "off") == 0 && __builtin_strcmp(name(Storage::Auto), "auto") == 0,
+           "bootcfg: storage names round-trip");
     c = parse("timer=hpet");
     expect(c.timer == TimerPref::Hpet, "bootcfg: timer=hpet");
     c = parse("timer=pm");

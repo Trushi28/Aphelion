@@ -31,9 +31,10 @@ endif
 
 LIMINE_CONF := $(BUILD)/limine.conf
 DEFAULT_INDEX := $(if $(filter shell,$(BOOT_DEFAULT)),1,2)
-STORAGE_WORD := $(if $(filter usb,$(PROFILE)),off,auto)
-SHELL_CMDLINE := mode=shell storage=$(STORAGE_WORD)
-TEST_CMDLINE := mode=test storage=$(STORAGE_WORD)
+SHELL_STORAGE_WORD := $(if $(filter usb,$(PROFILE)),usb,auto)
+TEST_STORAGE_WORD := $(if $(filter usb,$(PROFILE)),off,auto)
+SHELL_CMDLINE := mode=shell storage=$(SHELL_STORAGE_WORD)
+TEST_CMDLINE := mode=test storage=$(TEST_STORAGE_WORD)
 
 define LIMINE_CONF_TEXT
 timeout: $(MENU_TIMEOUT)
@@ -80,7 +81,7 @@ ISO := $(BUILD)/aphelion.iso
 
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
-.PHONY: test-mm test-sched test-console test-input all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+.PHONY: usb-image run-usb run-uefi-usb test-mm test-sched test-console test-input test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -107,8 +108,22 @@ $(BUILD)/%.o: %.asm
 
 -include $(OBJECTS:.o=.d)
 
-$(KERNEL_ELF): $(OBJECTS) $(KDIR)/linker.ld
-	$(LD) $(LDFLAGS) $(OBJECTS) -o $@
+BUILD_ID_SRC := $(BUILD)/buildid.cpp
+BUILD_ID_TXT := $(BUILD)/buildid.txt
+BUILD_ID_OBJ := $(BUILD)/buildid.o
+
+$(BUILD_ID_SRC): $(OBJECTS)
+	@mkdir -p $(BUILD)
+	@id=$$(cat $(OBJECTS) | sha256sum | cut -c1-12 | tr a-f A-F); \
+	printf '%s' "$$id" > $(BUILD_ID_TXT); \
+	printf 'extern "C" const char aphelion_build_id[] = "%s";\n' "$$id" > $@.new; \
+	cmp -s $@.new $@ && rm -f $@.new || mv $@.new $@
+
+$(BUILD_ID_OBJ): $(BUILD_ID_SRC)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(KERNEL_ELF): $(OBJECTS) $(BUILD_ID_OBJ) $(KDIR)/linker.ld
+	$(LD) $(LDFLAGS) $(OBJECTS) $(BUILD_ID_OBJ) -o $@
 
 $(LIMINE_CONF): FORCE
 	@mkdir -p $(BUILD)
@@ -126,7 +141,7 @@ iso: $(KERNEL_ELF) $(LIMINE)/limine.h $(LIMINE_CONF)
 		-no-emul-boot -boot-load-size 4 -boot-info-table \
 		--efi-boot boot/limine/limine-uefi-cd.bin \
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
-		$(ISO_ROOT) -o $(ISO)
+		-V APH$$(cat $(BUILD_ID_TXT)) $(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 
 $(DISK_IMG):
@@ -189,6 +204,23 @@ run-uefi-nvme: iso $(DISK_IMG)
 	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
 	$(QEMU_Q35) -bios $(OVMF) -cdrom $(ISO) $(DRIVE_NVME) $(QEMU_TAIL)
 
+USB_IMG      := $(BUILD)/usb.img
+USB_IMG_SIZE ?= 256M
+DRIVE_USB     = -device qemu-xhci,id=xhci -drive if=none,id=stick,file=$(USB_IMG),format=raw -device usb-storage,bus=xhci.0,drive=stick,bootindex=0
+
+usb-image: iso
+	cp $(ISO) $(USB_IMG)
+	truncate -s $(USB_IMG_SIZE) $(USB_IMG)
+
+run-usb:
+	$(MAKE) PROFILE=usb usb-image
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 2 $(DRIVE_USB) $(QEMU_TAIL)
+
+run-uefi-usb:
+	$(MAKE) PROFILE=usb usb-image
+	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 2 -bios $(OVMF) $(DRIVE_USB) $(QEMU_TAIL)
+
 run-nodisk: iso
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown
 
@@ -212,10 +244,30 @@ test-input:
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/input_host_test.cpp -o $(BUILD)/input_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/input_host_test
 
+test-usb:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/usb_host_test.cpp -o $(BUILD)/usb_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/usb_host_test
+
+test-usbstor:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim-usb -Itools/hostshim -I$(KDIR)/include tools/usbstor_host_test.cpp -o $(BUILD)/usbstor_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/usbstor_host_test
+
 test-sched:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/sched_host_test.cpp -o $(BUILD)/sched_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/sched_host_test
+
+test-nebula:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/nebula_selftest.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp tools/nebula_host_test.cpp -o $(BUILD)/nebula_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/nebula_host_test
+
+test-helm:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp $(KDIR)/src/shell/helm_core.cpp $(KDIR)/src/shell/helm_builtin.cpp $(KDIR)/src/shell/helm_fs.cpp $(KDIR)/src/shell/helm_text.cpp tools/helm_host_test.cpp -o $(BUILD)/helm_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/helm_host_test
 
 test-stellar-thread:
 	@mkdir -p $(BUILD)

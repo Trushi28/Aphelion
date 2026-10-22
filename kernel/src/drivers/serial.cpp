@@ -8,7 +8,8 @@
 namespace serial {
 
 static constexpr u16 COM1 = 0x3F8;
-static constexpr u32 TX_SPINS = 100000;
+static constexpr u32 TX_SPINS = 4000000;
+static constexpr u32 TX_STUCK_SPINS = 2000;
 static constexpr u32 RX_DRAIN_LIMIT = 64;
 static constexpr u32 ISR_ROUNDS = 8;
 
@@ -16,6 +17,7 @@ static bool g_present = false;
 static bool g_rx_irq = false;
 static u64 g_rx_bytes = 0;
 static u64 g_tx_drops = 0;
+static volatile bool g_tx_stuck = false;
 static cpu::Spinlock g_rx_lock;
 
 void init() {
@@ -42,10 +44,15 @@ u64 rx_bytes() { return g_rx_bytes; }
 u64 tx_drops() { return g_tx_drops; }
 
 static bool wait_tx() {
-    for (u32 spins = 0; spins < TX_SPINS; ++spins) {
-        if (cpu::in8(COM1 + 5) & 0x20) return true;
+    u32 limit = g_tx_stuck ? TX_STUCK_SPINS : TX_SPINS;
+    for (u32 spins = 0; spins < limit; ++spins) {
+        if (cpu::in8(COM1 + 5) & 0x20) {
+            g_tx_stuck = false;
+            return true;
+        }
         cpu::io_wait();
     }
+    g_tx_stuck = true;
     ++g_tx_drops;
     return false;
 }

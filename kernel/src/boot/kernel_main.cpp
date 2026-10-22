@@ -20,7 +20,8 @@
 #include <cosmos/keyboard.hpp>
 #include <cosmos/input.hpp>
 #include <cosmos/power.hpp>
-#include <cosmos/probe.hpp>
+#include <cosmos/helm.hpp>
+#include <cosmos/nebula_realms.hpp>
 #include <cosmos/corona.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
@@ -28,6 +29,8 @@
 #include <cosmos/nvme.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/stellar.hpp>
+#include <cosmos/xhci.hpp>
+#include <cosmos/usbstor.hpp>
 #include <cosmos/clock.hpp>
 #include <cosmos/civil.hpp>
 
@@ -60,6 +63,10 @@ static volatile limine_hhdm_request hhdm_request = {
 __attribute__((used, section(".requests")))
 static volatile limine_executable_cmdline_request cmdline_request = {
     .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST, .revision = 0, .response = nullptr
+};
+__attribute__((used, section(".requests")))
+static volatile limine_kernel_file_request exec_file_request = {
+    .id = LIMINE_KERNEL_FILE_REQUEST, .revision = 0, .response = nullptr
 };
 __attribute__((used, section(".requests")))
 static volatile limine_rsdp_request rsdp_request = {
@@ -113,6 +120,50 @@ static void bring_up_core(bool is_bsp) {
     apic::init(g_hhdm_offset);
 }
 
+extern "C" const char aphelion_build_id[];
+
+static bool boot_disk_guid(u8* out) {
+    if (!exec_file_request.response || !exec_file_request.response->kernel_file) return false;
+    const limine_uuid& id = exec_file_request.response->kernel_file->gpt_disk_uuid;
+    out[0] = static_cast<u8>(id.a); out[1] = static_cast<u8>(id.a >> 8); out[2] = static_cast<u8>(id.a >> 16); out[3] = static_cast<u8>(id.a >> 24);
+    out[4] = static_cast<u8>(id.b); out[5] = static_cast<u8>(id.b >> 8);
+    out[6] = static_cast<u8>(id.c); out[7] = static_cast<u8>(id.c >> 8);
+    bool any = false;
+    for (int i = 0; i < 8; ++i) { out[8 + i] = id.d[i]; }
+    for (int i = 0; i < 16; ++i) if (out[i]) any = true;
+    return any;
+}
+
+static void start_usb_storage() {
+    if (timesrc::tsc_khz() == 0) timesrc::calibrate(10, 4, false);
+    if (timesrc::tsc_khz() == 0) {
+        serial::writeln("[storage] storage=usb requested but no time source could be measured, so USB timeouts cannot be trusted");
+        fb::printf(0xE0D080, "[--] USB storage: no usable time source for USB timeouts\n");
+        return;
+    }
+    if (!xhci::init(g_hhdm_offset)) {
+        serial::writeln("[storage] storage=usb requested but no xHCI controller started");
+        fb::printf(0xE0D080, "[--] USB storage: no xHCI controller could be started\n");
+        return;
+    }
+    u8 guid[16];
+    bool have_guid = boot_disk_guid(guid);
+    char volume_id[24];
+    u32 n = 0;
+    volume_id[n++] = 'A'; volume_id[n++] = 'P'; volume_id[n++] = 'H';
+    for (u32 i = 0; aphelion_build_id[i] && n + 1 < sizeof(volume_id); ++i) volume_id[n++] = aphelion_build_id[i];
+    volume_id[n] = 0;
+    serial::printf("[storage] identifying the boot stick by %s%s\n", have_guid ? "disk GUID" : "volume id only (Limine reported no GPT disk GUID)",
+                    have_guid ? ", falling back to volume id" : "");
+    usbstor::init(have_guid ? guid : nullptr, volume_id);
+    if (usbstor::window_present()) {
+        const usbstor::LunInfo* w = usbstor::window_lun();
+        fb::printf(0xC0FFC0, "[ok] USB storage window: %lu MiB free after the boot image (%s %s)\n", w->tail_sectors / 2048, w->vendor, w->product);
+    } else {
+        fb::printf(0xE0D080, "[--] USB storage: %s\n", usbstor::window_status());
+    }
+}
+
 extern "C" void ap_entry(limine_smp_info* info) {
     percore::early_init();
     fpu::init_core();
@@ -144,6 +195,15 @@ static u64 cstr_len(const char* s) {
     u64 n = 0;
     while (s[n]) ++n;
     return n;
+}
+
+static char g_disk_note[112];
+
+static void set_disk_note(const char* a, const char* b) {
+    u32 n = 0;
+    for (const char* p = a; p && *p && n + 1 < sizeof(g_disk_note); ++p) g_disk_note[n++] = *p;
+    for (const char* p = b; p && *p && n + 1 < sizeof(g_disk_note); ++p) g_disk_note[n++] = *p;
+    g_disk_note[n] = 0;
 }
 
 static bool file_equals(u64 star, const char* expect, u64 snap = stellar::LIVE) {
@@ -636,10 +696,12 @@ static bool selftest_extents() {
 }
 
 static void reclaim_task(void*) {
+    constexpr u64 PATIENCE_MS = 20000;
     u64 start = clock::uptime_ms();
     while (orbital::cores_on_kernel_stacks() < g_expected_cores) {
-        if (clock::uptime_ms() - start > 3000) {
-            serial::writeln("[universe] some core never left its bootloader stack, leaving bootloader memory alone");
+        if (clock::uptime_ms() - start > PATIENCE_MS) {
+            serial::printf("[universe] only %u of %lu core(s) left their bootloader stacks in %lu ms, leaving bootloader memory alone\n",
+                            orbital::cores_on_kernel_stacks(), g_expected_cores, PATIENCE_MS);
             orbital::exit_current();
         }
         orbital::yield();
@@ -848,17 +910,40 @@ extern "C" NORETURN void kernel_main() {
 
     const bool test_mode = bootcfg::get().mode == bootcfg::Mode::Test;
 
+    const bool usb_mode = bootcfg::get().storage == bootcfg::Storage::Usb;
+
     if (bootcfg::get().storage == bootcfg::Storage::Auto) {
         virtioblk::init(g_hhdm_offset);
         ahci::init(g_hhdm_offset);
         nvme::init(g_hhdm_offset);
+    } else if (usb_mode) {
+        start_usb_storage();
     } else {
         serial::writeln("[storage] disabled by the boot configuration: no disk driver is started and no disk is touched");
         fb::printf(0xE0D080, "[--] Storage disabled by the boot configuration: no disk is initialised or touched\n");
     }
-    if (blockdev::present() && !test_mode) {
+    nebula::register_builtin_realms();
+    nebula::disk_set_confirmed_only(usb_mode);
+    if (blockdev::present() && (!test_mode || usb_mode)) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n", blockdev::active()->name(), blockdev::capacity_sectors());
-        serial::printf("[storage] %s found; the filesystem test suite is skipped in shell mode\n", blockdev::active()->name());
+        serial::printf("[storage] %s found; the filesystem test suite is skipped (%s)\n", blockdev::active()->name(),
+                        usb_mode ? "the USB window is never formatted or written without an explicit command" : "shell mode");
+        stellar::init(g_hhdm_offset);
+        stellar::Status shell_mount_why = stellar::Status::Ok;
+        if (stellar::mount(&shell_mount_why)) {
+            nebula::disk_set_mounted(true);
+            set_disk_note(usb_mode ? "USB window: Stellar volume mounted as disk:" : "Stellar volume mounted as disk:", nullptr);
+            serial::printf("[nebula] Stellar volume mounted for the shell: %lu sectors, %lu free\n", stellar::total_sectors(), stellar::free_space_sectors());
+        } else {
+            const char* why_text = usb_mode && shell_mount_why == stellar::Status::NotFormatted ? "blank, not formatted yet" : stellar::status_name(shell_mount_why);
+            set_disk_note(usb_mode ? "USB window has no Stellar volume: " : "no Stellar volume: ", why_text);
+            serial::printf("[nebula] no Stellar volume for the shell (%s); %s\n", why_text,
+                            usb_mode ? "storage init erase <MiB> creates one in the USB window" : "mkfs erase creates one on a blank disk");
+        }
+        if (usb_mode) {
+            serial::printf("[storage] %s\n", g_disk_note);
+            fb::printf(nebula::disk_is_mounted() ? 0xC0FFC0 : 0xE0D080, "[%s] %s\n", nebula::disk_is_mounted() ? "ok" : "--", g_disk_note);
+        }
     } else if (blockdev::present()) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n",
                    blockdev::active()->name(), blockdev::capacity_sectors());
@@ -881,6 +966,7 @@ extern "C" NORETURN void kernel_main() {
             }
         }
         bool tail_free = fs_ready && stellar::total_sectors() + TEST_TAIL_SECTORS <= blockdev::capacity_sectors();
+        nebula::disk_set_mounted(fs_ready);
 
         u64 total_sectors = blockdev::capacity_sectors();
         if (tail_free && total_sectors > 64) {
@@ -1208,6 +1294,10 @@ extern "C" NORETURN void kernel_main() {
     serial::printf("[gdt] %u core(s) verified on private GDT, TSS and IST stacks\n", gdt::cores_seen());
     serial::printf("[selftest] per-core gdt: %s\n", gdt_ok ? "ok" : "MISMATCH");
 
+    if (test_mode) {
+        bool nebula_ok = nebula::selftest();
+        serial::printf("[selftest] nebula: %s\n", nebula_ok ? "ok" : "MISMATCH");
+    }
     fb::printf(0x8FD3FF, "\nOrbital scheduler: bringing up this core...\n");
     clock::sync();
     orbital::init_core();
@@ -1246,16 +1336,20 @@ extern "C" NORETURN void kernel_main() {
         for (u64 i = 0; i < MM_WORKERS; ++i)
             orbital::spawn("mm-stress", &demo_mm_stress, reinterpret_cast<void*>(i));
     } else {
-        probe::Facts facts{};
+        helm::Facts facts{};
         facts.suns = static_cast<u32>(g_cpus_online);
         facts.storage = blockdev::present() ? blockdev::active()->name()
                         : (bootcfg::get().storage == bootcfg::Storage::Off ? "disabled by the boot configuration" : "no block device found");
+        facts.usb_mode = usb_mode;
         facts.keyboard_ready = kb_status == keyboard::Status::Ready;
         facts.keyboard_irq = kb_irq;
         facts.serial_present = serial::present();
         facts.serial_irq = serial_irq;
-        probe::set_facts(facts);
-        if (!probe::spawn()) serial::writeln("[boot] FATAL: could not start the console probe");
+        facts.disk_mounted = nebula::disk_is_mounted();
+        facts.disk_note = g_disk_note;
+        helm::set_facts(facts);
+        nebula::sys_set_facts(facts.storage, facts.suns);
+        if (!helm::spawn()) serial::writeln("[boot] FATAL: could not start the Helm shell");
     }
     orbital::spawn("reclaim", &reclaim_task, nullptr);
     if (test_mode) orbital::spawn_selftest();

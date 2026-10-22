@@ -54,7 +54,7 @@ object, freeing a large block twice and freeing a pointer the heap does not own 
 link instead of misbehaving. `operator new` stops the kernel when memory runs out (there are no exceptions), while
 `kheap::alloc` returns `nullptr`. A slab that becomes empty goes back to Universe unless it is the only one with free
 space in its class. `kheap::stats()` reports live objects and bytes, slab and large-block pages, call counts and
-failed allocations. Nothing in the kernel allocates from it yet except its own tests; the Nebula VFS and the shell will.
+failed allocations. Nothing in the kernel allocates from it yet except its own tests; Nebula and Helm use it for their larger buffers.
 
 **Virtual (`Constellation`).** The Core is built fresh instead of continuing on Limine's
 tables (`mm/vmm.cpp`): reusing bootloader-reclaimable memory before replacing the tables that
@@ -165,6 +165,43 @@ registers.
 All three wait with `cli` / check / `sti; hlt` (no lost-wakeup window) and fall back to
 polling if no interrupt arrives.
 
+### USB storage
+
+`storage=usb` starts only the xHCI driver and the USB storage layer; no other disk driver runs.
+
+`xhci` finds class 0C/03/30 devices, maps BAR0 uncached, takes the controller from the firmware (USB legacy support
+handoff), resets it and runs it polled: one command ring, one event ring, no interrupts. It reads the supported-protocol
+capabilities to tell USB 3 ports from USB 2 ones, resets USB 2 ports itself, and enumerates each device with Enable
+Slot, Address Device, descriptor reads, Set Configuration and Configure Endpoint. Rings are 256 TRBs with a toggling
+link TRB; 32- and 64-byte contexts both work; transfers go through a 64 KiB bounce buffer. A STALL halts the endpoint,
+so the driver issues Reset Endpoint and Set TR Dequeue Pointer for it (control pipe included) and, for bulk pipes,
+CLEAR_FEATURE(ENDPOINT_HALT). A transfer that times out marks the device dead, because the ring state cannot be
+trusted afterwards. All waits are bounded by the TSC. Hubs are not driven, so a stick must sit on a root port.
+
+`usbproto` (pure, host-tested) walks configuration descriptors for a Bulk-Only Transport interface (alternate setting
+0, SuperSpeed companion bursts) and builds and parses CBW, CSW and the SCSI commands used: INQUIRY, TEST UNIT READY,
+REQUEST SENSE, READ CAPACITY(10/16), READ and WRITE (10 or 16 as the range needs) and SYNCHRONIZE CACHE.
+
+`usbstor` runs the BOT state machine under one command mutex: CBW, optional data stage, CSW. A stall in the data stage
+clears the halt and still reads the CSW; a bad signature, tag or phase error performs the reset recovery (class reset
+plus clearing both halts). Success is judged by the CSW status and by the residue: a read or write that moved fewer
+bytes than asked is a failure, never a short success. UNIT ATTENTION is retried. Only 512-byte-sector media is driven.
+
+`diskmap` (pure, host-tested) decides what a drive is. It reads LBA 0 and 1, validates the MBR, the GPT header and
+entry array by CRC, and reads the ISO 9660 descriptor at LBA 64, to learn where the image ends: the end of the last
+partition, the backup GPT, or the ISO volume size, whichever is highest (a damaged GPT counts as the whole drive).
+`identify` compares the drive with what the kernel booted from: the GPT disk GUID from Limine's executable-file
+response wins, a different GUID rejects the drive, and a drive without a GPT falls back to the volume id
+`APH<12 hex>` that the Makefile stamps into the ISO and into the kernel from the same hash of the object files.
+`tail` then yields the free space: start at the end of the image rounded up to 1 MiB plus a 1 MiB guard, end at the
+drive's last whole MiB, at least 16 MiB, otherwise none.
+
+Only the drive that matched exactly once gets a `Window`, a block device restricted to that range and registered
+with `blockdev`. Stellar mounts it like any other disk. Nothing before that point issues a write to any USB drive,
+and the window never accepts a sector outside its range. The window is never formatted at boot, not even in test
+mode; `storage init erase <MiB>` in the shell formats it, and only when the typed size equals the window size and
+no Stellar volume is already there.
+
 ### Locking
 
 `orbital::Mutex` is recursive and owned by the Satellite. A contended waiter calls `yield_contended()`, which
@@ -176,18 +213,19 @@ its own around every request, always acquired in that order. `Mutex` still yield
 ### Boot words and the timer
 
 Limine passes the kernel command line; `bootcfg` reads three space-separated words from it, `mode=shell|test`,
-`storage=auto|off` and `timer=auto|hpet|pm|pit`. An unknown word is reported and ignored. `storage` defaults to
+`storage=auto|off|usb` and `timer=auto|hpet|pm|pit`. An unknown word is reported and ignored. `storage` defaults to
 `off` in shell mode and `auto` in test mode. With `storage=off` no virtio, AHCI or NVMe driver is started and no
 filesystem is mounted, so nothing on the machine can write to a disk. **A boot with no command line is still test
 mode with storage on**, so every configuration the Makefile generates names both words explicitly.
 
 `make iso` writes `build/limine.conf` with two entries, `Aphelion Shell` (`mode=shell`) and `Aphelion Test`
 (`mode=test`). `PROFILE=dev` (the default) passes `storage=auto` and boots the test entry after 3 seconds;
-`PROFILE=usb` passes `storage=off` on both entries and boots the shell after 5 seconds, so an ISO written to a
-stick can never initialise a disk driver. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` override either
+`PROFILE=usb` passes `storage=usb` on the shell entry and `storage=off` on the test entry and boots the shell after 5
+seconds, so an ISO written to a stick never initialises an AHCI, NVMe or virtio driver and can reach only the USB
+window described below. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` override either
 profile; CI builds with `MENU_TIMEOUT=0`. In shell mode `kernel_main` skips the demo Satellites, the stress
 workers, the filesystem test suite and the scheduler self-test, keeps the bootloader-memory reclaim task and starts
-the console probe.
+Helm. The disk is mounted when it already holds a Stellar volume and is never formatted unless the user runs `mkfs erase`.
 
 The APIC timer is calibrated against the first working reference of HPET, ACPI PM timer (3.579545 MHz, 24 or 32
 bit as the FADT says) and the PIT, with a TSC-based timeout on every wait so a reference that does not count can no
@@ -256,18 +294,63 @@ every transmit wait. USB keyboards are not supported until an xHCI HID driver ex
 ### Kernel log and power
 
 `klog` is a 16 KiB ring fed by `serial::putc` with a try-lock, so a contended or interrupt-time write is dropped
-rather than blocking. Output sent to the console by the probe bypasses it. `power::reboot` tries the ACPI FADT
+rather than blocking. Output the shell sends to the console bypasses it. `power::reboot` tries the ACPI FADT
 reset register, the keyboard controller pulse, the PCI reset register at 0xCF9 and finally a triple fault.
 `power::poweroff` only works under a hypervisor (it writes the QEMU, Bochs and VirtualBox ports, and only after
 CPUID reports a hypervisor); real ACPI power-off needs the `_S5` sleep type from the AML tables and arrives with
 uACPI.
 
-### Console probe
+### Nebula
 
-Shell mode starts `helm-probe`, a stand-in for the real shell: a splash, an information panel and a line editor
-(history, cursor keys, Ctrl+A/E/U/K/L/C) with `help`, `about`, `clear`, `echo`, `unicode`, `colors`, `ps`, `cores`,
-`mem`, `uptime`, `klog`, `keys`, `reboot` and `poweroff`. It exists to exercise the console and both input paths on
-real hardware before the filesystem and shell land.
+Nebula is the namespace layer between the shell and storage. A path is `realm:/a/b`; realm names match
+`[a-z][a-z0-9-]{0,15}` and a colon before the first slash marks one. Names are well-formed UTF-8 of at most 51 bytes
+(Stellar's limit), with no control, C1, bidirectional-override, BOM or line-separator scalars, no `.` or `..`
+component and no `/`. A path has at most 32 components and 512 bytes. `./a:b` names a file with a colon in a
+relative path.
+
+A `Realm` is an abstract class over opaque nodes: `root`, `find`, `info`, `list`, `read_all`, `write_all`,
+`create_file`, `make_dir`, `remove` and `rename`, plus `writable`, `available` and a space report. Four are built in. `ram` keeps up to 2048 items and 48 MiB in kernel-heap blocks. `disk` forwards to
+Stellar. `snap` exposes Stellar snapshots read-only as `snap:/<id>/...` by mapping the id to a snapshot scope.
+`sys` renders each file on demand from live kernel state and is read-only; its files have no fixed size, so reads
+accept a short or long answer and writers are refused.
+
+Stellar moves whole files, so partial I/O is layered on top. A session owns up to 16 generation-checked handles; an
+open file is read into a heap buffer (at most 16 MiB), `read_at`, `write_at`, `append` and `resize` act on that
+buffer, and `sync`, `close` or `close_session` write it back with one Stellar call. A registry of 64 slots keeps one
+writer per file. Cross-realm `cp` and `mv` copy the file or tree and, for `mv`, remove the source afterwards;
+trees deeper than 16 levels are refused. Nothing about Stellar's semantics changed; the only addition is
+`stellar::snapshot_ids`, which lists live snapshot ids.
+
+No global constructors run in the kernel, so every realm and registry is `constinit` and gets its non-zero defaults
+at registration time. `nebula::selftest()` runs during the test boot; `tools/nebula_host_test.cpp` runs the whole layer
+against the real Stellar code on an in-memory disk under ASan and UBSan.
+
+### Helm
+
+Helm is a Satellite named `helm` that owns the console in shell mode. `helm_parse` turns a line into stages
+separated by `|`, joined by `;`, `&&` and `||`, with `>`, `>>` and `<` redirects, single and double quotes,
+backslash escapes, `$name`, `${name}`, `$?` and `$cwd`. The parser reports a typed error with the column, and
+`help syntax` prints the rules. Variables are never word split. A glob (`*`, `?`, `[a-z]`) expands only in the last
+path component and an empty match is an error; redirect targets cannot contain wildcards.
+
+A pipe runs its stages one after another and captures each stage's output in a heap buffer capped at 8 MiB, so no
+stage needs a second thread. Commands poll `Shell::poll()` inside their loops; every 64th call drains the input queue
+looking for Ctrl-C, which is why keys typed while a command runs are dropped. `run [-k] script` executes a file at
+most four levels deep. `cp` and `mv` refuse to replace anything without `-f` and never merge directories.
+
+The line editor works in code points and display cells: UTF-8 is validated on input, wide characters take two cells,
+combining marks take none, and the line scrolls horizontally rather than wrapping. History keeps the last 64 lines,
+Tab completes commands, realm names and paths, and a second Tab lists the candidates. The editor draws through the
+console's ANSI subset, so the same bytes go to the serial line.
+
+`tools/helm_host_test.cpp` drives the parser, the shell and the real Nebula and Stellar code on a memory disk.
+`tools/ci-shell.sh` boots the shell three times under QEMU (no disk, a blank virtio disk, and the same disk again
+after a reboot) and types through both the serial port and the emulated PS/2 keyboard.
+
+With `storage=usb` Helm also has `usb`, which lists the xHCI controllers, the ports and the drives with the verdict
+for each, and `storage`, which shows the USB window and the filesystem state. `storage init erase <MiB>` formats the
+window only after the size is typed back, and `mkfs erase` refuses in this mode so the stick cannot be formatted
+without that confirmation.
 
 ### Hardware and interrupts
 

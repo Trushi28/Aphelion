@@ -5,6 +5,7 @@
 
 namespace cpu {
 
+inline u64 rdtsc() { return __builtin_ia32_rdtsc(); }
 inline void invlpg(u64) {}
 inline u64 (*g_read_u64)(u64) = nullptr;
 inline u64 read_u64(u64 va) { return g_read_u64(va); }

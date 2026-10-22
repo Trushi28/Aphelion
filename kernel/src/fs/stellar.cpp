@@ -1017,6 +1017,18 @@ static int snap_find(u64 id) {
     return -1;
 }
 
+u32 snapshot_ids(u64* out, u32 max) {
+    Guard guard;
+    u32 n = 0;
+    for (u32 i = 0; i < SNAPSHOT_MAX && n < max; ++i) {
+        if (g_snaps[i].id == 0) continue;
+        u32 j = n++;
+        while (j > 0 && out[j - 1] > g_snaps[i].id) { out[j] = out[j - 1]; --j; }
+        out[j] = g_snaps[i].id;
+    }
+    return n;
+}
+
 static void release_extent(u64 first, u64 count, u64 born) {
     if (born >= g_sb.epoch) { release_sectors(first, count); return; }
     if (g_snap_max_epoch >= born) return;
