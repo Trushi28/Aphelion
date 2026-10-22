@@ -704,7 +704,7 @@ static void reclaim_task(void*) {
                             orbital::cores_on_kernel_stacks(), g_expected_cores, PATIENCE_MS);
             orbital::exit_current();
         }
-        orbital::yield();
+        orbital::sleep_ms(2);
     }
     universe::reclaim_bootloader_regions(g_entries, g_n_entries);
     orbital::exit_current();

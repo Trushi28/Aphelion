@@ -277,6 +277,7 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
 extern "C" void satellite_trampoline() {
     finish_switch();
     Satellite* self = g_current[apic::id()];
+    if (self == &g_idle[apic::id()]) __atomic_add_fetch(&g_cores_on_kstack, 1u, __ATOMIC_SEQ_CST);
     cpu::sti();
     self->entry(self->arg);
 
@@ -362,7 +363,6 @@ static bool zombies_pending() { return __atomic_load_n(&g_zombies, __ATOMIC_RELA
 
 static void idle_entry(void*) {
     u32 me = apic::id();
-    __atomic_add_fetch(&g_cores_on_kstack, 1u, __ATOMIC_SEQ_CST);
     cpu::sti();
     for (;;) {
         reap_zombies();

@@ -120,18 +120,19 @@ void poll_rx() {
     cpu::irq_restore(flags);
 }
 
-static void put_uint(u64 v, u32 base, bool upper) {
+static void put_uint(u64 v, u32 base, bool upper, u32 width = 0, bool zero = false) {
     char buf[32];
     const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     int i = 0;
     if (v == 0) buf[i++] = '0';
     while (v) { buf[i++] = digits[v % base]; v /= base; }
+    for (u32 pad = static_cast<u32>(i); pad < width; ++pad) putc(zero ? '0' : ' ');
     while (i--) putc(buf[i]);
 }
 
-static void put_int(i64 v) {
-    if (v < 0) { putc('-'); put_uint(static_cast<u64>(-v), 10, false); }
-    else put_uint(static_cast<u64>(v), 10, false);
+static void put_int(i64 v, u32 width = 0, bool zero = false) {
+    if (v < 0) { putc('-'); put_uint(static_cast<u64>(-v), 10, false, width > 0 ? width - 1 : 0, zero); }
+    else put_uint(static_cast<u64>(v), 10, false, width, zero);
 }
 
 void printf(const char* fmt, ...) {
@@ -142,16 +143,20 @@ void printf(const char* fmt, ...) {
     __builtin_va_start(ap, fmt);
     for (const char* p = fmt; *p; ++p) {
         if (*p != '%') { putc(*p); continue; }
+        bool zero = false;
+        u32 width = 0;
+        if (*(p + 1) == '0') { zero = true; ++p; }
+        while (*(p + 1) >= '0' && *(p + 1) <= '9') width = width * 10 + static_cast<u32>(*++p - '0');
         switch (*++p) {
             case 's': write(__builtin_va_arg(ap, const char*)); break;
             case 'c': putc(static_cast<char>(__builtin_va_arg(ap, int))); break;
-            case 'd': put_int(__builtin_va_arg(ap, int)); break;
-            case 'u': put_uint(__builtin_va_arg(ap, unsigned), 10, false); break;
-            case 'x': put_uint(__builtin_va_arg(ap, unsigned), 16, false); break;
+            case 'd': put_int(__builtin_va_arg(ap, int), width, zero); break;
+            case 'u': put_uint(__builtin_va_arg(ap, unsigned), 10, false, width, zero); break;
+            case 'x': put_uint(__builtin_va_arg(ap, unsigned), 16, false, width, zero); break;
             case 'p': write("0x"); put_uint(__builtin_va_arg(ap, u64), 16, false); break;
             case 'l':
-                if (*(p + 1) == 'u') { ++p; put_uint(__builtin_va_arg(ap, u64), 10, false); }
-                else if (*(p + 1) == 'x') { ++p; put_uint(__builtin_va_arg(ap, u64), 16, false); }
+                if (*(p + 1) == 'u') { ++p; put_uint(__builtin_va_arg(ap, u64), 10, false, width, zero); }
+                else if (*(p + 1) == 'x') { ++p; put_uint(__builtin_va_arg(ap, u64), 16, false, width, zero); }
                 break;
             case '%': putc('%'); break;
             default: putc('%'); putc(*p); break;
