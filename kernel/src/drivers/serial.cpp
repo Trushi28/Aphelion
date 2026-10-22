@@ -10,6 +10,7 @@ namespace serial {
 static constexpr u16 COM1 = 0x3F8;
 static constexpr u32 TX_SPINS = 4000000;
 static constexpr u32 TX_STUCK_SPINS = 2000;
+static constexpr u32 TX_LOCK_SPINS = 50000000;
 static constexpr u32 RX_DRAIN_LIMIT = 64;
 static constexpr u32 ISR_ROUNDS = 8;
 
@@ -67,17 +68,55 @@ static void emit(char c) {
     cpu::out8(COM1, static_cast<u8>(c));
 }
 
-void putc(char c) {
+static cpu::Spinlock g_tx_lock;
+
+struct TxGuard {
+    u64 flags;
+    bool held;
+    TxGuard() {
+        flags = cpu::irq_save();
+        held = false;
+        for (u32 spins = 0; spins < TX_LOCK_SPINS; ++spins) {
+            if (!__atomic_exchange_n(&g_tx_lock.locked, 1, __ATOMIC_ACQUIRE)) {
+                held = true;
+                break;
+            }
+            asm volatile("pause");
+        }
+    }
+    ~TxGuard() {
+        if (held) g_tx_lock.unlock();
+        cpu::irq_restore(flags);
+    }
+};
+
+static void putc_raw(char c) {
     klog::put(c);
     emit(c);
 }
 
+static void write_raw(const char* s) { while (*s) putc_raw(*s++); }
+
+void putc(char c) {
+    TxGuard guard;
+    putc_raw(c);
+}
+
 void console_write(const char* s, u32 n) {
+    TxGuard guard;
     for (u32 i = 0; i < n; ++i) emit(s[i]);
 }
 
-void write(const char* s) { while (*s) putc(*s++); }
-void writeln(const char* s) { write(s); putc('\n'); }
+void write(const char* s) {
+    TxGuard guard;
+    write_raw(s);
+}
+
+void writeln(const char* s) {
+    TxGuard guard;
+    write_raw(s);
+    putc_raw('\n');
+}
 
 static void drain_rx() {
     for (u32 n = 0; n < RX_DRAIN_LIMIT; ++n) {
@@ -126,44 +165,41 @@ static void put_uint(u64 v, u32 base, bool upper, u32 width = 0, bool zero = fal
     int i = 0;
     if (v == 0) buf[i++] = '0';
     while (v) { buf[i++] = digits[v % base]; v /= base; }
-    for (u32 pad = static_cast<u32>(i); pad < width; ++pad) putc(zero ? '0' : ' ');
-    while (i--) putc(buf[i]);
+    for (u32 pad = static_cast<u32>(i); pad < width; ++pad) putc_raw(zero ? '0' : ' ');
+    while (i--) putc_raw(buf[i]);
 }
 
 static void put_int(i64 v, u32 width = 0, bool zero = false) {
-    if (v < 0) { putc('-'); put_uint(static_cast<u64>(-v), 10, false, width > 0 ? width - 1 : 0, zero); }
+    if (v < 0) { putc_raw('-'); put_uint(static_cast<u64>(-v), 10, false, width > 0 ? width - 1 : 0, zero); }
     else put_uint(static_cast<u64>(v), 10, false, width, zero);
 }
 
 void printf(const char* fmt, ...) {
-
-    static cpu::Spinlock lock;
-    lock.lock();
+    TxGuard guard;
     __builtin_va_list ap;
     __builtin_va_start(ap, fmt);
     for (const char* p = fmt; *p; ++p) {
-        if (*p != '%') { putc(*p); continue; }
+        if (*p != '%') { putc_raw(*p); continue; }
         bool zero = false;
         u32 width = 0;
         if (*(p + 1) == '0') { zero = true; ++p; }
         while (*(p + 1) >= '0' && *(p + 1) <= '9') width = width * 10 + static_cast<u32>(*++p - '0');
         switch (*++p) {
-            case 's': write(__builtin_va_arg(ap, const char*)); break;
-            case 'c': putc(static_cast<char>(__builtin_va_arg(ap, int))); break;
+            case 's': write_raw(__builtin_va_arg(ap, const char*)); break;
+            case 'c': putc_raw(static_cast<char>(__builtin_va_arg(ap, int))); break;
             case 'd': put_int(__builtin_va_arg(ap, int), width, zero); break;
             case 'u': put_uint(__builtin_va_arg(ap, unsigned), 10, false, width, zero); break;
             case 'x': put_uint(__builtin_va_arg(ap, unsigned), 16, false, width, zero); break;
-            case 'p': write("0x"); put_uint(__builtin_va_arg(ap, u64), 16, false); break;
+            case 'p': write_raw("0x"); put_uint(__builtin_va_arg(ap, u64), 16, false); break;
             case 'l':
                 if (*(p + 1) == 'u') { ++p; put_uint(__builtin_va_arg(ap, u64), 10, false, width, zero); }
                 else if (*(p + 1) == 'x') { ++p; put_uint(__builtin_va_arg(ap, u64), 16, false, width, zero); }
                 break;
-            case '%': putc('%'); break;
-            default: putc('%'); putc(*p); break;
+            case '%': putc_raw('%'); break;
+            default: putc_raw('%'); putc_raw(*p); break;
         }
     }
     __builtin_va_end(ap);
-    lock.unlock();
 }
 
 }

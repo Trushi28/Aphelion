@@ -81,9 +81,9 @@ def pump(sock, seconds):
     return True
 
 
-def expect(sock, pattern, what, wait=60):
+def expect(sock, pattern, what, wait=60, since=None):
     rx = re.compile(pattern.encode("utf-8"))
-    start = len(transcript)
+    start = len(transcript) if since is None else since
     end = min(time.time() + wait, deadline)
     while time.time() < end:
         m = rx.search(bytes(transcript[start:]))
@@ -102,13 +102,15 @@ def send(sock, text):
 
 
 proc, serial = launch("one")
-expect(serial, "xHCI|xhci", "the xHCI controller line", wait=90)
-expect(serial, "storage window: [0-9]+ sector", "a storage window on the booted stick", wait=90)
-expect(serial, "▸", "the shell prompt", wait=60)
+mark = len(transcript)
+expect(serial, "xHCI|xhci", "the xHCI controller line", wait=90, since=mark)
+expect(serial, "storage window: [0-9]+ sector", "a storage window on the booted stick", wait=90, since=mark)
+expect(serial, "▸", "the shell prompt", wait=60, since=mark)
 
+mark = len(transcript)
 send(serial, "usb\r")
-expect(serial, "boot stick", "the booted stick listed as such")
-expect(serial, "other disk \\(untouched\\)", "the decoy stick listed as untouched")
+expect(serial, "boot stick", "the booted stick listed as such", since=mark)
+expect(serial, "other disk \\(untouched\\)", "the decoy stick listed as untouched", since=mark)
 
 send(serial, "storage\r")
 expect(serial, "blank, not formatted yet", "a blank window before formatting")
@@ -135,8 +137,9 @@ if proc.poll() is None:
     fail("the machine did not reset after the reboot command")
 
 proc, serial = launch("two")
-expect(serial, "USB window: Stellar volume mounted", "the formatted window mounting on the next boot", wait=120)
-expect(serial, "▸", "the shell prompt after the second boot", wait=60)
+mark = len(transcript)
+expect(serial, "USB window: Stellar volume mounted", "the formatted window mounting on the next boot", wait=120, since=mark)
+expect(serial, "▸", "the shell prompt after the second boot", wait=60, since=mark)
 send(serial, "storage\r")
 expect(serial, "Stellar, mounted", "the storage command reporting the mounted volume")
 send(serial, "poweroff\r")
