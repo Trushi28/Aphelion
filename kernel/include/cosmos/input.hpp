@@ -6,6 +6,7 @@ namespace input {
 
 void init();
 bool ready();
+void set_wake_hook(void (*hook)());
 
 bool push(const Key& key);
 void feed_scancode(u8 byte);

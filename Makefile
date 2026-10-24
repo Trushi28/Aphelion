@@ -19,7 +19,7 @@ LIMINE_BRANCH := v9.x-binary
 OPT ?= -O2
 
 PROFILE      ?= dev
-BOOT_DEFAULT ?= $(if $(filter usb,$(PROFILE)),shell,test)
+BOOT_DEFAULT ?= $(if $(filter usb,$(PROFILE)),test,shell)
 MENU_TIMEOUT ?= $(if $(filter usb,$(PROFILE)),5,3)
 
 ifeq ($(filter $(PROFILE),dev usb),)
@@ -81,7 +81,7 @@ ISO := $(BUILD)/aphelion.iso
 
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
-.PHONY: usb-image run-usb run-uefi-usb test-mm test-sched test-console test-input test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+.PHONY: usb-image run-usb run-uefi-usb test-mm test-sched test-console test-input test-lens-types test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -224,49 +224,96 @@ run-uefi-usb:
 run-nodisk: iso
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown
 
+TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm
+
+unit_inc_stellar  := -I$(KDIR)/include
+unit_src_stellar  := $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp
+unit_inc_mm       := -Itools/hostshim -I$(KDIR)/include
+unit_src_mm       := tools/mm_host_test.cpp
+unit_inc_console  := -Itools/hostshim -I$(KDIR)/include
+unit_src_console  := tools/console_host_test.cpp
+unit_inc_input    := -Itools/hostshim -I$(KDIR)/include
+unit_src_input    := tools/input_host_test.cpp
+unit_inc_usb      := -Itools/hostshim -I$(KDIR)/include
+unit_src_usb      := tools/usb_host_test.cpp
+unit_inc_usbstor  := -Itools/hostshim-usb -Itools/hostshim -I$(KDIR)/include
+unit_src_usbstor  := tools/usbstor_host_test.cpp
+unit_inc_sched    := -Itools/hostshim -I$(KDIR)/include
+unit_src_sched    := tools/sched_host_test.cpp
+unit_inc_lens-types := -I$(KDIR)/include
+unit_src_lens-types := tools/lens_types_host_test.cpp
+
+FS_CORE_SRC := $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp
+LENS_SRC    := $(KDIR)/src/fs/lens.cpp $(KDIR)/src/fs/lens_ops.cpp
+
+unit_inc_nebula   := -I$(KDIR)/include
+unit_src_nebula   := $(FS_CORE_SRC) $(KDIR)/src/fs/nebula_selftest.cpp tools/nebula_host_test.cpp
+unit_inc_lens     := -I$(KDIR)/include
+unit_src_lens     := $(FS_CORE_SRC) $(LENS_SRC) $(KDIR)/src/fs/lens_epoch.cpp $(KDIR)/src/fs/lens_batch.cpp $(KDIR)/src/fs/lens_stream.cpp $(KDIR)/src/fs/lens_text.cpp $(KDIR)/src/fs/realm_sys.cpp tools/lens_host_test.cpp
+unit_inc_helm     := -I$(KDIR)/include
+unit_src_helm     := $(FS_CORE_SRC) $(LENS_SRC) $(KDIR)/src/fs/lens_text.cpp $(KDIR)/src/shell/helm_core.cpp $(KDIR)/src/shell/helm_builtin.cpp $(KDIR)/src/shell/helm_fs.cpp $(KDIR)/src/shell/helm_text.cpp $(KDIR)/src/shell/helm_rows.cpp $(KDIR)/src/fs/lens_stream.cpp tools/helm_host_test.cpp
+
+.PHONY: unit-deps print-units
+print-units:
+	@echo $(TEST_UNITS)
+
+unit-deps:
+	@test -n "$(UNIT)" || { echo "usage: make unit-deps UNIT=<$(TEST_UNITS)>" >&2; exit 2; }
+	@g++ -std=c++20 -MM $(unit_inc_$(UNIT)) $(unit_src_$(UNIT)) | sed -e 's/^[^:]*: *//' -e 's/ \\$$//' | tr ' ' '\n' | sed -e '/^$$/d' -e 's,[^ /]*/\.\./,,g' | sort -u
+
 test-stellar:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp -o $(BUILD)/stellar_host_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize=alignment $(unit_inc_stellar) $(unit_src_stellar) -o $(BUILD)/stellar_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/stellar_host_test
 
 test-mm:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/mm_host_test.cpp -o $(BUILD)/mm_host_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined $(unit_inc_mm) $(unit_src_mm) -o $(BUILD)/mm_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/mm_host_test
 
 test-console:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/console_host_test.cpp -o $(BUILD)/console_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_console) $(unit_src_console) -o $(BUILD)/console_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/console_host_test
 
 test-input:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/input_host_test.cpp -o $(BUILD)/input_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_input) $(unit_src_input) -o $(BUILD)/input_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/input_host_test
 
 test-usb:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/usb_host_test.cpp -o $(BUILD)/usb_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_usb) $(unit_src_usb) -o $(BUILD)/usb_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/usb_host_test
 
 test-usbstor:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim-usb -Itools/hostshim -I$(KDIR)/include tools/usbstor_host_test.cpp -o $(BUILD)/usbstor_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_usbstor) $(unit_src_usbstor) -o $(BUILD)/usbstor_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/usbstor_host_test
 
 test-sched:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -Itools/hostshim -I$(KDIR)/include tools/sched_host_test.cpp -o $(BUILD)/sched_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_sched) $(unit_src_sched) -o $(BUILD)/sched_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/sched_host_test
+
+test-lens-types:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined $(unit_inc_lens-types) $(unit_src_lens-types) -o $(BUILD)/lens_types_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/lens_types_host_test
+
+test-lens:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize=alignment $(unit_inc_lens) $(unit_src_lens) -o $(BUILD)/lens_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/lens_host_test
 
 test-nebula:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/nebula_selftest.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp tools/nebula_host_test.cpp -o $(BUILD)/nebula_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment $(unit_inc_nebula) $(unit_src_nebula) -o $(BUILD)/nebula_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/nebula_host_test
 
 test-helm:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp $(KDIR)/src/shell/helm_core.cpp $(KDIR)/src/shell/helm_builtin.cpp $(KDIR)/src/shell/helm_fs.cpp $(KDIR)/src/shell/helm_text.cpp tools/helm_host_test.cpp -o $(BUILD)/helm_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize=alignment $(unit_inc_helm) $(unit_src_helm) -o $(BUILD)/helm_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/helm_host_test
 
 test-stellar-thread:

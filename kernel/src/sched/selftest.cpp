@@ -7,6 +7,7 @@
 #include <cosmos/serial.hpp>
 #include <cosmos/timesrc.hpp>
 #include <cosmos/vmm.hpp>
+#include <cosmos/lens_text.hpp>
 
 namespace orbital {
 
@@ -148,7 +149,7 @@ void fpu_worker(void* arg) {
         ++w->checks;
         if (use_fpu) {
             fpu::store_registers(got);
-            if (memcmp(want, got, bytes) != 0) ++w->state_errors;
+            if (mem::compare(want, got, bytes) != 0) ++w->state_errors;
             fpu::Modes now = fpu::get_modes();
             if (now.control_word != modes.control_word || (now.mxcsr & ~0x3Fu) != modes.mxcsr) ++w->mode_errors;
         }
@@ -496,6 +497,7 @@ void orchestrator(void*) {
     ok = test_semaphore() && ok;
     ok = test_sleeplock() && ok;
     ok = test_join() && ok;
+    ok = lens::selftest() && ok;
     ok = test_fpu_isolation(&fpu_checked) && ok;
     ok = test_introspection() && ok;
     ok = test_wake_latency() && ok;

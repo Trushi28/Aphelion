@@ -62,6 +62,9 @@ public:
     const Palette& palette() const { return palette_; }
 
     bool row_dirty(u32 row) const { return (dirty_[row >> 6] >> (row & 63)) & 1; }
+
+    u32 dirty_begin(u32 row) const { return dirty_lo_[row]; }
+    u32 dirty_end(u32 row) const { return dirty_hi_[row]; }
     bool any_dirty() const;
     void clear_dirty();
     void mark_all_dirty();
@@ -74,8 +77,21 @@ private:
 
     Cell blank() const;
     Cell& at(u32 col, u32 row) { return grid_[row * cols_ + col]; }
-    void mark_row(u32 row) { dirty_[row >> 6] |= 1ull << (row & 63); }
-    void mark_cursor() { mark_row(cy_); }
+    void mark_row(u32 row) { mark_span(row, 0, cols_); }
+
+    void mark_span(u32 row, u32 c0, u32 c1) {
+        u64 bit = 1ull << (row & 63);
+        if (dirty_[row >> 6] & bit) {
+            if (c0 < dirty_lo_[row]) dirty_lo_[row] = static_cast<u16>(c0);
+            if (c1 > dirty_hi_[row]) dirty_hi_[row] = static_cast<u16>(c1);
+        } else {
+            dirty_[row >> 6] |= bit;
+            dirty_lo_[row] = static_cast<u16>(c0);
+            dirty_hi_[row] = static_cast<u16>(c1);
+        }
+    }
+
+    void mark_cursor() { mark_span(cy_, cx_, cx_ + 1 < cols_ ? cx_ + 1 : cols_); }
     void move_to(u32 col, u32 row);
 
     void line_feed();
@@ -123,6 +139,8 @@ private:
     u32 saved_attr_ = 0;
     Palette palette_{};
     u64 dirty_[(MAX_ROWS + 63) / 64] = {};
+    u16 dirty_lo_[MAX_ROWS] = {};
+    u16 dirty_hi_[MAX_ROWS] = {};
     i32 scrolled_ = 0;
 
     State state_ = State::Ground;

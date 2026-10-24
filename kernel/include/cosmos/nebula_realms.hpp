@@ -13,6 +13,8 @@ Realm* disk_realm();
 Realm* snap_realm();
 
 void disk_set_mounted(bool mounted);
+
+u32 disk_generation();
 bool disk_is_mounted();
 void disk_set_confirmed_only(bool confirmed_only);
 bool disk_is_confirmed_only();

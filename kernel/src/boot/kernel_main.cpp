@@ -22,6 +22,8 @@
 #include <cosmos/power.hpp>
 #include <cosmos/helm.hpp>
 #include <cosmos/nebula_realms.hpp>
+#include <cosmos/lens_text.hpp>
+#include <cosmos/console_stream.hpp>
 #include <cosmos/corona.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
@@ -92,9 +94,8 @@ static u64 g_hhdm_offset = 0;
 
 static constexpr u64 MAX_MEMMAP_ENTRIES = 512;
 static universe::MemmapEntry g_entries[MAX_MEMMAP_ENTRIES];
-static u64 g_n_entries = 0;                    
-static u64 g_expected_cores = 1;               
-
+static u64 g_n_entries = 0;
+static u64 g_expected_cores = 1;
 
 static constexpr u64 TEST_TAIL_SECTORS = 64;
 static constexpr const char* HELLO_REWRITTEN = "Aphelion Stellar FS -- rewritten after snapshot.\n";
@@ -682,12 +683,12 @@ static bool selftest_extents() {
     u64 f = stellar::create_file(dir, "a", pat, sizeof(pat));
     stellar::test_set_max_extent_sectors(0);
     bool ok = f != NONE && stellar::stat(f, &si) && (si.flags & stellar::FLAG_EXTENT_TABLE) && si.extents == 20;
-    ok = ok && stellar::read_file(f, back, sizeof(back)) == sizeof(pat) && __builtin_memcmp(pat, back, sizeof(pat)) == 0;
+    ok = ok && stellar::read_file(f, back, sizeof(back)) == sizeof(pat) && mem::compare(pat, back, sizeof(pat)) == 0;
     ok = ok && stellar::verify_file(f);
 
     for (u64 i = 0; i < 30000; ++i) pat[i] = static_cast<u8>(i * 5 + 3);
     ok = ok && stellar::write_file(f, pat, 30000) == f && stellar::stat(f, &si) && !(si.flags & stellar::FLAG_EXTENT_TABLE) && si.extents == 1;
-    ok = ok && stellar::read_file(f, back, sizeof(back)) == 30000 && __builtin_memcmp(pat, back, 30000) == 0;
+    ok = ok && stellar::read_file(f, back, sizeof(back)) == 30000 && mem::compare(pat, back, 30000) == 0;
 
     purge_dir(dir, 0);
     ok = ok && stellar::unlink(root, "ext-selftest");
@@ -923,6 +924,10 @@ extern "C" NORETURN void kernel_main() {
         fb::printf(0xE0D080, "[--] Storage disabled by the boot configuration: no disk is initialised or touched\n");
     }
     nebula::register_builtin_realms();
+    if (!lens::mint_boot_roots().ok()) serial::writeln("[lens] FATAL: could not mint the boot root lenses");
+    if (!lens::mint_boot_console(lens::console_stream()).ok()) serial::writeln("[lens] FATAL: could not mint the console lens");
+    input::set_wake_hook(&lens::stream_event);
+    lens::seal();
     nebula::disk_set_confirmed_only(usb_mode);
     if (blockdev::present() && (!test_mode || usb_mode)) {
         fb::printf(0xC0FFC0, "[ok] %s online (%lu sectors)\n", blockdev::active()->name(), blockdev::capacity_sectors());
@@ -1238,8 +1243,6 @@ extern "C" NORETURN void kernel_main() {
     } else {
         fb::printf(0xB0B0C0, "[--] No block device found\n");
     }
-
-    
 
     static u32 core_ids[gdt::MAX_CORES];
     u32 core_id_count = 0;

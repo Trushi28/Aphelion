@@ -1,11 +1,11 @@
-#include <cosmos/helm.hpp>
+#include <cosmos/helm_rows.hpp>
 #include <cosmos/kheap.hpp>
 
 namespace helm {
 
 namespace {
 
-u32 length(const char* s) { return static_cast<u32>(__builtin_strlen(s)); }
+u32 length(const char* s) { return static_cast<u32>(cstr::length(s)); }
 
 int usage(Io& io, const char* text) {
     print_error(io, text);
@@ -253,6 +253,7 @@ struct SortCtx {
     Shell* sh;
     Io* io;
     bool reverse, numeric, unique;
+    const char* key;
     struct Span { const u8* p; u64 len; };
     Span* spans;
     u64 count;
@@ -275,6 +276,16 @@ u64 leading_number(const u8* p, u64 len, bool* neg) {
 }
 
 int compare_spans(const SortCtx& c, const SortCtx::Span& a, const SortCtx::Span& b) {
+    if (c.key) {
+        rows::View va, vb;
+        bool ha = rows::field(a.p, a.len, c.key, &va);
+        bool hb = rows::field(b.p, b.len, c.key, &vb);
+        if (ha != hb) return ha ? -1 : 1;
+        if (ha) {
+            int r = rows::compare(va, vb);
+            if (r) return r;
+        }
+    }
     if (c.numeric) {
         bool na, nb;
         u64 x = leading_number(a.p, a.len, &na), y = leading_number(b.p, b.len, &nb);
@@ -294,7 +305,7 @@ bool sort_add(SortCtx& c, const u8* p, u64 len) {
         if (cap > 1000000) return false;
         SortCtx::Span* bigger = static_cast<SortCtx::Span*>(kheap::alloc(static_cast<usize>(cap * sizeof(SortCtx::Span))));
         if (!bigger) return false;
-        if (c.count) __builtin_memcpy(bigger, c.spans, static_cast<usize>(c.count * sizeof(SortCtx::Span)));
+        if (c.count) mem::copy(bigger, c.spans, static_cast<usize>(c.count * sizeof(SortCtx::Span)));
         if (c.spans) kheap::free(c.spans);
         c.spans = bigger;
         c.capacity = cap;
@@ -308,10 +319,10 @@ void sort_emit(const char*, const u8* data, u64 size, void* raw) {
     if (c.failed) return;
     u8* copy = static_cast<u8*>(kheap::alloc(size ? static_cast<usize>(size) : 1));
     if (!copy) { c.failed = true; return; }
-    if (size) __builtin_memcpy(copy, data, static_cast<usize>(size));
+    if (size) mem::copy(copy, data, static_cast<usize>(size));
     u8** bigger = static_cast<u8**>(kheap::alloc(sizeof(u8*) * (c.owned_count + 1)));
     if (!bigger) { kheap::free(copy); c.failed = true; return; }
-    if (c.owned_count) __builtin_memcpy(bigger, c.owned, sizeof(u8*) * c.owned_count);
+    if (c.owned_count) mem::copy(bigger, c.owned, sizeof(u8*) * c.owned_count);
     if (c.owned) kheap::free(c.owned);
     c.owned = bigger;
     c.owned[c.owned_count++] = copy;
@@ -326,12 +337,13 @@ int cmd_sort(Shell& sh, Io& io, u32 argc, char** argv) {
     c.sh = &sh;
     c.io = &io;
     int opt;
-    while ((opt = next_option(o, "rnu", "")) >= 0) {
+    while ((opt = next_option(o, "rnu", "k")) >= 0) {
         if (opt == 'r') c.reverse = true;
         else if (opt == 'n') c.numeric = true;
+        else if (opt == 'k') c.key = o.value;
         else c.unique = true;
     }
-    if (o.bad) return usage(io, "usage: sort [-r] [-n] [-u] [file...]");
+    if (o.bad) return usage(io, "usage: sort [-r] [-n] [-u] [-k FIELD] [file...]");
     int st = for_each_input(sh, io, o, &sort_emit, &c);
     if (c.failed) { print_error(io, "too many lines or out of memory"); st = 1; }
     if (!c.failed && !sh.aborted) {
@@ -354,11 +366,19 @@ int cmd_sort(Shell& sh, Io& io, u32 argc, char** argv) {
             }
             if (sh.aborted) break;
         }
+        rows::Set table{};
+        bool as_table = c.key && io.out.terminal();
         for (u64 i = 0; i < n && !sh.aborted; ++i) {
             if (c.unique && i > 0 && compare_spans(c, c.spans[i], c.spans[i - 1]) == 0) continue;
+            if (as_table) {
+                rows::add(table, c.spans[i].p, c.spans[i].len);
+                continue;
+            }
             io.out.bytes(reinterpret_cast<const char*>(c.spans[i].p), c.spans[i].len);
             io.out.put('\n');
         }
+        if (as_table && !table.failed) rows::print_table(io.out, table);
+        rows::release(table);
     }
     for (u32 i = 0; i < c.owned_count; ++i) kheap::free(c.owned[i]);
     if (c.owned) kheap::free(c.owned);
@@ -379,7 +399,7 @@ void uniq_emit(const char*, const u8* data, u64 size, void* raw) {
     };
     while (next_line(data, size, &pos, &s, &l)) {
         if (c.sh->poll()) return;
-        if (have && l == prev_l && (l == 0 || __builtin_memcmp(data + s, data + prev_s, static_cast<usize>(l)) == 0)) { ++run; continue; }
+        if (have && l == prev_l && (l == 0 || mem::compare(data + s, data + prev_s, static_cast<usize>(l)) == 0)) { ++run; continue; }
         flush();
         prev_s = s;
         prev_l = l;
@@ -459,7 +479,7 @@ constexpr Command COMMANDS[] = {
     {"tail", "tail [-n lines] [file...]", "the last lines of files or input", &cmd_tail},
     {"grep", "grep [-i] [-v] [-c] [-n] text [file...]", "lines that contain text", &cmd_grep},
     {"count", "count [-l] [-w] [-c] [-m] [file...]", "lines, words, bytes, characters", &cmd_count},
-    {"sort", "sort [-r] [-n] [-u] [file...]", "sort lines by bytes or by leading number", &cmd_sort},
+    {"sort", "sort [-r] [-n] [-u] [-k FIELD] [file...]", "sort lines by bytes, by leading number, or by a row field", &cmd_sort},
     {"uniq", "uniq [-c] [file...]", "collapse adjacent identical lines", &cmd_uniq},
     {"hex", "hex [-s offset] [-n bytes] [file]", "hex and ASCII dump", &cmd_hex},
 };

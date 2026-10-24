@@ -104,10 +104,23 @@ void render_cell(u32* dst, u64 pitch, const term::Cell& c, bool cursor) {
         }
     } else {
         const u8* g = font::glyph(f, cp, (attr & term::BOLD) != 0, nullptr);
-        u32 i = 0;
-        for (u32 y = 0; y < h; ++y) {
-            u32* line = dst + y * pitch;
-            for (u32 x = 0; x < w; ++x, ++i) line[x] = g_lut[font::coverage(g, i)];
+        if ((w & 1) == 0) {
+
+            const u32* lut = g_lut;
+            for (u32 y = 0; y < h; ++y) {
+                u32* line = dst + y * pitch;
+                for (u32 x = 0; x < w; x += 2) {
+                    u8 b = *g++;
+                    line[x] = lut[b & 15];
+                    line[x + 1] = lut[b >> 4];
+                }
+            }
+        } else {
+            u32 i = 0;
+            for (u32 y = 0; y < h; ++y) {
+                u32* line = dst + y * pitch;
+                for (u32 x = 0; x < w; ++x, ++i) line[x] = g_lut[font::coverage(g, i)];
+            }
         }
     }
     if ((attr & term::UNDERLINE) && !(attr & term::WIDE_TAIL)) {
@@ -125,7 +138,13 @@ u32* fb_row(u64 y) {
 void copy_lines_to_fb(u64 y0, u64 lines) {
     if (!g_back) return;
     for (u64 y = y0; y < y0 + lines && y < g_info.height; ++y)
-        memcpy(fb_row(y), g_back + y * g_pitch_px, g_info.width * 4);
+        mem::copy(fb_row(y), g_back + y * g_pitch_px, g_info.width * 4);
+}
+
+void copy_span_to_fb(u64 y0, u64 lines, u64 x0, u64 count) {
+    if (!g_back) return;
+    for (u64 y = y0; y < y0 + lines && y < g_info.height; ++y)
+        mem::copy(fb_row(y) + x0, g_back + y * g_pitch_px + x0, count * 4);
 }
 
 void fill_surface(u32 rgb) {
@@ -143,14 +162,18 @@ void fill_surface(u32 rgb) {
 void draw_row(u32 row, bool cursor_visible, u32 cursor_col, u32 cursor_row) {
     const font::Face& f = *g_face;
     u64 y = g_origin_y + static_cast<u64>(row) * f.cell_h;
-    for (u32 col = 0; col < g_cols; ++col) {
+    u32 first = g_term.dirty_begin(row);
+    u32 last = g_term.dirty_end(row);
+    if (last > g_cols) last = g_cols;
+    if (first >= last) return;
+    for (u32 col = first; col < last; ++col) {
         u64 x = g_origin_x + static_cast<u64>(col) * f.cell_w;
         bool cur = cursor_visible && row == cursor_row && col == cursor_col;
         const term::Cell& c = g_term.cell(col, row);
         if (g_back) render_cell(g_back + y * g_pitch_px + x, g_pitch_px, c, cur);
         else render_cell(fb_row(y) + x, g_info.pitch / 4, c, cur);
     }
-    if (g_back) copy_lines_to_fb(y, f.cell_h);
+    if (g_back) copy_span_to_fb(y, f.cell_h, g_origin_x + static_cast<u64>(first) * f.cell_w, static_cast<u64>(last - first) * f.cell_w);
 }
 
 void flush_locked() {
@@ -162,7 +185,7 @@ void flush_locked() {
             u64 grid_h = static_cast<u64>(g_rows) * f.cell_h;
             u64 shift = static_cast<u64>(scrolled) * f.cell_h;
             if (shift < grid_h) {
-                memmove(g_back + static_cast<u64>(g_origin_y) * g_pitch_px,
+                mem::move(g_back + static_cast<u64>(g_origin_y) * g_pitch_px,
                         g_back + (static_cast<u64>(g_origin_y) + shift) * g_pitch_px,
                         (grid_h - shift) * g_pitch_px * 4);
             }
@@ -359,7 +382,6 @@ bool selftest() {
     ok = ok && t.cursor_col() == col0 && t.cursor_row() == row0;
     return ok;
 }
-
 
 void enable_locking() { __atomic_store_n(&g_locking, true, __ATOMIC_RELEASE); }
 

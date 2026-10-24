@@ -27,3 +27,5 @@ extern "C" void* memcpy(void* dst, const void* src, usize n);
 extern "C" void* memmove(void* dst, const void* src, usize n);
 extern "C" int   memcmp(const void* a, const void* b, usize n);
 extern "C" usize strlen(const char* s);
+
+#include <cosmos/mem.hpp>

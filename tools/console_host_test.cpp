@@ -19,7 +19,7 @@ struct Vec {
         free(p);
         p = static_cast<T*>(malloc((o.n ? o.n : 1) * sizeof(T)));
         n = cap = o.n;
-        if (o.n) __builtin_memcpy(p, o.p, o.n * sizeof(T));
+        if (o.n) mem::copy(p, o.p, o.n * sizeof(T));
         return *this;
     }
     ~Vec() { free(p); }
@@ -45,7 +45,7 @@ struct Vec {
     const T* data() const { return p; }
     T& operator[](size_t i) { return p[i]; }
     const T& operator[](size_t i) const { return p[i]; }
-    bool operator==(const Vec& o) const { return n == o.n && (n == 0 || __builtin_memcmp(p, o.p, n * sizeof(T)) == 0); }
+    bool operator==(const Vec& o) const { return n == o.n && (n == 0 || mem::compare(p, o.p, n * sizeof(T)) == 0); }
     bool operator!=(const Vec& o) const { return !(*this == o); }
 };
 
@@ -54,14 +54,14 @@ struct Str {
     Str() { b[0] = 0; }
     Str(const char* s) { snprintf(b, sizeof(b), "%s", s); }
     bool empty() const { return b[0] == 0; }
-    bool operator==(const char* s) const { return __builtin_strcmp(b, s) == 0; }
+    bool operator==(const char* s) const { return cstr::compare(b, s) == 0; }
     const char* c_str() const { return b; }
     void append(const char* s) {
-        size_t l = __builtin_strlen(b);
+        size_t l = cstr::length(b);
         snprintf(b + l, sizeof(b) - l, "%s", s);
     }
     Str& operator+=(const char* s) { append(s); return *this; }
-    size_t size() const { return __builtin_strlen(b); }
+    size_t size() const { return cstr::length(b); }
 };
 
 struct Bytes {
@@ -331,7 +331,7 @@ static void random_stream(Str& out, unsigned& seed, int n) {
     char tmp[32];
     out = Str();
     for (int i = 0; i < n; ++i) {
-        switch (rnd() % 14) {
+        switch (rnd() % 26) {
             case 0: out += "\n"; break;
             case 1: out += "\r"; break;
             case 2: snprintf(tmp, sizeof(tmp), "\x1b[%um", 30 + rnd() % 8); out += tmp; break;
@@ -345,6 +345,16 @@ static void random_stream(Str& out, unsigned& seed, int n) {
             case 10: snprintf(tmp, sizeof(tmp), "\x1b[%uM", 1 + rnd() % 3); out += tmp; break;
             case 11: out += "\x1b[4m"; break;
             case 12: snprintf(tmp, sizeof(tmp), "\x1b[%uS", 1 + rnd() % 4); out += tmp; break;
+            case 13: out += "\b"; break;
+            case 14: out += "\t"; break;
+            case 15: snprintf(tmp, sizeof(tmp), "\x1b[%u@", 1 + rnd() % 4); out += tmp; break;
+            case 16: snprintf(tmp, sizeof(tmp), "\x1b[%uP", 1 + rnd() % 4); out += tmp; break;
+            case 17: snprintf(tmp, sizeof(tmp), "\x1b[%uX", 1 + rnd() % 4); out += tmp; break;
+            case 18: snprintf(tmp, sizeof(tmp), "\x1b[%uC", 1 + rnd() % 5); out += tmp; break;
+            case 19: snprintf(tmp, sizeof(tmp), "\x1b[%uD", 1 + rnd() % 5); out += tmp; break;
+            case 20: snprintf(tmp, sizeof(tmp), "\x1b[%uA", 1 + rnd() % 3); out += tmp; break;
+            case 21: out += "\x1b[?25l"; break;
+            case 22: case 23: case 24: out += "\x1b[?25h"; break;
             default: out += words[rnd() % 9]; break;
         }
     }
@@ -392,7 +402,36 @@ static void render_tests() {
     for (size_t i = 0; i < shown.size(); ++i) if (shown[i] != s.back[i]) { back_matches = false; break; }
     expect(back_matches, "corona: the screen shows exactly what the backbuffer holds");
 
-    corona::write("\x1b[2J\x1b[H");
+    corona::write("\x1b[2J\x1b[H\x1b[?25h");
+    {
+        unsigned seed3 = 4242;
+        bool eq = true;
+        for (int trial = 0; trial < 30 && eq; ++trial) {
+            Str stream;
+            random_stream(stream, seed3, 90);
+            const char* d = stream.c_str();
+            for (size_t i = 0; i < stream.size() && eq;) {
+                size_t j = i + 1;
+                if (d[i] == 0x1b) while (j < stream.size() && !(d[j] >= 0x40 && d[j] <= 0x7E && j > i + 1)) ++j;
+                if (j < stream.size() && d[i] == 0x1b) ++j;
+                else if ((static_cast<unsigned char>(d[i]) & 0xC0) == 0xC0)
+                    while (j < stream.size() && (static_cast<unsigned char>(d[j]) & 0xC0) == 0x80) ++j;
+                corona::write(stream.c_str() + i, static_cast<u32>(j - i));
+                i = j;
+                {
+                    Vec<u32> inc = s.visible();
+                    if (inc != full_redraw_snapshot(s)) {
+                        printf("  difference in typing trial %d after:", trial);
+                        for (size_t q = (i > 12 ? i - 12 : 0); q < i; ++q) printf(" %02x", static_cast<unsigned char>(d[q]));
+                        printf("\n");
+                        eq = false;
+                    }
+                }
+            }
+        }
+        expect(eq, "corona: key-by-key editing equals a full redraw at every step");
+    }
+    corona::write("\x1b[?25h\x1b[2J\x1b[H");
     for (int i = 0; i < 400; ++i) {
         char line[64];
         snprintf(line, sizeof(line), "line %d \xE2\x95\x91 \xCE\xA9\n", i);
@@ -527,7 +566,7 @@ static void font_tests() {
     bool all_unique = true;
     for (u32 a = 0x2800; a < 0x2900 && all_unique; a += 17)
         for (u32 b = a + 1; b < 0x2900; b += 23)
-            if (__builtin_memcmp(glyph(f, a, false, nullptr), glyph(f, b, false, nullptr), n / 2) == 0) all_unique = false;
+            if (mem::compare(glyph(f, a, false, nullptr), glyph(f, b, false, nullptr), n / 2) == 0) all_unique = false;
     expect(all_unique, "font: distinct braille patterns have distinct glyphs");
     expect(ink_of(glyph(f, 0x20B9, false, nullptr), n) > ink_of(glyph(f, '-', false, nullptr), n), "font: the rupee sign has more ink than a hyphen");
 }

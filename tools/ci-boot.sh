@@ -106,6 +106,7 @@ check_common() {
     grep -q '\[smp-mm\] FAIL' "$LOG.clean" && fail "concurrent allocator stress reported a failure"
     grep -q '\[selftest\] smp-mm: ok' "$LOG.clean" || fail "concurrent allocator stress did not pass"
     grep -q '\[selftest\] nebula: ok' "$LOG.clean" || fail "Nebula namespace self-test did not pass"
+    grep -q '\[selftest\] lens: ok' "$LOG.clean" || fail "Lens layer self-test (rights, escapes, stale lenses, pipes, timed await) did not pass"
     grep -q '\[selftest\] vmm: ok' "$LOG.clean" || fail "virtual memory self-test did not pass"
     grep -q '\[selftest\] stack guards: ok' "$LOG.clean" || fail "kernel stack guard self-test did not pass"
     if grep -q '\[fpu\] [0-9]* core' "$LOG.clean"; then

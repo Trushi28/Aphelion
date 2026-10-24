@@ -20,7 +20,7 @@ bool same(const char* a, const char* b) {
     return *a == *b;
 }
 
-u32 length(const char* s) { return static_cast<u32>(__builtin_strlen(s)); }
+u32 length(const char* s) { return static_cast<u32>(cstr::length(s)); }
 
 const char* next_cp(const char* s) {
     ++s;
@@ -44,12 +44,12 @@ void capture_write(void* ctx, const char* d, u32 n) {
         while (cap < c.size + n) cap *= 2;
         u8* bigger = static_cast<u8*>(kheap::alloc(static_cast<usize>(cap)));
         if (!bigger) { c.overflow = true; return; }
-        if (c.size) __builtin_memcpy(bigger, c.data, static_cast<usize>(c.size));
+        if (c.size) mem::copy(bigger, c.data, static_cast<usize>(c.size));
         if (c.data) kheap::free(c.data);
         c.data = bigger;
         c.cap = cap;
     }
-    __builtin_memcpy(c.data + c.size, d, n);
+    mem::copy(c.data + c.size, d, n);
     c.size += n;
 }
 
@@ -68,7 +68,7 @@ struct ArgSet {
 bool add_arg(ArgSet& a, const char* text, u32 len) {
     if (a.argc >= MAX_ARGS || a.used + len + 1 > ARENA_BYTES) return false;
     char* dst = a.arena + a.used;
-    __builtin_memcpy(dst, text, len);
+    mem::copy(dst, text, len);
     dst[len] = 0;
     a.used += len + 1;
     a.argv[a.argc++] = dst;
@@ -129,7 +129,7 @@ bool expand_word(Shell& sh, const char* raw, char* out, u32 cap) {
             value = tmp;
         } else if ((value = var_get(sh, name)) == nullptr) {
             if (same(name, "cwd")) {
-                nebula::location_text(sh.session, tmp, sizeof(tmp));
+                lens::text::location_text(sh.cursor, tmp, sizeof(tmp));
                 value = tmp;
             } else {
                 value = "";
@@ -161,12 +161,12 @@ nebula::Status glob_expand(Shell& sh, const char* pattern, ArgSet& args, Io* io,
     if (first_mark < dir_len) return nebula::Status::InvalidPath;
 
     char dir[nebula::path::TEXT_MAX];
-    __builtin_memcpy(dir, pattern, dir_len);
+    mem::copy(dir, pattern, dir_len);
     dir[dir_len] = 0;
     const char* leaf = pattern + dir_len;
 
     nebula::Listing l;
-    nebula::Status st = nebula::list(sh.session, dir_len ? dir : ".", &l, false);
+    nebula::Status st = lens::text::list(sh.cursor, dir_len ? dir : ".", &l, false);
     if (st != nebula::Status::Ok) return st;
     u32 matched = 0;
     nebula::Status result = nebula::Status::Ok;
@@ -175,8 +175,8 @@ nebula::Status glob_expand(Shell& sh, const char* pattern, ArgSet& args, Io* io,
         char full[nebula::path::TEXT_MAX];
         u32 nl = length(l.items[i].name);
         if (dir_len + nl + 1 >= sizeof(full)) { result = nebula::Status::InvalidPath; break; }
-        __builtin_memcpy(full, dir, dir_len);
-        __builtin_memcpy(full + dir_len, l.items[i].name, nl);
+        mem::copy(full, dir, dir_len);
+        mem::copy(full + dir_len, l.items[i].name, nl);
         full[dir_len + nl] = 0;
         if (!add_arg(args, full, dir_len + nl)) { result = nebula::Status::TooLarge; break; }
         ++matched;
@@ -205,7 +205,7 @@ bool expand_stage(Shell& sh, const parse::Parsed& p, u32 stage, ArgSet& args, Wr
             nebula::Status st = glob_expand(sh, buf, args, nullptr, &none);
             if (st != nebula::Status::Ok || none) {
                 char shown[nebula::path::TEXT_MAX + 64];
-                __builtin_memcpy(shown, buf, length(buf) + 1);
+                mem::copy(shown, buf, length(buf) + 1);
                 strip_marks(shown);
                 err.rgb(palette::SAND);
                 if (st == nebula::Status::InvalidPath) err.str("  wildcards are only allowed in the last path component: ");
@@ -287,7 +287,7 @@ int run_pipe(Shell& sh, Work& w, const parse::Pipe& pipe) {
         char target[nebula::path::TEXT_MAX + 64];
         if (const parse::Word* in_word = find_redirect(w.parsed, stage, true)) {
             if (!redirect_target(sh, w.parsed, *in_word, target, sizeof(target), err)) { status = 1; break; }
-            nebula::Status st = nebula::read_file(sh.session, target, &in_blob);
+            nebula::Status st = lens::text::read_file(sh.cursor, target, &in_blob);
             if (st != nebula::Status::Ok) {
                 err.rgb(palette::SAND);
                 err.str("  cannot read ");
@@ -344,8 +344,8 @@ int run_pipe(Shell& sh, Work& w, const parse::Pipe& pipe) {
                 status = 1;
             } else {
                 nebula::Status st = out_word->role == parse::Role::Append
-                    ? nebula::append_file(sh.session, out_target, cap.data, cap.size)
-                    : nebula::write_file(sh.session, out_target, cap.data, cap.size);
+                    ? lens::text::append_file(sh.cursor, out_target, cap.data, cap.size)
+                    : lens::text::write_file(sh.cursor, out_target, cap.data, cap.size);
                 if (st != nebula::Status::Ok) {
                     err.rgb(palette::SAND);
                     err.str("  cannot write ");
@@ -396,14 +396,14 @@ u32 table_count() { return g_table_count; }
 const Table* table_at(u32 index) { return index < g_table_count ? g_tables[index] : nullptr; }
 
 void init(Shell& sh, Sink terminal, bool color, u32 cols, const char* start_realm) {
-    __builtin_memset(&sh, 0, sizeof(sh));
+    mem::zero(&sh, sizeof(sh));
     sh.terminal = terminal;
     sh.color = color;
     sh.cols = cols ? cols : 80;
-    nebula::init_session(sh.session, start_realm);
+    (void)lens::text::init(sh.cursor, start_realm);
 }
 
-void shutdown(Shell& sh) { nebula::close_session(sh.session); }
+void shutdown(Shell& sh) { lens::text::close(sh.cursor); }
 
 const char* var_get(const Shell& sh, const char* name) {
     for (u32 i = 0; i < MAX_VARS; ++i)
@@ -427,8 +427,8 @@ bool var_set(Shell& sh, const char* name, const char* value) {
     }
     if (!slot) return false;
     slot->used = true;
-    __builtin_memcpy(slot->name, name, nl + 1);
-    __builtin_memcpy(slot->value, value, length(value) + 1);
+    mem::copy(slot->name, name, nl + 1);
+    mem::copy(slot->value, value, length(value) + 1);
     return true;
 }
 
@@ -568,7 +568,7 @@ int for_each_input(Shell& sh, Io& io, Options& o, InputFn fn, void* ctx) {
             continue;
         }
         nebula::Blob b;
-        nebula::Status st = nebula::read_file(sh.session, o.argv[i], &b);
+        nebula::Status st = lens::text::read_file(sh.cursor, o.argv[i], &b);
         if (st != nebula::Status::Ok) {
             print_status(io, "cannot read", o.argv[i], st);
             status = 1;
@@ -664,9 +664,9 @@ void candidate_add(Candidates& c, const char* name, bool dir, const char* suffix
     u32 sl = suffix ? length(suffix) : 0;
     if (n + extra + sl + 1 > CANDIDATE_BYTES) { c.truncated = true; return; }
     char* dst = c.items[c.count++];
-    __builtin_memcpy(dst, name, n);
+    mem::copy(dst, name, n);
     u32 p = n;
-    if (suffix) { __builtin_memcpy(dst + p, suffix, sl); p += sl; }
+    if (suffix) { mem::copy(dst + p, suffix, sl); p += sl; }
     if (dir) dst[p++] = '/';
     dst[p] = 0;
 }
@@ -700,7 +700,7 @@ bool needs_escape(char c, char quote) {
 }
 
 bool complete(Shell& sh, const char* line, u32 cursor, Completion* out) {
-    __builtin_memset(out, 0, sizeof(*out));
+    mem::zero(out, sizeof(*out));
     u32 word_start = 0;
     bool cmd_pos = true;
     bool in_word = false;
@@ -771,13 +771,13 @@ bool complete(Shell& sh, const char* line, u32 cursor, Completion* out) {
         }
         for (u32 i = 1; i < cand.count; ++i) {
             char tmp[CANDIDATE_BYTES];
-            __builtin_memcpy(tmp, cand.items[i], CANDIDATE_BYTES);
+            mem::copy(tmp, cand.items[i], CANDIDATE_BYTES);
             u32 j = i;
             while (j > 0 && less(tmp, cand.items[j - 1])) {
-                __builtin_memcpy(cand.items[j], cand.items[j - 1], CANDIDATE_BYTES);
+                mem::copy(cand.items[j], cand.items[j - 1], CANDIDATE_BYTES);
                 --j;
             }
-            __builtin_memcpy(cand.items[j], tmp, CANDIDATE_BYTES);
+            mem::copy(cand.items[j], tmp, CANDIDATE_BYTES);
         }
     } else {
         i64 last_slash = -1;
@@ -790,7 +790,7 @@ bool complete(Shell& sh, const char* line, u32 cursor, Completion* out) {
         }
         leaf = typed + dir_len;
         char dir[nebula::path::TEXT_MAX];
-        __builtin_memcpy(dir, typed, dir_len);
+        mem::copy(dir, typed, dir_len);
         dir[dir_len] = 0;
         if (dir_len == 0) {
             for (u32 r = 0; r < nebula::realm_count(); ++r) {
@@ -799,7 +799,7 @@ bool complete(Shell& sh, const char* line, u32 cursor, Completion* out) {
             }
         }
         nebula::Listing l;
-        if (nebula::list(sh.session, dir_len ? dir : ".", &l, false) == nebula::Status::Ok) {
+        if (lens::text::list(sh.cursor, dir_len ? dir : ".", &l, false) == nebula::Status::Ok) {
             for (u32 i = 0; i < l.count; ++i)
                 if (has_prefix(l.items[i].name, leaf)) candidate_add(cand, l.items[i].name, l.items[i].kind == nebula::Kind::Dir);
             nebula::release(l);
@@ -858,7 +858,7 @@ bool complete(Shell& sh, const char* line, u32 cursor, Completion* out) {
         u32 p = 0;
         for (u32 i = 0; i < cand.count; ++i) {
             u32 n = length(cand.items[i]);
-            __builtin_memcpy(out->names + p, cand.items[i], n + 1);
+            mem::copy(out->names + p, cand.items[i], n + 1);
             p += n + 1;
         }
         out->names_bytes = total;

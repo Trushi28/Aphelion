@@ -10,7 +10,7 @@ bool same(const char* a, const char* b) {
     return *a == *b;
 }
 
-u32 length(const char* s) { return static_cast<u32>(__builtin_strlen(s)); }
+u32 length(const char* s) { return static_cast<u32>(cstr::length(s)); }
 
 int cmd_echo(Shell&, Io& io, u32 argc, char** argv) {
     u32 first = 1;
@@ -49,16 +49,16 @@ int cmd_set(Shell& sh, Io& io, u32 argc, char** argv) {
     while (a[eq] && a[eq] != '=') ++eq;
     if (a[eq] == '=') {
         if (eq >= sizeof(name)) { print_error(io, "variable name is too long"); return 1; }
-        __builtin_memcpy(name, a, eq);
+        mem::copy(name, a, eq);
         name[eq] = 0;
         const char* tail = a + eq + 1;
         u32 tl = length(tail);
         if (tl >= sizeof(value)) { print_error(io, "value is too long"); return 1; }
-        __builtin_memcpy(value, tail, tl);
+        mem::copy(value, tail, tl);
         vn = tl;
     } else {
         if (length(a) >= sizeof(name)) { print_error(io, "variable name is too long"); return 1; }
-        __builtin_memcpy(name, a, length(a) + 1);
+        mem::copy(name, a, length(a) + 1);
     }
     bool have = vn > 0;
     for (u32 i = first_value; i < argc; ++i) {
@@ -66,7 +66,7 @@ int cmd_set(Shell& sh, Io& io, u32 argc, char** argv) {
         u32 extra = have ? 1 : 0;
         if (vn + extra + al + 1 >= sizeof(value)) { print_error(io, "value is too long"); return 1; }
         if (have) value[vn++] = ' ';
-        __builtin_memcpy(value + vn, argv[i], al);
+        mem::copy(value + vn, argv[i], al);
         vn += al;
         have = true;
     }
@@ -186,7 +186,7 @@ int cmd_run(Shell& sh, Io& io, u32 argc, char** argv) {
     if (argc - o.index != 1) { print_error(io, "usage: run [-k] file"); return 2; }
     if (sh.depth >= MAX_SCRIPT_DEPTH) { print_error(io, "scripts are nested too deeply"); return 1; }
     nebula::Blob b;
-    nebula::Status st = nebula::read_file(sh.session, argv[o.index], &b);
+    nebula::Status st = lens::text::read_file(sh.cursor, argv[o.index], &b);
     if (st != nebula::Status::Ok) { print_status(io, "cannot read", argv[o.index], st); return 1; }
     ++sh.depth;
     int status = 0;
@@ -207,7 +207,7 @@ int cmd_run(Shell& sh, Io& io, u32 argc, char** argv) {
             if (!keep_going) break;
             continue;
         }
-        __builtin_memcpy(line, b.data + start, static_cast<usize>(len));
+        mem::copy(line, b.data + start, static_cast<usize>(len));
         line[len] = 0;
         bool blank = true;
         for (u64 i = 0; i < len; ++i)

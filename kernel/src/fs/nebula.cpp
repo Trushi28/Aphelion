@@ -206,7 +206,7 @@ Status ensure_capacity(OpenFile& f, u64 need) {
     if (cap > MAX_FILE_BYTES) cap = MAX_FILE_BYTES;
     u8* bigger = static_cast<u8*>(kheap::alloc(static_cast<usize>(cap)));
     if (!bigger) return Status::NoMemory;
-    if (f.size) __builtin_memcpy(bigger, f.data, static_cast<usize>(f.size));
+    if (f.size) mem::copy(bigger, f.data, static_cast<usize>(f.size));
     if (f.data) kheap::free(f.data);
     f.data = bigger;
     f.capacity = cap;
@@ -232,6 +232,28 @@ Status slurp(Realm* realm, Node node, const Info& inf, u8** out, u64* got) {
     return Status::Ok;
 }
 
+Status store_node_impl(Realm* realm, Node parent, const char* leaf, bool exists, Node node, const void* data, u64 size) {
+    if (size > MAX_FILE_BYTES) return Status::TooLarge;
+    if (!realm->writable()) return Status::ReadOnly;
+    bool created = false;
+    Status st;
+    if (!exists) {
+        st = realm->create_file(parent, leaf, &node);
+        if (st != Status::Ok) return st;
+        created = true;
+    } else {
+        Info inf;
+        st = realm->info(node, &inf);
+        if (st != Status::Ok) return st;
+        if (inf.kind == Kind::Dir) return Status::IsADirectory;
+    }
+    if (!writer_claim(realm, node)) return Status::Busy;
+    st = realm->write_all(node, data, size);
+    writer_release(realm, node);
+    if (st != Status::Ok && created) realm->remove(parent, leaf);
+    return st;
+}
+
 Status store(const path::Path& p, const void* data, u64 size) {
     if (size > MAX_FILE_BYTES) return Status::TooLarge;
     Resolved r;
@@ -239,23 +261,7 @@ Status store(const path::Path& p, const void* data, u64 size) {
     if (st != Status::Ok) return st;
     if (!r.realm->writable()) return Status::ReadOnly;
     if (r.is_root) return Status::IsADirectory;
-    Node node = r.node;
-    bool created = false;
-    if (!r.exists) {
-        st = r.realm->create_file(r.parent, r.leaf, &node);
-        if (st != Status::Ok) return st;
-        created = true;
-    } else {
-        Info inf;
-        st = r.realm->info(node, &inf);
-        if (st != Status::Ok) return st;
-        if (inf.kind == Kind::Dir) return Status::IsADirectory;
-    }
-    if (!writer_claim(r.realm, node)) return Status::Busy;
-    st = r.realm->write_all(node, data, size);
-    writer_release(r.realm, node);
-    if (st != Status::Ok && created) r.realm->remove(r.parent, r.leaf);
-    return st;
+    return store_node_impl(r.realm, r.parent, r.leaf, r.exists, r.node, data, size);
 }
 
 }
@@ -305,7 +311,7 @@ u32 realm_count() { return g_realm_count; }
 Realm* realm_at(u32 index) { return index < g_realm_count ? g_realms[index] : nullptr; }
 
 void init_session(Session& s, const char* realm) {
-    __builtin_memset(&s, 0, sizeof(s));
+    mem::zero(&s, sizeof(s));
     path::copy_text(s.here.realm, realm, path::text_length(realm) > path::REALM_MAX ? path::REALM_MAX : path::text_length(realm));
     s.here.count = 0;
     s.ready = true;
@@ -349,19 +355,10 @@ Status stat(Session& s, const char* text, Info* out) {
     return r.realm->info(r.node, out);
 }
 
-Status list(Session& s, const char* text, Listing* out, bool with_info) {
+Status list_node(Realm* realm, Node dir, Listing* out, bool with_info, bool sorted) {
     *out = Listing{};
-    Resolved r;
-    Status st = resolve(s, text, &r);
-    if (st != Status::Ok) return st;
-    if (!r.exists) return Status::NotFound;
-    Info inf;
-    st = r.realm->info(r.node, &inf);
-    if (st != Status::Ok) return st;
-    if (inf.kind != Kind::Dir) return Status::NotADirectory;
-
     NameList names;
-    st = collect(r.realm, r.node, names);
+    Status st = collect(realm, dir, names);
     if (st != Status::Ok) return st;
     if (names.count) {
         out->items = static_cast<Entry*>(kheap::alloc(static_cast<usize>(names.count) * sizeof(Entry)));
@@ -376,7 +373,7 @@ Status list(Session& s, const char* text, Listing* out, bool with_info) {
         e.mtime_ms = 0;
         if (with_info) {
             Info ci;
-            if (r.realm->info(names.items[i].node, &ci) == Status::Ok) {
+            if (realm->info(names.items[i].node, &ci) == Status::Ok) {
                 e.size = ci.size;
                 e.mtime_ms = ci.mtime_ms;
             }
@@ -384,13 +381,54 @@ Status list(Session& s, const char* text, Listing* out, bool with_info) {
     }
     out->truncated = names.truncated;
     name_list_free(names);
-    sort_entries(out->items, out->count);
+    if (sorted) sort_entries(out->items, out->count);
     return Status::Ok;
+}
+
+Status list(Session& s, const char* text, Listing* out, bool with_info) {
+    *out = Listing{};
+    Resolved r;
+    Status st = resolve(s, text, &r);
+    if (st != Status::Ok) return st;
+    if (!r.exists) return Status::NotFound;
+    Info inf;
+    st = r.realm->info(r.node, &inf);
+    if (st != Status::Ok) return st;
+    if (inf.kind != Kind::Dir) return Status::NotADirectory;
+    return list_node(r.realm, r.node, out, with_info, true);
 }
 
 void release(Listing& l) {
     if (l.items) kheap::free(l.items);
     l = Listing{};
+}
+
+static Status make_open_file(OpenFile* out, Realm* realm, Node node, u32 flags, const Info& binfo) {
+    bool write = (flags & OPEN_WRITE) != 0;
+    bool truncate = write && (flags & OPEN_TRUNCATE);
+    if (write && !writer_claim(realm, node)) return Status::Busy;
+
+    OpenFile f{};
+    f.realm = realm;
+    f.node = node;
+    f.flags = flags;
+    if (truncate) {
+        f.dirty = true;
+    } else if (binfo.size > 0 || binfo.dynamic) {
+        u8* buf = nullptr;
+        u64 got = 0;
+        Status st = slurp(realm, node, binfo, &buf, &got);
+        if (st != Status::Ok) {
+            if (write) writer_release(realm, node);
+            return st;
+        }
+        f.data = buf;
+        f.capacity = binfo.size + (binfo.dynamic ? DYNAMIC_SLACK : 0);
+        f.size = got;
+        if (!buf) f.capacity = 0;
+    }
+    *out = f;
+    return Status::Ok;
 }
 
 Status open(Session& s, const char* text, u32 flags, Handle* out) {
@@ -407,9 +445,8 @@ Status open(Session& s, const char* text, u32 flags, Handle* out) {
     if (slot == MAX_HANDLES) return Status::Busy;
 
     Node node = r.node;
-    u64 size = 0;
-    bool dynamic = false;
     Info binfo{};
+    OpenFile f_{};
     bool created = false;
     if (!r.exists) {
         if (!(flags & OPEN_CREATE) || !write) return Status::NotFound;
@@ -424,56 +461,32 @@ Status open(Session& s, const char* text, u32 flags, Handle* out) {
         if (st != Status::Ok) return st;
         if (inf.kind == Kind::Dir) return Status::IsADirectory;
         if (write && !r.realm->writable()) return Status::ReadOnly;
-        size = inf.size;
-        dynamic = inf.dynamic;
         binfo = inf;
     }
 
-    bool truncate = write && (flags & OPEN_TRUNCATE);
-    if (write && !writer_claim(r.realm, node)) {
+    st = make_open_file(&f_, r.realm, node, flags, binfo);
+    if (st != Status::Ok) {
         if (created) r.realm->remove(r.parent, r.leaf);
-        return Status::Busy;
-    }
-
-    OpenFile f{};
-    f.realm = r.realm;
-    f.node = node;
-    f.flags = flags;
-    if (truncate) {
-        f.dirty = true;
-    } else if (size > 0 || dynamic) {
-        u8* buf = nullptr;
-        u64 got = 0;
-        st = slurp(r.realm, node, binfo, &buf, &got);
-        if (st != Status::Ok) {
-            if (write) writer_release(r.realm, node);
-            return st;
-        }
-        f.data = buf;
-        f.capacity = binfo.size + (dynamic ? DYNAMIC_SLACK : 0);
-        f.size = got;
-        if (!buf) f.capacity = 0;
+        return st;
     }
 
     OpenFile& dest = s.files[slot];
     u16 gen = static_cast<u16>(dest.generation + 1);
     if (gen == 0) gen = 1;
-    f.used = true;
-    f.generation = gen;
-    dest = f;
+    f_.used = true;
+    f_.generation = gen;
+    dest = f_;
     *out = (static_cast<u32>(gen) << 16) | (slot + 1);
     return Status::Ok;
 }
 
-Status read_at(Session& s, Handle h, u64 offset, void* buf, u64 length, u64* got) {
-    OpenFile* f = lookup(s, h);
-    if (!f) return Status::BadHandle;
-    if (!(f->flags & OPEN_READ)) return Status::Denied;
+Status file_read(OpenFile& f, u64 offset, void* buf, u64 length, u64* got) {
+    if (!(f.flags & OPEN_READ)) return Status::Denied;
     *got = 0;
-    if (offset >= f->size || length == 0) return Status::Ok;
-    u64 n = f->size - offset;
+    if (offset >= f.size || length == 0) return Status::Ok;
+    u64 n = f.size - offset;
     if (n > length) n = length;
-    __builtin_memcpy(buf, f->data + offset, static_cast<usize>(n));
+    mem::copy(buf, f.data + offset, static_cast<usize>(n));
     *got = n;
     return Status::Ok;
 }
@@ -481,32 +494,75 @@ Status read_at(Session& s, Handle h, u64 offset, void* buf, u64 length, u64* got
 static Status grow_zeroed(OpenFile& f, u64 new_size) {
     Status st = ensure_capacity(f, new_size);
     if (st != Status::Ok) return st;
-    if (new_size > f.size) __builtin_memset(f.data + f.size, 0, static_cast<usize>(new_size - f.size));
+    if (new_size > f.size) mem::zero(f.data + f.size, static_cast<usize>(new_size - f.size));
     f.size = new_size;
     f.dirty = true;
     return Status::Ok;
 }
 
-Status write_at(Session& s, Handle h, u64 offset, const void* data, u64 length) {
-    OpenFile* f = lookup(s, h);
-    if (!f) return Status::BadHandle;
-    if (!(f->flags & OPEN_WRITE)) return Status::Denied;
+Status file_write(OpenFile& f, u64 offset, const void* data, u64 length) {
+    if (!(f.flags & OPEN_WRITE)) return Status::Denied;
     if (length == 0) return Status::Ok;
     if (offset > MAX_FILE_BYTES || length > MAX_FILE_BYTES - offset) return Status::TooLarge;
     u64 end = offset + length;
-    if (end > f->size) {
-        Status st = grow_zeroed(*f, end);
+    if (end > f.size) {
+        Status st = grow_zeroed(f, end);
         if (st != Status::Ok) return st;
     }
-    __builtin_memcpy(f->data + offset, data, static_cast<usize>(length));
-    f->dirty = true;
+    mem::copy(f.data + offset, data, static_cast<usize>(length));
+    f.dirty = true;
     return Status::Ok;
+}
+
+Status file_append(OpenFile& f, const void* data, u64 length) { return file_write(f, f.size, data, length); }
+
+Status file_resize(OpenFile& f, u64 new_size) {
+    if (!(f.flags & OPEN_WRITE)) return Status::Denied;
+    if (new_size > MAX_FILE_BYTES) return Status::TooLarge;
+    if (new_size > f.size) return grow_zeroed(f, new_size);
+    if (new_size < f.size) {
+        f.size = new_size;
+        f.dirty = true;
+    }
+    return Status::Ok;
+}
+
+Status file_sync(OpenFile& f) {
+    if (!(f.flags & OPEN_WRITE) || !f.dirty) return Status::Ok;
+    Status st = f.realm->write_all(f.node, f.data, f.size);
+    if (st == Status::Ok) f.dirty = false;
+    return st;
+}
+
+Status file_close(OpenFile& f) {
+    Status st = Status::Ok;
+    if ((f.flags & OPEN_WRITE)) {
+        st = file_sync(f);
+        writer_release(f.realm, f.node);
+    }
+    if (f.data) kheap::free(f.data);
+    u16 gen = f.generation;
+    f = OpenFile{};
+    f.generation = gen;
+    return st;
+}
+
+Status read_at(Session& s, Handle h, u64 offset, void* buf, u64 length, u64* got) {
+    OpenFile* f = lookup(s, h);
+    if (!f) return Status::BadHandle;
+    return file_read(*f, offset, buf, length, got);
+}
+
+Status write_at(Session& s, Handle h, u64 offset, const void* data, u64 length) {
+    OpenFile* f = lookup(s, h);
+    if (!f) return Status::BadHandle;
+    return file_write(*f, offset, data, length);
 }
 
 Status append(Session& s, Handle h, const void* data, u64 length) {
     OpenFile* f = lookup(s, h);
     if (!f) return Status::BadHandle;
-    return write_at(s, h, f->size, data, length);
+    return file_append(*f, data, length);
 }
 
 Status size_of(Session& s, Handle h, u64* out) {
@@ -519,38 +575,19 @@ Status size_of(Session& s, Handle h, u64* out) {
 Status resize(Session& s, Handle h, u64 new_size) {
     OpenFile* f = lookup(s, h);
     if (!f) return Status::BadHandle;
-    if (!(f->flags & OPEN_WRITE)) return Status::Denied;
-    if (new_size > MAX_FILE_BYTES) return Status::TooLarge;
-    if (new_size > f->size) return grow_zeroed(*f, new_size);
-    if (new_size < f->size) {
-        f->size = new_size;
-        f->dirty = true;
-    }
-    return Status::Ok;
+    return file_resize(*f, new_size);
 }
 
 Status sync(Session& s, Handle h) {
     OpenFile* f = lookup(s, h);
     if (!f) return Status::BadHandle;
-    if (!(f->flags & OPEN_WRITE) || !f->dirty) return Status::Ok;
-    Status st = f->realm->write_all(f->node, f->data, f->size);
-    if (st == Status::Ok) f->dirty = false;
-    return st;
+    return file_sync(*f);
 }
 
 Status close(Session& s, Handle h) {
     OpenFile* f = lookup(s, h);
     if (!f) return Status::BadHandle;
-    Status st = Status::Ok;
-    if ((f->flags & OPEN_WRITE)) {
-        st = sync(s, h);
-        writer_release(f->realm, f->node);
-    }
-    if (f->data) kheap::free(f->data);
-    u16 gen = f->generation;
-    *f = OpenFile{};
-    f->generation = gen;
-    return st;
+    return file_close(*f);
 }
 
 Status read_file(Session& s, const char* text, Blob* out) {
@@ -808,6 +845,43 @@ Status copy_tree(Session& s, const char* from, const char* to, u32* copied) {
     if (st != Status::Ok) return st;
     path::Path src = a.path;
     return copy_below(a.realm, a.node, src, dest, 0, copied);
+}
+
+bool node_busy(Realm* realm, Node node) { return writer_busy(realm, node); }
+
+Status open_node(OpenFile& out, Realm* realm, Node node, u32 flags) {
+    out = OpenFile{};
+    if (!(flags & (OPEN_READ | OPEN_WRITE))) return Status::Unsupported;
+    if (!realm->available()) return Status::Unavailable;
+    bool write = (flags & OPEN_WRITE) != 0;
+    Info inf;
+    Status st = realm->info(node, &inf);
+    if (st != Status::Ok) return st;
+    if (inf.kind == Kind::Dir) return Status::IsADirectory;
+    if (write && (!realm->writable() || inf.read_only)) return Status::ReadOnly;
+    st = make_open_file(&out, realm, node, flags, inf);
+    if (st != Status::Ok) return st;
+    out.used = true;
+    return Status::Ok;
+}
+
+Status read_node(Realm* realm, Node file, Blob* out) {
+    *out = Blob{};
+    Info inf;
+    Status st = realm->info(file, &inf);
+    if (st != Status::Ok) return st;
+    if (inf.kind == Kind::Dir) return Status::IsADirectory;
+    u8* buf = nullptr;
+    u64 got = 0;
+    st = slurp(realm, file, inf, &buf, &got);
+    if (st != Status::Ok) return st;
+    out->data = buf;
+    out->size = got;
+    return Status::Ok;
+}
+
+Status store_node(Realm* realm, Node parent, const char* leaf, bool exists, Node node, const void* data, u64 size) {
+    return store_node_impl(realm, parent, leaf, exists, node, data, size);
 }
 
 }

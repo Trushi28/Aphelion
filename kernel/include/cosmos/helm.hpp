@@ -1,6 +1,7 @@
 #pragma once
 #include <cosmos/types.hpp>
 #include <cosmos/nebula.hpp>
+#include <cosmos/lens_text.hpp>
 #include <cosmos/helm_parse.hpp>
 #include <cosmos/utf8.hpp>
 
@@ -81,7 +82,7 @@ public:
     void repeat(const char* s, u32 count) { for (u32 i = 0; i < count; ++i) str(s); }
     void pad_to(const char* s, u32 cells) {
         str(s);
-        u32 c = utf8::cells(s, static_cast<u32>(__builtin_strlen(s)));
+        u32 c = utf8::cells(s, static_cast<u32>(cstr::length(s)));
         if (c < cells) spaces(cells - c);
     }
     void rgb(u32 c) {
@@ -100,7 +101,7 @@ private:
     bool terminal_;
     u32 n_ = 0;
     u64 total_ = 0;
-    char buf_[512];
+    char buf_[2048];
 };
 
 constexpr u32 MAX_VARS = 24;
@@ -115,7 +116,7 @@ struct Var {
 };
 
 struct Shell {
-    nebula::Session session;
+    lens::text::Cursor cursor;
     nebula::path::Path previous;
     bool has_previous;
     Var vars[MAX_VARS];
@@ -174,6 +175,7 @@ const Table* table_at(u32 index);
 void register_builtin_commands();
 void register_fs_commands();
 void register_text_commands();
+void register_row_commands();
 void register_sys_commands();
 void print_splash(Writer& w);
 void print_about(Writer& w);

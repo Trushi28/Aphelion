@@ -4,9 +4,56 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      units: ${{ steps.plan.outputs.units }}
+      boot: ${{ steps.plan.outputs.boot }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select what to run
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          range=""
+          case "$EVENT" in
+            pull_request) range="origin/$BASE_REF...$AFTER" ;;
+            push) range="$BEFORE..$AFTER" ;;
+          esac
+          tools/ci-affected.sh "$range" | tee -a "$GITHUB_OUTPUT"
+
+  host-tests:
+    needs: plan
+    if: needs.plan.outputs.units != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        unit: ${{ fromJSON(needs.plan.outputs.units) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test ${{ matrix.unit }}
+        run: make test-${{ matrix.unit }}
+
+  iso:
+    needs: plan
+    if: needs.plan.outputs.boot == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,69 +61,53 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential nasm xorriso mtools qemu-system-x86 qemu-utils
+          sudo apt-get install -y build-essential nasm xorriso mtools
 
       - name: Build
         run: make iso MENU_TIMEOUT=0
 
-      - name: Filesystem tests
-        run: make test-stellar
+      - name: Build the shell image
+        run: make iso BOOT_DEFAULT=shell MENU_TIMEOUT=0 ISO=build/aphelion-shell.iso
 
-      - name: Memory tests
-        run: make test-mm
-
-      - name: Scheduler and boot configuration tests
-        run: make test-sched
-
-      - name: Console tests
-        run: make test-console
-
-      - name: Input tests
-        run: make test-input
-
-      - name: Nebula namespace tests
-        run: make test-nebula
-
-      - name: Helm shell tests
-        run: make test-helm
-
-      - name: USB protocol and storage tests
-        run: make test-usb test-usbstor
-
-      - name: Boot on NVMe, 1 core
-        run: tools/ci-boot.sh nvme 1
-
-      - name: Boot on NVMe, 4 cores
-        run: tools/ci-boot.sh nvme 4
-
-      - name: Boot on AHCI
-        run: tools/ci-boot.sh ahci 1
-
-      - name: Boot on virtio-blk
-        run: tools/ci-boot.sh virtio 1
-
-      - name: Boot the shell
-        run: |
-          make iso BOOT_DEFAULT=shell MENU_TIMEOUT=0 ISO=build/aphelion-shell.iso
-          tools/ci-shell.sh 2
-
-      - name: Boot from a USB stick
-        run: |
-          make iso PROFILE=usb MENU_TIMEOUT=0 ISO=build/aphelion-usb.iso
-          tools/ci-usb.sh
+      - name: Build the USB image
+        run: make iso PROFILE=usb MENU_TIMEOUT=0 ISO=build/aphelion-usb.iso
 
       - name: Build host filesystem tools
         run: make stellarfs
 
-      - name: Crash fuzz, NVMe
-        run: tools/crash-fuzz.sh nvme 1 16 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images
+          path: |
+            build/aphelion.iso
+            build/aphelion-shell.iso
+            build/aphelion-usb.iso
+            build/stellarfs
+          if-no-files-found: error
 
-      - name: Crash fuzz, AHCI
-        run: tools/crash-fuzz.sh ahci 1 10 7
-
-      - name: Crash fuzz, virtio-blk
-        run: tools/crash-fuzz.sh virtio 1 10 7
-
+  boot:
+    needs: iso
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { disk: nvme, cores: 1 }
+          - { disk: nvme, cores: 4 }
+          - { disk: ahci, cores: 1 }
+          - { disk: virtio, cores: 1 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: images
+          path: build
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+      - name: Boot on ${{ matrix.disk }}, ${{ matrix.cores }} core(s)
+        run: tools/ci-boot.sh ${{ matrix.disk }} ${{ matrix.cores }}
       - name: Boot timings
         if: always()
         run: |
@@ -85,11 +116,98 @@ jobs:
             echo "== $(basename "$f" .time)"
             cat "$f"
           done
-
-      - name: Upload boot logs
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: boot-logs
+          name: boot-logs-${{ matrix.disk }}-${{ matrix.cores }}
           path: build/ci-logs
           if-no-files-found: ignore
+
+  shell:
+    needs: iso
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: images
+          path: build
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+      - name: Boot the shell
+        run: tools/ci-shell.sh 2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-logs-shell
+          path: build/ci-logs
+          if-no-files-found: ignore
+
+  usb:
+    needs: iso
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: images
+          path: build
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+      - name: Boot from a USB stick
+        run: tools/ci-usb.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-logs-usb
+          path: build/ci-logs
+          if-no-files-found: ignore
+
+  crash-fuzz:
+    needs: iso
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { disk: nvme, rounds: 16 }
+          - { disk: ahci, rounds: 10 }
+          - { disk: virtio, rounds: 10 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: images
+          path: build
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
+      - name: Crash fuzz, ${{ matrix.disk }}
+        run: |
+          chmod +x build/stellarfs
+          tools/crash-fuzz.sh ${{ matrix.disk }} 1 ${{ matrix.rounds }} 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-logs-fuzz-${{ matrix.disk }}
+          path: build/ci-logs
+          if-no-files-found: ignore
+
+  ci-ok:
+    if: always()
+    needs: [plan, host-tests, iso, boot, shell, usb, crash-fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Everything that ran passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac

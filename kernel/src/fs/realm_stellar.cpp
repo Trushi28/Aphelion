@@ -6,6 +6,7 @@ namespace nebula {
 namespace {
 
 bool g_mounted;
+u32 g_disk_generation;
 bool g_confirmed_only;
 
 struct ListCtx {
@@ -240,7 +241,11 @@ Status status_from_stellar(stellar::Status s) {
 Realm* disk_realm() { return &g_disk; }
 Realm* snap_realm() { return &g_snap; }
 
-void disk_set_mounted(bool mounted) { g_mounted = mounted; }
+void disk_set_mounted(bool mounted) {
+    g_mounted = mounted;
+    ++g_disk_generation;
+}
+u32 disk_generation() { return g_disk_generation; }
 bool disk_is_mounted() { return g_mounted; }
 void disk_set_confirmed_only(bool confirmed_only) { g_confirmed_only = confirmed_only; }
 bool disk_is_confirmed_only() { return g_confirmed_only; }

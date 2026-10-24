@@ -21,6 +21,7 @@ u64 g_total = 0;
 cpu::Spinlock g_lock;
 orbital::WaitQueue g_wait;
 bool g_ready = false;
+void (*g_hook)() = nullptr;
 
 Set1Decoder g_scan;
 AnsiDecoder g_ansi;
@@ -55,6 +56,8 @@ void init() {
 
 bool ready() { return g_ready; }
 
+void set_wake_hook(void (*hook)()) { g_hook = hook; }
+
 bool push(const Key& key) {
     if (!g_ready) return false;
     u64 flags = cpu::irq_save();
@@ -69,7 +72,10 @@ bool push(const Key& key) {
     }
     g_lock.unlock();
     cpu::irq_restore(flags);
-    if (ok) g_wait.wake_one();
+    if (ok) {
+        g_wait.wake_one();
+        if (g_hook) g_hook();
+    }
     return ok;
 }
 

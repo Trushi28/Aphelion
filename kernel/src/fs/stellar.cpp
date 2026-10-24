@@ -302,7 +302,6 @@ static u64 (*g_clock_fn)() = nullptr;
 static u64 now() { return g_clock_fn ? g_clock_fn() : 0; }
 void set_clock(u64 (*fn)()) { g_clock_fn = fn; }
 
-
 static CacheSlot g_cache[CACHE_SLOTS];
 static u64 g_io_reads = 0, g_io_writes = 0, g_cache_hits = 0;
 
@@ -387,7 +386,7 @@ static void* alloc_ram(u64 bytes) {
     u64 phys = universe::alloc(order);
     if (phys == 0) { fail(Status::NoMemory); return nullptr; }
     void* v = reinterpret_cast<void*>(g_hhdm + phys);
-    __builtin_memset(v, 0, universe::PAGE_SIZE << order);
+    mem::zero(v, universe::PAGE_SIZE << order);
     return v;
 }
 
@@ -451,12 +450,12 @@ static bool g_rd_crc_failed = false;
 static u32 sector_crc(const u8* b) { return crc32_full(b, CRC_OFF); }
 static bool crc_ok(const u8* b) {
     u32 stored;
-    __builtin_memcpy(&stored, b + CRC_OFF, sizeof(stored));
+    mem::copy(&stored, b + CRC_OFF, sizeof(stored));
     return stored == sector_crc(b);
 }
 static void crc_stamp(u8* b) {
     u32 c = sector_crc(b);
-    __builtin_memcpy(b + CRC_OFF, &c, sizeof(c));
+    mem::copy(b + CRC_OFF, &c, sizeof(c));
 }
 static void cache_drop(u64 first, u64 count);
 
@@ -469,7 +468,7 @@ static bool rd(u64 sector, void* out) {
     CacheSlot& c = g_cache[sector % CACHE_SLOTS];
     if (c.valid && c.sector == sector) {
         ++g_cache_hits;
-        __builtin_memcpy(out, c.data, SECTOR_SIZE);
+        mem::copy(out, c.data, SECTOR_SIZE);
         return true;
     }
     ++g_io_reads;
@@ -482,7 +481,7 @@ static bool rd(u64 sector, void* out) {
     }
     c.sector = sector;
     c.valid = true;
-    __builtin_memcpy(out, c.data, SECTOR_SIZE);
+    mem::copy(out, c.data, SECTOR_SIZE);
     return true;
 }
 
@@ -492,7 +491,7 @@ static bool wr(u64 sector, const void* in) {
     ++g_io_writes;
     ++g_mut;
     u8 tmp[SECTOR_SIZE];
-    __builtin_memcpy(tmp, in, SECTOR_SIZE);
+    mem::copy(tmp, in, SECTOR_SIZE);
     crc_stamp(tmp);
     if (!blockdev::write_sector(sector, tmp)) {
         if (c.valid && c.sector == sector) c.valid = false;
@@ -500,7 +499,7 @@ static bool wr(u64 sector, const void* in) {
     }
     c.sector = sector;
     c.valid = true;
-    __builtin_memcpy(c.data, tmp, SECTOR_SIZE);
+    mem::copy(c.data, tmp, SECTOR_SIZE);
     return true;
 }
 
@@ -579,7 +578,7 @@ static bool bm_flush_slot(BmSlot& sl) {
     u64 off = sl.page * BM_PAYLOAD;
     u64 n = off < total_bytes ? total_bytes - off : 0;
     if (n > BM_PAYLOAD) n = BM_PAYLOAD;
-    __builtin_memcpy(buf, sl.data, n);
+    mem::copy(buf, sl.data, n);
     crc_stamp(buf);
     ++g_bm_page_writes;
     if (!raw_wr(g_sb.bitmap_start + sl.page, buf)) return false;
@@ -638,7 +637,7 @@ static BmSlot* bm_slot(u64 page) {
             fail(Status::Checksum);
             return nullptr;
         }
-        __builtin_memcpy(victim->data, buf, BM_PAYLOAD);
+        mem::copy(victim->data, buf, BM_PAYLOAD);
         if (g_bm_free[page] == BM_UNKNOWN) bm_set_free(page, page_zero_bits(page, victim->data));
     }
     victim->page = page;
@@ -734,7 +733,7 @@ static bool format_bitmap() {
     u8 zero[SECTOR_SIZE];
     for (auto& b : zero) b = 0;
     crc_stamp(zero);
-    for (u32 i = 0; i < BM_BATCH; ++i) __builtin_memcpy(g_bm_scratch + i * SECTOR_SIZE, zero, SECTOR_SIZE);
+    for (u32 i = 0; i < BM_BATCH; ++i) mem::copy(g_bm_scratch + i * SECTOR_SIZE, zero, SECTOR_SIZE);
     for (u64 p = 0; p < g_bm_pages; p += BM_BATCH) {
         u64 n = g_bm_pages - p < BM_BATCH ? g_bm_pages - p : BM_BATCH;
         g_io_writes += n;
@@ -749,7 +748,7 @@ static bool format_bitmap() {
 
 static bool sb_write_slot(u32 slot) {
     u8 buf[SECTOR_SIZE];
-    __builtin_memcpy(buf, &g_sb, sizeof(g_sb));
+    mem::copy(buf, &g_sb, sizeof(g_sb));
     crc_stamp(buf);
     return raw_wr(slot, buf);
 }
@@ -870,6 +869,13 @@ bool end_batch(Status* why) {
     return ok;
 }
 
+void abort_batch() {
+    if (g_txn_depth == 0 || !g_lock.held_by_me()) return;
+    g_txn_poisoned = true;
+    if (--g_txn_depth == 0) end_outermost(true);
+    g_lock.unlock();
+}
+
 enum class Learn { Ok, Damaged, IoError };
 
 static Learn bm_learn(u64 first) {
@@ -988,7 +994,6 @@ static void release_sectors(u64 first, u64 count) {
     }
     if (first < g_alloc_hint) g_alloc_hint = first;
 }
-
 
 static SnapRec g_snaps[SNAPSHOT_MAX];
 static u64 g_snap_page_sector[SNAP_PAGES];
@@ -2086,7 +2091,7 @@ struct RunBuf {
             Run* nv = static_cast<Run*>(alloc_ram(static_cast<u64>(nc) * sizeof(Run)));
             if (!nv) return false;
             if (v) {
-                __builtin_memcpy(nv, v, static_cast<u64>(n) * sizeof(Run));
+                mem::copy(nv, v, static_cast<u64>(n) * sizeof(Run));
                 free_ram(v, cap * sizeof(Run));
             }
             v = nv;
@@ -2245,7 +2250,7 @@ static bool write_format_markers() {
     u8 buf[SECTOR_SIZE];
     for (auto& b : buf) b = 0;
     u64 magic = MAGIC;
-    __builtin_memcpy(buf, &magic, sizeof(magic));
+    mem::copy(buf, &magic, sizeof(magic));
     for (u32 slot = 0; slot < SB_SLOTS; ++slot)
         if (!raw_wr(slot, buf)) return false;
     return flush_dev();
@@ -2319,7 +2324,7 @@ static SbState sb_parse(u32 slot, Superblock* out, const char** why) {
     ++g_io_reads;
     if (!blockdev::read_sector(slot, buf)) { *why = "unreadable"; return SbState::IoError; }
     Superblock sb;
-    __builtin_memcpy(&sb, buf, sizeof(sb));
+    mem::copy(&sb, buf, sizeof(sb));
     if (sb.magic != MAGIC || sb.version != VERSION) { *why = "not a v8 superblock"; return SbState::Blank; }
     if (!crc_ok(buf)) { *why = "bad checksum"; return SbState::Invalid; }
     if (sb.features_incompat & ~FEATURES_INCOMPAT_KNOWN) { *why = "unknown incompatible features"; return SbState::Unsupported; }
@@ -2413,7 +2418,7 @@ bool can_auto_format() {
         if (!blockdev::read_sector(s, buf)) return false;
         if (s < SB_SLOTS) {
             u64 magic;
-            __builtin_memcpy(&magic, buf, sizeof(magic));
+            mem::copy(&magic, buf, sizeof(magic));
             if (magic == MAGIC) return true;
         }
         for (u32 i = 0; blank && i < SECTOR_SIZE; ++i)
@@ -2548,7 +2553,7 @@ struct StarStack {
             u64* nv = static_cast<u64*>(alloc_ram(static_cast<u64>(nc) * sizeof(u64)));
             if (!nv) return false;
             if (v) {
-                __builtin_memcpy(nv, v, static_cast<u64>(n) * sizeof(u64));
+                mem::copy(nv, v, static_cast<u64>(n) * sizeof(u64));
                 free_ram(v, static_cast<u64>(cap) * sizeof(u64));
             }
             v = nv;
@@ -2876,7 +2881,7 @@ static u64 gc_core_inner() {
         g_mark_base = w * PAGE_BITS;
         g_mark_limit = (w + np) * PAGE_BITS;
         if (g_mark_limit > g_sb.total_sectors) g_mark_limit = g_sb.total_sectors;
-        __builtin_memset(g_mark, 0, np * BM_PAYLOAD);
+        mem::zero(g_mark, np * BM_PAYLOAD);
         mk_range(0, data_start);
 
         ok = mark_tree(g_sb.catalog_root, 0);
@@ -2895,10 +2900,10 @@ static u64 gc_core_inner() {
             const u8* want = g_mark + i * BM_PAYLOAD;
             u64 lo = page_data_lo(p), hi = page_hi(p);
             if (hi > lo) freed += count_leaked(cur, want, lo - p * PAGE_BITS, hi - p * PAGE_BITS);
-            if (__builtin_memcmp(cur, want, BM_PAYLOAD) != 0 || (g_bm_flags[p] & BM_BAD)) {
+            if (mem::compare(cur, want, BM_PAYLOAD) != 0 || (g_bm_flags[p] & BM_BAD)) {
                 BmSlot* sl = bm_slot(p);
                 if (!sl) { ok = false; break; }
-                __builtin_memcpy(sl->data, want, BM_PAYLOAD);
+                mem::copy(sl->data, want, BM_PAYLOAD);
                 bm_mark_dirty(sl);
                 ++g_mut;
             }
@@ -3154,13 +3159,13 @@ static u64 resolve_n(const char* path, u64 len, u64 snap) {
 
 u64 resolve(const char* path, u64 snap, Status* why) {
     Api api(why);
-    u64 len = path ? strlen(path) : 0;
+    u64 len = path ? cstr::length(path) : 0;
     return api.val(resolve_n(path, len, snap));
 }
 
 static u64 resolve_parent_impl(const char* path, char* leaf, u64 leaf_size, u64 snap) {
     if (!path || !leaf || path[0] != '/') return fail_id(Status::InvalidName);
-    u64 len = strlen(path);
+    u64 len = cstr::length(path);
     while (len > 1 && path[len - 1] == '/') --len;
     u64 slash = len;
     while (slash > 0 && path[slash - 1] != '/') --slash;
@@ -3490,7 +3495,7 @@ static void ck_snap_table() {
             if (r.id == 0) continue;
             ++here;
             bool sane = r.id < g_sb.snap_next_id && in_data_area(r.catalog_root) && r.epoch != 0 && r.epoch <= g_sb.epoch;
-            if (!sane || __builtin_memcmp(&r, &g_snaps[p * SNAP_PER_PAGE + j], sizeof(r)) != 0) ck_bump(g_ck.r->bad_structure);
+            if (!sane || mem::compare(&r, &g_snaps[p * SNAP_PER_PAGE + j], sizeof(r)) != 0) ck_bump(g_ck.r->bad_structure);
         }
         if (here != pg->count) ck_bump(g_ck.r->bad_structure);
         live += here;
@@ -3533,14 +3538,14 @@ static bool check_impl(CheckReport* out, bool deep) {
             if (g_ck.claims) {
                 g_ck.win_lo = data_start + pass * wsec;
                 g_ck.win_hi = g_ck.win_lo + wsec < g_sb.total_sectors ? g_ck.win_lo + wsec : g_sb.total_sectors;
-                __builtin_memset(g_ck.ref, 0, bit_bytes);
-                __builtin_memset(g_ck.seen, 0, bit_bytes);
+                mem::zero(g_ck.ref, bit_bytes);
+                mem::zero(g_ck.seen, bit_bytes);
             }
             if (g_ck.stars) {
                 g_ck.star_lo = pass * wstar;
                 g_ck.star_hi = g_ck.star_lo + wstar < nstars ? g_ck.star_lo + wstar : nstars;
-                __builtin_memset(g_ck.nlinks, 0, star_count * sizeof(u32));
-                __builtin_memset(g_ck.edges, 0, star_count * sizeof(u32));
+                mem::zero(g_ck.nlinks, star_count * sizeof(u32));
+                mem::zero(g_ck.edges, star_count * sizeof(u32));
             }
             g_ck.root = g_sb.catalog_root;
             ck_node(g_sb.catalog_root, 0);
@@ -3560,7 +3565,7 @@ static bool check_impl(CheckReport* out, bool deep) {
             for (u32 i = 0; i < SNAPSHOT_MAX; ++i) {
                 if (g_snaps[i].id == 0) continue;
                 if (g_ck.first) ++out->snapshots;
-                __builtin_memset(g_ck.seen, 0, bit_bytes);
+                mem::zero(g_ck.seen, bit_bytes);
                 g_ck.root = g_snaps[i].catalog_root;
                 if (g_ck.first && g_snaps[i].scope != INVALID_STAR) {
                     StarEntry se;

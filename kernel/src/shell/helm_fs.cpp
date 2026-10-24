@@ -12,7 +12,7 @@ bool same(const char* a, const char* b) {
     return *a == *b;
 }
 
-u32 length(const char* s) { return static_cast<u32>(__builtin_strlen(s)); }
+u32 length(const char* s) { return static_cast<u32>(cstr::length(s)); }
 
 int usage(Io& io, const char* text) {
     print_error(io, text);
@@ -21,7 +21,7 @@ int usage(Io& io, const char* text) {
 
 int cmd_pwd(Shell& sh, Io& io, u32, char**) {
     char loc[nebula::path::TEXT_MAX];
-    nebula::location_text(sh.session, loc, sizeof(loc));
+    lens::text::location_text(sh.cursor, loc, sizeof(loc));
     io.out.str(loc);
     io.out.put('\n');
     return 0;
@@ -30,10 +30,10 @@ int cmd_pwd(Shell& sh, Io& io, u32, char**) {
 int cmd_cd(Shell& sh, Io& io, u32 argc, char** argv) {
     if (argc > 2) return usage(io, "usage: cd [path|-]");
     char target[nebula::path::TEXT_MAX];
-    nebula::path::Path before = sh.session.here;
+    nebula::path::Path before = sh.cursor.here;
     if (argc == 1) {
-        u32 n = length(sh.session.here.realm);
-        __builtin_memcpy(target, sh.session.here.realm, n);
+        u32 n = length(sh.cursor.here.realm);
+        mem::copy(target, sh.cursor.here.realm, n);
         target[n] = ':';
         target[n + 1] = 0;
     } else if (same(argv[1], "-")) {
@@ -42,9 +42,9 @@ int cmd_cd(Shell& sh, Io& io, u32 argc, char** argv) {
     } else {
         u32 n = length(argv[1]);
         if (n >= sizeof(target)) { print_error(io, "path is too long"); return 1; }
-        __builtin_memcpy(target, argv[1], n + 1);
+        mem::copy(target, argv[1], n + 1);
     }
-    nebula::Status st = nebula::change_location(sh.session, target);
+    nebula::Status st = lens::text::change_location(sh.cursor, target);
     if (st != nebula::Status::Ok) { print_status(io, "cannot enter", target, st); return 1; }
     sh.previous = before;
     sh.has_previous = true;
@@ -84,7 +84,7 @@ void print_long_row(Writer& w, nebula::Kind kind, u64 size, u64 mtime, const cha
 
 int ls_path(Shell& sh, Io& io, const char* path, bool lng, bool one, bool header) {
     nebula::Info inf;
-    nebula::Status st = nebula::stat(sh.session, path, &inf);
+    nebula::Status st = lens::text::stat(sh.cursor, path, &inf);
     if (st != nebula::Status::Ok) { print_status(io, "cannot list", path, st); return 1; }
     if (inf.kind == nebula::Kind::File) {
         if (lng) print_long_row(io.out, inf.kind, inf.size, inf.mtime_ms, path);
@@ -92,7 +92,7 @@ int ls_path(Shell& sh, Io& io, const char* path, bool lng, bool one, bool header
         return 0;
     }
     nebula::Listing l;
-    st = nebula::list(sh.session, path, &l, lng);
+    st = lens::text::list(sh.cursor, path, &l, lng);
     if (st != nebula::Status::Ok) { print_status(io, "cannot list", path, st); return 1; }
     if (header) {
         io.out.rgb(palette::AMBER);
@@ -178,7 +178,7 @@ void tree_walk(Shell& sh, Io& io, TreeState& t, u32 depth) {
     if (depth >= t.max_depth) return;
     nebula::Listing l;
     t.path[t.path_len] = 0;
-    nebula::Status st = nebula::list(sh.session, t.path, &l, false);
+    nebula::Status st = lens::text::list(sh.cursor, t.path, &l, false);
     if (st != nebula::Status::Ok) {
         io.err.rgb(palette::SAND);
         io.err.str("  cannot list ");
@@ -210,11 +210,11 @@ void tree_walk(Shell& sh, Io& io, TreeState& t, u32 depth) {
             u32 nl = length(l.items[i].name);
             if (t.path_len + 1 + nl + 1 < nebula::path::TEXT_MAX && t.prefix_len + 7 <= sizeof(t.prefix)) {
                 if (t.path_len && t.path[t.path_len - 1] != '/') t.path[t.path_len++] = '/';
-                __builtin_memcpy(t.path + t.path_len, l.items[i].name, nl);
+                mem::copy(t.path + t.path_len, l.items[i].name, nl);
                 t.path_len += nl;
                 const char* seg = last ? "    " : "\xE2\x94\x82   ";
                 u32 sl = length(seg);
-                __builtin_memcpy(t.prefix + t.prefix_len, seg, sl);
+                mem::copy(t.prefix + t.prefix_len, seg, sl);
                 t.prefix_len += sl;
                 tree_walk(sh, io, t, depth + 1);
             }
@@ -244,7 +244,7 @@ int cmd_tree(Shell& sh, Io& io, u32 argc, char** argv) {
     if (argc - o.index > 1) return usage(io, "usage: tree [-d] [-L depth] [path]");
     const char* start = o.index < argc ? argv[o.index] : ".";
     nebula::Info inf;
-    nebula::Status st = nebula::stat(sh.session, start, &inf);
+    nebula::Status st = lens::text::stat(sh.cursor, start, &inf);
     if (st != nebula::Status::Ok) { print_status(io, "cannot list", start, st); return 1; }
     if (inf.kind != nebula::Kind::Dir) { print_status(io, "cannot list", start, nebula::Status::NotADirectory); return 1; }
     TreeState* t = static_cast<TreeState*>(kheap::alloc_zeroed(sizeof(TreeState)));
@@ -252,7 +252,7 @@ int cmd_tree(Shell& sh, Io& io, u32 argc, char** argv) {
     if (!t || !path) { if (t) kheap::free(t); if (path) kheap::free(path); print_error(io, "out of memory"); return 1; }
     u32 n = length(start);
     if (n >= nebula::path::TEXT_MAX) { kheap::free(t); kheap::free(path); print_error(io, "path is too long"); return 1; }
-    __builtin_memcpy(path, start, n + 1);
+    mem::copy(path, start, n + 1);
     t->path = path;
     t->path_len = n;
     t->max_depth = depth;
@@ -347,11 +347,9 @@ int cmd_stat(Shell& sh, Io& io, u32 argc, char** argv) {
     if (argc < 2) return usage(io, "usage: stat path...");
     int status = 0;
     for (u32 i = 1; i < argc; ++i) {
-        nebula::Resolved r;
-        nebula::Status st = nebula::resolve(sh.session, argv[i], &r);
-        nebula::Info inf{};
-        if (st == nebula::Status::Ok && !r.exists) st = nebula::Status::NotFound;
-        if (st == nebula::Status::Ok) st = r.realm->info(r.node, &inf);
+        lens::text::StatRow r{};
+        nebula::Status st = lens::text::stat_row(sh.cursor, argv[i], &r);
+        const nebula::Info& inf = r.info;
         if (st != nebula::Status::Ok) { print_status(io, "cannot stat", argv[i], st); status = 1; continue; }
         char loc[nebula::path::TEXT_MAX];
         nebula::path::to_text(r.path, loc, sizeof(loc));
@@ -368,7 +366,7 @@ int cmd_stat(Shell& sh, Io& io, u32 argc, char** argv) {
         char t[24];
         format_time(inf.mtime_ms, t);
         row("changed"); io.out.str(t); io.out.put('\n');
-        row("realm"); io.out.str(r.realm->name()); io.out.str(r.realm->writable() && !inf.read_only ? ", writable" : ", read-only"); io.out.put('\n');
+        row("realm"); io.out.str(r.realm); io.out.str(r.writable && !inf.read_only ? ", writable" : ", read-only"); io.out.put('\n');
         row("links"); io.out.num(inf.links); io.out.put('\n');
     }
     return status;
@@ -379,10 +377,10 @@ int cmd_touch(Shell& sh, Io& io, u32 argc, char** argv) {
     int status = 0;
     for (u32 i = 1; i < argc; ++i) {
         nebula::Info inf;
-        nebula::Status st = nebula::stat(sh.session, argv[i], &inf);
+        nebula::Status st = lens::text::stat(sh.cursor, argv[i], &inf);
         if (st == nebula::Status::Ok) continue;
         if (st != nebula::Status::NotFound) { print_status(io, "cannot touch", argv[i], st); status = 1; continue; }
-        st = nebula::write_file(sh.session, argv[i], nullptr, 0);
+        st = lens::text::write_file(sh.cursor, argv[i], nullptr, 0);
         if (st != nebula::Status::Ok) { print_status(io, "cannot create", argv[i], st); status = 1; }
     }
     return status;
@@ -396,7 +394,7 @@ int cmd_mkdir(Shell& sh, Io& io, u32 argc, char** argv) {
     if (o.bad || o.index >= argc) return usage(io, "usage: mkdir [-p] dir...");
     int status = 0;
     for (u32 i = o.index; i < argc; ++i) {
-        nebula::Status st = parents ? nebula::make_path(sh.session, argv[i]) : nebula::make_dir(sh.session, argv[i]);
+        nebula::Status st = parents ? lens::text::make_path(sh.cursor, argv[i]) : lens::text::make_dir(sh.cursor, argv[i]);
         if (st != nebula::Status::Ok) { print_status(io, "cannot create", argv[i], st); status = 1; }
     }
     return status;
@@ -415,7 +413,7 @@ int cmd_rm(Shell& sh, Io& io, u32 argc, char** argv) {
     for (u32 i = o.index; i < argc; ++i) {
         if (sh.poll()) return 130;
         nebula::Info inf;
-        nebula::Status st = nebula::stat(sh.session, argv[i], &inf);
+        nebula::Status st = lens::text::stat(sh.cursor, argv[i], &inf);
         if (st == nebula::Status::NotFound && force) continue;
         if (st != nebula::Status::Ok) { print_status(io, "cannot remove", argv[i], st); status = 1; continue; }
         if (inf.kind == nebula::Kind::Dir && !recursive) {
@@ -427,7 +425,7 @@ int cmd_rm(Shell& sh, Io& io, u32 argc, char** argv) {
             status = 1;
             continue;
         }
-        st = recursive ? nebula::remove_tree(sh.session, argv[i], nullptr) : nebula::remove(sh.session, argv[i]);
+        st = recursive ? lens::text::remove_tree(sh.cursor, argv[i], nullptr) : lens::text::remove(sh.cursor, argv[i]);
         if (st != nebula::Status::Ok) { print_status(io, "cannot remove", argv[i], st); status = 1; }
     }
     return status;
@@ -438,9 +436,9 @@ int cmd_rmdir(Shell& sh, Io& io, u32 argc, char** argv) {
     int status = 0;
     for (u32 i = 1; i < argc; ++i) {
         nebula::Info inf;
-        nebula::Status st = nebula::stat(sh.session, argv[i], &inf);
+        nebula::Status st = lens::text::stat(sh.cursor, argv[i], &inf);
         if (st == nebula::Status::Ok && inf.kind != nebula::Kind::Dir) st = nebula::Status::NotADirectory;
-        if (st == nebula::Status::Ok) st = nebula::remove(sh.session, argv[i]);
+        if (st == nebula::Status::Ok) st = lens::text::remove(sh.cursor, argv[i]);
         if (st != nebula::Status::Ok) { print_status(io, "cannot remove", argv[i], st); status = 1; }
     }
     return status;
@@ -448,18 +446,19 @@ int cmd_rmdir(Shell& sh, Io& io, u32 argc, char** argv) {
 
 bool final_target(Shell& sh, const char* src, const char* dst, char* out, u32 cap, bool* exists, nebula::Status* why) {
     nebula::Info di;
-    nebula::Status st = nebula::stat(sh.session, dst, &di);
+    nebula::Status st = lens::text::stat(sh.cursor, dst, &di);
     u32 dl = length(dst);
     if (dl >= cap) { *why = nebula::Status::InvalidPath; return false; }
-    __builtin_memcpy(out, dst, dl + 1);
+    mem::copy(out, dst, dl + 1);
     *exists = false;
     if (st == nebula::Status::Ok) {
         *exists = true;
         if (di.kind == nebula::Kind::Dir) {
-            nebula::Resolved r;
-            st = nebula::resolve(sh.session, src, &r);
+            nebula::path::Path sp;
+            st = lens::text::canonical(sh.cursor, src, &sp);
             if (st != nebula::Status::Ok) { *why = st; return false; }
-            u32 ln = length(r.leaf);
+            const char* leaf = sp.count ? sp.comps[sp.count - 1] : "";
+            u32 ln = length(leaf);
             if (ln == 0) { *why = nebula::Status::InvalidPath; return false; }
             u32 p = dl;
             if (p == 0 || out[p - 1] != '/') {
@@ -467,9 +466,9 @@ bool final_target(Shell& sh, const char* src, const char* dst, char* out, u32 ca
                 out[p++] = '/';
             }
             if (p + ln + 1 > cap) { *why = nebula::Status::InvalidPath; return false; }
-            __builtin_memcpy(out + p, r.leaf, ln + 1);
+            mem::copy(out + p, leaf, ln + 1);
             nebula::Info ti;
-            *exists = nebula::stat(sh.session, out, &ti) == nebula::Status::Ok;
+            *exists = lens::text::stat(sh.cursor, out, &ti) == nebula::Status::Ok;
         }
     } else if (st != nebula::Status::NotFound) {
         *why = st;
@@ -499,14 +498,14 @@ int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
     const char* dst = argv[argc - 1];
     u32 nsrc = argc - 1 - o.index;
     nebula::Info di;
-    bool dst_is_dir = nebula::stat(sh.session, dst, &di) == nebula::Status::Ok && di.kind == nebula::Kind::Dir;
+    bool dst_is_dir = lens::text::stat(sh.cursor, dst, &di) == nebula::Status::Ok && di.kind == nebula::Kind::Dir;
     if (nsrc > 1 && !dst_is_dir) { print_error(io, "with several sources the destination must be an existing directory"); return 1; }
     int status = 0;
     for (u32 i = 0; i < nsrc; ++i) {
         if (sh.poll()) return 130;
         const char* src = argv[o.index + i];
         nebula::Info si;
-        nebula::Status st = nebula::stat(sh.session, src, &si);
+        nebula::Status st = lens::text::stat(sh.cursor, src, &si);
         if (st != nebula::Status::Ok) { print_status(io, move ? "cannot move" : "cannot copy", src, st); status = 1; continue; }
         char target[nebula::path::TEXT_MAX];
         bool exists = false;
@@ -517,7 +516,7 @@ int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
         }
         if (exists) {
             nebula::Info ti;
-            bool target_dir = nebula::stat(sh.session, target, &ti) == nebula::Status::Ok && ti.kind == nebula::Kind::Dir;
+            bool target_dir = lens::text::stat(sh.cursor, target, &ti) == nebula::Status::Ok && ti.kind == nebula::Kind::Dir;
             if (!force || target_dir || si.kind == nebula::Kind::Dir) {
                 if (target_dir || si.kind == nebula::Kind::Dir) {
                     io.err.rgb(palette::SAND);
@@ -533,11 +532,11 @@ int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
             }
         }
         if (move) {
-            st = nebula::rename(sh.session, src, target, force ? nebula::RENAME_REPLACE : 0);
+            st = lens::text::rename(sh.cursor, src, target, force ? nebula::RENAME_REPLACE : 0);
             if (st == nebula::Status::CrossRealm) {
                 u32 copied = 0;
-                st = nebula::copy_tree(sh.session, src, target, &copied);
-                if (st == nebula::Status::Ok) st = nebula::remove_tree(sh.session, src, nullptr);
+                st = lens::text::copy_tree(sh.cursor, src, target, &copied);
+                if (st == nebula::Status::Ok) st = lens::text::remove_tree(sh.cursor, src, nullptr);
             }
         } else if (si.kind == nebula::Kind::Dir) {
             if (!recursive) {
@@ -550,9 +549,9 @@ int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
                 continue;
             }
             u32 copied = 0;
-            st = nebula::copy_tree(sh.session, src, target, &copied);
+            st = lens::text::copy_tree(sh.cursor, src, target, &copied);
         } else {
-            st = nebula::copy_file(sh.session, src, target);
+            st = lens::text::copy_file(sh.cursor, src, target);
         }
         if (st != nebula::Status::Ok) { print_status(io, move ? "cannot move" : "cannot copy", src, st); status = 1; }
     }
@@ -609,7 +608,7 @@ void find_walk(FindCtx& f, u32 depth) {
     if (depth > nebula::MAX_TREE_DEPTH || f.stop) return;
     nebula::Listing l;
     f.path[f.path_len] = 0;
-    if (nebula::list(f.sh->session, f.path, &l, false) != nebula::Status::Ok) return;
+    if (lens::text::list(f.sh->cursor, f.path, &l, false) != nebula::Status::Ok) return;
     for (u32 i = 0; i < l.count && !f.stop; ++i) {
         if (f.sh->poll()) { f.stop = true; break; }
         const nebula::Entry& e = l.items[i];
@@ -618,7 +617,7 @@ void find_walk(FindCtx& f, u32 depth) {
         u32 nl = length(e.name);
         if (f.path_len + 1 + nl + 1 >= nebula::path::TEXT_MAX) continue;
         if (f.path_len && f.path[f.path_len - 1] != '/') f.path[f.path_len++] = '/';
-        __builtin_memcpy(f.path + f.path_len, e.name, nl);
+        mem::copy(f.path + f.path_len, e.name, nl);
         f.path_len += nl;
         f.path[f.path_len] = 0;
         bool type_ok = f.type == 0 || (f.type == 'd' && is_dir) || (f.type == 'f' && !is_dir);
@@ -657,14 +656,14 @@ int cmd_find(Shell& sh, Io& io, u32 argc, char** argv) {
         }
     }
     nebula::Info inf;
-    nebula::Status st = nebula::stat(sh.session, start, &inf);
+    nebula::Status st = lens::text::stat(sh.cursor, start, &inf);
     if (st != nebula::Status::Ok) { print_status(io, "cannot search", start, st); return 1; }
     if (inf.kind != nebula::Kind::Dir) { print_status(io, "cannot search", start, nebula::Status::NotADirectory); return 1; }
     f.path = static_cast<char*>(kheap::alloc(nebula::path::TEXT_MAX));
     if (!f.path) { print_error(io, "out of memory"); return 1; }
     u32 n = length(start);
     if (n >= nebula::path::TEXT_MAX) { kheap::free(f.path); print_error(io, "path is too long"); return 1; }
-    __builtin_memcpy(f.path, start, n + 1);
+    mem::copy(f.path, start, n + 1);
     f.path_len = n;
     find_walk(f, 0);
     kheap::free(f.path);

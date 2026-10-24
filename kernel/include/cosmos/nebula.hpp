@@ -72,6 +72,10 @@ public:
     virtual Status make_dir(Node dir, const char* name, Node* out) = 0;
     virtual Status remove(Node dir, const char* name) = 0;
     virtual Status rename(Node from_dir, const char* from, Node to_dir, const char* to, bool replace) = 0;
+    virtual bool transactional() const { return false; }
+    virtual bool txn_begin() { return false; }
+    virtual void txn_commit() {}
+    virtual void txn_abort() {}
     virtual u64 space_free() { return 0; }
     virtual u64 space_total() { return 0; }
 };
@@ -169,5 +173,17 @@ constexpr u32 RENAME_REPLACE = 1u << 0;
 Status rename(Session& s, const char* from, const char* to, u32 flags);
 Status copy_file(Session& s, const char* from, const char* to);
 Status copy_tree(Session& s, const char* from, const char* to, u32* copied);
+
+bool node_busy(Realm* realm, Node node);
+Status open_node(OpenFile& out, Realm* realm, Node node, u32 flags);
+Status file_read(OpenFile& f, u64 offset, void* buf, u64 length, u64* got);
+Status file_write(OpenFile& f, u64 offset, const void* data, u64 length);
+Status file_append(OpenFile& f, const void* data, u64 length);
+Status file_resize(OpenFile& f, u64 new_size);
+Status file_sync(OpenFile& f);
+Status file_close(OpenFile& f);
+Status list_node(Realm* realm, Node dir, Listing* out, bool with_info, bool sorted);
+Status read_node(Realm* realm, Node file, Blob* out);
+Status store_node(Realm* realm, Node parent, const char* leaf, bool exists, Node node, const void* data, u64 size);
 
 }

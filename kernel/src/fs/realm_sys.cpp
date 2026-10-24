@@ -10,7 +10,7 @@ namespace nebula {
 
 namespace {
 
-constexpr u32 RENDER_CAP = 24576;
+constexpr u32 RENDER_CAP = 40960;
 
 const char* g_storage_text = "unknown";
 u32 g_suns = 1;
@@ -35,6 +35,16 @@ struct Text {
         for (u32 i = digits; i < width; ++i) put(' ');
         num(v);
     }
+
+    void kv(const char* key, const char* value) {
+        str(key);
+        str(": ");
+        for (; *value && *value != '\n'; ++value) put(*value);
+        put('\n');
+    }
+
+    void field(const char* name, u64 v) { put(' '); str(name); put('='); num(v); }
+    void field(const char* name, const char* v) { put(' '); str(name); put('='); str(v); }
     void line(const char* key, u64 value, const char* unit) {
         str(key);
         str(": ");
@@ -55,18 +65,17 @@ const char* state_name(orbital::State s) {
 }
 
 void render_version(Text& t) {
-    t.str("Aphelion x86_64 C++20 non-POSIX kernel\n");
+    t.kv("kernel", "Aphelion x86_64 C++20 non-POSIX kernel");
     t.line("suns", g_suns, nullptr);
     power::Capabilities caps = power::capabilities();
-    t.str("hypervisor: ");
-    t.str(caps.hypervisor ? "yes\n" : "no\n");
+    t.kv("hypervisor", caps.hypervisor ? "yes" : "no");
 }
 
 void render_uptime(Text& t) {
     u64 ms = clock::uptime_ms();
     t.line("uptime_ms", ms, nullptr);
     u64 s = ms / 1000;
-    t.str("up ");
+    t.str("uptime: ");
     t.num(s / 3600);
     t.str("h ");
     t.num((s / 60) % 60);
@@ -92,15 +101,13 @@ void render_cpus(Text& t) {
     u32 n = orbital::cores(info, 64);
     orbital::Stats st = orbital::stats();
     for (u32 i = 0; i < n; ++i) {
-        t.str("sun ");
+        t.str("sun.");
         t.num(i);
-        t.str(" apic ");
-        t.num(info[i].apic_id);
-        t.str(info[i].idle ? " idle" : " running");
-        t.str(" queued ");
-        t.num(info[i].queued);
-        t.put(' ');
-        t.str(info[i].running);
+        t.str(":");
+        t.field("apic", info[i].apic_id);
+        t.field("state", info[i].idle ? "idle" : "running");
+        t.field("queued", info[i].queued);
+        t.field("task", info[i].running);
         t.put('\n');
     }
     t.line("preemptions", st.preemptions, nullptr);
@@ -113,17 +120,14 @@ void render_tasks(Text& t) {
     orbital::SatelliteInfo info[64];
     u32 n = orbital::snapshot(info, 64);
     for (u32 i = 0; i < n; ++i) {
-        t.pad(info[i].id, 3);
-        t.put(' ');
-        t.str(state_name(info[i].state));
-        t.str(" ring ");
-        t.num(static_cast<u64>(info[i].ring));
-        t.str(" core ");
-        t.num(info[i].core);
-        t.str(" switches ");
-        t.num(info[i].switches);
-        t.put(' ');
-        t.str(info[i].name);
+        t.str("task.");
+        t.num(info[i].id);
+        t.str(":");
+        t.field("state", state_name(info[i].state));
+        t.field("ring", static_cast<u64>(info[i].ring));
+        t.field("core", info[i].core);
+        t.field("switches", info[i].switches);
+        t.field("name", info[i].name);
         t.put('\n');
     }
 }
@@ -132,16 +136,16 @@ void render_realms(Text& t) {
     for (u32 i = 0; i < realm_count(); ++i) {
         Realm* r = realm_at(i);
         t.str(r->name());
-        t.str(r->available() ? " available " : " unavailable ");
-        t.str(r->writable() ? "writable " : "read-only ");
-        t.str(r->summary());
+        t.str(":");
+        t.field("state", r->available() ? "available" : "unavailable");
+        t.field("access", r->writable() ? "writable" : "read-only");
+        t.field("summary", r->summary());
         t.put('\n');
     }
 }
 
 void render_storage(Text& t) {
-    t.str(g_storage_text);
-    t.put('\n');
+    t.kv("device", g_storage_text);
     Realm* d = disk_realm();
     if (d->available()) {
         t.line("disk_free", d->space_free() >> 20, "MiB");
@@ -150,18 +154,44 @@ void render_storage(Text& t) {
     }
 }
 
+constexpr u64 LOG_WINDOW = 4096;
+
 void render_log(Text& t) {
     u64 tail = klog::tail();
-    u64 seq = tail > 8192 ? tail - 8192 : 0;
+    u64 seq = tail > LOG_WINDOW ? tail - LOG_WINDOW : 0;
+    u64 start = seq;
     char chunk[256];
+    bool skipping = seq != 0;
+    bool fresh = true;
+    u64 line_seq = 0;
     for (;;) {
+        u64 base = seq;
         u32 n = klog::read(seq, chunk, sizeof(chunk));
         if (!n) break;
         for (u32 i = 0; i < n; ++i) {
             char c = chunk[i];
-            if (c == '\n' || (c >= 0x20 && c < 0x7F) || static_cast<u8>(c) >= 0x80) t.put(c);
+            if (skipping) {
+                if (c == '\n') skipping = false;
+                continue;
+            }
+            if (c == '\n') {
+                if (!fresh) t.put('\n');
+                fresh = true;
+                continue;
+            }
+            if (!(c >= 0x20 && c < 0x7F) && static_cast<u8>(c) < 0x80) continue;
+            if (fresh) {
+                line_seq = base + i;
+                t.str("log.");
+                t.num(line_seq);
+                t.str(": ");
+                fresh = false;
+            }
+            t.put(c);
         }
     }
+    if (!fresh) t.put('\n');
+    (void)start;
 }
 
 struct SysFile {
@@ -245,7 +275,7 @@ private:
         Text t{scratch, RENDER_CAP, 0};
         FILES[index].render(t);
         u64 n = t.n < capacity ? t.n : capacity;
-        if (buf && n) __builtin_memcpy(buf, scratch, static_cast<usize>(n));
+        if (buf && n) mem::copy(buf, scratch, static_cast<usize>(n));
         *size = buf ? n : t.n;
         kheap::free(scratch);
         return Status::Ok;

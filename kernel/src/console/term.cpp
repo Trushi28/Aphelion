@@ -100,7 +100,8 @@ void Terminal::fill(u32 col0, u32 row0, u32 col1, u32 row1) {
     Cell b = blank();
     for (u32 r = row0; r <= row1 && r < rows_; ++r) {
         for (u32 c = col0; c <= col1 && c < cols_; ++c) at(c, r) = b;
-        mark_row(r);
+
+        mark_span(r, col0 > 0 ? col0 - 1 : 0, col1 + 2 < cols_ ? col1 + 2 : cols_);
     }
 }
 
@@ -116,8 +117,10 @@ void Terminal::scroll_up(u32 n) {
     if (n == 0) return;
     u32 height = bottom_ - top_ + 1;
     if (n > height) n = height;
+
+    mark_cursor();
     for (u32 r = top_; r + n <= bottom_; ++r)
-        memmove(&at(0, r), &at(0, r + n), cols_ * sizeof(Cell));
+        mem::move(&at(0, r), &at(0, r + n), cols_ * sizeof(Cell));
     Cell b = blank();
     for (u32 r = bottom_ + 1 - n; r <= bottom_; ++r)
         for (u32 c = 0; c < cols_; ++c) at(c, r) = b;
@@ -144,7 +147,7 @@ void Terminal::scroll_down(u32 n) {
     u32 height = bottom_ - top_ + 1;
     if (n > height) n = height;
     for (u32 r = bottom_; r >= top_ + n; --r) {
-        memmove(&at(0, r), &at(0, r - n), cols_ * sizeof(Cell));
+        mem::move(&at(0, r), &at(0, r - n), cols_ * sizeof(Cell));
         if (r == 0) break;
     }
     Cell b = blank();
@@ -173,6 +176,7 @@ void Terminal::carriage_return() {
     mark_cursor();
     cx_ = 0;
     wrap_pending_ = false;
+    mark_cursor();
 }
 
 void Terminal::insert_lines(u32 n) {
@@ -183,6 +187,7 @@ void Terminal::insert_lines(u32 n) {
     top_ = saved_top;
     cx_ = 0;
     wrap_pending_ = false;
+    mark_row(cy_);
 }
 
 void Terminal::delete_lines(u32 n) {
@@ -196,7 +201,7 @@ void Terminal::delete_lines(u32 n) {
         u32 height = bottom_ - top_ + 1;
         if (n > height) n = height;
         for (u32 r = top_; r + n <= bottom_; ++r)
-            memmove(&at(0, r), &at(0, r + n), cols_ * sizeof(Cell));
+            mem::move(&at(0, r), &at(0, r + n), cols_ * sizeof(Cell));
         Cell b = blank();
         for (u32 r = bottom_ + 1 - n; r <= bottom_; ++r)
             for (u32 c = 0; c < cols_; ++c) at(c, r) = b;
@@ -205,6 +210,7 @@ void Terminal::delete_lines(u32 n) {
     top_ = saved_top;
     cx_ = 0;
     wrap_pending_ = false;
+    mark_row(cy_);
 }
 
 void Terminal::insert_chars(u32 n) {
@@ -216,7 +222,7 @@ void Terminal::insert_chars(u32 n) {
     }
     Cell b = blank();
     for (u32 c = cx_; c < cx_ + n; ++c) at(c, cy_) = b;
-    mark_cursor();
+    mark_span(cy_, cx_ > 0 ? cx_ - 1 : 0, cols_);
 }
 
 void Terminal::delete_chars(u32 n) {
@@ -225,7 +231,7 @@ void Terminal::delete_chars(u32 n) {
     for (u32 c = cx_; c + n < cols_; ++c) at(c, cy_) = at(c + n, cy_);
     Cell b = blank();
     for (u32 c = cols_ - n; c < cols_; ++c) at(c, cy_) = b;
-    mark_cursor();
+    mark_span(cy_, cx_ > 0 ? cx_ - 1 : 0, cols_);
 }
 
 void Terminal::erase_chars(u32 n) {
@@ -270,7 +276,7 @@ void Terminal::put_cp(u32 cp) {
         if (!autowrap_) return;
         break_wide(cx_, cy_);
         at(cx_, cy_) = blank();
-        mark_cursor();
+        mark_row(cy_);
         new_line_wrap();
     }
     break_wide(cx_, cy_);
@@ -278,7 +284,8 @@ void Terminal::put_cp(u32 cp) {
     u32 base = attr_ & ~(WIDE_LEAD | WIDE_TAIL);
     at(cx_, cy_) = Cell{ make_glyph(cp, base | (w == 2 ? static_cast<u32>(WIDE_LEAD) : 0u)), fg_, bg_ };
     if (w == 2) at(cx_ + 1, cy_) = Cell{ make_glyph(0, base | WIDE_TAIL), fg_, bg_ };
-    mark_row(cy_);
+
+    mark_span(cy_, cx_ > 0 ? cx_ - 1 : 0, cx_ + w + 2 < cols_ ? cx_ + w + 2 : cols_);
     u32 next = cx_ + w;
     if (next >= cols_) {
         cx_ = cols_ - 1;

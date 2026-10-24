@@ -9,6 +9,7 @@
 #include <cosmos/nebula.hpp>
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/helm.hpp>
+#include <cosmos/lens_text.hpp>
 #include <cosmos/helm_parse.hpp>
 
 extern "C" {
@@ -24,10 +25,10 @@ static u8* g_disk;
 static u64 g_sectors;
 
 namespace blockdev {
-bool read_sector(u64 s, void* b) { if (s >= g_sectors) return false; __builtin_memcpy(b, g_disk + s * 512, 512); return true; }
-bool write_sector(u64 s, const void* b) { if (s >= g_sectors) return false; __builtin_memcpy(g_disk + s * 512, b, 512); return true; }
-bool read_sectors(u64 s, u64 n, void* b) { if (s + n > g_sectors) return false; __builtin_memcpy(b, g_disk + s * 512, n * 512); return true; }
-bool write_sectors(u64 s, u64 n, const void* b) { if (s + n > g_sectors) return false; __builtin_memcpy(g_disk + s * 512, b, n * 512); return true; }
+bool read_sector(u64 s, void* b) { if (s >= g_sectors) return false; mem::copy(b, g_disk + s * 512, 512); return true; }
+bool write_sector(u64 s, const void* b) { if (s >= g_sectors) return false; mem::copy(g_disk + s * 512, b, 512); return true; }
+bool read_sectors(u64 s, u64 n, void* b) { if (s + n > g_sectors) return false; mem::copy(b, g_disk + s * 512, n * 512); return true; }
+bool write_sectors(u64 s, u64 n, const void* b) { if (s + n > g_sectors) return false; mem::copy(g_disk + s * 512, b, n * 512); return true; }
 u64 capacity_sectors() { return g_sectors; }
 bool flush() { return true; }
 bool present() { return true; }
@@ -37,6 +38,8 @@ namespace orbital {
 void yield() { sched_yield(); }
 void yield_contended() { sched_yield(); }
 u64 self_token() { static thread_local char tag; return reinterpret_cast<u64>(&tag); }
+bool WaitQueue::wait_until_for(bool (*)(void*), void*, u64) { return false; }
+u32 WaitQueue::wake_all() { return 0; }
 }
 
 namespace universe {
@@ -51,7 +54,7 @@ void free(void* p) { ::free(p); }
 }
 
 static u64 g_clock = 1800000000000ull;
-namespace clock { u64 now_ms() { return g_clock += 61000; } }
+namespace clock { u64 now_ms() { return g_clock += 61000; } u64 uptime_ms() { return 0; } }
 
 namespace serial {
 void printf(const char*, ...) {}
@@ -64,7 +67,7 @@ static int g_checks = 0;
 
 static bool same(const char* a, const char* b) { while (*a && *a == *b) { ++a; ++b; } return *a == *b; }
 static bool contains(const char* hay, const char* needle) {
-    u32 n = __builtin_strlen(needle);
+    u32 n = cstr::length(needle);
     for (u32 i = 0; hay[i]; ++i) {
         u32 k = 0;
         while (k < n && hay[i + k] == needle[k]) ++k;
@@ -132,9 +135,9 @@ public:
     nebula::Status list(nebula::Node, nebula::ChildFn fn, void* ctx) override { fn("version", nebula::Kind::File, {1, 1}, ctx); return nebula::Status::Ok; }
     nebula::Status read_all(nebula::Node, void* buf, u64 cap, u64* size) override {
         const char* t = "Aphelion\n";
-        u64 n = __builtin_strlen(t);
+        u64 n = cstr::length(t);
         if (n > cap) n = cap;
-        __builtin_memcpy(buf, t, n);
+        mem::copy(buf, t, n);
         *size = n;
         return nebula::Status::Ok;
     }
@@ -225,7 +228,7 @@ static void test_parser() {
 
 static bool completes_to(const char* line, const char* insert, u32 count) {
     helm::Completion c;
-    u32 cursor = static_cast<u32>(__builtin_strlen(line));
+    u32 cursor = static_cast<u32>(cstr::length(line));
     bool ok = helm::complete(*g_sh, line, cursor, &c);
     bool good = ok && same(c.insert, insert) && c.count == count;
     if (!good) printf("   complete '%s': ok=%d insert='%s' count=%u (want '%s' %u)\n", line, ok, ok ? c.insert : "", ok ? c.count : 0, insert, count);
@@ -405,15 +408,30 @@ static void test_completion() {
     sh("rm -r -f *");
 }
 
+static void test_lens_location() {
+    printf("-- lens-backed location\n");
+    CHECK(out_is("mkdir -p ram:/lt/a/b; cd ram:/lt/a/b; pwd", "ram:/lt/a/b\n"), "pwd after cd into a nested directory");
+    CHECK(out_is("cd ../..; pwd", "ram:/lt\n"), "cd .. walks up the parent lenses");
+    CHECK(out_is("echo hi > a/f; cat a/f", "hi\n"), "relative path from the current lens");
+    CHECK(out_is("cd a/b; cat ../f; cd -; pwd", "hi\nram:/lt\n"), "relative read through .. and cd -");
+    CHECK(out_is("cd ../../../..; pwd", "ram:/\n"), "cd above the root stops at the root");
+    CHECK(out_has("cd ram:/lt; touch ./c:d; ls", "c:d"), "a file name with a colon");
+    CHECK(out_has("stat sys:/version", "sys, read-only"), "a probe reports its read-only realm");
+    CHECK(out_has("echo x > sys:/version", "read-only"), "a write to a probe is refused");
+    CHECK(out_is("cd ram:/lt/a; mv ../a ../a2; pwd", "ram:/lt/a2\n"), "moving the current directory: the prompt follows it");
+    CHECK(out_is("cat f", "hi\n"), "and relative paths still work");
+    CHECK(out_is("rm -r ../a2; pwd", "ram:/lt\n"), "removing the current directory climbs to what survives");
+    sh("cd ram:/; rm -r ram:/lt");
+}
+
 static u32 g_poll_calls;
 static bool poll_always(void*) { ++g_poll_calls; return true; }
 
 static void test_interrupt_and_limits() {
     printf("-- interrupt and limits\n");
-    nebula::Handle h;
-    CHECK(nebula::open(g_sh->session, "big.txt", nebula::OPEN_WRITE | nebula::OPEN_CREATE, &h) == nebula::Status::Ok, "open big file");
-    for (u32 i = 0; i < 200; ++i) nebula::append(g_sh->session, h, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", 65);
-    CHECK(nebula::close(g_sh->session, h) == nebula::Status::Ok, "close big file");
+    static char big[200 * 65];
+    for (u32 i = 0; i < 200; ++i) mem::copy(big + i * 65, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", 65);
+    CHECK(lens::text::write_file(g_sh->cursor, "big.txt", big, sizeof(big)) == nebula::Status::Ok, "write big file");
     g_sh->interrupt_poll = &poll_always;
     g_poll_calls = 0;
     sh("grep 0 big.txt | count -l");
@@ -490,16 +508,107 @@ static void test_disk() {
     nebula::disk_set_confirmed_only(false);
     CHECK(out_has("mkfs", "usage: mkfs erase") && g_status == 2, "mkfs needs the erase word");
     CHECK(out_has("mkfs wipe", "usage: mkfs erase") && g_status == 2, "mkfs rejects other words");
-    __builtin_memset(g_disk, 0xAB, 64 * 512);
+    mem::fill(g_disk, 0xAB, 64 * 512);
     CHECK(out_has("mkfs erase", "refusing to touch it") && g_status == 1, "mkfs refuses a foreign disk");
     CHECK(g_disk[0] == 0xAB && g_disk[64 * 512 - 1] == 0xAB, "the refused disk was left untouched");
-    __builtin_memset(g_disk, 0, 64 * 512);
+    mem::zero(g_disk, 64 * 512);
     CHECK(out_has("mkfs erase", "new Stellar volume created") && g_status == 0, "mkfs formats a blank disk");
     CHECK(nebula::disk_is_mounted(), "mkfs leaves the volume mounted");
     CHECK(out_is("ls disk:/ | grep -c .", "0\n"), "the new volume is empty");
     CHECK(out_is("echo fresh > disk:/f; cat disk:/f", "fresh\n"), "the new volume is writable");
     CHECK(out_has("check", "volume is consistent"), "the new volume checks clean");
     sh("rm -r -f *; cd ram:/");
+}
+
+class TestConsole final : public lens::Stream {
+public:
+    char out[64];
+    u32 out_len = 0;
+    const char* name() const override { return "console"; }
+    lens::Result<usize> read(lens::Bytes) override { return lens::Result<usize>::fail(lens::Status::NotReady); }
+    lens::Result<usize> write(lens::ConstBytes src) override {
+        for (usize i = 0; i < src.len && out_len + 1 < sizeof(out); ++i) out[out_len++] = static_cast<char>(src.ptr[i]);
+        out[out_len] = 0;
+        return lens::Result<usize>::success(src.len);
+    }
+    lens::Readiness ready() override { return lens::Ready::Writable; }
+    void retain() override {}
+    void release() override {}
+};
+static TestConsole g_console;
+
+static void test_console_lens() {
+    printf("-- console lens\n");
+    lens::Domain& d = g_sh->cursor.domain;
+    lens::Lens con = lens::text::console(g_sh->cursor);
+    CHECK(!con.is_null(), "the shell holds a console lens");
+    CHECK(lens::kind_of(d, con).value() == lens::NodeKind::Stream, "it is a stream");
+    CHECK(lens::rights_of(d, con).value() == (lens::Right::Read | lens::Right::Write), "with read and write, and no authority to hand it on");
+    lens::ConstBytes hi = lens::text_bytes("hi");
+    CHECK(lens::write(d, con, 0, hi).ok() && same(g_console.out, "hi"), "a write through the lens reaches the console");
+    char b[4];
+    CHECK(lens::read(d, con, 0, lens::Bytes(reinterpret_cast<u8*>(b), 4)).status() == lens::Status::NotReady, "a read with no input is not ready");
+    lens::Wait w{con, lens::Ready::Writable, {}};
+    CHECK(lens::await(d, &w, 1, 0).ok() && w.got.has(lens::Ready::Writable), "await sees it writable");
+    lens::Result<lens::Lens> narrowed = lens::narrow(d, con, lens::Right::Write);
+    CHECK(narrowed.ok() && lens::read(d, narrowed.value(), 0, lens::Bytes(reinterpret_cast<u8*>(b), 4)).status() == lens::Status::Denied, "a narrowed copy cannot read");
+    CHECK(lens::close(d, narrowed.value()).ok(), "and closes");
+}
+
+static void test_rows() {
+    printf("-- rows\n");
+    static const char rows_text[] =
+        "task.1: state=running ring=0 core=0 switches=40 name=helm\n"
+        "task.2: state=sleeping ring=3 core=1 switches=500 name=net rx\n"
+        "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"
+        "task.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n";
+    sh("cd ram:/");
+    CHECK(lens::text::write_file(g_sh->cursor, "t.txt", rows_text, sizeof(rows_text) - 1) == nebula::Status::Ok, "write the rows");
+
+    const char* t2 = "task.2: state=sleeping ring=3 core=1 switches=500 name=net rx\n";
+    const char* t3 = "task.3: state=ready ring=3 core=1 switches=7 name=disk\n";
+    char both[256];
+    __builtin_snprintf(both, sizeof(both), "%s%s", t2, t3);
+    CHECK(out_is("cat t.txt | where core == 1 | cat", both), "where on a pipe keeps the matching rows");
+    CHECK(out_is("where core == 1 t.txt | cat", both), "where on a file");
+    CHECK(out_is("where core eq 1 t.txt | cat", both), "word operators work where symbols would redirect");
+
+    char swapped[256];
+    __builtin_snprintf(swapped, sizeof(swapped), "%s%s", t3, t2);
+    char big[256];
+    __builtin_snprintf(big, sizeof(big), "%stask.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n", t2);
+    CHECK(out_is("where switches gt 100 t.txt | cat", big), "numbers compare as numbers, not text");
+    CHECK(out_is("where switches '>' 100 t.txt | cat", big), "a quoted symbol is an operator, not a redirect");
+    CHECK(out_is("where name == 'net rx' t.txt | cat", t2), "a value with a space");
+    CHECK(out_is("where id == task.3 t.txt | cat", t3), "the row key is the id field");
+    CHECK(out_is("where state ~ 'sl*' t.txt | cat", big), "glob match");
+    CHECK(out_is("where state != sleeping t.txt | cat", "task.1: state=running ring=0 core=0 switches=40 name=helm\n" "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"), "not equal");
+    CHECK(out_is("where nothing == 1 t.txt | cat", ""), "a field no row has matches nothing");
+
+    CHECK(out_is("sort -k switches t.txt | cat",
+                 "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"
+                 "task.1: state=running ring=0 core=0 switches=40 name=helm\n"
+                 "task.2: state=sleeping ring=3 core=1 switches=500 name=net rx\n"
+                 "task.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n"), "sort -k sorts by a numeric field");
+    CHECK(out_is("sort -r -k switches t.txt | head -n 1 | cat", "task.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n"), "sort -r -k");
+    CHECK(out_is("sort -k name t.txt | head -n 2 | cat",
+                 "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"
+                 "task.1: state=running ring=0 core=0 switches=40 name=helm\n"), "sort -k by a text field");
+    CHECK(out_is("cat t.txt | where core == 1 | sort -k switches | cat", swapped), "the full pipeline");
+    CHECK(out_is("cat t.txt | where core == 1 | sort -r -k switches | head -n 1 | cat", t2), "where then sort then head");
+
+    CHECK(out_is("pick -f t.txt core name | head -n 2 | cat", "task.1: core=0 name=helm\ntask.2: core=1 name=net rx\n"), "pick keeps the named fields in the order given");
+    CHECK(out_is("pick -f t.txt name core | head -n 1 | cat", "task.1: name=helm core=0\n"), "and in that order");
+    CHECK(out_is("where core == 1 t.txt | pick name | cat", "task.2: name=net rx\ntask.3: name=disk\n"), "pick after where");
+
+    const char* shown = sh("where core == 1 t.txt");
+    CHECK(contains(shown, "id") && contains(shown, "switches") && contains(shown, "net rx") && contains(shown, "2 rows"), "a terminal gets a table with a header and a row count");
+    printf("%s", shown);
+    CHECK(contains(sh("where core == 9 t.txt"), "") && same(sh("where core == 9 t.txt"), ""), "no matches, no table");
+    CHECK(g_status == 0, "no matches is not an error");
+    CHECK(same(sh("where core"), "") == false && g_status == 2, "where needs three words");
+    CHECK(g_status == 2 && contains(sh("where core between 1 t.txt"), "usage"), "an unknown operator is a usage error");
+    sh("rm t.txt");
 }
 
 int main() {
@@ -515,7 +624,11 @@ int main() {
     helm::register_builtin_commands();
     helm::register_fs_commands();
     helm::register_text_commands();
+    helm::register_row_commands();
 
+    CHECK(lens::mint_boot_roots().ok(), "mint the boot roots");
+    CHECK(lens::mint_boot_console(&g_console).ok(), "mint the console");
+    lens::seal();
     static helm::Shell shell;
     g_sh = &shell;
     helm::init(shell, helm::Sink{&sink_write, nullptr}, false, 40, "ram");
@@ -523,8 +636,11 @@ int main() {
     test_parser();
     test_shell();
     test_completion();
+    test_lens_location();
     test_interrupt_and_limits();
     test_disk();
+    test_console_lens();
+    test_rows();
     helm::shutdown(shell);
 
     printf("%d checks, %d failed\n", g_checks, g_fail);

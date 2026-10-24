@@ -18,7 +18,6 @@ deadline = time.time() + limit
 transcript = bytearray()
 PROMPT = "▸"
 
-
 def alive():
     try:
         os.kill(qpid, 0)
@@ -27,14 +26,12 @@ def alive():
     except (OSError, IOError):
         return False
 
-
 def fail(reason):
     with open(log_path, "wb") as f:
         f.write(transcript)
     tail = transcript.decode("utf-8", "replace").replace("\r", "")[-2200:]
     print("FAIL (shell %s, %s): %s\n%s" % (scenario, log_path, reason, tail))
     sys.exit(1)
-
 
 def connect(name):
     path = os.path.join(directory, name)
@@ -50,7 +47,6 @@ def connect(name):
         time.sleep(0.2)
     fail("QEMU never opened the %s socket" % name)
 
-
 def pump(sock, seconds):
     end = time.time() + seconds
     while time.time() < end:
@@ -62,7 +58,6 @@ def pump(sock, seconds):
         except BlockingIOError:
             time.sleep(0.05)
     return True
-
 
 def expect(sock, pattern, what, wait=20, after=None):
     rx = re.compile(pattern.encode("utf-8"), re.S)
@@ -79,17 +74,14 @@ def expect(sock, pattern, what, wait=20, after=None):
             break
     fail("expected %s" % what)
 
-
 def send(sock, data):
     sock.sendall(data if isinstance(data, bytes) else data.encode("utf-8"))
-
 
 def run(sock, line, pattern, what, wait=20):
     mark = len(transcript)
     send(sock, line + "\r")
     got = expect(sock, "\r\n" + pattern.replace(".*", ".*?"), what, wait=wait, after=mark)
     expect(sock, PROMPT, "the prompt after %s" % what, wait=wait, after=got)
-
 
 def finish(serial, monitor, closing):
     send(serial, "reboot\r")
@@ -105,7 +97,6 @@ def finish(serial, monitor, closing):
     with open(log_path, "wb") as f:
         f.write(transcript)
     print("ok: " + closing)
-
 
 serial = connect("serial")
 monitor = connect("monitor")
@@ -137,8 +128,26 @@ if scenario == "nodisk":
     run(serial, "mkfs erase", ".*no block device", "mkfs without a disk")
     run(serial, "snapshot", ".*no disk volume", "snapshot without a disk volume")
     run(serial, "cat ram:/missing", ".*not found", "an error for a missing file")
+    run(serial, "mkdir -p ram:/lt/a/b; cd ram:/lt/a/b; pwd", "ram:/lt/a/b\r\n", "pwd after cd into a nested directory")
+    run(serial, "cd ../..; pwd", "ram:/lt\r\n", "cd .. walking up the parent lenses")
+    run(serial, "echo hi > a/f; cat a/f", "hi\r\n", "a relative path resolved from the current lens")
+    run(serial, "cd a/b; cat ../f; cd -; pwd", "hi\r\n.*ram:/lt\r\n", "a relative read through .. and cd -")
+    run(serial, "cd ../../../..; pwd", "ram:/\r\n", "cd above the root stopping at the root")
+    run(serial, "cd ram:/lt; touch ./c:d; ls", ".*c:d", "a file name with a colon")
+    run(serial, "stat sys:/version", ".*realm +sys, read-only", "a probe reporting its read-only realm")
+    run(serial, "echo x > sys:/version", ".*read-only", "a write to a probe being refused")
+    run(serial, "cat sys:/uptime", ".*uptime_ms: [0-9]+", "the uptime probe as key: value text")
+    run(serial, "cat sys:/cpus", ".*sun\\.0: apic=[0-9]+ state=", "the cpus probe, one line per sun")
+    run(serial, "cat sys:/tasks", ".*task\\.[0-9]+: state=.*name=helm", "the tasks probe, one line per satellite")
+    run(serial, "rm -r ram:/lt; cd ram:/", "", "cleaning up")
     run(serial, "ps", ".*helm", "the Satellite list")
     run(serial, "cores", ".*Sun 0", "the core list")
+    run(serial, "ps | where name == helm | cat", ".*task\\.[0-9]+: state=[a-z]+ ring=[0-9]+ core=[0-9]+ switches=[0-9]+ name=helm", "ps piped as parseable rows, filtered by a field")
+    run(serial, "ps | sort -r -k switches | head -n 1 | cat", ".*task\\.[0-9]+: state=", "ps rows sorted by a numeric field")
+    run(serial, "ps | pick name state | head -n 1 | cat", ".*task\\.[0-9]+: name=.* state=", "pick keeping only the named fields")
+    run(serial, "ps | where state == running", ".*id +state +ring +core +switches +name", "a terminal getting an aligned table")
+    run(serial, "tty", ".*console: kind=stream rights=rw[-a-z]* readable=(yes|no) writable=yes", "the console lens the shell holds")
+    run(serial, "cat sys:/log | head -n 1 | cat", ".*log\\.[0-9]+: ", "the kernel log as a keyed probe")
 
     send(serial, "cat ram:/u\t")
     expect(serial, "cat ram:/u8", "tab completion of a path", wait=10)
@@ -190,6 +199,9 @@ if scenario == "disk-first":
     run(serial, "echo changed > disk:/proj/src/main", "", "overwriting after the snapshot")
     run(serial, "cat snap:/1/proj/src/main", "persisted ₹\r\n", "the snapshot keeping the old contents")
     run(serial, "cat disk:/proj/src/main", "changed\r\n", "the live file")
+    run(serial, "cd snap:/1/proj/src; cat main; pwd", "persisted ₹\r\n.*snap:/1/proj/src\r\n", "a relative read inside a snapshot")
+    run(serial, "cd disk:/proj/src; cat main; cd ..; pwd", "changed\r\n.*disk:/proj\r\n", "relative paths on the disk")
+    run(serial, "cd ram:/", "", "back to ram")
     run(serial, "rm snap:/1/proj/src/main", ".*read-only", "snapshots being read-only")
     run(serial, "cp -r snap:/1/proj disk:/restored", "", "restoring a tree from a snapshot")
     run(serial, "cat disk:/restored/src/main", "persisted ₹\r\n", "the restored file")
@@ -203,6 +215,8 @@ if scenario == "disk-second":
     run(serial, "cat disk:/proj/src/main", "changed\r\n", "the file written in the previous boot")
     run(serial, "cat disk:/restored/src/main", "persisted ₹\r\n", "the restored tree written in the previous boot")
     run(serial, "cat disk:/b", "big\r\n", "the cross-realm copy written in the previous boot")
+    run(serial, "cd disk:/proj/src; cat main; pwd", "changed\r\n.*disk:/proj/src\r\n", "the previous boot's file by a relative path")
+    run(serial, "cd ram:/", "", "back to ram")
     run(serial, "cat snap:/1/proj/src/main", "persisted ₹\r\n", "the snapshot surviving the reboot")
     run(serial, "mkfs erase", ".*refusing to erase", "mkfs refusing to erase a mounted volume after the reboot")
     run(serial, "check", ".*volume is consistent", "a check after the reboot")

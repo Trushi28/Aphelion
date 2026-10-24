@@ -117,7 +117,7 @@ void remember(Editor& e, const char* s, u32 n) {
     if (!n) return;
     u32 last = (e.history_next + HISTORY - 1) % HISTORY;
     if (e.history_count && same_text(e.history[last], s)) return;
-    __builtin_memcpy(e.history[e.history_next], s, n + 1);
+    mem::copy(e.history[e.history_next], s, n + 1);
     e.history_next = (e.history_next + 1) % HISTORY;
     if (e.history_count < HISTORY) ++e.history_count;
 }
@@ -129,11 +129,11 @@ const char* recall(const Editor& e, u32 back) {
 
 void build_prompt(Shell& sh, Editor& e) {
     char loc[nebula::path::TEXT_MAX];
-    nebula::location_text(sh.session, loc, sizeof(loc));
-    u32 n = static_cast<u32>(__builtin_strlen(loc));
+    lens::text::location_text(sh.cursor, loc, sizeof(loc));
+    u32 n = static_cast<u32>(cstr::length(loc));
     u32 cells = utf8::cells(loc, n);
     if (cells <= PROMPT_PATH_CELLS) {
-        __builtin_memcpy(e.prompt_path, loc, n + 1);
+        mem::copy(e.prompt_path, loc, n + 1);
     } else {
         u32 start = 0;
         for (u32 i = 0; i < n; ++i) {
@@ -143,9 +143,9 @@ void build_prompt(Shell& sh, Editor& e) {
         e.prompt_path[0] = '\xE2';
         e.prompt_path[1] = '\x80';
         e.prompt_path[2] = '\xA6';
-        __builtin_memcpy(e.prompt_path + 3, loc + start, n - start + 1);
+        mem::copy(e.prompt_path + 3, loc + start, n - start + 1);
     }
-    e.prompt_cells = 8 + 1 + utf8::cells(e.prompt_path, static_cast<u32>(__builtin_strlen(e.prompt_path))) + 3;
+    e.prompt_cells = 8 + 1 + utf8::cells(e.prompt_path, static_cast<u32>(cstr::length(e.prompt_path))) + 3;
 }
 
 void draw_prompt(Writer& w, const Editor& e) {
@@ -186,7 +186,7 @@ void list_candidates(Writer& w, const Completion& c, u32 cols) {
     u32 widest = 0;
     const char* p = c.names;
     for (u32 i = 0; i < c.count; ++i) {
-        u32 n = static_cast<u32>(__builtin_strlen(p));
+        u32 n = static_cast<u32>(cstr::length(p));
         u32 cells = utf8::cells(p, n);
         if (cells > widest) widest = cells;
         p += n + 1;
@@ -199,7 +199,7 @@ void list_candidates(Writer& w, const Completion& c, u32 cols) {
     p = c.names;
     for (u32 i = 0; i < c.count && i < 128; ++i) {
         items[i] = p;
-        p += __builtin_strlen(p) + 1;
+        p += cstr::length(p) + 1;
     }
     w.put('\n');
     for (u32 r = 0; r < rows; ++r) {
@@ -207,7 +207,7 @@ void list_candidates(Writer& w, const Completion& c, u32 cols) {
             u32 idx = col * rows + r;
             if (idx >= c.count) break;
             const char* name = items[idx];
-            u32 n = static_cast<u32>(__builtin_strlen(name));
+            u32 n = static_cast<u32>(cstr::length(name));
             bool dir = n && name[n - 1] == '/';
             if (dir) w.rgb(palette::ICE);
             w.str(name);
@@ -234,14 +234,14 @@ void handle_tab(Shell& sh, Writer& w, Editor& e, u32 cols) {
     }
     char rebuilt[LINE_BYTES];
     u32 n = 0;
-    u32 ins = static_cast<u32>(__builtin_strlen(c.insert));
+    u32 ins = static_cast<u32>(cstr::length(c.insert));
     if (c.start + ins + (total - cursor) + 1 < sizeof(rebuilt)) {
-        __builtin_memcpy(rebuilt, text, c.start);
+        mem::copy(rebuilt, text, c.start);
         n = c.start;
-        __builtin_memcpy(rebuilt + n, c.insert, ins);
+        mem::copy(rebuilt + n, c.insert, ins);
         n += ins;
         u32 new_cursor = n;
-        __builtin_memcpy(rebuilt + n, text + cursor, total - cursor);
+        mem::copy(rebuilt + n, text + cursor, total - cursor);
         n += total - cursor;
         rebuilt[n] = 0;
         l.set(rebuilt, n);
@@ -313,13 +313,13 @@ void loop(void*) {
             if (h) {
                 if (e->history_back == 0) l.encode(e->saved, sizeof(e->saved));
                 ++e->history_back;
-                l.set(h, static_cast<u32>(__builtin_strlen(h)));
+                l.set(h, static_cast<u32>(cstr::length(h)));
             }
         } else if (k.sym == input::Sym::Down) {
             if (e->history_back > 0) {
                 --e->history_back;
                 const char* h = e->history_back ? recall(*e, e->history_back) : e->saved;
-                l.set(h, static_cast<u32>(__builtin_strlen(h)));
+                l.set(h, static_cast<u32>(cstr::length(h)));
             }
         } else if (k.sym == input::Sym::None && k.ctrl()) {
             if (k.cp == 'c') {
@@ -384,6 +384,7 @@ bool spawn() {
     register_builtin_commands();
     register_fs_commands();
     register_text_commands();
+    register_row_commands();
     register_sys_commands();
     register_table(&TABLE);
     return orbital::spawn("helm", &loop, nullptr) != nullptr;

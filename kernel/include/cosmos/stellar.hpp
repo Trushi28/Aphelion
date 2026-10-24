@@ -85,6 +85,7 @@ u32 live_snapshot_count();
 u64 gc(Status* why = nullptr);
 void begin_batch();
 bool end_batch(Status* why = nullptr);
+void abort_batch();
 u32 crc32(const void* data, u64 len);
 bool verify_file(u64 star, u64 snap = LIVE, Status* why = nullptr);
 

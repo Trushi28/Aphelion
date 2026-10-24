@@ -233,7 +233,20 @@ int cmd_colors(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
-int cmd_ps(Shell&, Io& io, u32, char**) {
+int emit_probe(Shell& sh, Io& io, const char* path) {
+    nebula::Blob b{};
+    nebula::Status st = lens::text::read_file(sh.cursor, path, &b);
+    if (st != nebula::Status::Ok) {
+        print_status(io, "cannot read", path, st);
+        return code_of(st);
+    }
+    io.out.bytes(reinterpret_cast<const char*>(b.data), b.size);
+    nebula::release(b);
+    return 0;
+}
+
+int cmd_ps(Shell& sh, Io& io, u32, char**) {
+    if (!io.out.terminal()) return emit_probe(sh, io, "sys:/tasks");
     Writer& w = io.out;
     orbital::SatelliteInfo info[64];
     u32 n = orbital::snapshot(info, 64);
@@ -262,7 +275,8 @@ int cmd_ps(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
-int cmd_cores(Shell&, Io& io, u32, char**) {
+int cmd_cores(Shell& sh, Io& io, u32, char**) {
+    if (!io.out.terminal()) return emit_probe(sh, io, "sys:/cpus");
     Writer& w = io.out;
     orbital::CoreInfo info[64];
     u32 n = orbital::cores(info, 64);
@@ -344,28 +358,71 @@ int cmd_date(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
+int cmd_tty(Shell& sh, Io& io, u32, char**) {
+    lens::Domain& d = sh.cursor.domain;
+    lens::Lens con = lens::text::console(sh.cursor);
+    if (con.is_null()) {
+        print_error(io, "this shell has no console lens");
+        return 1;
+    }
+    lens::Result<lens::Rights> rights = lens::rights_of(d, con);
+    char letters[16];
+    lens::rights_text(rights.value(), letters, sizeof(letters));
+    lens::Wait w{con, lens::Ready::Readable | lens::Ready::Writable, {}};
+    (void)lens::await(d, &w, 1, 0);
+    Writer& o = io.out;
+    o.str("console: kind=");
+    o.str(lens::kind_name(lens::kind_of(d, con).value()));
+    o.str(" rights=");
+    o.str(letters);
+    o.str(" readable=");
+    o.str(w.got.has(lens::Ready::Readable) ? "yes" : "no");
+    o.str(" writable=");
+    o.str(w.got.has(lens::Ready::Writable) ? "yes" : "no");
+    o.put('\n');
+    return 0;
+}
+
 int cmd_klog(Shell& sh, Io& io, u32 argc, char** argv) {
     u64 want = 2048;
     if (argc > 2 || (argc == 2 && !parse_u64(argv[1], &want))) {
         print_error(io, "usage: klog [bytes]");
         return 2;
     }
-    if (want > 8192) want = 8192;
-    u64 tail = klog::tail();
-    u64 seq = tail > want ? tail - want : 0;
-    char chunk[256];
+    if (want > 4096) want = 4096;
+    nebula::Blob log{};
+    nebula::Status st = lens::text::read_file(sh.cursor, "sys:/log", &log);
+    if (st != nebula::Status::Ok) {
+        print_status(io, "cannot read", "sys:/log", st);
+        return code_of(st);
+    }
+    const char* text = static_cast<const char*>(static_cast<const void*>(log.data));
+    u64 total = 0;
+    for (u64 i = 0; i < log.size;) {
+        u64 j = i;
+        while (j < log.size && text[j] != ':') ++j;
+        i = j + 2 < log.size ? j + 2 : log.size;
+        while (i < log.size && text[i] != '\n') { ++total; ++i; }
+        ++total;
+        if (i < log.size) ++i;
+    }
+    u64 skip = total > want ? total - want : 0;
+    u64 seen = 0;
     io.out.rgb(palette::MIST);
-    for (;;) {
-        if (sh.poll()) break;
-        u32 n = klog::read(seq, chunk, sizeof(chunk));
-        if (!n) break;
-        for (u32 i = 0; i < n; ++i) {
-            char c = chunk[i];
-            if (c == '\n' || (c >= 0x20 && c < 0x7F) || static_cast<u8>(c) >= 0x80) io.out.put(c);
+    for (u64 i = 0; i < log.size && !sh.poll();) {
+        u64 j = i;
+        while (j < log.size && text[j] != ':') ++j;
+        i = j + 2 < log.size ? j + 2 : log.size;
+        while (i < log.size && text[i] != '\n') {
+            if (seen++ >= skip) io.out.put(text[i]);
+            ++i;
         }
+        if (seen++ >= skip) io.out.put('\n');
+        if (i < log.size) ++i;
     }
     io.out.reset();
     io.out.put('\n');
+    nebula::release(log);
     return sh.aborted ? 130 : 0;
 }
 
@@ -611,12 +668,13 @@ constexpr Command COMMANDS[] = {
     {"clear", "clear", "clear the screen (also Ctrl+L)", &cmd_clear},
     {"unicode", "unicode", "a glyph coverage sample", &cmd_unicode},
     {"colors", "colors", "the Corona palette", &cmd_colors},
-    {"ps", "ps", "Satellites known to Orbital", &cmd_ps},
-    {"cores", "cores", "per-core scheduler state", &cmd_cores},
+    {"ps", "ps", "Satellites known to Orbital; piped, one parseable row each", &cmd_ps},
+    {"cores", "cores", "per-core scheduler state; piped, one parseable row each", &cmd_cores},
     {"mem", "mem", "Universe, kernel heap and ram realm counters", &cmd_mem},
     {"uptime", "uptime", "time since boot", &cmd_uptime},
     {"date", "date", "wall clock time in UTC when the firmware set one", &cmd_date},
     {"klog", "klog [bytes]", "tail of the kernel log", &cmd_klog},
+    {"tty", "tty", "the console lens this shell holds: rights and readiness", &cmd_tty},
     {"keys", "keys", "show decoded key events, Esc leaves", &cmd_keys},
     {"sleep", "sleep milliseconds", "wait", &cmd_sleep},
     {"usb", "usb", "xHCI controllers, devices and drives", &cmd_usb},
