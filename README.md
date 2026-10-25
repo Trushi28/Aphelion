@@ -137,7 +137,11 @@ What this means in practice:
 - Two sticks written from the same ISO cannot be told apart, so with both plugged in neither gets a window.
 - Hubs, UAS-only drives, 4096-byte-sector drives and USB keyboards are not supported yet. Use the laptop's own
   keyboard (PS/2 or the serial console) for the shell.
-- Real ACPI power-off arrives with the uACPI series; until then `poweroff` is safe but only works under a hypervisor.
+- `poweroff` uses the ACPI S5 sleep state (the `_S5_` package is read from the DSDT without an AML interpreter) and falls
+  back to the QEMU, Bochs and VirtualBox ports under a hypervisor. It is untested on real hardware.
+- The `make run*` targets let QEMU behave like a machine: `reboot` restarts the guest and `poweroff` exits QEMU. To keep a
+  crashed guest on screen instead, run `make run QEMU_EXIT="-no-reboot -no-shutdown"`; QEMU then shows "paused" after a
+  clean `poweroff` too, which is the flag, not a crash.
 
 `make run-usb` and `make run-uefi-usb` boot the usb profile in QEMU from an emulated xHCI stick (`build/usb.img`,
 the ISO padded to `USB_IMG_SIZE`, 256M by default).

@@ -12,6 +12,9 @@ ALWAYS_INLINE u8 in8(u16 port) {
 ALWAYS_INLINE void out16(u16 port, u16 val) {
     asm volatile("outw %0, %1" :: "a"(val), "Nd"(port) : "memory");
 }
+ALWAYS_INLINE u16 in16(u16 port) {
+    u16 v; asm volatile("inw %1, %0" : "=a"(v) : "Nd"(port) : "memory"); return v;
+}
 ALWAYS_INLINE void out32(u16 port, u32 val) {
     asm volatile("outl %0, %1" :: "a"(val), "Nd"(port) : "memory");
 }

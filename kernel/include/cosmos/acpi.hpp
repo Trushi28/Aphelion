@@ -33,6 +33,13 @@ struct Info {
     u8 reset_space = 0;
     u64 reset_address = 0;
     u8 reset_value = 0;
+    u16 smi_cmd = 0;
+    u8 acpi_enable = 0;
+    u16 pm1a_cnt = 0;
+    u16 pm1b_cnt = 0;
+    bool s5_found = false;
+    u8 slp_typ_a = 0;
+    u8 slp_typ_b = 0;
 };
 
 constexpr u16 IAPC_LEGACY_DEVICES = 1u << 0;

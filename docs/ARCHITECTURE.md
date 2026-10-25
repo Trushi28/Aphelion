@@ -296,9 +296,12 @@ every transmit wait. USB keyboards are not supported until an xHCI HID driver ex
 `klog` is a 16 KiB ring fed by `serial::putc` with a try-lock, so a contended or interrupt-time write is dropped
 rather than blocking. Output the shell sends to the console bypasses it. `power::reboot` tries the ACPI FADT
 reset register, the keyboard controller pulse, the PCI reset register at 0xCF9 and finally a triple fault.
-`power::poweroff` only works under a hypervisor (it writes the QEMU, Bochs and VirtualBox ports, and only after
-CPUID reports a hypervisor); real ACPI power-off needs the `_S5` sleep type from the AML tables and arrives with
-uACPI.
+`power::poweroff` takes the ACPI route first: `acpi::init` reads the PM1a/PM1b control blocks and the SMI command
+port from the FADT and finds `Name (_S5_, Package () { SLP_TYPa, SLP_TYPb, ... })` in the DSDT (then the SSDTs) with a
+small scan (`acpi_s5.hpp`, covered by `make test-acpi`) instead of an AML interpreter. Poweroff enables ACPI mode through
+the SMI command port if SCI_EN is clear, then writes SLP_TYP and SLP_EN to PM1a (and PM1b). If that returns, and only
+under a hypervisor (CPUID says so), it writes the QEMU, Bochs and VirtualBox power-off ports. Either way the shell
+flushes the disk first.
 
 ### Nebula
 

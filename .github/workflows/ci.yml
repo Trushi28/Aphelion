@@ -63,8 +63,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential nasm xorriso mtools
 
-      - name: Build
-        run: make iso MENU_TIMEOUT=0
+      - name: Build the self-test image
+        run: make iso BOOT_DEFAULT=test MENU_TIMEOUT=0
 
       - name: Build the shell image
         run: make iso BOOT_DEFAULT=shell MENU_TIMEOUT=0 ISO=build/aphelion-shell.iso

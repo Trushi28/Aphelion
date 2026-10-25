@@ -18,8 +18,13 @@ LIMINE_BRANCH := v9.x-binary
 
 OPT ?= -O2
 
+# What QEMU does when the guest resets or powers off. The default behaves like a real machine: `reboot` restarts the
+# guest and `poweroff` exits QEMU. To keep a crashed (triple-faulted) guest on screen while debugging, run with
+# QEMU_EXIT="-no-reboot -no-shutdown"; QEMU then also shows "paused" after a clean `poweroff`, which is not a crash.
+QEMU_EXIT ?=
+
 PROFILE      ?= dev
-BOOT_DEFAULT ?= $(if $(filter usb,$(PROFILE)),test,shell)
+BOOT_DEFAULT ?= $(if $(filter usb,$(PROFILE)),shell,test)
 MENU_TIMEOUT ?= $(if $(filter usb,$(PROFILE)),5,3)
 
 ifeq ($(filter $(PROFILE),dev usb),)
@@ -81,7 +86,7 @@ ISO := $(BUILD)/aphelion.iso
 
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
-.PHONY: usb-image run-usb run-uefi-usb test-mm test-sched test-console test-input test-lens-types test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+.PHONY: usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -154,41 +159,41 @@ reset-disk:
 run: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-		-serial stdio -no-reboot -no-shutdown
+		-serial stdio $(QEMU_EXIT)
 
 run-smp: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 4 -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-		-serial stdio -no-reboot -no-shutdown
+		-serial stdio $(QEMU_EXIT)
 
 run-headless: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-		-serial stdio -display none -no-reboot -no-shutdown
+		-serial stdio -display none $(QEMU_EXIT)
 
 run-uefi: iso $(DISK_IMG)
 	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -bios $(OVMF) -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-		-serial stdio -no-reboot -no-shutdown
+		-serial stdio $(QEMU_EXIT)
 
 run-uefi-smp: iso $(DISK_IMG)
 	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 4 -bios $(OVMF) -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-		-serial stdio -no-reboot -no-shutdown
+		-serial stdio $(QEMU_EXIT)
 
 run-uefi-headless: iso $(DISK_IMG)
 	@test -n "$(OVMF)" || { echo "OVMF firmware not found; pass OVMF=/path/to/OVMF.fd"; exit 1; }
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -bios $(OVMF) -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
-		-serial stdio -display none -no-reboot -no-shutdown
+		-serial stdio -display none $(QEMU_EXIT)
 
 SMP        ?= 4
 QEMU_Q35    = qemu-system-x86_64 -M q35 -cpu max -m 256M -smp $(SMP)
 DRIVE_AHCI  = -drive file=$(DISK_IMG),if=none,id=ahd0,format=raw -device ide-hd,drive=ahd0,bus=ide.0
 DRIVE_NVME  = -drive file=$(DISK_IMG),if=none,id=nvm0,format=raw -device nvme,drive=nvm0,serial=aphelion0
-QEMU_TAIL   = -serial stdio -no-reboot -no-shutdown
+QEMU_TAIL   = -serial stdio $(QEMU_EXIT)
 
 run-ahci: iso $(DISK_IMG)
 	$(QEMU_Q35) -cdrom $(ISO) $(DRIVE_AHCI) $(QEMU_TAIL)
@@ -222,9 +227,9 @@ run-uefi-usb:
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 2 -bios $(OVMF) $(DRIVE_USB) $(QEMU_TAIL)
 
 run-nodisk: iso
-	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio $(QEMU_EXIT)
 
-TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm
+TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm acpi
 
 unit_inc_stellar  := -I$(KDIR)/include
 unit_src_stellar  := $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp
@@ -240,6 +245,8 @@ unit_inc_usbstor  := -Itools/hostshim-usb -Itools/hostshim -I$(KDIR)/include
 unit_src_usbstor  := tools/usbstor_host_test.cpp
 unit_inc_sched    := -Itools/hostshim -I$(KDIR)/include
 unit_src_sched    := tools/sched_host_test.cpp
+unit_inc_acpi     := -I$(KDIR)/include
+unit_src_acpi     := tools/acpi_host_test.cpp
 unit_inc_lens-types := -I$(KDIR)/include
 unit_src_lens-types := tools/lens_types_host_test.cpp
 
@@ -295,6 +302,11 @@ test-sched:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_sched) $(unit_src_sched) -o $(BUILD)/sched_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/sched_host_test
+
+test-acpi:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_acpi) $(unit_src_acpi) -o $(BUILD)/acpi_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/acpi_host_test
 
 test-lens-types:
 	@mkdir -p $(BUILD)

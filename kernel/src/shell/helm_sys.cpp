@@ -142,7 +142,7 @@ void print_about(Writer& w) {
 
     power::Capabilities caps = power::capabilities();
     v[6].str("reboot ready \xC2\xB7 poweroff ");
-    v[6].str(caps.poweroff_supported ? "ready" : "not yet on real hardware");
+    v[6].str(caps.poweroff_supported ? "ready" : "unavailable (no ACPI S5)");
 
     u32 inner = 0;
     for (u32 i = 0; i < PANEL_ROWS; ++i) {
@@ -656,7 +656,7 @@ int cmd_poweroff(Shell&, Io& io, u32, char**) {
     settle_disk();
     if (!power::poweroff()) {
         io.out.rgb(palette::SAND);
-        io.out.str("  poweroff is not available on this platform yet; it is safe to hold the power button\n");
+        io.out.str("  the platform did not power off (see the kernel log); it is safe to hold the power button\n");
         io.out.reset();
         return 1;
     }

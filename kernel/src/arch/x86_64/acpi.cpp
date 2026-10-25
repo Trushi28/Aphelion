@@ -1,4 +1,5 @@
 #include <cosmos/acpi.hpp>
+#include <cosmos/acpi_s5.hpp>
 #include <cosmos/serial.hpp>
 #include <cosmos/vmm.hpp>
 
@@ -82,12 +83,20 @@ struct PACKED HpetTable {
     u8 page_protection;
 };
 
+constexpr u32 FADT_DSDT = 40;
+constexpr u32 FADT_SMI_CMD = 48;
+constexpr u32 FADT_ACPI_ENABLE = 52;
+constexpr u32 FADT_PM1A_CNT_BLK = 64;
+constexpr u32 FADT_PM1B_CNT_BLK = 68;
 constexpr u32 FADT_PM_TMR_BLK = 76;
 constexpr u32 FADT_IAPC_BOOT_ARCH = 109;
 constexpr u32 FADT_FLAGS = 112;
 constexpr u32 FADT_RESET_REG = 116;
 constexpr u32 FADT_RESET_VALUE = 128;
 constexpr u32 FADT_FLAG_RESET_REG_SUP = 1u << 10;
+constexpr u32 FADT_X_DSDT = 140;
+constexpr u32 FADT_X_PM1A_CNT_BLK = 172;
+constexpr u32 FADT_X_PM1B_CNT_BLK = 184;
 constexpr u32 FADT_X_PM_TMR_BLK = 208;
 constexpr u32 FADT_FLAG_TMR_VAL_EXT = 1u << 8;
 constexpr u8 SPACE_SYSTEM_MEMORY = 0;
@@ -171,6 +180,50 @@ template <typename T> static T field(const SdtHeader* t, u32 offset) {
     return v;
 }
 
+static void scan_s5(SdtHeader* t) {
+    if (g_info.s5_found) return;
+    auto* body = reinterpret_cast<const u8*>(t) + sizeof(SdtHeader);
+    u8 a, b;
+    if (find_s5(body, t->length - sizeof(SdtHeader), &a, &b)) {
+        g_info.s5_found = true;
+        g_info.slp_typ_a = a;
+        g_info.slp_typ_b = b;
+    }
+}
+
+static u16 pm1_control_port(SdtHeader* t, u32 legacy, u32 extended) {
+    u64 port = 0;
+    if (t->length >= legacy + 4) port = field<u32>(t, legacy);
+    if (t->length >= extended + sizeof(GenericAddress)) {
+        auto gas = field<GenericAddress>(t, extended);
+        if (gas.space_id == SPACE_SYSTEM_IO && gas.address != 0) port = gas.address;
+    }
+    return (port == 0 || port > 0xFFFE) ? 0 : static_cast<u16>(port);
+}
+
+static void parse_fadt_power(SdtHeader* t) {
+    if (t->length >= FADT_ACPI_ENABLE + 1) {
+        u32 smi = field<u32>(t, FADT_SMI_CMD);
+        if (smi != 0 && smi <= 0xFFFF) {
+            g_info.smi_cmd = static_cast<u16>(smi);
+            g_info.acpi_enable = field<u8>(t, FADT_ACPI_ENABLE);
+        }
+    }
+    g_info.pm1a_cnt = pm1_control_port(t, FADT_PM1A_CNT_BLK, FADT_X_PM1A_CNT_BLK);
+    g_info.pm1b_cnt = pm1_control_port(t, FADT_PM1B_CNT_BLK, FADT_X_PM1B_CNT_BLK);
+
+    u64 dsdt = 0;
+    if (t->length >= FADT_DSDT + 4) dsdt = field<u32>(t, FADT_DSDT);
+    if (t->revision >= 2 && t->length >= FADT_X_DSDT + 8) {
+        u64 x = field<u64>(t, FADT_X_DSDT);
+        if (x != 0) dsdt = x;
+    }
+    if (dsdt == 0) return;
+    SdtHeader* table = map_sdt(dsdt);
+    if (!table || !sig_matches(table->sig, "DSDT", 4)) return;
+    scan_s5(table);
+}
+
 static void parse_fadt(SdtHeader* t) {
     g_info.fadt_found = true;
     g_info.fadt_revision = t->revision;
@@ -192,6 +245,8 @@ static void parse_fadt(SdtHeader* t) {
             g_info.reset_value = field<u8>(t, FADT_RESET_VALUE);
         }
     }
+
+    parse_fadt_power(t);
 
     u64 port = 0;
     if (t->length >= FADT_PM_TMR_BLK + 4) port = field<u32>(t, FADT_PM_TMR_BLK);
@@ -246,7 +301,20 @@ void init(u64 rsdp_phys) {
         } else if (sig_matches(hdr->sig, "FACP", 4)) {
             auto* t = map_sdt(table_phys);
             if (t) parse_fadt(t);
+        } else if (sig_matches(hdr->sig, "SSDT", 4)) {
+            if (!g_info.s5_found) {
+                auto* t = map_sdt(table_phys);
+                if (t) scan_s5(t);
+            }
         }
+    }
+    if (g_info.fadt_found) {
+        if (g_info.s5_found && g_info.pm1a_cnt != 0)
+            serial::printf("[acpi] power: S5 sleep type %u/%u, PM1a control %x%s\n", static_cast<unsigned>(g_info.slp_typ_a),
+                           static_cast<unsigned>(g_info.slp_typ_b), static_cast<unsigned>(g_info.pm1a_cnt),
+                           g_info.pm1b_cnt ? " (+PM1b)" : "");
+        else
+            serial::writeln("[acpi] power: no usable _S5_ object or PM1 control block");
     }
     serial::printf("[acpi] timers: HPET %s, PM timer %s\n", g_info.hpet_found ? "present" : "absent",
                     g_info.pm_timer_found ? "present" : "absent");
