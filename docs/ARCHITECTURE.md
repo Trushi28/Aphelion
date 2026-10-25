@@ -219,11 +219,11 @@ filesystem is mounted, so nothing on the machine can write to a disk. **A boot w
 mode with storage on**, so every configuration the Makefile generates names both words explicitly.
 
 `make iso` writes `build/limine.conf` with two entries, `Aphelion Shell` (`mode=shell`) and `Aphelion Test`
-(`mode=test`). `PROFILE=dev` (the default) passes `storage=auto` and boots the test entry after 3 seconds;
+(`mode=test`). `PROFILE=dev` (the default) passes `storage=auto` and boots the shell entry after 3 seconds, with the test entry one key press away in the Limine menu;
 `PROFILE=usb` passes `storage=usb` on the shell entry and `storage=off` on the test entry and boots the shell after 5
 seconds, so an ISO written to a stick never initialises an AHCI, NVMe or virtio driver and can reach only the USB
 window described below. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` override either
-profile; CI builds with `MENU_TIMEOUT=0`. In shell mode `kernel_main` skips the demo Satellites, the stress
+profile. `make test-iso` builds `build/aphelion-test.iso`, the same menu with the test entry preselected, and CI builds that image with `MENU_TIMEOUT=0` for the boot and crash-fuzz jobs. In shell mode `kernel_main` skips the demo Satellites, the stress
 workers, the filesystem test suite and the scheduler self-test, keeps the bootloader-memory reclaim task and starts
 Helm. The disk is mounted when it already holds a Stellar volume and is never formatted unless the user runs `mkfs erase`.
 

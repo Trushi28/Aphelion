@@ -18,13 +18,10 @@ LIMINE_BRANCH := v9.x-binary
 
 OPT ?= -O2
 
-# What QEMU does when the guest resets or powers off. The default behaves like a real machine: `reboot` restarts the
-# guest and `poweroff` exits QEMU. To keep a crashed (triple-faulted) guest on screen while debugging, run with
-# QEMU_EXIT="-no-reboot -no-shutdown"; QEMU then also shows "paused" after a clean `poweroff`, which is not a crash.
 QEMU_EXIT ?=
 
 PROFILE      ?= dev
-BOOT_DEFAULT ?= $(if $(filter usb,$(PROFILE)),shell,test)
+BOOT_DEFAULT ?= shell
 MENU_TIMEOUT ?= $(if $(filter usb,$(PROFILE)),5,3)
 
 ifeq ($(filter $(PROFILE),dev usb),)
@@ -83,10 +80,11 @@ OBJECTS := $(CXX_SOURCES:%.cpp=$(BUILD)/%.o) $(ASM_SOURCES:%.asm=$(BUILD)/%.o)
 
 KERNEL_ELF := $(BUILD)/kernel.elf
 ISO := $(BUILD)/aphelion.iso
+TEST_ISO := $(BUILD)/aphelion-test.iso
 
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
-.PHONY: usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+.PHONY: test-iso run-test usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -149,6 +147,9 @@ iso: $(KERNEL_ELF) $(LIMINE)/limine.h $(LIMINE_CONF)
 		-V APH$$(cat $(BUILD_ID_TXT)) $(ISO_ROOT) -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 
+test-iso:
+	$(MAKE) iso BOOT_DEFAULT=test ISO=$(TEST_ISO)
+
 $(DISK_IMG):
 	qemu-img create -f raw $(DISK_IMG) $(DISK_SIZE)
 
@@ -160,6 +161,11 @@ run: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) \
 		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
 		-serial stdio $(QEMU_EXIT)
+
+run-test: test-iso $(DISK_IMG)
+	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp $(SMP) -cdrom $(TEST_ISO) \
+		-drive file=$(DISK_IMG),if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0 \
+		-serial stdio -display none $(QEMU_EXIT)
 
 run-smp: iso $(DISK_IMG)
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -smp 4 -cdrom $(ISO) \
@@ -338,7 +344,7 @@ FUZZ_CORES  ?= 4
 FUZZ_ROUNDS ?= 30
 FUZZ_SEED   ?= 1
 
-crash-fuzz: iso stellarfs
+crash-fuzz: test-iso stellarfs
 	tools/crash-fuzz.sh $(FUZZ_KIND) $(FUZZ_CORES) $(FUZZ_ROUNDS) $(FUZZ_SEED)
 
 bench-stellar:

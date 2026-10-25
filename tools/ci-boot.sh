@@ -3,7 +3,7 @@ set -eu
 
 DISK_KIND="${1:-nvme}"
 CORES="${2:-1}"
-ISO="${ISO:-build/aphelion.iso}"
+ISO="${ISO:-build/aphelion-test.iso}"
 LIMIT="${BOOT_TIMEOUT:-120}"
 LOG_DIR="${LOG_DIR:-build/ci-logs}"
 PASS="fresh"

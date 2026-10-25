@@ -3,7 +3,6 @@
 
 namespace acpi {
 
-// Reads one integer out of an AML package element. SLP_TYP is a 3-bit field, so anything larger is refused.
 inline bool s5_element(const u8* aml, u32 len, u32& p, u8& out) {
     if (p >= len) return false;
     u32 value;
@@ -27,10 +26,6 @@ inline bool s5_element(const u8* aml, u32 len, u32& p, u8& out) {
     return true;
 }
 
-// Finds `Name (_S5_, Package () { SLP_TYPa, SLP_TYPb, ... })` in a DSDT or SSDT body. This is the minimal scan every
-// hobby and many production kernels use instead of a full AML interpreter: the object is a constant package in
-// practice. A false match inside a string or a method body is rejected by requiring NameOp before the name and
-// PackageOp after it.
 inline bool find_s5(const u8* aml, u32 len, u8* typ_a, u8* typ_b) {
     if (len < 8) return false;
     for (u32 i = 1; i + 5 < len; ++i) {

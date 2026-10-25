@@ -94,6 +94,7 @@ make run-smp        # boot with 4 cores
 make run-nvme       # boot with an NVMe disk (SMP=4 for multi-core)
 make run-ahci       # boot with an AHCI/SATA disk
 make run-headless   # serial output only
+make run-test       # build the self-test image (build/aphelion-test.iso) and boot it headless; this is what CI runs
 make test-stellar   # run the filesystem tests on the host, without QEMU
 make test-sched     # boot words, timer maths, run queues and the MLFQ policy on the host
 make test-console   # UTF-8, terminal emulator, font blob and incremental rendering on the host
@@ -112,7 +113,7 @@ block driver, so switching between virtio-blk, AHCI and NVMe keeps the same file
 `make iso` generates a Limine menu with two entries, **Aphelion Shell** and **Aphelion Test**.
 `make iso PROFILE=usb` builds the variant meant for real hardware: the shell entry passes `storage=usb` and the
 test entry `storage=off`, so no AHCI, NVMe or virtio driver ever starts and nothing on the machine's own drives can be
-touched; the shell is the default. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` change the selection.
+touched. The shell is the default in both profiles, so every `make run*` boots the shell; pick **Aphelion Test** in the menu for the self-tests, or use `make test-iso` / `make run-test`. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` change the selection.
 
 ```sh
 make iso PROFILE=usb

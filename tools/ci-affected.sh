@@ -16,9 +16,20 @@ elif ! git diff --name-only $RANGE -- > "$TMP/changed" 2>/dev/null; then
     echo "ci-affected: cannot diff '$RANGE'; running everything" >&2
 fi
 
-if ! $all && grep -qE '^(Makefile|\.github/workflows/ci\.yml|tools/ci-affected\.sh)$' "$TMP/changed"; then
+if ! $all && grep -qE '^(\.github/workflows/ci\.yml|tools/ci-affected\.sh)$' "$TMP/changed"; then
     all=true
-    echo "ci-affected: build or CI configuration changed; running everything" >&2
+    echo "ci-affected: CI configuration changed; running everything" >&2
+fi
+
+makefile=false
+if ! $all && grep -qx 'Makefile' "$TMP/changed"; then
+    makefile=true
+    if git diff -U0 $RANGE -- Makefile | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -qE 'unit_|test-[a-z]|TEST_UNITS|FS_CORE_SRC|LENS_SRC|g\+\+'; then
+        all=true
+        echo "ci-affected: the Makefile's host test rules changed; running every unit" >&2
+    else
+        echo "ci-affected: Makefile changed outside the host test rules; units unchanged" >&2
+    fi
 fi
 
 picked=""
@@ -40,7 +51,7 @@ done
 boot=false
 if $all; then
     boot=true
-elif grep -qE '^(kernel/|limine/|tools/(ci-boot|ci-shell|ci-usb|crash-fuzz)\.sh$|tools/(bakefont\.py|stellarfs\.cpp)$)' "$TMP/changed"; then
+elif $makefile || grep -qE '^(kernel/|limine/|tools/(ci-boot|ci-shell|ci-usb|crash-fuzz)\.sh$|tools/(bakefont\.py|stellarfs\.cpp)$)' "$TMP/changed"; then
     boot=true
     echo "ci-affected: boot  <- $(grep -E '^(kernel/|limine/|tools/)' "$TMP/changed" | head -n 1)" >&2
 else

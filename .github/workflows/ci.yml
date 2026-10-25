@@ -42,14 +42,15 @@ jobs:
     needs: plan
     if: needs.plan.outputs.units != '[]'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        unit: ${{ fromJSON(needs.plan.outputs.units) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Test ${{ matrix.unit }}
-        run: make test-${{ matrix.unit }}
+      - name: Test ${{ join(fromJSON(needs.plan.outputs.units), ', ') }}
+        env:
+          UNITS: ${{ join(fromJSON(needs.plan.outputs.units), ' ') }}
+        run: |
+          targets=""
+          for u in $UNITS; do targets="$targets test-$u"; done
+          make -k -j"$(nproc)" -O $targets
 
   iso:
     needs: plan
@@ -64,10 +65,10 @@ jobs:
           sudo apt-get install -y build-essential nasm xorriso mtools
 
       - name: Build the self-test image
-        run: make iso BOOT_DEFAULT=test MENU_TIMEOUT=0
+        run: make test-iso MENU_TIMEOUT=0
 
       - name: Build the shell image
-        run: make iso BOOT_DEFAULT=shell MENU_TIMEOUT=0 ISO=build/aphelion-shell.iso
+        run: make iso MENU_TIMEOUT=0 ISO=build/aphelion-shell.iso
 
       - name: Build the USB image
         run: make iso PROFILE=usb MENU_TIMEOUT=0 ISO=build/aphelion-usb.iso
@@ -79,7 +80,7 @@ jobs:
         with:
           name: images
           path: |
-            build/aphelion.iso
+            build/aphelion-test.iso
             build/aphelion-shell.iso
             build/aphelion-usb.iso
             build/stellarfs

@@ -273,13 +273,15 @@ Thirty real bugs and design flaws found while building Aphelion, kept because th
     and such a port is listed as "unknown port speed".
 
 
-51. **`poweroff` "triple reset" in QEMU was mostly the QEMU flags, and the CI boot images were built in the wrong mode.**
+51. **`poweroff` "triple reset" in QEMU was mostly the QEMU flags, and the CI images did not boot the mode CI expects.**
     The run targets passed `-no-reboot -no-shutdown`, which turns a successful ACPI power-off into a paused VM, the same
     picture as a triple fault, so a working `poweroff` looked like a crash. The run targets now default to QEMU's real
     machine behaviour (`QEMU_EXIT`), and `poweroff` goes through ACPI S5 with the PM1 control blocks, the SMI enable
-    handshake and the `_S5_` sleep type, with the hypervisor ports as a fallback. Separately, `BOOT_DEFAULT` had been
-    inverted (`dev` booted the shell and `usb` the self-tests, the opposite of what the docs and `ci-boot.sh`,
-    `crash-fuzz.sh` and `ci-usb.sh` assume), so every CI image booted the wrong mode: no filesystem suite, no xHCI
-    line, no `hello.txt` self-test. The default is fixed and `ci.yml` now names `BOOT_DEFAULT=test` for the self-test
-    image so a default can never silently change what CI measures. Two shell-test patterns were also stale: `cat
-    sys:/version` begins with `kernel: `, and `stat` now colours its key column.
+    handshake and the `_S5_` sleep type, with the hypervisor ports as a fallback. Separately, the default image had
+    become the shell image while `ci-boot.sh` and `crash-fuzz.sh` still booted `build/aphelion.iso` expecting the
+    self-tests, and the usb profile defaulted to the self-tests while `ci-usb.sh` expects the shell. `BOOT_DEFAULT` is now
+    `shell` for every profile, so `make run*` never starts the test suite, and CI builds its own `build/aphelion-test.iso`
+    with `make test-iso`, so a default can no longer change what CI measures. Two shell-test patterns were also stale:
+    `cat sys:/version` begins with `kernel: `, and `stat` now colours its key column. The change planner no longer runs
+    every host unit when the Makefile changes; it does so only when the diff touches the host test rules, and the host
+    units run as one job instead of one job each.
