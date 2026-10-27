@@ -33,6 +33,8 @@ struct Pipe {
     usize mask;
     u64 rd;
     u64 wr;
+    orbital::Mutex rd_lock;
+    orbital::Mutex wr_lock;
     u32 open_ends;
     bool reader_gone;
     bool writer_gone;
@@ -43,23 +45,34 @@ struct Pipe {
 u64 load(const u64* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 bool flag(const bool* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 
+struct Hold {
+    orbital::Mutex& m;
+    explicit Hold(orbital::Mutex& x) : m(x) { m.lock(); }
+    ~Hold() { m.unlock(); }
+    Hold(const Hold&) = delete;
+    Hold& operator=(const Hold&) = delete;
+};
+
 Result<usize> PipeEnd::read(Bytes dst) {
     if (!reader) return Result<usize>::fail(Status::Denied);
     Pipe& p = *pipe;
-    u64 rd = p.rd;
-    u64 avail = load(&p.wr) - rd;
-    if (avail == 0) {
-        if (flag(&p.writer_gone)) {
-
-            avail = load(&p.wr) - rd;
-            if (avail == 0) return Result<usize>::success(0);
-        } else {
-            return Result<usize>::fail(Status::NotReady);
+    usize n = 0;
+    {
+        Hold hold(p.rd_lock);
+        u64 rd = load(&p.rd);
+        u64 avail = load(&p.wr) - rd;
+        if (avail == 0) {
+            if (flag(&p.writer_gone)) {
+                avail = load(&p.wr) - rd;
+                if (avail == 0) return Result<usize>::success(0);
+            } else {
+                return Result<usize>::fail(Status::NotReady);
+            }
         }
+        n = dst.len < avail ? dst.len : static_cast<usize>(avail);
+        for (usize i = 0; i < n; ++i) dst.ptr[i] = p.buf[(rd + i) & p.mask];
+        __atomic_store_n(&p.rd, rd + n, __ATOMIC_RELEASE);
     }
-    usize n = dst.len < avail ? dst.len : static_cast<usize>(avail);
-    for (usize i = 0; i < n; ++i) dst.ptr[i] = p.buf[(rd + i) & p.mask];
-    __atomic_store_n(&p.rd, rd + n, __ATOMIC_RELEASE);
     if (n) stream_event();
     return Result<usize>::success(n);
 }
@@ -69,12 +82,16 @@ Result<usize> PipeEnd::write(ConstBytes src) {
     Pipe& p = *pipe;
     if (flag(&p.reader_gone)) return Result<usize>::fail(Status::Closed);
     if (src.len == 0) return Result<usize>::success(0);
-    u64 wr = p.wr;
-    u64 room = (p.mask + 1) - (wr - load(&p.rd));
-    if (room == 0) return Result<usize>::fail(Status::NotReady);
-    usize n = src.len < room ? src.len : static_cast<usize>(room);
-    for (usize i = 0; i < n; ++i) p.buf[(wr + i) & p.mask] = src.ptr[i];
-    __atomic_store_n(&p.wr, wr + n, __ATOMIC_RELEASE);
+    usize n = 0;
+    {
+        Hold hold(p.wr_lock);
+        u64 wr = load(&p.wr);
+        u64 room = (p.mask + 1) - (wr - load(&p.rd));
+        if (room == 0) return Result<usize>::fail(Status::NotReady);
+        n = src.len < room ? src.len : static_cast<usize>(room);
+        for (usize i = 0; i < n; ++i) p.buf[(wr + i) & p.mask] = src.ptr[i];
+        __atomic_store_n(&p.wr, wr + n, __ATOMIC_RELEASE);
+    }
     stream_event();
     return Result<usize>::success(n);
 }

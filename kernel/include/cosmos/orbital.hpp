@@ -174,6 +174,7 @@ public:
         depth_ = 1;
     }
     void unlock() {
+        if (!held_by_me()) cpu::hang();
         if (--depth_ == 0) __atomic_store_n(&owner_, 0, __ATOMIC_RELEASE);
     }
     bool held_by_me() const { return __atomic_load_n(&owner_, __ATOMIC_RELAXED) == self_token(); }

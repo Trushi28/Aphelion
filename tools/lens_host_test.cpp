@@ -21,6 +21,12 @@ void* calloc(unsigned long, unsigned long);
 void free(void*);
 int sched_yield(void);
 int usleep(unsigned);
+int fork(void);
+int waitpid(int, int*, int);
+unsigned alarm(unsigned);
+int open(const char*, int, ...);
+int dup2(int, int);
+void _exit(int);
 typedef unsigned long pthread_t;
 int pthread_create(pthread_t*, const void*, void* (*)(void*), void*);
 int pthread_join(pthread_t, void**);
@@ -1880,6 +1886,120 @@ static void test_pipes() {
     free(d);
 }
 
+constexpr u32 RIG_WRITERS = 3;
+constexpr u32 RIG_READERS = 3;
+constexpr u32 RIG_PER_WRITER = 20000;
+
+struct PipeRig {
+    Domain* doms[2];
+    Lens rds[2];
+    Lens wrs[2];
+    u32 writers_done;
+    u32 received[RIG_WRITERS];
+    u32 stray;
+};
+static PipeRig g_rig;
+
+struct RigArg {
+    u32 index;
+};
+
+static void* rig_writer(void* p) {
+    u32 id = static_cast<RigArg*>(p)->index;
+    u32 side = id & 1;
+    u32 left = RIG_PER_WRITER;
+    u8 chunk[16];
+    for (u32 i = 0; i < sizeof(chunk); ++i) chunk[i] = static_cast<u8>(id);
+    while (left) {
+        u32 want = 1 + (left * 7 + id) % 13;
+        if (want > left) want = left;
+        auto r = lens::write(*g_rig.doms[side], g_rig.wrs[side], 0, lens::ConstBytes(chunk, want));
+        if (r.ok()) left -= static_cast<u32>(r.value());
+        else sched_yield();
+    }
+    __atomic_add_fetch(&g_rig.writers_done, 1, __ATOMIC_SEQ_CST);
+    return nullptr;
+}
+
+static void* rig_reader(void* p) {
+    u32 side = static_cast<RigArg*>(p)->index & 1;
+    u32 mine[RIG_WRITERS] = {};
+    u32 stray = 0;
+    u8 buf[11];
+    for (;;) {
+        bool finished = __atomic_load_n(&g_rig.writers_done, __ATOMIC_SEQ_CST) == RIG_WRITERS;
+        auto r = lens::read(*g_rig.doms[side], g_rig.rds[side], 0, lens::Bytes(buf, sizeof(buf)));
+        if (r.ok()) {
+            for (usize i = 0; i < r.value(); ++i) {
+                if (buf[i] < RIG_WRITERS) ++mine[buf[i]];
+                else ++stray;
+            }
+        } else if (finished) {
+            break;
+        } else {
+            sched_yield();
+        }
+    }
+    for (u32 i = 0; i < RIG_WRITERS; ++i) __atomic_add_fetch(&g_rig.received[i], mine[i], __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_rig.stray, stray, __ATOMIC_SEQ_CST);
+    return nullptr;
+}
+
+static void test_pipe_shared_ends() {
+    lens::test_unseal();
+    g_rig = PipeRig{};
+    g_rig.doms[0] = new_domain();
+    g_rig.doms[1] = new_domain();
+    CHECK(lens::make_pipe(*g_rig.doms[0], 64, &g_rig.rds[0], &g_rig.wrs[0]).ok(), "a pipe for the shared-end test");
+    auto w2 = lens::delegate(*g_rig.doms[0], g_rig.wrs[0], *g_rig.doms[1], Right::Write | Right::Append);
+    auto r2 = lens::delegate(*g_rig.doms[0], g_rig.rds[0], *g_rig.doms[1], Right::Read);
+    CHECK(w2.ok() && r2.ok(), "both ends are delegated to a second domain");
+    g_rig.wrs[1] = w2.value();
+    g_rig.rds[1] = r2.value();
+
+    RigArg args[RIG_WRITERS + RIG_READERS];
+    pthread_t th[RIG_WRITERS + RIG_READERS];
+    for (u32 i = 0; i < RIG_WRITERS + RIG_READERS; ++i) args[i].index = i;
+    for (u32 i = 0; i < RIG_READERS; ++i) pthread_create(&th[RIG_WRITERS + i], nullptr, &rig_reader, &args[i]);
+    for (u32 i = 0; i < RIG_WRITERS; ++i) pthread_create(&th[i], nullptr, &rig_writer, &args[i]);
+    for (u32 i = 0; i < RIG_WRITERS + RIG_READERS; ++i) pthread_join(th[i], nullptr);
+
+    for (u32 i = 0; i < RIG_WRITERS; ++i) CHECK(g_rig.received[i] == RIG_PER_WRITER, "every byte a writer sent arrives exactly once");
+    CHECK(g_rig.stray == 0, "no byte arrives corrupted");
+
+    lens::close_all(*g_rig.doms[0]);
+    lens::close_all(*g_rig.doms[1]);
+    free(g_rig.doms[0]);
+    free(g_rig.doms[1]);
+}
+
+static orbital::Mutex g_owner_probe;
+
+static void test_mutex_ownership() {
+    g_owner_probe.lock();
+    g_owner_probe.lock();
+    CHECK(g_owner_probe.held_by_me(), "the locker owns the mutex");
+    int pid = fork();
+    if (pid == 0) {
+        int nul = open("/dev/null", 1);
+        if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        alarm(5);
+        pthread_t th;
+        auto intruder = [](void*) -> void* { g_owner_probe.unlock(); return nullptr; };
+        pthread_create(&th, nullptr, intruder, nullptr);
+        pthread_join(th, nullptr);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    bool survived = (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0;
+    CHECK(!survived, "unlocking a mutex held by another task is fatal");
+    g_owner_probe.unlock();
+    CHECK(g_owner_probe.held_by_me(), "a nested unlock keeps the owner");
+    g_owner_probe.unlock();
+    CHECK(!g_owner_probe.held_by_me(), "the last unlock releases it");
+}
+
 static void test_console_stream_and_await() {
     Domain* d = new_domain();
     lens::test_unseal();
@@ -2205,6 +2325,8 @@ int main() {
     test_sys_probes();
     printf("-- pipes and streams\n");
     test_pipes();
+    test_pipe_shared_ends();
+    test_mutex_ownership();
     test_console_stream_and_await();
     printf("-- cursor\n");
     test_cursor();
