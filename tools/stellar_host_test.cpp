@@ -3452,6 +3452,112 @@ int main() {
         fresh_fs();
     }
 
+    {
+        using stellar::Status;
+        const u64 NONE = stellar::INVALID_STAR;
+        const u64 ROOT = stellar::ROOT_STAR;
+        static u8 pat[60000], got[60000];
+        auto fillp = [&](u64 n, u32 salt) { for (u64 i = 0; i < n; ++i) pat[i] = static_cast<u8>(i * 13 + salt + (i >> 8)); };
+
+        fresh_fs(4096);
+        const u64 sizes[] = {1, 511, 512, 4095, 4096, 4097, 8192, 12345, 40960, 50001};
+        bool shape_ok = true;
+        for (u64 size : sizes) {
+            fillp(size, static_cast<u32>(size));
+            char nm[16]; name_of(nm, "r", size);
+            u64 f = stellar::create_file(ROOT, nm, pat, size);
+            if (f == NONE) { shape_ok = false; continue; }
+            const u64 offs[] = {0, 1, 511, 512, 4095, 4096, 4097, 8191, 8192, 20000, size - 1, size, size + 10};
+            const u64 lens[] = {0, 1, 7, 512, 4095, 4096, 4097, 8192, 9000, 60000};
+            for (u64 off : offs) {
+                for (u64 len : lens) {
+                    for (u64 i = 0; i < sizeof(got); ++i) got[i] = 0xEE;
+                    Status why = Status::Internal;
+                    u64 n = stellar::read_range(f, off, got, len, stellar::LIVE, &why);
+                    u64 want = off >= size ? 0 : (size - off < len ? size - off : len);
+                    bool good = n == want && (want == 0 || mem::compare(pat + off, got, want) == 0) && got[want] == 0xEE;
+                    if (!good) { printf("  read_range size=%lu off=%lu len=%lu returned %lu want %lu\n", size, off, len, n, want); shape_ok = false; }
+                }
+            }
+        }
+        CHECK(shape_ok, "read_range matches the file bytes for every size, offset and length, and writes nothing past the result");
+
+        {
+            fillp(30000, 9);
+            u64 f = stellar::create_file(ROOT, "ver", pat, 30000);
+            u64 version = 0;
+            Status why = Status::Internal;
+            CHECK(stellar::read_range(f, 0, got, 10, stellar::LIVE, &why, &version) == 10 && version != 0, "the first ranged read hands back a version token");
+            u64 first = version;
+            CHECK(stellar::read_range(f, 4096, got, 100, stellar::LIVE, &why, &version) == 100 && version == first, "later reads under the same token succeed unchanged");
+            fillp(30000, 10);
+            CHECK(stellar::write_file(f, pat, 30000) == f, "rewrite the file");
+            u64 stale = first;
+            CHECK(stellar::read_range(f, 0, got, 10, stellar::LIVE, &why, &stale) == stellar::READ_ERROR && why == Status::Busy, "a stale token is refused with Busy");
+            u64 fresh = 0;
+            CHECK(stellar::read_range(f, 0, got, 30000, stellar::LIVE, &why, &fresh) == 30000 && fresh != first && mem::compare(pat, got, 30000) == 0, "a new token sees the new contents");
+        }
+
+        {
+            fillp(20000, 3);
+            u64 f = stellar::create_file(ROOT, "snapfile", pat, 20000);
+            u64 snap = stellar::snapshot();
+            static u8 old_pat[20000];
+            mem::copy(old_pat, pat, 20000);
+            fillp(20000, 4);
+            CHECK(stellar::write_file(f, pat, 20000) == f, "rewrite after the snapshot");
+            Status why = Status::Internal;
+            for (u64 i = 0; i < 20000; ++i) got[i] = 0xEE;
+            CHECK(stellar::read_range(f, 5000, got, 9000, snap, &why) == 9000 && mem::compare(old_pat + 5000, got, 9000) == 0, "a ranged read in a snapshot sees the frozen bytes");
+            CHECK(stellar::read_range(f, 5000, got, 9000, stellar::LIVE, &why) == 9000 && mem::compare(pat + 5000, got, 9000) == 0, "and the live view sees the new ones");
+            CHECK(stellar::read_range(ROOT, 0, got, 10, stellar::LIVE, &why) == stellar::READ_ERROR && why == Status::IsADirectory, "a directory cannot be range-read");
+            CHECK(stellar::read_range(f + 100000, 0, got, 10, stellar::LIVE, &why) == stellar::READ_ERROR && why == Status::NotFound, "an unknown star is NotFound");
+        }
+
+        {
+            fresh_fs(4096);
+            stellar::test_set_max_extent_sectors(3);
+            fillp(50001, 6);
+            u64 f = stellar::create_file(ROOT, "frag", pat, 50001);
+            bool frag_ok = f != NONE;
+            const u64 offs[] = {0, 1535, 1536, 1537, 4095, 4096, 7000, 30000, 49999};
+            const u64 flens[] = {1, 700, 4096, 9000, 60000};
+            for (u64 off : offs) {
+                for (u64 len : flens) {
+                    for (u64 i = 0; i < sizeof(got); ++i) got[i] = 0xEE;
+                    u64 n = stellar::read_range(f, off, got, len);
+                    u64 want = 50001 - off < len ? 50001 - off : len;
+                    bool good = n == want && mem::compare(pat + off, got, want) == 0 && got[want] == 0xEE;
+                    if (!good) { printf("  fragmented read_range off=%lu len=%lu returned %lu want %lu\n", off, len, n, want); frag_ok = false; }
+                }
+            }
+            CHECK(frag_ok, "ranged reads are exact across the extents of a fragmented file");
+            stellar::test_set_max_extent_sectors(0);
+        }
+
+        {
+            fresh_fs(4096);
+            static u8 blob[20000], sink[20000];
+            for (u64 i = 0; i < sizeof(blob); ++i) blob[i] = static_cast<u8>(i * 17 + 1);
+            u64 f = stellar::create_file(ROOT, "dmg", blob, sizeof(blob));
+            CHECK(stellar::mount(), "remount to clear the sector cache");
+            u64 first = 0;
+            for (u64 sec = 2; sec < g_sectors && !first; ++sec)
+                if (mem::compare(g_disk + sec * 512, blob, 512) == 0) first = sec;
+            CHECK(first != 0, "locate the extent");
+            g_disk[(first + 9) * 512 + 3] ^= 0x20;
+            CHECK(stellar::mount(), "remount with a damaged block");
+            Status why = Status::Internal;
+            CHECK(stellar::read_range(f, 0, sink, 4096, stellar::LIVE, &why) == 4096 && mem::compare(blob, sink, 4096) == 0, "a range inside a good block still reads");
+            CHECK(stellar::read_range(f, 4096, sink, 4096, stellar::LIVE, &why) == stellar::READ_ERROR && why == Status::Checksum, "a whole damaged block is refused");
+            CHECK(stellar::read_range(f, 4200, sink, 100, stellar::LIVE, &why) == stellar::READ_ERROR && why == Status::Checksum, "a partial read inside the damaged block is refused");
+            CHECK(stellar::read_range(f, 4000, sink, 200, stellar::LIVE, &why) == stellar::READ_ERROR && why == Status::Checksum, "a range straddling into the damaged block is refused");
+            CHECK(stellar::read_range(f, 12288, sink, 7712, stellar::LIVE, &why) == 7712 && mem::compare(blob + 12288, sink, 7712) == 0, "blocks after the damage read normally");
+        }
+
+        fresh_fs();
+    }
+
     printf(g_fail ? "\n%d FAILURE(S)\n" : "\nall stellar host tests passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -414,6 +414,14 @@ static Status make_open_file(OpenFile* out, Realm* realm, Node node, u32 flags, 
     f.flags = flags;
     if (truncate) {
         f.dirty = true;
+    } else if (!write && !binfo.dynamic && realm->ranged()) {
+        u64 version = 0;
+        u64 unused = 0;
+        Status st = realm->read_range(node, 0, nullptr, 0, &unused, &version);
+        if (st != Status::Ok) return st;
+        f.ranged = true;
+        f.version = version;
+        f.size = binfo.size;
     } else if (binfo.size > 0 || binfo.dynamic) {
         u8* buf = nullptr;
         u64 got = 0;
@@ -486,6 +494,7 @@ Status file_read(OpenFile& f, u64 offset, void* buf, u64 length, u64* got) {
     if (offset >= f.size || length == 0) return Status::Ok;
     u64 n = f.size - offset;
     if (n > length) n = length;
+    if (f.ranged) return f.realm->read_range(f.node, offset, buf, n, got, &f.version);
     mem::copy(buf, f.data + offset, static_cast<usize>(n));
     *got = n;
     return Status::Ok;

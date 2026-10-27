@@ -547,6 +547,92 @@ static void test_no_space_cleanup() {
     CHECK(stellar::check(&(*new (malloc(sizeof(stellar::CheckReport))) stellar::CheckReport{}), true), "volume still consistent");
 }
 
+static void test_ranged_reads() {
+    printf("-- ranged reads\n");
+    free(g_disk);
+    g_sectors = 32768;
+    g_disk = static_cast<u8*>(calloc(g_sectors, 512));
+    stellar::init(0);
+    CHECK(stellar::format(g_sectors), "format for ranged reads");
+    nebula::disk_set_mounted(true);
+    nebula::Session s;
+    nebula::init_session(s, "disk");
+
+    const u64 size = 3 * 1024 * 1024 + 777;
+    u8* data = static_cast<u8*>(malloc(size));
+    for (u64 i = 0; i < size; ++i) data[i] = static_cast<u8>(i * 31 + (i >> 12));
+    CHECK_ST(nebula::write_file(s, "big", data, size), Status::Ok, "write a multi-megabyte file");
+
+    nebula::Handle h;
+    CHECK_ST(nebula::open(s, "big", nebula::OPEN_READ, &h), Status::Ok, "open it read-only");
+    u8* back = static_cast<u8*>(malloc(size));
+    u64 got = 0;
+    CHECK_ST(nebula::read_at(s, h, 0, back, 100, &got), Status::Ok, "read the first bytes");
+    CHECK(got == 100 && __builtin_memcmp(back, data, 100) == 0, "first bytes match");
+    got = 0;
+    CHECK_ST(nebula::read_at(s, h, 1500000, back, 70000, &got), Status::Ok, "read from the middle");
+    CHECK(got == 70000 && __builtin_memcmp(back, data + 1500000, 70000) == 0, "middle bytes match");
+    got = 0;
+    CHECK_ST(nebula::read_at(s, h, size - 50, back, 4096, &got), Status::Ok, "read across the end");
+    CHECK(got == 50 && __builtin_memcmp(back, data + size - 50, 50) == 0, "the read stops at the end of the file");
+    got = 99;
+    CHECK_ST(nebula::read_at(s, h, size + 5, back, 10, &got), Status::Ok, "read past the end");
+    CHECK(got == 0, "nothing comes back past the end");
+    u64 sz = 0;
+    CHECK_ST(nebula::size_of(s, h, &sz), Status::Ok, "size of the handle");
+    CHECK(sz == size, "the handle knows the size without loading the file");
+
+    u8* whole = back;
+    got = 0;
+    CHECK_ST(nebula::read_at(s, h, 0, whole, size, &got), Status::Ok, "read the whole file through the handle");
+    CHECK(got == size && __builtin_memcmp(whole, data, size) == 0, "whole-file contents match");
+
+    nebula::Handle h2;
+    CHECK_ST(nebula::open(s, "big", nebula::OPEN_READ, &h2), Status::Ok, "a second reader opens too");
+    got = 0;
+    CHECK_ST(nebula::read_at(s, h2, 4096, back, 8192, &got), Status::Ok, "and reads independently");
+    CHECK(got == 8192 && __builtin_memcmp(back, data + 4096, 8192) == 0, "second reader contents match");
+
+    u8* other = static_cast<u8*>(malloc(size));
+    for (u64 i = 0; i < size; ++i) other[i] = static_cast<u8>(i * 7 + 3);
+    CHECK_ST(nebula::write_file(s, "big", other, size), Status::Ok, "the file is rewritten while readers are open");
+    got = 0;
+    Status st = nebula::read_at(s, h, 0, back, 100, &got);
+    CHECK(st == Status::Busy, "an open ranged reader is told the file changed instead of getting mixed bytes");
+    CHECK_ST(nebula::close(s, h), Status::Ok, "close the first reader");
+    CHECK_ST(nebula::close(s, h2), Status::Ok, "close the second reader");
+
+    CHECK_ST(nebula::open(s, "big", nebula::OPEN_READ, &h), Status::Ok, "reopen after the rewrite");
+    got = 0;
+    CHECK_ST(nebula::read_at(s, h, 100000, back, 5000, &got), Status::Ok, "read the new contents");
+    CHECK(got == 5000 && __builtin_memcmp(back, other + 100000, 5000) == 0, "new contents match");
+    CHECK_ST(nebula::close(s, h), Status::Ok, "close");
+
+    nebula::Handle w;
+    CHECK_ST(nebula::open(s, "big", nebula::OPEN_READ | nebula::OPEN_WRITE, &w), Status::Ok, "a writable handle still opens");
+    got = 0;
+    CHECK_ST(nebula::read_at(s, w, 10, back, 20, &got), Status::Ok, "and reads from its own buffer");
+    CHECK(got == 20 && __builtin_memcmp(back, other + 10, 20) == 0, "writable handle contents match");
+    CHECK_ST(nebula::write_at(s, w, 10, "ranged", 6), Status::Ok, "write through it");
+    got = 0;
+    CHECK_ST(nebula::read_at(s, w, 10, back, 6, &got), Status::Ok, "read back its own write");
+    CHECK(got == 6 && __builtin_memcmp(back, "ranged", 6) == 0, "the write is visible before close");
+    CHECK_ST(nebula::close(s, w), Status::Ok, "flush on close");
+
+    nebula::Session ram;
+    nebula::init_session(ram, "ram");
+    CHECK_ST(nebula::write_file(ram, "note", "hello ranged", 12), Status::Ok, "a ram file");
+    CHECK_ST(nebula::open(ram, "note", nebula::OPEN_READ, &h), Status::Ok, "open it");
+    got = 0;
+    CHECK_ST(nebula::read_at(ram, h, 6, back, 20, &got), Status::Ok, "ram realms keep the buffered path");
+    CHECK(got == 6 && __builtin_memcmp(back, "ranged", 6) == 0, "ram contents match");
+    CHECK_ST(nebula::close(ram, h), Status::Ok, "close");
+
+    free(data);
+    free(other);
+    free(back);
+}
+
 class DynamicRealm final : public nebula::Realm {
 public:
     const char* name() const override { return "dyn"; }
@@ -636,6 +722,7 @@ int main() {
     test_limits();
     test_disk_specific();
     test_dynamic();
+    test_ranged_reads();
     test_no_space_cleanup();
 
     printf("%d checks, %d failed\n", g_checks, g_fail);

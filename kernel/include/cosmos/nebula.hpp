@@ -68,6 +68,11 @@ public:
     virtual Status list(Node dir, ChildFn fn, void* ctx) = 0;
     virtual Status read_all(Node file, void* buf, u64 capacity, u64* size) = 0;
     virtual Status write_all(Node file, const void* data, u64 size) = 0;
+    virtual bool ranged() const { return false; }
+    virtual Status read_range(Node file, u64 offset, void* buf, u64 length, u64* got, u64* version) {
+        (void)file; (void)offset; (void)buf; (void)length; (void)got; (void)version;
+        return Status::Unsupported;
+    }
     virtual Status create_file(Node dir, const char* name, Node* out) = 0;
     virtual Status make_dir(Node dir, const char* name, Node* out) = 0;
     virtual Status remove(Node dir, const char* name) = 0;
@@ -104,6 +109,8 @@ struct OpenFile {
     u64 size;
     u64 capacity;
     bool dirty;
+    bool ranged;
+    u64 version;
 };
 
 struct Session {

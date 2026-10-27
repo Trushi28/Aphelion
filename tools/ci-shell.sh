@@ -188,10 +188,9 @@ if scenario == "nodisk":
     finish(serial, monitor, "shell mode without a disk: Unicode files, pipes, realms, completion, interrupt, PS/2 and serial input, klog and reboot")
 
 if scenario == "disk-first":
-    run(serial, "ls disk:/", ".*not available", "disk: being unavailable before mkfs")
+    run(serial, "ls disk:/ | grep -c .", "0\r\n", "a blank disk being formatted and mounted at boot")
     run(serial, "mkfs", ".*usage: mkfs erase", "mkfs asking for the erase word")
-    run(serial, "mkfs erase", ".*new Stellar volume created", "mkfs erase on a blank disk")
-    run(serial, "mkfs erase", ".*refusing to erase", "mkfs refusing to erase a mounted volume")
+    run(serial, "mkfs erase", ".*refusing to erase", "mkfs refusing to erase the volume created at boot")
     run(serial, "mkdir -p disk:/proj/src", "", "mkdir on the disk")
     run(serial, "echo persisted ₹ > disk:/proj/src/main", "", "writing a file to the disk")
     run(serial, "cat disk:/proj/src/main", "persisted ₹\r\n", "reading it back")
@@ -209,7 +208,7 @@ if scenario == "disk-first":
     run(serial, "check -d", ".*volume is consistent", "a deep check")
     run(serial, "cat sys:/storage", ".*", "the storage description")
     run(serial, "sync", "", "sync")
-    finish(serial, monitor, "shell mode on a blank disk: mkfs erase, disk and snapshot realms, deep check")
+    finish(serial, monitor, "shell mode on a blank disk formatted at boot: disk and snapshot realms, deep check")
 
 if scenario == "disk-second":
     run(serial, "cat disk:/proj/src/main", "changed\r\n", "the file written in the previous boot")

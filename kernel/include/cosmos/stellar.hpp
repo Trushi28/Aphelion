@@ -63,6 +63,7 @@ u64 create_file(u64 parent, const char* name, const void* data, u64 size, Status
 u64 create_constellation(u64 parent, const char* name, Status* why = nullptr);
 
 u64 read_file(u64 star, void* buf, u64 max_size, u64 snap = LIVE, Status* why = nullptr);
+u64 read_range(u64 star, u64 offset, void* buf, u64 length, u64 snap = LIVE, Status* why = nullptr, u64* version = nullptr);
 u64 find(u64 dir_star, const char* name, u64 snap = LIVE, Status* why = nullptr);
 u64 resolve(const char* path, u64 snap = LIVE, Status* why = nullptr);
 u64 resolve_parent(const char* path, char* leaf, u64 leaf_size, u64 snap = LIVE, Status* why = nullptr);

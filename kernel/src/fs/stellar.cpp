@@ -3065,6 +3065,110 @@ u64 read_file(u64 star, void* buf, u64 max_size, u64 snap, Status* why) {
     return api.val(read_file_impl(star, buf, max_size, snap));
 }
 
+static u64 entry_version(const StarEntry& e) {
+    const u64 parts[5] = { e.first_sector, e.csum_sector, e.size_bytes, e.mtime, e.gen };
+    u64 h = 0xcbf29ce484222325ull;
+    for (u64 part : parts) {
+        h ^= part;
+        h *= 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    return h ? h : 1;
+}
+
+static u64 block_length(u64 size, u64 block) {
+    u64 len = size - block * BLOCK_BYTES;
+    return len < BLOCK_BYTES ? len : BLOCK_BYTES;
+}
+
+static bool block_checksum_ok(u64 block, const u8* data, u64 len, u32 want) {
+    if (crc32_full(data, len) == want) return true;
+    serial::printf("[stellar] checksum mismatch reading block %lu of a file, refusing the data\n", block);
+    return fail(Status::Checksum);
+}
+
+static bool skip_checksums(CsumIter& it, u64 count) {
+    u32 ignored;
+    for (u64 i = 0; i < count; ++i)
+        if (!it.take(&ignored)) return false;
+    return true;
+}
+
+static u64 read_range_impl(u64 star, u64 offset, void* buf, u64 length, u64 snap, u64* version) {
+    if (!g_mounted) { fail(Status::NotMounted); return READ_ERROR; }
+    u64 root, top;
+    if (!view_open(snap, &root, &top)) return READ_ERROR;
+    if (star == ROOT_STAR) star = top;
+    StarEntry e;
+    if (!bt_search(root, star, &e)) { fail(Status::NotFound); return READ_ERROR; }
+    if (e.type == TYPE_CONSTELLATION) { fail(Status::IsADirectory); return READ_ERROR; }
+    if (e.type != TYPE_FILE) { fail(Status::NotFound); return READ_ERROR; }
+    if (version) {
+        u64 current = entry_version(e);
+        if (*version == 0) {
+            *version = current;
+        } else if (*version != current) {
+            fail(Status::Busy);
+            return READ_ERROR;
+        }
+    }
+    const u64 size = e.size_bytes;
+    if (offset >= size || length == 0) return 0;
+    u64 total = size - offset;
+    if (total > length) total = length;
+    if (!ensure_scratch()) return READ_ERROR;
+
+    u8* dst = static_cast<u8*>(buf);
+    u64 pos = offset;
+    u64 remaining = total;
+    while (remaining > 0) {
+        const u64 block = pos / BLOCK_BYTES;
+        const u64 in_block = pos % BLOCK_BYTES;
+        const u64 this_len = block_length(size, block);
+        u8* out = dst + (pos - offset);
+        if (in_block == 0 && remaining >= this_len) {
+            u64 blocks = remaining / BLOCK_BYTES;
+            if (blocks == 0) blocks = 1;
+            u64 span = blocks * BLOCK_BYTES;
+            if (span > remaining) span = remaining;
+            ReadCtx rc{ out, span, 0, block * BLOCK_SECTORS };
+            if (!walk_extents(e, &read_visit, &rc, false)) return READ_ERROR;
+            if (rc.done < span) { fail(Status::Io); return READ_ERROR; }
+            CsumIter it;
+            it.init(e);
+            if (!skip_checksums(it, block)) return READ_ERROR;
+            for (u64 i = 0; i < blocks; ++i) {
+                u32 want;
+                if (!it.take(&want)) return READ_ERROR;
+                if (!block_checksum_ok(block + i, out + i * BLOCK_BYTES, block_length(size, block + i), want)) return READ_ERROR;
+            }
+            pos += span;
+            remaining -= span;
+        } else {
+            u64 take = BLOCK_BYTES - in_block;
+            if (take > remaining) take = remaining;
+            ReadCtx rc{ g_verify_scratch, this_len, 0, block * BLOCK_SECTORS };
+            if (!walk_extents(e, &read_visit, &rc, false)) return READ_ERROR;
+            if (rc.done < this_len) { fail(Status::Io); return READ_ERROR; }
+            CsumIter it;
+            it.init(e);
+            if (!skip_checksums(it, block)) return READ_ERROR;
+            u32 want;
+            if (!it.take(&want)) return READ_ERROR;
+            if (!block_checksum_ok(block, g_verify_scratch, this_len, want)) return READ_ERROR;
+            mem::copy(out, g_verify_scratch + in_block, take);
+            pos += take;
+            remaining -= take;
+        }
+    }
+    return total;
+}
+
+u64 read_range(u64 star, u64 offset, void* buf, u64 length, u64 snap, Status* why, u64* version) {
+    Api api(why);
+    return api.val(read_range_impl(star, offset, buf, length, snap, version));
+}
+
 static u64 find_impl(u64 dir_star, const char* name, u64 snap) {
     if (!g_mounted) return fail_id(Status::NotMounted);
     if (!valid_name(name)) return fail_id(Status::InvalidName);

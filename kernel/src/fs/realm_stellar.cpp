@@ -67,6 +67,16 @@ public:
         return Status::Ok;
     }
 
+    bool ranged() const override { return true; }
+
+    Status read_range(Node file, u64 offset, void* buf, u64 length, u64* got, u64* version) override {
+        stellar::Status why = stellar::Status::Ok;
+        u64 n = stellar::read_range(file.id, offset, buf, length, stellar::LIVE, &why, version);
+        if (n == stellar::READ_ERROR) return status_from_stellar(why);
+        *got = n;
+        return Status::Ok;
+    }
+
     Status write_all(Node file, const void* data, u64 size) override {
         stellar::Status why = stellar::Status::Ok;
         u64 r = stellar::write_file(file.id, data, size, &why);
@@ -196,6 +206,17 @@ public:
         u64 n = stellar::read_file(file.id, buf, capacity, file.scope, &why);
         if (n == stellar::READ_ERROR) return status_from_stellar(why);
         *size = n;
+        return Status::Ok;
+    }
+
+    bool ranged() const override { return true; }
+
+    Status read_range(Node file, u64 offset, void* buf, u64 length, u64* got, u64* version) override {
+        if (is_index(file)) return Status::IsADirectory;
+        stellar::Status why = stellar::Status::Ok;
+        u64 n = stellar::read_range(file.id, offset, buf, length, file.scope, &why, version);
+        if (n == stellar::READ_ERROR) return status_from_stellar(why);
+        *got = n;
         return Status::Ok;
     }
 

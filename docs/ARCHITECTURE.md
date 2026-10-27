@@ -225,7 +225,7 @@ seconds, so an ISO written to a stick never initialises an AHCI, NVMe or virtio 
 window described below. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` override either
 profile. `make test-iso` builds `build/aphelion-test.iso`, the same menu with the test entry preselected, and CI builds that image with `MENU_TIMEOUT=0` for the boot and crash-fuzz jobs. In shell mode `kernel_main` skips the demo Satellites, the stress
 workers, the filesystem test suite and the scheduler self-test, keeps the bootloader-memory reclaim task and starts
-Helm. The disk is mounted when it already holds a Stellar volume and is never formatted unless the user runs `mkfs erase`.
+Helm. The disk is mounted when it already holds a Stellar volume. A completely blank disk (its first 64 sectors are all zero) is formatted automatically on a shell boot; a disk that holds anything else is never touched unless the user runs `mkfs erase`, and the USB window is never formatted without `storage init erase`.
 
 The APIC timer is calibrated against the first working reference of HPET, ACPI PM timer (3.579545 MHz, 24 or 32
 bit as the FADT says) and the PIT, with a TSC-based timeout on every wait so a reference that does not count can no
@@ -317,9 +317,13 @@ Stellar. `snap` exposes Stellar snapshots read-only as `snap:/<id>/...` by mappi
 `sys` renders each file on demand from live kernel state and is read-only; its files have no fixed size, so reads
 accept a short or long answer and writers are refused.
 
-Stellar moves whole files, so partial I/O is layered on top. A session owns up to 16 generation-checked handles; an
-open file is read into a heap buffer (at most 16 MiB), `read_at`, `write_at`, `append` and `resize` act on that
-buffer, and `sync`, `close` or `close_session` write it back with one Stellar call. A registry of 64 slots keeps one
+Stellar writes whole files, so partial writes are layered on top. A session owns up to 16 generation-checked handles.
+A writable handle reads the file into a heap buffer (at most 16 MiB); `write_at`, `append` and `resize` act on that
+buffer, and `sync`, `close` or `close_session` write it back with one Stellar call. A read-only handle on the disk or
+snap realm keeps no buffer: `stellar::read_range` reads just the requested blocks and verifies each one against its
+CRC32, and a version token taken at open time makes a read fail with `Busy` once the file has been rewritten, instead
+of mixing old and new bytes. Lens reopens the handle on that `Busy` and retries once. Partial writes stay whole-file
+because Stellar extents are not shared or reference-counted between versions of a file. A registry of 64 slots keeps one
 writer per file. Cross-realm `cp` and `mv` copy the file or tree and, for `mv`, remove the source afterwards;
 trees deeper than 16 levels are refused. Nothing about Stellar's semantics changed; the only addition is
 `stellar::snapshot_ids`, which lists live snapshot ids.

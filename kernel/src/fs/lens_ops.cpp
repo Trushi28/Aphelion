@@ -109,6 +109,11 @@ Result<usize> read(Domain& d, Lens l, u64 offset, Bytes dst) {
     if (st != Status::Ok) return Result<usize>::fail(st);
     u64 got = 0;
     st = from_nebula(nebula::file_read(s->buffer, offset, dst.ptr, dst.len, &got));
+    if (st == Status::Busy && s->buffer.ranged) {
+        (void)nebula::file_close(s->buffer);
+        st = ensure_buffer(s, false);
+        if (st == Status::Ok) st = from_nebula(nebula::file_read(s->buffer, offset, dst.ptr, dst.len, &got));
+    }
     if (st != Status::Ok) return Result<usize>::fail(st);
     return Result<usize>::success(static_cast<usize>(got));
 }
