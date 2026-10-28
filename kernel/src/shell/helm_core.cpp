@@ -1,4 +1,4 @@
-#include <cosmos/helm.hpp>
+#include <cosmos/helm_rows.hpp>
 #include <cosmos/kheap.hpp>
 #include <cosmos/civil.hpp>
 
@@ -117,23 +117,21 @@ bool expand_word(Shell& sh, const char* raw, char* out, u32 cap) {
         name[k] = 0;
         char tmp[nebula::path::TEXT_MAX];
         const char* value = nullptr;
-        if (same(name, "?")) {
+        if (same(name, "status")) {
             u32 t = 0;
             int v = sh.status;
             char d[12];
             u32 dl = 0;
-            if (v == 0) d[dl++] = '0';
+            if (v <= 0) d[dl++] = '0';
             while (v > 0) { d[dl++] = static_cast<char>('0' + v % 10); v /= 10; }
             while (dl) tmp[t++] = d[--dl];
             tmp[t] = 0;
             value = tmp;
+        } else if (same(name, "here")) {
+            lens::text::location_text(sh.cursor, tmp, sizeof(tmp));
+            value = tmp;
         } else if ((value = var_get(sh, name)) == nullptr) {
-            if (same(name, "cwd")) {
-                lens::text::location_text(sh.cursor, tmp, sizeof(tmp));
-                value = tmp;
-            } else {
-                value = "";
-            }
+            value = "";
         }
         for (u32 v = 0; value[v]; ++v)
             if (!emit(value[v])) return false;
@@ -187,22 +185,177 @@ nebula::Status glob_expand(Shell& sh, const char* pattern, ArgSet& args, Io* io,
     return result;
 }
 
-bool expand_stage(Shell& sh, const parse::Parsed& p, u32 stage, ArgSet& args, Writer& err) {
-    args.used = 0;
-    args.argc = 0;
-    for (u32 i = 0; i < p.word_count; ++i) {
-        const parse::Word& w = p.words[i];
-        if (w.stage != stage || w.role != parse::Role::Arg) continue;
-        char buf[nebula::path::TEXT_MAX + 64];
-        if (!expand_word(sh, p.text(w), buf, sizeof(buf))) {
-            err.rgb(palette::SAND);
-            err.str("  word is too long after expansion\n");
-            err.reset();
+constexpr u32 MAX_NAMED = 8;
+
+struct Expanded {
+    ArgSet args;
+    Named named[MAX_NAMED];
+    u32 named_count;
+    const Command* cmd;
+};
+
+bool has_key(const char* keys, const char* key, u32 klen) {
+    const char* p = keys;
+    while (*p) {
+        const char* e = p;
+        while (*e && *e != ' ') ++e;
+        if (static_cast<u32>(e - p) == klen && mem::compare(p, key, klen) == 0) return true;
+        p = *e ? e + 1 : e;
+    }
+    return false;
+}
+
+bool is_key_word(const char* raw, u32 len) {
+    if (len < 2 || raw[len - 1] != ':') return false;
+    if (raw[0] < 'a' || raw[0] > 'z') return false;
+    for (u32 i = 0; i + 1 < len; ++i) {
+        char c = raw[i];
+        if (!((c >= 'a' && c <= 'z') || c == '-')) return false;
+    }
+    return true;
+}
+
+void warn(Writer& err, const char* a, const char* b = nullptr, const char* c = nullptr, const char* d = nullptr) {
+    err.rgb(palette::SAND);
+    err.str("  ");
+    err.str(a);
+    if (b) err.str(b);
+    if (c) err.str(c);
+    if (d) err.str(d);
+    err.str("\n");
+    err.reset();
+}
+
+char* arena_put(ArgSet& a, const char* text, u32 len) {
+    if (a.used + len + 1 > ARENA_BYTES) return nullptr;
+    char* dst = a.arena + a.used;
+    mem::copy(dst, text, len);
+    dst[len] = 0;
+    a.used += len + 1;
+    return dst;
+}
+
+void list_keys(const char* keys, char* out, u32 cap) {
+    u32 n = 0;
+    const char* p = keys;
+    while (*p && n + 2 < cap) {
+        while (*p && *p != ' ' && n + 2 < cap) out[n++] = *p++;
+        out[n++] = ':';
+        if (*p == ' ') { out[n++] = ' '; ++p; }
+    }
+    out[n] = 0;
+}
+
+bool expand_stage(Shell& sh, const parse::Parsed& p, u32 stage, Expanded& ex, Writer& err, int* status) {
+    ex.args.used = 0;
+    ex.args.argc = 0;
+    ex.named_count = 0;
+    ex.cmd = nullptr;
+    *status = 1;
+    u32 total = p.stages[stage].args;
+    u32 first = 0;
+    for (u32 i = 0; i < p.word_count; ++i)
+        if (p.words[i].stage == stage) { first = i; break; }
+
+    char buf[nebula::path::TEXT_MAX + 64];
+    if (!expand_word(sh, p.text(p.words[first]), buf, sizeof(buf))) {
+        warn(err, "word is too long after expansion");
+        return false;
+    }
+    if (has_marks(buf)) {
+        warn(err, "a command name cannot contain wildcards");
+        return false;
+    }
+    const Command* cmd = find_command(buf);
+    if (!cmd) {
+        err.rgb(palette::SAND);
+        err.str("  unknown command: ");
+        err.str(buf);
+        err.reset();
+        err.str("\n  try ");
+        err.rgb(palette::ICE);
+        err.str("help");
+        err.reset();
+        err.put('\n');
+        *status = 127;
+        return false;
+    }
+    ex.cmd = cmd;
+    if (!add_arg(ex.args, buf, length(buf))) {
+        warn(err, "too many or too long arguments");
+        return false;
+    }
+
+    for (u32 k = 1; k < total; ++k) {
+        const parse::Word& w = p.words[first + k];
+        const char* raw = p.text(w);
+        if (!w.quoted && is_key_word(raw, w.len)) {
+            u32 klen = w.len - 1;
+            char key[VAR_NAME + 8];
+            if (klen < sizeof(key)) {
+                mem::copy(key, raw, klen);
+                key[klen] = 0;
+            }
+            if (klen < sizeof(key) && has_key(cmd->keys, raw, klen)) {
+                if (k + 1 >= total) {
+                    warn(err, raw, " needs a value");
+                    return false;
+                }
+                for (u32 n = 0; n < ex.named_count; ++n) {
+                    if (same(ex.named[n].key, key)) {
+                        warn(err, raw, " was given twice");
+                        return false;
+                    }
+                }
+                if (ex.named_count >= MAX_NAMED) {
+                    warn(err, "too many options");
+                    return false;
+                }
+                const parse::Word& vw = p.words[first + k + 1];
+                char vbuf[nebula::path::TEXT_MAX + 64];
+                if (!expand_word(sh, p.text(vw), vbuf, sizeof(vbuf))) {
+                    warn(err, "word is too long after expansion");
+                    return false;
+                }
+                strip_marks(vbuf);
+                char* kp = arena_put(ex.args, key, klen);
+                char* vp = arena_put(ex.args, vbuf, length(vbuf));
+                if (!kp || !vp) {
+                    warn(err, "too many or too long arguments");
+                    return false;
+                }
+                ex.named[ex.named_count++] = Named{kp, vp};
+                ++k;
+                continue;
+            }
+            if (klen < sizeof(key) && !nebula::find_realm(key)) {
+                char known[160];
+                list_keys(cmd->keys, known, sizeof(known));
+                err.rgb(palette::SAND);
+                err.str("  ");
+                err.str(cmd->name);
+                err.str(" does not take the option ");
+                err.str(raw);
+                if (known[0]) { err.str("; its options: "); err.str(known); }
+                else err.str("; it takes none");
+                err.str(" (quote the word to use it as plain text)\n");
+                err.reset();
+                return false;
+            }
+        }
+        if (!expand_word(sh, raw, buf, sizeof(buf))) {
+            warn(err, "word is too long after expansion");
             return false;
         }
-        if (has_marks(buf)) {
+        if (cmd->flags & CMD_LITERAL) {
+            strip_marks(buf);
+            if (!add_arg(ex.args, buf, length(buf))) {
+                warn(err, "too many or too long arguments");
+                return false;
+            }
+        } else if (has_marks(buf)) {
             bool none = false;
-            nebula::Status st = glob_expand(sh, buf, args, nullptr, &none);
+            nebula::Status st = glob_expand(sh, buf, ex.args, nullptr, &none);
             if (st != nebula::Status::Ok || none) {
                 char shown[nebula::path::TEXT_MAX + 64];
                 mem::copy(shown, buf, length(buf) + 1);
@@ -210,168 +363,148 @@ bool expand_stage(Shell& sh, const parse::Parsed& p, u32 stage, ArgSet& args, Wr
                 err.rgb(palette::SAND);
                 if (st == nebula::Status::InvalidPath) err.str("  wildcards are only allowed in the last path component: ");
                 else if (none) err.str("  no match: ");
-                else { err.str("  cannot expand "); }
+                else err.str("  cannot expand ");
                 err.str(shown);
                 if (!none && st != nebula::Status::InvalidPath) { err.str(": "); err.str(nebula::status_text(st)); }
                 err.str("\n");
                 err.reset();
                 return false;
             }
-        } else if (!add_arg(args, buf, length(buf))) {
-            err.rgb(palette::SAND);
-            err.str("  too many or too long arguments\n");
-            err.reset();
+        } else if (!add_arg(ex.args, buf, length(buf))) {
+            warn(err, "too many or too long arguments");
             return false;
         }
     }
     return true;
 }
 
-const parse::Word* find_redirect(const parse::Parsed& p, u32 stage, bool input) {
-    for (u32 i = 0; i < p.word_count; ++i) {
-        const parse::Word& w = p.words[i];
-        if (w.stage != stage) continue;
-        if (input && w.role == parse::Role::In) return &w;
-        if (!input && (w.role == parse::Role::Out || w.role == parse::Role::Append)) return &w;
-    }
-    return nullptr;
+struct Flow {
+    enum Kind : u8 { None, Bytes, Rows };
+    Kind kind;
+    Capture bytes;
+    rows::Table table;
+};
+
+void flow_init(Flow& f) {
+    f.kind = Flow::None;
+    f.bytes = Capture{};
+    rows::begin(f.table);
 }
 
-bool redirect_target(Shell& sh, const parse::Parsed& p, const parse::Word& w, char* out, u32 cap, Writer& err) {
-    if (!expand_word(sh, p.text(w), out, cap)) {
-        err.rgb(palette::SAND);
-        err.str("  redirection target is too long\n");
-        err.reset();
-        return false;
-    }
-    if (has_marks(out)) {
-        err.rgb(palette::SAND);
-        err.str("  wildcards are not allowed in redirection targets\n");
-        err.reset();
-        return false;
-    }
-    return true;
+void flow_clear(Flow& f) {
+    capture_free(f.bytes);
+    rows::release(f.table);
+    f.kind = Flow::None;
 }
 
 int run_pipe(Shell& sh, Work& w, const parse::Pipe& pipe) {
-    Capture carry{};
-    bool have_carry = false;
+    Flow carry;
+    flow_init(carry);
     int status = 0;
     Writer err(sh.terminal, sh.color, true);
 
     for (u32 k = 0; k < pipe.stage_count; ++k) {
         u32 stage = pipe.first_stage + k;
         bool last = k + 1 == pipe.stage_count;
-        ArgSet args{w.arena, 0, w.argv, 0};
-        if (!expand_stage(sh, w.parsed, stage, args, err)) { status = 1; break; }
-        if (args.argc == 0) { status = 1; break; }
-        const Command* cmd = find_command(args.argv[0]);
-        if (!cmd) {
-            err.rgb(palette::SAND);
-            err.str("  unknown command: ");
-            err.str(args.argv[0]);
-            err.reset();
-            err.str("\n  try ");
-            err.rgb(palette::ICE);
-            err.str("help");
-            err.reset();
-            err.put('\n');
-            status = 127;
-            break;
-        }
+        Expanded ex{};
+        ex.args = ArgSet{w.arena, 0, w.argv, 0};
+        int failed = 1;
+        if (!expand_stage(sh, w.parsed, stage, ex, err, &failed)) { status = failed; break; }
+        const Command* cmd = ex.cmd;
 
-        nebula::Blob in_blob{};
+        Capture flat{};
+        rows::Table from_bytes;
+        rows::begin(from_bytes);
         const u8* in_ptr = nullptr;
         u64 in_size = 0;
         bool has_in = false;
-        char target[nebula::path::TEXT_MAX + 64];
-        if (const parse::Word* in_word = find_redirect(w.parsed, stage, true)) {
-            if (!redirect_target(sh, w.parsed, *in_word, target, sizeof(target), err)) { status = 1; break; }
-            nebula::Status st = lens::text::read_file(sh.cursor, target, &in_blob);
-            if (st != nebula::Status::Ok) {
-                err.rgb(palette::SAND);
-                err.str("  cannot read ");
-                err.str(target);
-                err.str(": ");
-                err.str(nebula::status_text(st));
-                err.str("\n");
-                err.reset();
-                status = 1;
-                break;
+        const rows::Table* in_rows = nullptr;
+        bool input_failed = false;
+        if (carry.kind == Flow::Rows) {
+            if (cmd->flags & (CMD_ROWS | CMD_ANY)) {
+                in_rows = &carry.table;
+            } else {
+                {
+                    Writer fw(Sink{&capture_write, &flat}, false, false);
+                    rows::flatten(fw, carry.table);
+                }
+                if (flat.overflow) {
+                    warn(err, "pipe buffer exceeded 8 MiB (or memory ran out)");
+                    input_failed = true;
+                } else {
+                    in_ptr = flat.data;
+                    in_size = flat.size;
+                    has_in = true;
+                }
             }
-            in_ptr = in_blob.data;
-            in_size = in_blob.size;
-            has_in = true;
-        } else if (have_carry) {
-            in_ptr = carry.data;
-            in_size = carry.size;
-            has_in = true;
+        } else if (carry.kind == Flow::Bytes) {
+            if (cmd->flags & CMD_ROWS) {
+                if (!rows::from_text(from_bytes, carry.bytes.data, carry.bytes.size)) {
+                    warn(err, "too many lines or out of memory");
+                    input_failed = true;
+                } else {
+                    in_rows = &from_bytes;
+                }
+            } else {
+                in_ptr = carry.bytes.data;
+                in_size = carry.bytes.size;
+                has_in = true;
+            }
         }
-
-        const parse::Word* out_word = find_redirect(w.parsed, stage, false);
-        char out_target[nebula::path::TEXT_MAX + 64];
-        if (out_word && !redirect_target(sh, w.parsed, *out_word, out_target, sizeof(out_target), err)) {
-            nebula::release(in_blob);
+        if (input_failed) {
+            capture_free(flat);
+            rows::release(from_bytes);
             status = 1;
             break;
         }
-        bool to_terminal = last && !out_word;
+
+        rows::Table produced;
+        rows::begin(produced);
         Capture cap{};
         {
-            Sink s = to_terminal ? sh.terminal : Sink{&capture_write, &cap};
-            Writer out(s, to_terminal && sh.color, to_terminal);
-            Io io{out, err, in_ptr, in_size, has_in};
-            status = cmd->fn(sh, io, args.argc, args.argv);
+            Sink s = last ? sh.terminal : Sink{&capture_write, &cap};
+            Writer out(s, last && sh.color, last);
+            Io io{out, err, in_ptr, in_size, has_in, in_rows, &produced, ex.named, ex.named_count};
+            status = cmd->fn(sh, io, ex.args.argc, ex.args.argv);
         }
-        nebula::release(in_blob);
-        if (have_carry) { capture_free(carry); have_carry = false; }
+        err.flush();
+        capture_free(flat);
+        rows::release(from_bytes);
+        flow_clear(carry);
 
         if (sh.aborted) {
             capture_free(cap);
-            err.rgb(palette::SAND);
-            err.str("  interrupted\n");
-            err.reset();
+            rows::release(produced);
+            warn(err, "interrupted");
             status = 130;
             break;
         }
-        if (out_word) {
-            if (cap.overflow) {
-                err.rgb(palette::SAND);
-                err.str("  output is larger than 8 MiB (or memory ran out); nothing was written to ");
-                err.str(out_target);
-                err.str("\n");
-                err.reset();
-                status = 1;
-            } else {
-                nebula::Status st = out_word->role == parse::Role::Append
-                    ? lens::text::append_file(sh.cursor, out_target, cap.data, cap.size)
-                    : lens::text::write_file(sh.cursor, out_target, cap.data, cap.size);
-                if (st != nebula::Status::Ok) {
-                    err.rgb(palette::SAND);
-                    err.str("  cannot write ");
-                    err.str(out_target);
-                    err.str(": ");
-                    err.str(nebula::status_text(st));
-                    err.str("\n");
-                    err.reset();
-                    status = 1;
-                }
+        bool have_rows = produced.cols > 0 && !produced.failed;
+        if (last) {
+            if (have_rows) {
+                Writer shown(sh.terminal, sh.color, true);
+                rows::render(shown, produced);
             }
             capture_free(cap);
-        } else if (!last) {
+            rows::release(produced);
+        } else if (have_rows) {
+            carry.table = produced;
+            carry.kind = Flow::Rows;
+            rows::begin(produced);
+            capture_free(cap);
+        } else {
+            rows::release(produced);
             if (cap.overflow) {
                 capture_free(cap);
-                err.rgb(palette::SAND);
-                err.str("  pipe buffer exceeded 8 MiB (or memory ran out)\n");
-                err.reset();
+                warn(err, "pipe buffer exceeded 8 MiB (or memory ran out)");
                 status = 1;
                 break;
             }
-            carry = cap;
-            have_carry = true;
+            carry.bytes = cap;
+            carry.kind = Flow::Bytes;
         }
     }
-    if (have_carry) capture_free(carry);
+    flow_clear(carry);
     return status;
 }
 
@@ -411,9 +544,11 @@ const char* var_get(const Shell& sh, const char* name) {
     return nullptr;
 }
 
+bool var_reserved(const char* name) { return same(name, "status") || same(name, "here"); }
+
 bool var_set(Shell& sh, const char* name, const char* value) {
     u32 nl = length(name);
-    if (nl == 0 || nl >= VAR_NAME || length(value) >= VAR_VALUE) return false;
+    if (nl == 0 || nl >= VAR_NAME || length(value) >= VAR_VALUE || var_reserved(name)) return false;
     if (name[0] >= '0' && name[0] <= '9') return false;
     for (u32 i = 0; i < nl; ++i) {
         char c = name[i];
@@ -463,47 +598,53 @@ void mark_wildcards(const char* in, char* out, u32 cap) {
     out[n] = 0;
 }
 
-Options options_begin(u32 argc, char** argv) { return Options{argc, argv, 1, 0, nullptr, 0}; }
+const char* opt(const Io& io, const char* key) {
+    for (u32 i = 0; i < io.named_count; ++i)
+        if (same(io.named[i].key, key)) return io.named[i].value;
+    return nullptr;
+}
 
-int next_option(Options& o, const char* flags, const char* valued) {
-    auto in_set = [](const char* set, char c) {
-        for (; *set; ++set)
-            if (*set == c) return true;
+Flag opt_flag(const Io& io, const char* key) {
+    const char* v = opt(io, key);
+    if (!v) return Flag::Absent;
+    u64 parsed = 0;
+    if (!rows::parse_value(rows::Kind::Flag, v, &parsed)) return Flag::Bad;
+    return parsed ? Flag::Yes : Flag::No;
+}
+
+bool opt_yes(const Io& io, const char* key) { return opt_flag(io, key) == Flag::Yes; }
+
+bool opt_u64(const Io& io, const char* key, u64* out) {
+    const char* v = opt(io, key);
+    return v && parse_u64(v, out);
+}
+
+bool opt_bool(Io& io, const char* key, bool* out) {
+    Flag f = opt_flag(io, key);
+    if (f == Flag::Bad) {
+        io.err.rgb(palette::SAND);
+        io.err.str("  ");
+        io.err.str(key);
+        io.err.str(": takes yes or no\n");
+        io.err.reset();
         return false;
-    };
-    if (o.pos == 0) {
-        if (o.index >= o.argc) return -1;
-        const char* arg = o.argv[o.index];
-        if (arg[0] != '-' || arg[1] == 0) return -1;
-        if (arg[1] == '-' && arg[2] == 0) { ++o.index; return -1; }
-        o.pos = 1;
     }
-    const char* arg = o.argv[o.index];
-    char c = arg[o.pos++];
-    o.value = nullptr;
-    if (in_set(valued, c)) {
-        if (arg[o.pos]) {
-            o.value = arg + o.pos;
-        } else if (o.index + 1 < o.argc) {
-            o.value = o.argv[o.index + 1];
-            ++o.index;
-        } else {
-            o.bad = c;
-            ++o.index;
-            o.pos = 0;
-            return ':';
-        }
-        ++o.index;
-        o.pos = 0;
-        return c;
+    if (f != Flag::Absent) *out = f == Flag::Yes;
+    return true;
+}
+
+bool opt_num(Io& io, const char* key, u64* out) {
+    const char* v = opt(io, key);
+    if (!v) return true;
+    if (!parse_u64(v, out)) {
+        io.err.rgb(palette::SAND);
+        io.err.str("  ");
+        io.err.str(key);
+        io.err.str(": takes a whole number\n");
+        io.err.reset();
+        return false;
     }
-    if (in_set(flags, c)) {
-        if (!arg[o.pos]) { ++o.index; o.pos = 0; }
-        return c;
-    }
-    o.bad = c;
-    if (!arg[o.pos]) { ++o.index; o.pos = 0; }
-    return '?';
+    return true;
 }
 
 bool parse_u64(const char* s, u64* out) {
@@ -550,9 +691,28 @@ void print_status(Io& io, const char* what, const char* subject, nebula::Status 
 
 int code_of(nebula::Status st) { return st == nebula::Status::Ok ? 0 : 1; }
 
-int for_each_input(Shell& sh, Io& io, Options& o, InputFn fn, void* ctx) {
+void write_safe(Writer& w, const u8* data, u64 size) {
+    utf8::Decoder d;
+    u32 cps[2];
+    for (u64 i = 0; i < size; ++i) {
+        u32 k = d.feed(data[i], cps);
+        for (u32 j = 0; j < k; ++j) {
+            u32 cp = cps[j];
+            if (cp == '\n' || cp == '\t') w.put(static_cast<char>(cp));
+            else if (cp == '\r') { if (!(i + 1 < size && data[i + 1] == '\n')) w.cp(0x240D); }
+            else if (cp < 0x20) w.cp(0x2400 + cp);
+            else if (cp == 0x7F) w.cp(0x2421);
+            else if (cp >= 0x80 && cp < 0xA0) w.cp(utf8::REPLACEMENT);
+            else w.cp(cp);
+        }
+    }
+    u32 tail[1];
+    if (d.finish(tail)) w.cp(utf8::REPLACEMENT);
+}
+
+int for_each_input(Shell& sh, Io& io, u32 argc, char** argv, u32 first, InputFn fn, void* ctx) {
     int status = 0;
-    if (o.index >= o.argc) {
+    if (first >= argc) {
         if (!io.has_in) {
             print_error(io, "no input: name a file or pipe something in");
             return 1;
@@ -560,21 +720,21 @@ int for_each_input(Shell& sh, Io& io, Options& o, InputFn fn, void* ctx) {
         fn(nullptr, io.in, io.in_size, ctx);
         return 0;
     }
-    for (u32 i = o.index; i < o.argc; ++i) {
+    for (u32 i = first; i < argc; ++i) {
         if (sh.poll()) return 130;
-        if (same(o.argv[i], "-")) {
-            if (!io.has_in) { print_error(io, "no input on stdin"); status = 1; continue; }
+        if (same(argv[i], "-")) {
+            if (!io.has_in) { print_error(io, "no input on the pipe"); status = 1; continue; }
             fn(nullptr, io.in, io.in_size, ctx);
             continue;
         }
         nebula::Blob b;
-        nebula::Status st = lens::text::read_file(sh.cursor, o.argv[i], &b);
+        nebula::Status st = lens::text::read_file(sh.cursor, argv[i], &b);
         if (st != nebula::Status::Ok) {
-            print_status(io, "cannot read", o.argv[i], st);
+            print_status(io, "cannot read", argv[i], st);
             status = 1;
             continue;
         }
-        fn(o.argv[i], b.data, b.size, ctx);
+        fn(argv[i], b.data, b.size, ctx);
         nebula::release(b);
     }
     return status;
@@ -639,8 +799,8 @@ int run_line(Shell& sh, const char* line) {
     }
     for (u32 i = 0; i < w->parsed.pipe_count && !sh.quit; ++i) {
         const parse::Pipe& pipe = w->parsed.pipes[i];
-        if (pipe.link == parse::Link::And && sh.status != 0) continue;
-        if (pipe.link == parse::Link::Or && sh.status == 0) continue;
+        if (pipe.link == parse::Link::Then && sh.status != 0) continue;
+        if (pipe.link == parse::Link::Else && sh.status == 0) continue;
         sh.status = run_pipe(sh, *w, pipe);
         if (sh.aborted) break;
     }
@@ -687,10 +847,10 @@ bool has_prefix(const char* s, const char* prefix) {
 
 bool needs_escape(char c, char quote) {
     if (quote == '\'') return false;
-    if (quote == '"') return c == '"' || c == '\\' || c == '$';
+    if (quote == '"') return c == '"' || c == '\\' || c == '@';
     switch (c) {
-        case ' ': case '\t': case '\\': case '"': case '\'': case '$': case '#': case '*': case '?':
-        case ';': case '|': case '&': case '<': case '>':
+        case ' ': case '\t': case '\\': case '"': case '\'': case '@': case '#': case '*': case '?':
+        case ';': case '|':
             return true;
         default:
             return false;
@@ -722,8 +882,14 @@ bool complete(Shell& sh, const char* line, u32 cursor, Completion* out) {
             word_start = i + 1;
             continue;
         }
-        if (c == ';' || c == '|' || c == '&') { cmd_pos = true; in_word = false; word_start = i + 1; continue; }
-        if (c == '<' || c == '>') { cmd_pos = false; in_word = false; word_start = i + 1; continue; }
+        if (c == ';' || c == '|') { cmd_pos = true; in_word = false; word_start = i + 1; continue; }
+        if (!in_word && (c == '=' || c == '!') && i + 2 <= cursor && line[i + 1] == '>' &&
+            (i + 2 == cursor || line[i + 2] == ' ' || line[i + 2] == '\t')) {
+            cmd_pos = true;
+            word_start = i + 2;
+            ++i;
+            continue;
+        }
         in_word = true;
     }
     if (!in_word) word_start = cursor;

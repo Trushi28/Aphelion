@@ -2,14 +2,22 @@
 
 extern "C" void* memset(void* dst, int v, usize n) {
     void* d = dst;
-    asm volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(static_cast<u8>(v)) : "memory");
+    u8 byte = static_cast<u8>(v);
+    u64 pattern = static_cast<u64>(byte) * 0x0101010101010101ull;
+    u64 quads = n >> 3;
+    u64 rest = n & 7;
+    asm volatile("rep stosq" : "+D"(d), "+c"(quads) : "a"(pattern) : "memory");
+    asm volatile("rep stosb" : "+D"(d), "+c"(rest) : "a"(byte) : "memory");
     return dst;
 }
 
 extern "C" void* memcpy(void* dst, const void* src, usize n) {
     void* d = dst;
     const void* s = src;
-    asm volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) :: "memory");
+    u64 quads = n >> 3;
+    u64 rest = n & 7;
+    asm volatile("rep movsq" : "+D"(d), "+S"(s), "+c"(quads) :: "memory");
+    asm volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(rest) :: "memory");
     return dst;
 }
 
@@ -19,7 +27,10 @@ extern "C" void* memmove(void* dst, const void* src, usize n) {
     if (d < s) {
         void* dd = d;
         const void* ss = s;
-        asm volatile("rep movsb" : "+D"(dd), "+S"(ss), "+c"(n) :: "memory");
+        u64 quads = n >> 3;
+        u64 rest = n & 7;
+        asm volatile("rep movsq" : "+D"(dd), "+S"(ss), "+c"(quads) :: "memory");
+        asm volatile("rep movsb" : "+D"(dd), "+S"(ss), "+c"(rest) :: "memory");
     } else {
         for (usize i = n; i-- > 0;) d[i] = s[i];
     }

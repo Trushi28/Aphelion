@@ -1,4 +1,4 @@
-#include <cosmos/helm.hpp>
+#include <cosmos/helm_rows.hpp>
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/xhci.hpp>
@@ -141,7 +141,7 @@ void print_about(Writer& w) {
     }
 
     power::Capabilities caps = power::capabilities();
-    v[6].str("reboot ready \xC2\xB7 poweroff ");
+    v[6].str("restart ready \xC2\xB7 sunset ");
     v[6].str(caps.poweroff_supported ? "ready" : "unavailable (no ACPI S5)");
 
     u32 inner = 0;
@@ -192,7 +192,7 @@ const char* state_name(orbital::State s) {
 
 int cmd_about(Shell&, Io& io, u32, char**) { print_about(io.out); return 0; }
 
-int cmd_clear(Shell&, Io& io, u32, char**) { io.out.str("\x1b[2J\x1b[H"); return 0; }
+int cmd_wipe(Shell&, Io& io, u32, char**) { io.out.str("\x1b[2J\x1b[H"); return 0; }
 
 int cmd_unicode(Shell&, Io& io, u32, char**) {
     Writer& w = io.out;
@@ -233,107 +233,112 @@ int cmd_colors(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
-int emit_probe(Shell& sh, Io& io, const char* path) {
-    nebula::Blob b{};
-    nebula::Status st = lens::text::read_file(sh.cursor, path, &b);
-    if (st != nebula::Status::Ok) {
-        print_status(io, "cannot read", path, st);
-        return code_of(st);
-    }
-    io.out.bytes(reinterpret_cast<const char*>(b.data), b.size);
-    nebula::release(b);
-    return 0;
+void note_number(char* out, u32 cap, u64 v, const char* tail) {
+    char d[24];
+    u32 n = 0, k = 0;
+    if (!v) d[n++] = '0';
+    while (v) { d[n++] = static_cast<char>('0' + v % 10); v /= 10; }
+    while (n && k + 1 < cap) out[k++] = d[--n];
+    while (*tail && k + 1 < cap) out[k++] = *tail++;
+    out[k] = 0;
 }
 
-int cmd_ps(Shell& sh, Io& io, u32, char**) {
-    if (!io.out.terminal()) return emit_probe(sh, io, "sys:/tasks");
-    Writer& w = io.out;
+int cmd_orbit(Shell&, Io& io, u32, char**) {
     orbital::SatelliteInfo info[64];
     u32 n = orbital::snapshot(info, 64);
-    w.rgb(palette::MIST);
-    w.str("   id  state     ring core  switches  name\n");
-    w.reset();
+    rows::Table& t = *io.out_rows;
+    rows::begin(t);
+    rows::add_column(t, "id", rows::Kind::Int);
+    rows::add_column(t, "state", rows::Kind::Text);
+    rows::add_column(t, "ring", rows::Kind::Int);
+    rows::add_column(t, "sun", rows::Kind::Int);
+    rows::add_column(t, "switches", rows::Kind::Int);
+    rows::add_column(t, "name", rows::Kind::Text);
     for (u32 i = 0; i < n; ++i) {
-        w.str("  ");
-        w.pad_num(info[i].id, 3);
-        w.str("  ");
-        w.pad_to(state_name(info[i].state), 8);
-        w.str("  ");
-        w.pad_num(static_cast<u64>(info[i].ring), 3);
-        w.str("  ");
-        w.pad_num(info[i].core, 4);
-        w.str("  ");
-        w.pad_num(info[i].switches, 8);
-        w.str("  ");
-        w.str(info[i].name);
-        w.put('\n');
+        u32 r = rows::add_row(t);
+        if (r == ~0u) break;
+        rows::set_num(t, r, 0, info[i].id);
+        rows::set_text(t, r, 1, state_name(info[i].state));
+        rows::set_num(t, r, 2, static_cast<u64>(info[i].ring));
+        rows::set_num(t, r, 3, info[i].core);
+        rows::set_num(t, r, 4, info[i].switches);
+        rows::set_text(t, r, 5, info[i].name);
     }
-    w.rgb(palette::MIST);
-    w.num(n);
-    w.str(" Satellites\n");
-    w.reset();
+    rows::set_note(t, "satellites known to Orbital");
     return 0;
 }
 
-int cmd_cores(Shell& sh, Io& io, u32, char**) {
-    if (!io.out.terminal()) return emit_probe(sh, io, "sys:/cpus");
-    Writer& w = io.out;
+int cmd_suns(Shell&, Io& io, u32, char**) {
     orbital::CoreInfo info[64];
     u32 n = orbital::cores(info, 64);
     orbital::Stats st = orbital::stats();
+    rows::Table& t = *io.out_rows;
+    rows::begin(t);
+    rows::add_column(t, "sun", rows::Kind::Int);
+    rows::add_column(t, "apic", rows::Kind::Int);
+    rows::add_column(t, "state", rows::Kind::Text);
+    rows::add_column(t, "queued", rows::Kind::Int);
+    rows::add_column(t, "running", rows::Kind::Text);
     for (u32 i = 0; i < n; ++i) {
-        w.str("  Sun ");
-        w.num(i);
-        w.str("  apic ");
-        w.pad_num(info[i].apic_id, 3);
-        w.str("  ");
-        w.str(info[i].idle ? "idle   " : "running");
-        w.str("  queued ");
-        w.num(info[i].queued);
-        w.str("  ");
-        w.str(info[i].running);
-        w.put('\n');
+        u32 r = rows::add_row(t);
+        if (r == ~0u) break;
+        rows::set_num(t, r, 0, i);
+        rows::set_num(t, r, 1, info[i].apic_id);
+        rows::set_text(t, r, 2, info[i].idle ? "idle" : "running");
+        rows::set_num(t, r, 3, info[i].queued);
+        rows::set_text(t, r, 4, info[i].running);
     }
-    w.rgb(palette::MIST);
-    w.str("  preemptions ");
-    w.num(st.preemptions);
-    w.str("  steals ");
-    w.num(st.steals);
-    w.str("  ipis ");
-    w.num(st.ipis_sent);
-    w.str("  boosts ");
-    w.num(st.boosts);
-    w.put('\n');
-    w.reset();
+    Text note;
+    note.str("preemptions ");
+    note.num(st.preemptions);
+    note.str("  steals ");
+    note.num(st.steals);
+    note.str("  ipis ");
+    note.num(st.ipis_sent);
+    note.str("  boosts ");
+    note.num(st.boosts);
+    rows::set_note(t, note.s);
     return 0;
 }
 
-int cmd_mem(Shell&, Io& io, u32, char**) {
-    Writer& w = io.out;
+int cmd_memory(Shell&, Io& io, u32, char**) {
     kheap::Stats h = kheap::stats();
-    w.str("  universe  ");
-    w.num(universe::free_bytes() >> 20);
-    w.str(" MiB free of ");
-    w.num(universe::total_bytes() >> 20);
-    w.str(" MiB in ");
-    w.num(universe::galaxy_count());
-    w.str(" galaxies\n  heap      ");
-    w.num(h.live_objects);
-    w.str(" objects, ");
-    w.num(h.live_bytes);
-    w.str(" bytes live, ");
-    w.num(h.failed_allocs);
-    w.str(" failed allocations\n");
     nebula::Realm* ram = nebula::ram_realm();
-    w.str("  ram realm ");
-    print_size(w, ram->space_total() - ram->space_free());
-    w.str(" used of ");
-    print_size(w, ram->space_total());
-    w.put('\n');
-    return 0;
+    rows::Table& t = *io.out_rows;
+    rows::begin(t);
+    rows::add_column(t, "area", rows::Kind::Text);
+    rows::add_column(t, "used", rows::Kind::Size);
+    rows::add_column(t, "total", rows::Kind::Size);
+    rows::add_column(t, "note", rows::Kind::Text);
+    char note[96];
+    u32 r = rows::add_row(t);
+    if (r == ~0u) return 1;
+    rows::set_text(t, r, 0, "universe");
+    rows::set_num(t, r, 1, universe::total_bytes() - universe::free_bytes());
+    rows::set_num(t, r, 2, universe::total_bytes());
+    note_number(note, sizeof(note), universe::galaxy_count(), " galaxies");
+    rows::set_text(t, r, 3, note);
+    r = rows::add_row(t);
+    if (r == ~0u) return 1;
+    rows::set_text(t, r, 0, "heap");
+    rows::set_num(t, r, 1, h.live_bytes);
+    rows::set_null(t, r, 2);
+    Text hn;
+    hn.num(h.live_objects);
+    hn.str(" objects, ");
+    hn.num(h.failed_allocs);
+    hn.str(" failed allocations");
+    rows::set_text(t, r, 3, hn.s);
+    r = rows::add_row(t);
+    if (r == ~0u) return 1;
+    rows::set_text(t, r, 0, "ram realm");
+    rows::set_num(t, r, 1, ram->space_total() - ram->space_free());
+    rows::set_num(t, r, 2, ram->space_total());
+    rows::set_text(t, r, 3, "");
+    return t.failed ? 1 : 0;
 }
 
-int cmd_uptime(Shell&, Io& io, u32, char**) {
+int cmd_age(Shell&, Io& io, u32, char**) {
     u64 s = clock::uptime_ms() / 1000;
     Writer& w = io.out;
     w.str("  up ");
@@ -346,7 +351,7 @@ int cmd_uptime(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
-int cmd_date(Shell&, Io& io, u32, char**) {
+int cmd_now(Shell&, Io& io, u32, char**) {
     if (!clock::wall_valid()) {
         print_error(io, "the wall clock was not set by the firmware; only uptime is known");
         return 1;
@@ -358,7 +363,7 @@ int cmd_date(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
-int cmd_tty(Shell& sh, Io& io, u32, char**) {
+int cmd_console(Shell& sh, Io& io, u32, char**) {
     lens::Domain& d = sh.cursor.domain;
     lens::Lens con = lens::text::console(sh.cursor);
     if (con.is_null()) {
@@ -383,10 +388,10 @@ int cmd_tty(Shell& sh, Io& io, u32, char**) {
     return 0;
 }
 
-int cmd_klog(Shell& sh, Io& io, u32 argc, char** argv) {
+int cmd_log(Shell& sh, Io& io, u32 argc, char** argv) {
     u64 want = 2048;
     if (argc > 2 || (argc == 2 && !parse_u64(argv[1], &want))) {
-        print_error(io, "usage: klog [bytes]");
+        print_error(io, "usage: log [bytes]");
         return 2;
     }
     if (want > 4096) want = 4096;
@@ -468,10 +473,10 @@ int cmd_keys(Shell&, Io& io, u32, char**) {
     }
 }
 
-int cmd_sleep(Shell& sh, Io& io, u32 argc, char** argv) {
-    if (argc != 2) { print_error(io, "usage: sleep milliseconds"); return 2; }
+int cmd_wait(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc != 2) { print_error(io, "usage: wait milliseconds"); return 2; }
     u64 ms;
-    if (!parse_u64(argv[1], &ms) || ms > 3600000) { print_error(io, "usage: sleep milliseconds (at most 3600000)"); return 2; }
+    if (!parse_u64(argv[1], &ms) || ms > 3600000) { print_error(io, "usage: wait milliseconds (at most 3600000)"); return 2; }
     while (ms > 0) {
         u64 slice = ms > 50 ? 50 : ms;
         orbital::sleep_ms(static_cast<u32>(slice));
@@ -643,14 +648,14 @@ void settle_disk() {
     if (nebula::disk_is_mounted() && blockdev::present()) blockdev::flush();
 }
 
-int cmd_reboot(Shell&, Io& io, u32, char**) {
+int cmd_restart(Shell&, Io& io, u32, char**) {
     io.out.str("  restarting...\n");
     io.out.flush();
     settle_disk();
     power::reboot();
 }
 
-int cmd_poweroff(Shell&, Io& io, u32, char**) {
+int cmd_sunset(Shell&, Io& io, u32, char**) {
     io.out.str("  powering off...\n");
     io.out.flush();
     settle_disk();
@@ -665,22 +670,22 @@ int cmd_poweroff(Shell&, Io& io, u32, char**) {
 
 constexpr Command COMMANDS[] = {
     {"about", "about", "the info panel again", &cmd_about},
-    {"clear", "clear", "clear the screen (also Ctrl+L)", &cmd_clear},
+    {"wipe", "wipe", "clear the screen (also Ctrl+L)", &cmd_wipe},
     {"unicode", "unicode", "a glyph coverage sample", &cmd_unicode},
     {"colors", "colors", "the Corona palette", &cmd_colors},
-    {"ps", "ps", "Satellites known to Orbital; piped, one parseable row each", &cmd_ps},
-    {"cores", "cores", "per-core scheduler state; piped, one parseable row each", &cmd_cores},
-    {"mem", "mem", "Universe, kernel heap and ram realm counters", &cmd_mem},
-    {"uptime", "uptime", "time since boot", &cmd_uptime},
-    {"date", "date", "wall clock time in UTC when the firmware set one", &cmd_date},
-    {"klog", "klog [bytes]", "tail of the kernel log", &cmd_klog},
-    {"tty", "tty", "the console lens this shell holds: rights and readiness", &cmd_tty},
+    {"orbit", "orbit", "the Satellites known to Orbital, as rows", &cmd_orbit},
+    {"suns", "suns", "per-Sun scheduler state, as rows", &cmd_suns},
+    {"memory", "memory", "Universe, kernel heap and ram realm usage, as rows", &cmd_memory},
+    {"age", "age", "time since boot", &cmd_age},
+    {"now", "now", "wall clock time in UTC when the firmware set one", &cmd_now},
+    {"log", "log [bytes]", "tail of the kernel log", &cmd_log},
+    {"console", "console", "the console lens this shell holds: rights and readiness", &cmd_console},
     {"keys", "keys", "show decoded key events, Esc leaves", &cmd_keys},
-    {"sleep", "sleep milliseconds", "wait", &cmd_sleep},
+    {"wait", "wait milliseconds", "pause", &cmd_wait},
     {"usb", "usb", "xHCI controllers, devices and drives", &cmd_usb},
     {"storage", "storage [init erase <MiB>]", "the storage device and volume; in usb mode, format the window", &cmd_storage},
-    {"reboot", "reboot", "flush the disk and restart", &cmd_reboot},
-    {"poweroff", "poweroff", "flush the disk and power off where the platform allows it", &cmd_poweroff},
+    {"restart", "restart", "flush the disk and restart", &cmd_restart},
+    {"sunset", "sunset", "flush the disk and power off where the platform allows it", &cmd_sunset},
 };
 
 constexpr Table TABLE{"system", COMMANDS, sizeof(COMMANDS) / sizeof(COMMANDS[0])};

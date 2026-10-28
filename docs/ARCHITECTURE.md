@@ -225,7 +225,7 @@ seconds, so an ISO written to a stick never initialises an AHCI, NVMe or virtio 
 window described below. `BOOT_DEFAULT=shell|test` and `MENU_TIMEOUT=<seconds>` override either
 profile. `make test-iso` builds `build/aphelion-test.iso`, the same menu with the test entry preselected, and CI builds that image with `MENU_TIMEOUT=0` for the boot and crash-fuzz jobs. In shell mode `kernel_main` skips the demo Satellites, the stress
 workers, the filesystem test suite and the scheduler self-test, keeps the bootloader-memory reclaim task and starts
-Helm. The disk is mounted when it already holds a Stellar volume. A completely blank disk (its first 64 sectors are all zero) is formatted automatically on a shell boot; a disk that holds anything else is never touched unless the user runs `mkfs erase`, and the USB window is never formatted without `storage init erase`.
+Helm. The disk is mounted when it already holds a Stellar volume. A completely blank disk (its first 64 sectors are all zero) is formatted automatically on a shell boot; a disk that holds anything else is never touched unless the user runs `kindle erase`, and the USB window is never formatted without `storage init erase`.
 
 The APIC timer is calibrated against the first working reference of HPET, ACPI PM timer (3.579545 MHz, 24 or 32
 bit as the FADT says) and the PIT, with a TSC-based timeout on every wait so a reference that does not count can no
@@ -258,7 +258,15 @@ The renderer draws into a RAM backbuffer and copies finished rows to the framebu
 the framebuffer is mapped write-combining and reading it back is very slow. A scroll is one `memmove` in RAM plus a
 row copy to the screen. If the backbuffer allocation fails (or the screen needs more than 96 MiB) it draws straight
 to the framebuffer and says so on the serial log. The grid is centred, with the leftover pixels filled in the
-background colour.
+background colour. Erase operations only mark the cells whose contents actually change, so clearing a mostly empty
+screen redraws only the rows that held text, and runs of blank cells with the same background are filled with
+one `rep stosq` per pixel row instead of being drawn cell by cell.
+
+Lines that scroll off the top of a full-screen region are copied into a ring of up to 2000 lines (capped at 12 MiB)
+taken from the kernel heap at boot. `corona::scroll_view` moves a view window back through that ring and the renderer
+draws from it instead of the live grid, with the cursor hidden. Any output returns the view to the bottom. Helm binds
+PageUp and PageDown to a page and Shift+Up and Shift+Down to a line. The ring does not survive a terminal
+reinitialisation and holds nothing for scrolls inside a smaller region, such as an editor's.
 
 The font is JetBrains Mono (SIL OFL 1.1, notice in `kernel/data/JetBrainsMono-OFL.txt`) baked by
 `tools/bakefont.py` into `kernel/data/corona-fonts.bin` at 9x20, 11x24 and 14x31 (4-bit coverage, regular and
@@ -334,16 +342,31 @@ against the real Stellar code on an in-memory disk under ASan and UBSan.
 
 ### Helm
 
-Helm is a Satellite named `helm` that owns the console in shell mode. `helm_parse` turns a line into stages
-separated by `|`, joined by `;`, `&&` and `||`, with `>`, `>>` and `<` redirects, single and double quotes,
-backslash escapes, `$name`, `${name}`, `$?` and `$cwd`. The parser reports a typed error with the column, and
-`help syntax` prints the rules. Variables are never word split. A glob (`*`, `?`, `[a-z]`) expands only in the last
-path component and an empty match is an error; redirect targets cannot contain wildcards.
+Helm is a Satellite named `helm` that owns the console in shell mode. It is deliberately not a POSIX shell. `helm_parse`
+turns a line into stages separated by `|`, joined by `;`, `=>` (run the next only after success) and `!>` (only after
+failure), with single and double quotes, backslash escapes, `@name`, `@{name}`, `@status` and `@here`. `<`, `>`, `&`
+and `$` mean nothing; output goes to a file with the `etch` command. The parser reports a typed error with the column,
+and `help syntax` prints the rules. Values are never word split. A glob (`*`, `?`) expands only in the last path
+component and an empty match is an error; a command flagged `CMD_LITERAL` (`where`, `bind`) never globs.
 
-A pipe runs its stages one after another and captures each stage's output in a heap buffer capped at 8 MiB, so no
-stage needs a second thread. Commands poll `Shell::poll()` inside their loops; every 64th call drains the input queue
-looking for Ctrl-C, which is why keys typed while a command runs are dropped. `run [-k] script` executes a file at
-most four levels deep. `cp` and `mv` refuse to replace anything without `-f` and never merge directories.
+Options are named. After the command's name is known, an unquoted word of lowercase letters ending in a colon is taken
+as a key when the command lists it in `Command::keys`, and the next word is its value (`chart depth: 3`). The same word
+is a realm path when it names a realm (`go sys:`); otherwise it is an error that lists the command's real options.
+Values reach commands as `Io::named` and are read with `opt`, `opt_bool` and `opt_num`; yes/no options accept yes, no,
+true, false, on, off, 1 and 0.
+
+Data between stages is typed. A stage hands the next either bytes or a `rows::Table`: columns of kind Text, Int, Size,
+Time or Flag, a cell pool and a row array, capped at 8 MiB. Commands flagged `CMD_ROWS` (`where`, `pick`, `order`,
+`first`, `last`, `distinct`) receive rows, converting text piped in to one row per line; `CMD_ANY` (`tally`) receives
+whichever arrives; every other command receives rows flattened to their body column (or an aligned text table). A
+command that fills `Io::out_rows` instead of writing bytes passes rows on, and at the end of a pipe Helm renders them
+as a table. Comparison is by kind: sizes parse `2KiB`, times parse `2026-10-01 12:30`, numbers sort as signed integers,
+and empty cells (a directory's size) sort last in either direction and never match a comparison.
+
+A pipe runs its stages one after another, so no stage needs a second thread. Commands poll `Shell::poll()` inside
+their loops; every 64th call drains the input queue looking for Ctrl-C, which is why keys typed while a command runs
+are dropped. `launch [keep: yes] script` executes a file at most four levels deep. `twin` and `drift` refuse to replace
+anything without `replace: yes` and never merge directories.
 
 The line editor works in code points and display cells: UTF-8 is validated on input, wide characters take two cells,
 combining marks take none, and the line scrolls horizontally rather than wrapping. History keeps the last 64 lines,
@@ -352,11 +375,11 @@ console's ANSI subset, so the same bytes go to the serial line.
 
 `tools/helm_host_test.cpp` drives the parser, the shell and the real Nebula and Stellar code on a memory disk.
 `tools/ci-shell.sh` boots the shell three times under QEMU (no disk, a blank virtio disk, and the same disk again
-after a reboot) and types through both the serial port and the emulated PS/2 keyboard.
+after a restart) and types through both the serial port and the emulated PS/2 keyboard.
 
 With `storage=usb` Helm also has `usb`, which lists the xHCI controllers, the ports and the drives with the verdict
 for each, and `storage`, which shows the USB window and the filesystem state. `storage init erase <MiB>` formats the
-window only after the size is typed back, and `mkfs erase` refuses in this mode so the stick cannot be formatted
+window only after the size is typed back, and `kindle erase` refuses in this mode so the stick cannot be formatted
 without that confirmation.
 
 ### Hardware and interrupts

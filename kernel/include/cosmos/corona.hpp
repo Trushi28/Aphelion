@@ -30,6 +30,12 @@ bool init(const fb::Info& info, const u8* font_blob, usize font_length);
 bool ready();
 bool enable_backbuffer(u32* memory, usize bytes);
 usize backbuffer_bytes_needed();
+usize scrollback_bytes_per_line();
+u32 enable_scrollback(term::Cell* memory, usize bytes);
+bool scroll_view(i32 lines);
+bool snap_to_live();
+u32 scrollback_lines();
+u32 view_offset();
 Metrics metrics();
 term::Terminal& terminal();
 

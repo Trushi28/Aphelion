@@ -72,6 +72,14 @@ public:
 
     u32 row_text(u32 row, char* out, u32 max) const;
 
+    void set_history(Cell* storage, u32 lines);
+    u32 history_count() const { return hist_count_; }
+    u32 history_capacity() const { return hist_cap_; }
+    u32 view_offset() const { return view_; }
+    bool scroll_view(i32 lines);
+    bool snap_to_live();
+    const Cell& view_cell(u32 col, u32 row) const;
+
 private:
     enum class State : u8 { Ground, Escape, Csi, Osc, OscEscape, Charset };
 
@@ -109,6 +117,7 @@ private:
     void fill(u32 col0, u32 row0, u32 col1, u32 row1);
     void break_wide(u32 col, u32 row);
     void new_line_wrap();
+    void push_history(u32 n);
 
     void control(u8 b);
     void escape_final(u8 b);
@@ -142,6 +151,12 @@ private:
     u16 dirty_lo_[MAX_ROWS] = {};
     u16 dirty_hi_[MAX_ROWS] = {};
     i32 scrolled_ = 0;
+    Cell* hist_ = nullptr;
+    u32 hist_cap_ = 0;
+    u32 hist_cols_ = 0;
+    u32 hist_head_ = 0;
+    u32 hist_count_ = 0;
+    u32 view_ = 0;
 
     State state_ = State::Ground;
     u32 params_[MAX_PARAMS] = {};

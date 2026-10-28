@@ -1,4 +1,4 @@
-#include <cosmos/helm.hpp>
+#include <cosmos/helm_rows.hpp>
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/blockdev.hpp>
 #include <cosmos/kheap.hpp>
@@ -6,6 +6,8 @@
 namespace helm {
 
 namespace {
+
+using rows::Kind;
 
 bool same(const char* a, const char* b) {
     while (*a && *a == *b) { ++a; ++b; }
@@ -19,7 +21,14 @@ int usage(Io& io, const char* text) {
     return 2;
 }
 
-int cmd_pwd(Shell& sh, Io& io, u32, char**) {
+bool too_many(Io& io, rows::Table& t) {
+    if (!t.failed) return false;
+    print_error(io, "too many rows or out of memory");
+    return true;
+}
+
+int cmd_here(Shell& sh, Io& io, u32 argc, char**) {
+    if (argc != 1) return usage(io, "usage: here");
     char loc[nebula::path::TEXT_MAX];
     lens::text::location_text(sh.cursor, loc, sizeof(loc));
     io.out.str(loc);
@@ -27,8 +36,8 @@ int cmd_pwd(Shell& sh, Io& io, u32, char**) {
     return 0;
 }
 
-int cmd_cd(Shell& sh, Io& io, u32 argc, char** argv) {
-    if (argc > 2) return usage(io, "usage: cd [path|-]");
+int cmd_go(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc > 2) return usage(io, "usage: go [path]   (no path goes to the root of the current realm; back returns to the last place)");
     char target[nebula::path::TEXT_MAX];
     nebula::path::Path before = sh.cursor.here;
     if (argc == 1) {
@@ -36,19 +45,144 @@ int cmd_cd(Shell& sh, Io& io, u32 argc, char** argv) {
         mem::copy(target, sh.cursor.here.realm, n);
         target[n] = ':';
         target[n + 1] = 0;
-    } else if (same(argv[1], "-")) {
-        if (!sh.has_previous) { print_error(io, "no previous location"); return 1; }
-        nebula::path::to_text(sh.previous, target, sizeof(target));
     } else {
         u32 n = length(argv[1]);
         if (n >= sizeof(target)) { print_error(io, "path is too long"); return 1; }
         mem::copy(target, argv[1], n + 1);
     }
     nebula::Status st = lens::text::change_location(sh.cursor, target);
-    if (st != nebula::Status::Ok) { print_status(io, "cannot enter", target, st); return 1; }
+    if (st != nebula::Status::Ok) { print_status(io, "cannot go to", target, st); return 1; }
     sh.previous = before;
     sh.has_previous = true;
     return 0;
+}
+
+int cmd_back(Shell& sh, Io& io, u32 argc, char**) {
+    if (argc != 1) return usage(io, "usage: back");
+    if (!sh.has_previous) { print_error(io, "there is no previous location"); return 1; }
+    char target[nebula::path::TEXT_MAX];
+    nebula::path::Path before = sh.cursor.here;
+    nebula::path::to_text(sh.previous, target, sizeof(target));
+    nebula::Status st = lens::text::change_location(sh.cursor, target);
+    if (st != nebula::Status::Ok) { print_status(io, "cannot go to", target, st); return 1; }
+    sh.previous = before;
+    sh.has_previous = true;
+    return 0;
+}
+
+struct ChartCtx {
+    Shell* sh;
+    Io* io;
+    rows::Table* out;
+    char* path;
+    u32 path_len;
+    char* rel;
+    u32 rel_len;
+    u32 max_depth;
+    int only;
+    bool stop;
+    bool failed;
+};
+
+void chart_row(ChartCtx& c, const char* name, u32 nlen, nebula::Kind kind, u64 size, u64 mtime) {
+    u32 r = rows::add_row(*c.out);
+    if (r == ~0u) { c.failed = true; c.stop = true; return; }
+    rows::set_text(*c.out, r, 0, name, nlen);
+    rows::set_text(*c.out, r, 1, kind == nebula::Kind::Dir ? "dir" : "file");
+    if (kind == nebula::Kind::Dir) rows::set_null(*c.out, r, 2);
+    else rows::set_num(*c.out, r, 2, size);
+    rows::set_num(*c.out, r, 3, mtime);
+    if (c.out->failed) { c.failed = true; c.stop = true; }
+}
+
+void chart_walk(ChartCtx& c, u32 depth) {
+    nebula::Listing l;
+    c.path[c.path_len] = 0;
+    nebula::Status st = lens::text::list(c.sh->cursor, c.path, &l, true);
+    if (st != nebula::Status::Ok) { print_status(*c.io, "cannot list", c.path, st); return; }
+    for (u32 i = 0; i < l.count && !c.stop; ++i) {
+        if (c.sh->poll()) { c.stop = true; break; }
+        const nebula::Entry& e = l.items[i];
+        bool is_dir = e.kind == nebula::Kind::Dir;
+        u32 nl = length(e.name);
+        if (c.path_len + 1 + nl + 1 >= nebula::path::TEXT_MAX || c.rel_len + 1 + nl + 1 >= nebula::path::TEXT_MAX) continue;
+        u32 saved_path = c.path_len;
+        u32 saved_rel = c.rel_len;
+        if (c.path_len && c.path[c.path_len - 1] != '/') c.path[c.path_len++] = '/';
+        mem::copy(c.path + c.path_len, e.name, nl);
+        c.path_len += nl;
+        if (c.rel_len) c.rel[c.rel_len++] = '/';
+        mem::copy(c.rel + c.rel_len, e.name, nl);
+        c.rel_len += nl;
+        c.rel[c.rel_len] = 0;
+        bool wanted = c.only == 0 || (c.only == 'd' && is_dir) || (c.only == 'f' && !is_dir);
+        if (wanted) chart_row(c, c.rel, c.rel_len, e.kind, e.size, e.mtime_ms);
+        if (is_dir && depth < c.max_depth && !c.stop) chart_walk(c, depth + 1);
+        c.path_len = saved_path;
+        c.rel_len = saved_rel;
+    }
+    nebula::release(l);
+}
+
+void chart_schema(rows::Table& t) {
+    rows::begin(t);
+    rows::add_column(t, "name", Kind::Text);
+    rows::add_column(t, "kind", Kind::Text);
+    rows::add_column(t, "size", Kind::Size);
+    rows::add_column(t, "changed", Kind::Time);
+    t.body = 0;
+}
+
+int cmd_chart(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc > 2) return usage(io, "usage: chart [path]  depth: N  only: dir|file");
+    u64 depth = 1;
+    if (!opt_num(io, "depth", &depth)) return 2;
+    if (depth == 0 || depth > nebula::MAX_TREE_DEPTH) return usage(io, "chart: depth: takes a number from 1 to 16");
+    int only = 0;
+    if (const char* o = opt(io, "only")) {
+        if (same(o, "dir")) only = 'd';
+        else if (same(o, "file")) only = 'f';
+        else return usage(io, "chart: only: takes dir or file");
+    }
+    const char* start = argc == 2 ? argv[1] : ".";
+    nebula::Info inf;
+    nebula::Status st = lens::text::stat(sh.cursor, start, &inf);
+    if (st != nebula::Status::Ok) { print_status(io, "cannot chart", start, st); return 1; }
+    rows::Table& out = *io.out_rows;
+    chart_schema(out);
+    ChartCtx c{};
+    c.sh = &sh;
+    c.io = &io;
+    c.out = &out;
+    c.only = only;
+    c.max_depth = static_cast<u32>(depth);
+    if (inf.kind != nebula::Kind::Dir) {
+        if (only != 'd') chart_row(c, start, length(start), inf.kind, inf.size, inf.mtime_ms);
+        return too_many(io, out) ? 1 : 0;
+    }
+    c.path = static_cast<char*>(kheap::alloc(nebula::path::TEXT_MAX));
+    c.rel = static_cast<char*>(kheap::alloc(nebula::path::TEXT_MAX));
+    if (!c.path || !c.rel) {
+        if (c.path) kheap::free(c.path);
+        if (c.rel) kheap::free(c.rel);
+        print_error(io, "out of memory");
+        return 1;
+    }
+    u32 n = length(start);
+    if (n >= nebula::path::TEXT_MAX) {
+        kheap::free(c.path);
+        kheap::free(c.rel);
+        print_error(io, "path is too long");
+        return 1;
+    }
+    mem::copy(c.path, start, n + 1);
+    c.path_len = n;
+    c.rel[0] = 0;
+    chart_walk(c, 1);
+    kheap::free(c.path);
+    kheap::free(c.rel);
+    if (c.stop && !c.failed) return 130;
+    return too_many(io, out) ? 1 : 0;
 }
 
 void print_entry_name(Writer& w, const char* name, nebula::Kind kind) {
@@ -60,106 +194,6 @@ void print_entry_name(Writer& w, const char* name, nebula::Kind kind) {
     } else {
         w.str(name);
     }
-}
-
-void print_long_row(Writer& w, nebula::Kind kind, u64 size, u64 mtime, const char* name) {
-    w.rgb(palette::MIST);
-    w.put(kind == nebula::Kind::Dir ? 'd' : '-');
-    w.put(' ');
-    if (kind == nebula::Kind::Dir) {
-        w.spaces(9);
-        w.put('-');
-    } else {
-        w.pad_num(size, 10);
-    }
-    w.str("  ");
-    char t[24];
-    format_time(mtime, t);
-    w.str(t);
-    w.str("  ");
-    w.reset();
-    print_entry_name(w, name, kind);
-    w.put('\n');
-}
-
-int ls_path(Shell& sh, Io& io, const char* path, bool lng, bool one, bool header) {
-    nebula::Info inf;
-    nebula::Status st = lens::text::stat(sh.cursor, path, &inf);
-    if (st != nebula::Status::Ok) { print_status(io, "cannot list", path, st); return 1; }
-    if (inf.kind == nebula::Kind::File) {
-        if (lng) print_long_row(io.out, inf.kind, inf.size, inf.mtime_ms, path);
-        else { io.out.str(path); io.out.put('\n'); }
-        return 0;
-    }
-    nebula::Listing l;
-    st = lens::text::list(sh.cursor, path, &l, lng);
-    if (st != nebula::Status::Ok) { print_status(io, "cannot list", path, st); return 1; }
-    if (header) {
-        io.out.rgb(palette::AMBER);
-        io.out.str(path);
-        io.out.str(":");
-        io.out.reset();
-        io.out.put('\n');
-    }
-    if (lng) {
-        for (u32 i = 0; i < l.count; ++i) {
-            if (sh.poll()) break;
-            print_long_row(io.out, l.items[i].kind, l.items[i].size, l.items[i].mtime_ms, l.items[i].name);
-        }
-    } else if (one || !io.out.terminal()) {
-        for (u32 i = 0; i < l.count; ++i) {
-            if (sh.poll()) break;
-            print_entry_name(io.out, l.items[i].name, l.items[i].kind);
-            io.out.put('\n');
-        }
-    } else if (l.count) {
-        u32 widest = 0;
-        for (u32 i = 0; i < l.count; ++i) {
-            u32 c = utf8::cells(l.items[i].name, length(l.items[i].name)) + (l.items[i].kind == nebula::Kind::Dir ? 1 : 0);
-            if (c > widest) widest = c;
-        }
-        u32 col_w = widest + 2;
-        u32 cols = sh.cols / col_w;
-        if (cols == 0) cols = 1;
-        u32 rows = (l.count + cols - 1) / cols;
-        for (u32 r = 0; r < rows; ++r) {
-            for (u32 c = 0; c < cols; ++c) {
-                u32 idx = c * rows + r;
-                if (idx >= l.count) break;
-                const nebula::Entry& e = l.items[idx];
-                print_entry_name(io.out, e.name, e.kind);
-                bool more = (c + 1) * rows + r < l.count;
-                if (more) {
-                    u32 used = utf8::cells(e.name, length(e.name)) + (e.kind == nebula::Kind::Dir ? 1 : 0);
-                    io.out.spaces(col_w - used);
-                }
-            }
-            io.out.put('\n');
-        }
-    }
-    if (l.truncated) print_error(io, "listing was cut off at 65536 entries");
-    nebula::release(l);
-    return 0;
-}
-
-int cmd_ls(Shell& sh, Io& io, u32 argc, char** argv) {
-    Options o = options_begin(argc, argv);
-    bool lng = false, one = false;
-    int c;
-    while ((c = next_option(o, "la1", "")) >= 0) {
-        if (c == 'l') lng = true;
-        else if (c == '1') one = true;
-    }
-    if (o.bad) return usage(io, "usage: ls [-l] [-1] [path...]");
-    if (o.index >= argc) return ls_path(sh, io, ".", lng, one, false);
-    int status = 0;
-    bool header = argc - o.index > 1;
-    for (u32 i = o.index; i < argc; ++i) {
-        if (i > o.index) io.out.put('\n');
-        if (ls_path(sh, io, argv[i], lng, one, header) != 0) status = 1;
-        if (sh.aborted) return 130;
-    }
-    return status;
 }
 
 struct TreeState {
@@ -180,13 +214,7 @@ void tree_walk(Shell& sh, Io& io, TreeState& t, u32 depth) {
     t.path[t.path_len] = 0;
     nebula::Status st = lens::text::list(sh.cursor, t.path, &l, false);
     if (st != nebula::Status::Ok) {
-        io.err.rgb(palette::SAND);
-        io.err.str("  cannot list ");
-        io.err.str(t.path);
-        io.err.str(": ");
-        io.err.str(nebula::status_text(st));
-        io.err.str("\n");
-        io.err.reset();
+        print_status(io, "cannot list", t.path, st);
         return;
     }
     u32 shown = 0;
@@ -227,26 +255,21 @@ void tree_walk(Shell& sh, Io& io, TreeState& t, u32 depth) {
     nebula::release(l);
 }
 
-int cmd_tree(Shell& sh, Io& io, u32 argc, char** argv) {
-    Options o = options_begin(argc, argv);
-    u32 depth = 6;
+int cmd_outline(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc > 2) return usage(io, "usage: outline [path]  depth: N  only: dir");
+    u64 depth = 6;
+    if (!opt_num(io, "depth", &depth)) return 2;
+    if (depth == 0 || depth > 15) return usage(io, "outline: depth: takes a number from 1 to 15");
     bool dirs_only = false;
-    int c;
-    while ((c = next_option(o, "d", "L")) >= 0) {
-        if (c == 'd') dirs_only = true;
-        else if (c == 'L') {
-            u64 v;
-            if (!parse_u64(o.value, &v) || v == 0 || v > 15) return usage(io, "tree: -L takes a depth from 1 to 15");
-            depth = static_cast<u32>(v);
-        }
+    if (const char* o = opt(io, "only")) {
+        if (!same(o, "dir")) return usage(io, "outline: only: takes dir");
+        dirs_only = true;
     }
-    if (o.bad) return usage(io, "usage: tree [-d] [-L depth] [path]");
-    if (argc - o.index > 1) return usage(io, "usage: tree [-d] [-L depth] [path]");
-    const char* start = o.index < argc ? argv[o.index] : ".";
+    const char* start = argc == 2 ? argv[1] : ".";
     nebula::Info inf;
     nebula::Status st = lens::text::stat(sh.cursor, start, &inf);
-    if (st != nebula::Status::Ok) { print_status(io, "cannot list", start, st); return 1; }
-    if (inf.kind != nebula::Kind::Dir) { print_status(io, "cannot list", start, nebula::Status::NotADirectory); return 1; }
+    if (st != nebula::Status::Ok) { print_status(io, "cannot outline", start, st); return 1; }
+    if (inf.kind != nebula::Kind::Dir) { print_status(io, "cannot outline", start, nebula::Status::NotADirectory); return 1; }
     TreeState* t = static_cast<TreeState*>(kheap::alloc_zeroed(sizeof(TreeState)));
     char* path = static_cast<char*>(kheap::alloc(nebula::path::TEXT_MAX));
     if (!t || !path) { if (t) kheap::free(t); if (path) kheap::free(path); print_error(io, "out of memory"); return 1; }
@@ -255,7 +278,7 @@ int cmd_tree(Shell& sh, Io& io, u32 argc, char** argv) {
     mem::copy(path, start, n + 1);
     t->path = path;
     t->path_len = n;
-    t->max_depth = depth;
+    t->max_depth = static_cast<u32>(depth);
     t->dirs_only = dirs_only;
     io.out.rgb(palette::ICE);
     io.out.str(start);
@@ -278,27 +301,7 @@ int cmd_tree(Shell& sh, Io& io, u32 argc, char** argv) {
     return status;
 }
 
-void write_sanitized(Writer& w, const u8* data, u64 size) {
-    utf8::Decoder d;
-    u32 cps[2];
-    for (u64 i = 0; i < size; ++i) {
-        u8 b = data[i];
-        u32 k = d.feed(b, cps);
-        for (u32 j = 0; j < k; ++j) {
-            u32 cp = cps[j];
-            if (cp == '\n' || cp == '\t') w.put(static_cast<char>(cp));
-            else if (cp == '\r') { if (!(i + 1 < size && data[i + 1] == '\n')) w.cp(0x240D); }
-            else if (cp < 0x20) w.cp(0x2400 + cp);
-            else if (cp == 0x7F) w.cp(0x2421);
-            else if (cp >= 0x80 && cp < 0xA0) w.cp(utf8::REPLACEMENT);
-            else w.cp(cp);
-        }
-    }
-    u32 tail[1];
-    if (d.finish(tail)) w.cp(utf8::REPLACEMENT);
-}
-
-struct CatCtx {
+struct BeaconCtx {
     Shell* sh;
     Io* io;
     bool numbered;
@@ -306,11 +309,11 @@ struct CatCtx {
     bool at_start;
 };
 
-void cat_emit(const char*, const u8* data, u64 size, void* raw) {
-    CatCtx& c = *static_cast<CatCtx*>(raw);
+void beacon_emit(const char*, const u8* data, u64 size, void* raw) {
+    BeaconCtx& c = *static_cast<BeaconCtx*>(raw);
     Writer& w = c.io->out;
     if (!c.numbered) {
-        if (w.terminal()) write_sanitized(w, data, size);
+        if (w.terminal()) write_safe(w, data, size);
         else w.bytes(reinterpret_cast<const char*>(data), size);
         return;
     }
@@ -326,120 +329,102 @@ void cat_emit(const char*, const u8* data, u64 size, void* raw) {
         }
         u64 j = i;
         while (j < size && data[j] != '\n') ++j;
-        if (w.terminal()) write_sanitized(w, data + i, j - i);
+        if (w.terminal()) write_safe(w, data + i, j - i);
         else w.bytes(reinterpret_cast<const char*>(data) + i, j - i);
         if (j < size) { w.put('\n'); c.at_start = true; ++j; }
         i = j;
     }
 }
 
-int cmd_cat(Shell& sh, Io& io, u32 argc, char** argv) {
-    Options o = options_begin(argc, argv);
-    CatCtx ctx{&sh, &io, false, 0, true};
-    int c;
-    while ((c = next_option(o, "n", "")) >= 0) ctx.numbered = true;
-    if (o.bad) return usage(io, "usage: cat [-n] [file...]");
-    int st = for_each_input(sh, io, o, &cat_emit, &ctx);
+int cmd_beacon(Shell& sh, Io& io, u32 argc, char** argv) {
+    BeaconCtx ctx{&sh, &io, false, 0, true};
+    if (!opt_bool(io, "numbered", &ctx.numbered)) return 2;
+    int st = for_each_input(sh, io, argc, argv, 1, &beacon_emit, &ctx);
     return sh.aborted ? 130 : st;
 }
 
-int cmd_stat(Shell& sh, Io& io, u32 argc, char** argv) {
-    if (argc < 2) return usage(io, "usage: stat path...");
+int cmd_probe(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc < 2) return usage(io, "usage: probe path...");
+    rows::Table& out = *io.out_rows;
+    rows::begin(out);
+    rows::add_column(out, "path", Kind::Text);
+    rows::add_column(out, "kind", Kind::Text);
+    rows::add_column(out, "size", Kind::Size);
+    rows::add_column(out, "changed", Kind::Time);
+    rows::add_column(out, "realm", Kind::Text);
+    rows::add_column(out, "access", Kind::Text);
+    rows::add_column(out, "links", Kind::Int);
     int status = 0;
     for (u32 i = 1; i < argc; ++i) {
         lens::text::StatRow r{};
         nebula::Status st = lens::text::stat_row(sh.cursor, argv[i], &r);
+        if (st != nebula::Status::Ok) { print_status(io, "cannot probe", argv[i], st); status = 1; continue; }
         const nebula::Info& inf = r.info;
-        if (st != nebula::Status::Ok) { print_status(io, "cannot stat", argv[i], st); status = 1; continue; }
         char loc[nebula::path::TEXT_MAX];
         nebula::path::to_text(r.path, loc, sizeof(loc));
-        auto row = [&](const char* k) { io.out.rgb(palette::AMBER); io.out.pad_to(k, 9); io.out.reset(); };
-        row("path"); io.out.str(loc); io.out.put('\n');
-        row("kind"); io.out.str(inf.kind == nebula::Kind::Dir ? "directory" : "file"); io.out.put('\n');
-        if (inf.kind == nebula::Kind::File) {
-            row("size");
-            io.out.num(inf.size);
-            io.out.str(" bytes");
-            if (inf.size >= 1024) { io.out.str(" ("); print_size(io.out, inf.size); io.out.put(')'); }
-            io.out.put('\n');
-        }
-        char t[24];
-        format_time(inf.mtime_ms, t);
-        row("changed"); io.out.str(t); io.out.put('\n');
-        row("realm"); io.out.str(r.realm); io.out.str(r.writable && !inf.read_only ? ", writable" : ", read-only"); io.out.put('\n');
-        row("links"); io.out.num(inf.links); io.out.put('\n');
+        u32 row = rows::add_row(out);
+        if (row == ~0u) break;
+        rows::set_text(out, row, 0, loc);
+        rows::set_text(out, row, 1, inf.kind == nebula::Kind::Dir ? "dir" : "file");
+        if (inf.kind == nebula::Kind::Dir) rows::set_null(out, row, 2);
+        else rows::set_num(out, row, 2, inf.size);
+        rows::set_num(out, row, 3, inf.mtime_ms);
+        rows::set_text(out, row, 4, r.realm);
+        rows::set_text(out, row, 5, r.writable && !inf.read_only ? "writable" : "read-only");
+        rows::set_num(out, row, 6, inf.links);
     }
+    if (too_many(io, out)) return 1;
     return status;
 }
 
-int cmd_touch(Shell& sh, Io& io, u32 argc, char** argv) {
-    if (argc < 2) return usage(io, "usage: touch file...");
+int cmd_spark(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc < 2) return usage(io, "usage: spark file...");
     int status = 0;
     for (u32 i = 1; i < argc; ++i) {
         nebula::Info inf;
         nebula::Status st = lens::text::stat(sh.cursor, argv[i], &inf);
         if (st == nebula::Status::Ok) continue;
-        if (st != nebula::Status::NotFound) { print_status(io, "cannot touch", argv[i], st); status = 1; continue; }
+        if (st != nebula::Status::NotFound) { print_status(io, "cannot spark", argv[i], st); status = 1; continue; }
         st = lens::text::write_file(sh.cursor, argv[i], nullptr, 0);
         if (st != nebula::Status::Ok) { print_status(io, "cannot create", argv[i], st); status = 1; }
     }
     return status;
 }
 
-int cmd_mkdir(Shell& sh, Io& io, u32 argc, char** argv) {
-    Options o = options_begin(argc, argv);
+int cmd_plant(Shell& sh, Io& io, u32 argc, char** argv) {
     bool parents = false;
-    int c;
-    while ((c = next_option(o, "p", "")) >= 0) parents = true;
-    if (o.bad || o.index >= argc) return usage(io, "usage: mkdir [-p] dir...");
+    if (!opt_bool(io, "parents", &parents)) return 2;
+    if (argc < 2) return usage(io, "usage: plant dir...  parents: yes");
     int status = 0;
-    for (u32 i = o.index; i < argc; ++i) {
+    for (u32 i = 1; i < argc; ++i) {
         nebula::Status st = parents ? lens::text::make_path(sh.cursor, argv[i]) : lens::text::make_dir(sh.cursor, argv[i]);
         if (st != nebula::Status::Ok) { print_status(io, "cannot create", argv[i], st); status = 1; }
     }
     return status;
 }
 
-int cmd_rm(Shell& sh, Io& io, u32 argc, char** argv) {
-    Options o = options_begin(argc, argv);
-    bool recursive = false, force = false;
-    int c;
-    while ((c = next_option(o, "rf", "")) >= 0) {
-        if (c == 'r') recursive = true;
-        else force = true;
-    }
-    if (o.bad || o.index >= argc) return usage(io, "usage: rm [-r] [-f] path...");
+int cmd_fade(Shell& sh, Io& io, u32 argc, char** argv) {
+    bool tree = false, missing = false;
+    if (!opt_bool(io, "tree", &tree) || !opt_bool(io, "missing", &missing)) return 2;
+    if (argc < 2) return usage(io, "usage: fade path...  tree: yes  missing: yes");
     int status = 0;
-    for (u32 i = o.index; i < argc; ++i) {
+    for (u32 i = 1; i < argc; ++i) {
         if (sh.poll()) return 130;
         nebula::Info inf;
         nebula::Status st = lens::text::stat(sh.cursor, argv[i], &inf);
-        if (st == nebula::Status::NotFound && force) continue;
-        if (st != nebula::Status::Ok) { print_status(io, "cannot remove", argv[i], st); status = 1; continue; }
-        if (inf.kind == nebula::Kind::Dir && !recursive) {
+        if (st == nebula::Status::NotFound && missing) continue;
+        if (st != nebula::Status::Ok) { print_status(io, "cannot fade", argv[i], st); status = 1; continue; }
+        st = tree ? lens::text::remove_tree(sh.cursor, argv[i], nullptr) : lens::text::remove(sh.cursor, argv[i]);
+        if (st == nebula::Status::NotEmpty && !tree) {
             io.err.rgb(palette::SAND);
             io.err.str("  ");
             io.err.str(argv[i]);
-            io.err.str(" is a directory: use rm -r, or rmdir if it is empty\n");
+            io.err.str(" is not empty; add tree: yes to fade it with everything inside\n");
             io.err.reset();
             status = 1;
             continue;
         }
-        st = recursive ? lens::text::remove_tree(sh.cursor, argv[i], nullptr) : lens::text::remove(sh.cursor, argv[i]);
-        if (st != nebula::Status::Ok) { print_status(io, "cannot remove", argv[i], st); status = 1; }
-    }
-    return status;
-}
-
-int cmd_rmdir(Shell& sh, Io& io, u32 argc, char** argv) {
-    if (argc < 2) return usage(io, "usage: rmdir dir...");
-    int status = 0;
-    for (u32 i = 1; i < argc; ++i) {
-        nebula::Info inf;
-        nebula::Status st = lens::text::stat(sh.cursor, argv[i], &inf);
-        if (st == nebula::Status::Ok && inf.kind != nebula::Kind::Dir) st = nebula::Status::NotADirectory;
-        if (st == nebula::Status::Ok) st = lens::text::remove(sh.cursor, argv[i]);
-        if (st != nebula::Status::Ok) { print_status(io, "cannot remove", argv[i], st); status = 1; }
+        if (st != nebula::Status::Ok) { print_status(io, "cannot fade", argv[i], st); status = 1; }
     }
     return status;
 }
@@ -481,48 +466,45 @@ void refuse_existing(Io& io, const char* target) {
     io.err.rgb(palette::SAND);
     io.err.str("  ");
     io.err.str(target);
-    io.err.str(" already exists; use -f to replace it\n");
+    io.err.str(" already exists; add replace: yes to overwrite it\n");
     io.err.reset();
 }
 
 int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
-    Options o = options_begin(argc, argv);
-    bool recursive = false, force = false;
-    int c;
-    while ((c = next_option(o, move ? "f" : "rf", "")) >= 0) {
-        if (c == 'r') recursive = true;
-        else force = true;
-    }
-    const char* use = move ? "usage: mv [-f] source... destination" : "usage: cp [-r] [-f] source... destination";
-    if (o.bad || argc - o.index < 2) return usage(io, use);
+    bool tree = false, replace = false;
+    if (!move && !opt_bool(io, "tree", &tree)) return 2;
+    if (!opt_bool(io, "replace", &replace)) return 2;
+    const char* use = move ? "usage: drift source... destination  replace: yes" : "usage: twin source... destination  tree: yes  replace: yes";
+    if (argc < 3) return usage(io, use);
     const char* dst = argv[argc - 1];
-    u32 nsrc = argc - 1 - o.index;
+    u32 nsrc = argc - 2;
     nebula::Info di;
     bool dst_is_dir = lens::text::stat(sh.cursor, dst, &di) == nebula::Status::Ok && di.kind == nebula::Kind::Dir;
     if (nsrc > 1 && !dst_is_dir) { print_error(io, "with several sources the destination must be an existing directory"); return 1; }
+    const char* verb = move ? "cannot drift" : "cannot twin";
     int status = 0;
     for (u32 i = 0; i < nsrc; ++i) {
         if (sh.poll()) return 130;
-        const char* src = argv[o.index + i];
+        const char* src = argv[1 + i];
         nebula::Info si;
         nebula::Status st = lens::text::stat(sh.cursor, src, &si);
-        if (st != nebula::Status::Ok) { print_status(io, move ? "cannot move" : "cannot copy", src, st); status = 1; continue; }
+        if (st != nebula::Status::Ok) { print_status(io, verb, src, st); status = 1; continue; }
         char target[nebula::path::TEXT_MAX];
         bool exists = false;
         if (!final_target(sh, src, dst, target, sizeof(target), &exists, &st)) {
-            print_status(io, move ? "cannot move" : "cannot copy", src, st);
+            print_status(io, verb, src, st);
             status = 1;
             continue;
         }
         if (exists) {
             nebula::Info ti;
             bool target_dir = lens::text::stat(sh.cursor, target, &ti) == nebula::Status::Ok && ti.kind == nebula::Kind::Dir;
-            if (!force || target_dir || si.kind == nebula::Kind::Dir) {
+            if (!replace || target_dir || si.kind == nebula::Kind::Dir) {
                 if (target_dir || si.kind == nebula::Kind::Dir) {
                     io.err.rgb(palette::SAND);
                     io.err.str("  ");
                     io.err.str(target);
-                    io.err.str(" already exists; directories are never merged or replaced, remove it first\n");
+                    io.err.str(" already exists; directories are never merged or replaced, fade it first\n");
                     io.err.reset();
                 } else {
                     refuse_existing(io, target);
@@ -532,18 +514,18 @@ int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
             }
         }
         if (move) {
-            st = lens::text::rename(sh.cursor, src, target, force ? nebula::RENAME_REPLACE : 0);
+            st = lens::text::rename(sh.cursor, src, target, replace ? nebula::RENAME_REPLACE : 0);
             if (st == nebula::Status::CrossRealm) {
                 u32 copied = 0;
                 st = lens::text::copy_tree(sh.cursor, src, target, &copied);
                 if (st == nebula::Status::Ok) st = lens::text::remove_tree(sh.cursor, src, nullptr);
             }
         } else if (si.kind == nebula::Kind::Dir) {
-            if (!recursive) {
+            if (!tree) {
                 io.err.rgb(palette::SAND);
                 io.err.str("  ");
                 io.err.str(src);
-                io.err.str(" is a directory: use cp -r\n");
+                io.err.str(" is a directory; add tree: yes to twin it with everything inside\n");
                 io.err.reset();
                 status = 1;
                 continue;
@@ -553,131 +535,62 @@ int transfer(Shell& sh, Io& io, u32 argc, char** argv, bool move) {
         } else {
             st = lens::text::copy_file(sh.cursor, src, target);
         }
-        if (st != nebula::Status::Ok) { print_status(io, move ? "cannot move" : "cannot copy", src, st); status = 1; }
+        if (st != nebula::Status::Ok) { print_status(io, verb, src, st); status = 1; }
     }
     return status;
 }
 
-int cmd_cp(Shell& sh, Io& io, u32 argc, char** argv) { return transfer(sh, io, argc, argv, false); }
-int cmd_mv(Shell& sh, Io& io, u32 argc, char** argv) { return transfer(sh, io, argc, argv, true); }
+int cmd_twin(Shell& sh, Io& io, u32 argc, char** argv) { return transfer(sh, io, argc, argv, false); }
+int cmd_drift(Shell& sh, Io& io, u32 argc, char** argv) { return transfer(sh, io, argc, argv, true); }
 
-int cmd_realms(Shell&, Io& io, u32, char**) {
-    Writer& w = io.out;
-    w.rgb(palette::MIST);
-    w.str("  realm   state        mode       size\n");
-    w.reset();
-    for (u32 i = 0; i < nebula::realm_count(); ++i) {
-        nebula::Realm* r = nebula::realm_at(i);
-        w.str("  ");
-        w.rgb(palette::ICE);
-        w.pad_to(r->name(), 8);
-        w.reset();
-        w.pad_to(r->available() ? "available" : "unavailable", 13);
-        w.pad_to(r->writable() ? "writable" : "read-only", 11);
-        u64 total = r->space_total();
-        if (r->available() && total) {
-            print_size(w, r->space_free());
-            w.str(" free of ");
-            print_size(w, total);
-        } else {
-            w.str("-");
-        }
-        w.put('\n');
-        w.str("          ");
-        w.rgb(palette::MIST);
-        w.str(r->summary());
-        w.reset();
-        w.put('\n');
-    }
+int cmd_etch(Shell& sh, Io& io, u32 argc, char** argv) {
+    bool append = false;
+    if (!opt_bool(io, "append", &append)) return 2;
+    if (argc != 2) return usage(io, "usage: etch file  append: yes   (writes what is piped in)");
+    if (!io.has_in) { print_error(io, "nothing to write: pipe something in, for example  chart | etch listing.txt"); return 1; }
+    nebula::Status st = append ? lens::text::append_file(sh.cursor, argv[1], io.in, io.in_size)
+                               : lens::text::write_file(sh.cursor, argv[1], io.in, io.in_size);
+    if (st != nebula::Status::Ok) { print_status(io, "cannot write", argv[1], st); return 1; }
     return 0;
 }
 
-struct FindCtx {
-    Shell* sh;
-    Io* io;
-    char* path;
-    u32 path_len;
-    char pattern[64];
-    bool has_pattern;
-    int type;
-    u64 hits;
-    bool stop;
-};
-
-void find_walk(FindCtx& f, u32 depth) {
-    if (depth > nebula::MAX_TREE_DEPTH || f.stop) return;
-    nebula::Listing l;
-    f.path[f.path_len] = 0;
-    if (lens::text::list(f.sh->cursor, f.path, &l, false) != nebula::Status::Ok) return;
-    for (u32 i = 0; i < l.count && !f.stop; ++i) {
-        if (f.sh->poll()) { f.stop = true; break; }
-        const nebula::Entry& e = l.items[i];
-        bool is_dir = e.kind == nebula::Kind::Dir;
-        u32 saved = f.path_len;
-        u32 nl = length(e.name);
-        if (f.path_len + 1 + nl + 1 >= nebula::path::TEXT_MAX) continue;
-        if (f.path_len && f.path[f.path_len - 1] != '/') f.path[f.path_len++] = '/';
-        mem::copy(f.path + f.path_len, e.name, nl);
-        f.path_len += nl;
-        f.path[f.path_len] = 0;
-        bool type_ok = f.type == 0 || (f.type == 'd' && is_dir) || (f.type == 'f' && !is_dir);
-        if (type_ok && (!f.has_pattern || glob_match(f.pattern, e.name))) {
-            f.io->out.str(f.path);
-            f.io->out.put('\n');
-            ++f.hits;
-        }
-        if (is_dir) find_walk(f, depth + 1);
-        f.path_len = saved;
-    }
-    nebula::release(l);
-}
-
-int cmd_find(Shell& sh, Io& io, u32 argc, char** argv) {
-    const char* start = ".";
-    FindCtx f{};
-    f.sh = &sh;
-    f.io = &io;
-    bool have_start = false;
-    for (u32 i = 1; i < argc; ++i) {
-        if (same(argv[i], "-name") && i + 1 < argc) {
-            const char* p = argv[++i];
-            if (length(p) >= sizeof(f.pattern)) return usage(io, "find: pattern is too long");
-            mark_wildcards(p, f.pattern, sizeof(f.pattern));
-            f.has_pattern = true;
-        } else if (same(argv[i], "-type") && i + 1 < argc) {
-            const char* t = argv[++i];
-            if (!(same(t, "f") || same(t, "d"))) return usage(io, "find: -type takes f or d");
-            f.type = t[0];
-        } else if (argv[i][0] != '-' && !have_start) {
-            start = argv[i];
-            have_start = true;
+int cmd_realms(Shell&, Io& io, u32 argc, char**) {
+    if (argc != 1) return usage(io, "usage: realms");
+    rows::Table& out = *io.out_rows;
+    rows::begin(out);
+    rows::add_column(out, "realm", Kind::Text);
+    rows::add_column(out, "state", Kind::Text);
+    rows::add_column(out, "access", Kind::Text);
+    rows::add_column(out, "free", Kind::Size);
+    rows::add_column(out, "size", Kind::Size);
+    rows::add_column(out, "about", Kind::Text);
+    for (u32 i = 0; i < nebula::realm_count(); ++i) {
+        nebula::Realm* r = nebula::realm_at(i);
+        u32 row = rows::add_row(out);
+        if (row == ~0u) break;
+        rows::set_text(out, row, 0, r->name());
+        rows::set_text(out, row, 1, r->available() ? "available" : "unavailable");
+        rows::set_text(out, row, 2, r->writable() ? "writable" : "read-only");
+        u64 total = r->space_total();
+        if (r->available() && total) {
+            rows::set_num(out, row, 3, r->space_free());
+            rows::set_num(out, row, 4, total);
         } else {
-            return usage(io, "usage: find [path] [-name pattern] [-type f|d]   (quote wildcards: -name '*.txt')");
+            rows::set_null(out, row, 3);
+            rows::set_null(out, row, 4);
         }
+        rows::set_text(out, row, 5, r->summary());
     }
-    nebula::Info inf;
-    nebula::Status st = lens::text::stat(sh.cursor, start, &inf);
-    if (st != nebula::Status::Ok) { print_status(io, "cannot search", start, st); return 1; }
-    if (inf.kind != nebula::Kind::Dir) { print_status(io, "cannot search", start, nebula::Status::NotADirectory); return 1; }
-    f.path = static_cast<char*>(kheap::alloc(nebula::path::TEXT_MAX));
-    if (!f.path) { print_error(io, "out of memory"); return 1; }
-    u32 n = length(start);
-    if (n >= nebula::path::TEXT_MAX) { kheap::free(f.path); print_error(io, "path is too long"); return 1; }
-    mem::copy(f.path, start, n + 1);
-    f.path_len = n;
-    find_walk(f, 0);
-    kheap::free(f.path);
-    if (f.stop) return 130;
-    return f.hits ? 0 : 1;
+    return too_many(io, out) ? 1 : 0;
 }
 
-int cmd_snapshot(Shell&, Io& io, u32 argc, char** argv) {
+int cmd_epoch(Shell&, Io& io, u32 argc, char** argv) {
     if (!nebula::disk_is_mounted()) { print_error(io, "no disk volume is mounted"); return 1; }
-    if (argc == 1 || same(argv[1], "take")) {
+    if (argc == 2 && same(argv[1], "take")) {
         u64 id = 0;
         nebula::Status st = nebula::disk_snapshot(&id);
-        if (st != nebula::Status::Ok) { print_status(io, "cannot snapshot", "disk", st); return 1; }
-        io.out.str("  snapshot ");
+        if (st != nebula::Status::Ok) { print_status(io, "cannot take an epoch of", "disk", st); return 1; }
+        io.out.str("  epoch ");
         io.out.num(id);
         io.out.str(" taken; browse it at ");
         io.out.rgb(palette::ICE);
@@ -687,46 +600,62 @@ int cmd_snapshot(Shell&, Io& io, u32 argc, char** argv) {
         io.out.put('\n');
         return 0;
     }
-    if (same(argv[1], "list")) {
+    if (argc == 1 || (argc == 2 && same(argv[1], "list"))) {
         u64 ids[stellar::SNAPSHOT_MAX];
         u32 n = stellar::snapshot_ids(ids, stellar::SNAPSHOT_MAX);
+        rows::Table& out = *io.out_rows;
+        rows::begin(out);
+        rows::add_column(out, "epoch", Kind::Int);
+        rows::add_column(out, "path", Kind::Text);
         for (u32 i = 0; i < n; ++i) {
-            io.out.str("  ");
-            io.out.rgb(palette::ICE);
-            io.out.str("snap:/");
-            io.out.num(ids[i]);
-            io.out.reset();
-            io.out.put('\n');
+            u32 row = rows::add_row(out);
+            if (row == ~0u) break;
+            rows::set_num(out, row, 0, ids[i]);
+            char path[32] = "snap:/";
+            u32 p = 6;
+            char digits[24];
+            u32 d = 0;
+            u64 v = ids[i];
+            if (!v) digits[d++] = '0';
+            while (v) { digits[d++] = static_cast<char>('0' + v % 10); v /= 10; }
+            while (d) path[p++] = digits[--d];
+            path[p] = 0;
+            rows::set_text(out, row, 1, path);
         }
-        io.out.rgb(palette::MIST);
-        io.out.num(n);
-        io.out.str(" of ");
-        io.out.num(stellar::SNAPSHOT_MAX);
-        io.out.str(" snapshots\n");
-        io.out.reset();
-        return 0;
+        char note[48] = "of ";
+        u32 p = 3;
+        char digits[24];
+        u32 d = 0;
+        u64 v = stellar::SNAPSHOT_MAX;
+        while (v) { digits[d++] = static_cast<char>('0' + v % 10); v /= 10; }
+        while (d) note[p++] = digits[--d];
+        const char* tail = " epochs possible";
+        for (u32 i = 0; tail[i]; ++i) note[p++] = tail[i];
+        note[p] = 0;
+        rows::set_note(out, note);
+        return too_many(io, out) ? 1 : 0;
     }
-    if (same(argv[1], "rm") && argc == 3) {
+    if (argc == 3 && same(argv[1], "drop")) {
         u64 id;
-        if (!parse_u64(argv[2], &id)) return usage(io, "usage: snapshot rm id");
+        if (!parse_u64(argv[2], &id)) return usage(io, "usage: epoch drop ID");
         nebula::Status st = nebula::disk_snapshot_delete(id);
-        if (st != nebula::Status::Ok) { print_status(io, "cannot delete snapshot", argv[2], st); return 1; }
+        if (st != nebula::Status::Ok) { print_status(io, "cannot drop epoch", argv[2], st); return 1; }
         return 0;
     }
-    return usage(io, "usage: snapshot [take|list|rm id]");
+    return usage(io, "usage: epoch [list|take|drop ID]");
 }
 
-int cmd_check(Shell&, Io& io, u32 argc, char** argv) {
+int cmd_audit(Shell&, Io& io, u32 argc, char**) {
     if (!nebula::disk_is_mounted()) { print_error(io, "no disk volume is mounted"); return 1; }
+    if (argc != 1) return usage(io, "usage: audit  deep: yes   (deep verifies every checksum and is slow on large volumes)");
     bool deep = false;
-    if (argc == 2 && same(argv[1], "-d")) deep = true;
-    else if (argc != 1) return usage(io, "usage: check [-d]   (-d verifies every checksum and is slow on large volumes)");
+    if (!opt_bool(io, "deep", &deep)) return 2;
     stellar::CheckReport rep{};
     stellar::Status why = stellar::Status::Ok;
     bool ok = stellar::check(&rep, deep, &why);
     Writer& w = io.out;
     auto line = [&](const char* k, u64 v) { w.str("  "); w.pad_to(k, 14); w.num(v); w.put('\n'); };
-    line("snapshots", rep.snapshots);
+    line("epochs", rep.snapshots);
     line("nodes", rep.nodes);
     line("directories", rep.dirs);
     line("files", rep.files);
@@ -744,15 +673,16 @@ int cmd_check(Shell&, Io& io, u32 argc, char** argv) {
     return ok && rep.ok() ? 0 : 1;
 }
 
-int cmd_sync(Shell&, Io& io, u32, char**) {
+int cmd_settle(Shell&, Io& io, u32 argc, char**) {
+    if (argc != 1) return usage(io, "usage: settle");
     if (!blockdev::present()) { print_error(io, "no block device"); return 1; }
     if (!blockdev::flush()) { print_error(io, "the device refused the flush"); return 1; }
     return 0;
 }
 
-int cmd_mkfs(Shell&, Io& io, u32 argc, char** argv) {
+int cmd_kindle(Shell&, Io& io, u32 argc, char** argv) {
     if (argc != 2 || !same(argv[1], "erase"))
-        return usage(io, "usage: mkfs erase   (creates an empty Stellar volume; only on a blank disk or one that already holds a Stellar volume)");
+        return usage(io, "usage: kindle erase   (creates an empty Stellar volume; only on a blank disk or one that already holds a Stellar volume)");
     if (!blockdev::present()) { print_error(io, "no block device"); return 1; }
     if (nebula::disk_is_confirmed_only()) {
         print_error(io, "this disk needs a typed confirmation; use: storage init erase <MiB>");
@@ -778,25 +708,24 @@ int cmd_mkfs(Shell&, Io& io, u32 argc, char** argv) {
 }
 
 constexpr Command COMMANDS[] = {
-    {"pwd", "pwd", "show the current location", &cmd_pwd},
-    {"cd", "cd [path|-]", "change location; realm: switches realm; no argument goes to the realm root", &cmd_cd},
-    {"ls", "ls [-l] [-1] [path...]", "list a directory; -l shows size and time", &cmd_ls},
-    {"tree", "tree [-d] [-L depth] [path]", "draw a directory tree", &cmd_tree},
-    {"cat", "cat [-n] [file...]", "print files or standard input", &cmd_cat},
-    {"stat", "stat path...", "kind, size, time and realm of a path", &cmd_stat},
-    {"touch", "touch file...", "create empty files that do not exist", &cmd_touch},
-    {"mkdir", "mkdir [-p] dir...", "create directories", &cmd_mkdir},
-    {"rm", "rm [-r] [-f] path...", "remove files; -r removes directories with their contents", &cmd_rm},
-    {"rmdir", "rmdir dir...", "remove empty directories", &cmd_rmdir},
-    {"cp", "cp [-r] [-f] source... dest", "copy files and, with -r, directories; works across realms", &cmd_cp},
-    {"mv", "mv [-f] source... dest", "move or rename; across realms it copies then removes", &cmd_mv},
-    {"find", "find [path] [-name pat] [-type f|d]", "search a tree; quote wildcards", &cmd_find},
-    {"realms", "realms", "the namespaces: ram, disk, snap, sys, and their space", &cmd_realms},
-    {"df", "df", "same as realms", &cmd_realms},
-    {"snapshot", "snapshot [take|list|rm id]", "freeze the disk volume; browse it under snap:/", &cmd_snapshot},
-    {"check", "check [-d]", "verify the Stellar volume's structures", &cmd_check},
-    {"sync", "sync", "ask the disk to flush its write cache", &cmd_sync},
-    {"mkfs", "mkfs erase", "create an empty Stellar volume on a blank disk", &cmd_mkfs},
+    {"here", "here", "show the current location", &cmd_here},
+    {"go", "go [path]", "change location; realm: switches realm; no path goes to the realm root", &cmd_go},
+    {"back", "back", "return to the previous location", &cmd_back},
+    {"chart", "chart [path]  depth: N  only: dir|file", "list a directory as rows: name, kind, size, changed", &cmd_chart, "depth only"},
+    {"outline", "outline [path]  depth: N  only: dir", "draw a directory as a tree", &cmd_outline, "depth only"},
+    {"beacon", "beacon [file...]  numbered: yes", "show files or piped input", &cmd_beacon, "numbered"},
+    {"probe", "probe path...", "kind, size, time, realm and access of paths, as rows", &cmd_probe},
+    {"spark", "spark file...", "create empty files that do not exist", &cmd_spark},
+    {"plant", "plant dir...  parents: yes", "create directories", &cmd_plant, "parents"},
+    {"fade", "fade path...  tree: yes  missing: yes", "remove files and empty directories; tree: yes takes everything inside too", &cmd_fade, "tree missing"},
+    {"twin", "twin source... dest  tree: yes  replace: yes", "copy files, and with tree: yes directories; works across realms", &cmd_twin, "tree replace"},
+    {"drift", "drift source... dest  replace: yes", "move or rename; across realms it copies then removes", &cmd_drift, "replace"},
+    {"etch", "etch file  append: yes", "write what is piped in to a file", &cmd_etch, "append"},
+    {"realms", "realms", "the namespaces ram, disk, snap, sys and their space, as rows", &cmd_realms},
+    {"epoch", "epoch [list|take|drop ID]", "freeze the disk volume as an epoch; browse it under snap:/", &cmd_epoch},
+    {"audit", "audit  deep: yes", "verify the Stellar volume's structures", &cmd_audit, "deep"},
+    {"settle", "settle", "ask the disk to flush its write cache", &cmd_settle},
+    {"kindle", "kindle erase", "create an empty Stellar volume on a blank disk", &cmd_kindle},
 };
 
 constexpr Table TABLE{"files and realms", COMMANDS, sizeof(COMMANDS) / sizeof(COMMANDS[0])};

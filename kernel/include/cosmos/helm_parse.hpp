@@ -22,26 +22,21 @@ enum class Error : u8 {
     TooMany,
     Unterminated,
     BadEscape,
-    BadRedirect,
     EmptyCommand,
-    BadOperator,
     BadText,
 };
 
-enum class Role : u8 { Arg, In, Out, Append };
-enum class Link : u8 { First, Seq, And, Or };
+enum class Link : u8 { First, Seq, Then, Else };
 
 struct Word {
     u32 off;
     u32 len;
     u32 stage;
-    Role role;
+    bool quoted;
 };
 
 struct Stage {
     u32 args;
-    bool has_in;
-    bool has_out;
 };
 
 struct Pipe {
@@ -71,9 +66,7 @@ inline const char* describe(Error e) {
         case Error::TooMany: return "too many words, stages or commands on one line";
         case Error::Unterminated: return "unterminated quote";
         case Error::BadEscape: return "bad escape sequence";
-        case Error::BadRedirect: return "redirection needs a file name";
         case Error::EmptyCommand: return "missing command";
-        case Error::BadOperator: return "a single & is not supported, use && to chain";
         case Error::BadText: return "line contains a control character or invalid UTF-8";
     }
     return "error";
@@ -82,7 +75,7 @@ inline const char* describe(Error e) {
 namespace detail {
 
 inline bool is_space(char c) { return c == ' ' || c == '\t'; }
-inline bool is_meta(char c) { return c == ';' || c == '|' || c == '&' || c == '<' || c == '>'; }
+inline bool is_meta(char c) { return c == ';' || c == '|'; }
 inline bool is_name_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
@@ -137,13 +130,16 @@ struct Builder {
         return true;
     }
 
+    bool variable_ahead() const {
+        if (line[i] != '@') return false;
+        char n = line[i + 1];
+        if (!is_name_char(n) && n != '{') return false;
+        return i == 0 || !is_name_char(line[i - 1]);
+    }
+
     bool variable() {
         ++i;
         char c = line[i];
-        if (c == '?') {
-            ++i;
-            return put(MARK_VAR) && put('?') && put(MARK_END);
-        }
         if (c == '{') {
             u32 j = i + 1;
             u32 n = 0;
@@ -155,7 +151,6 @@ struct Builder {
             i = j + 1;
             return put(MARK_END);
         }
-        if (!is_name_char(c)) return put('$');
         if (!put(MARK_VAR)) return false;
         while (is_name_char(line[i])) {
             if (!put(line[i])) return false;
@@ -170,13 +165,13 @@ struct Builder {
             char c = line[i];
             if (!c) return fail(Error::Unterminated);
             if (c == '"') { ++i; return true; }
-            if (c == '$') { if (!variable()) return false; continue; }
+            if (variable_ahead()) { if (!variable()) return false; continue; }
             if (c != '\\') { if (!put(c)) return false; ++i; continue; }
             char n = line[i + 1];
             if (!n) return fail(Error::Unterminated);
             i += 2;
             switch (n) {
-                case '"': case '\\': case '$': if (!put(n)) return false; break;
+                case '"': case '\\': case '@': if (!put(n)) return false; break;
                 case 'n': if (!put('\n')) return false; break;
                 case 't': if (!put('\t')) return false; break;
                 case 'e': if (!put('\x1b')) return false; break;
@@ -201,16 +196,17 @@ struct Builder {
         }
     }
 
-    bool word(u32 stage, Role role) {
+    bool word(u32 stage) {
         if (p.word_count >= MAX_WORDS) return fail(Error::TooMany);
         Word& w = p.words[p.word_count];
         w.off = p.pool_len;
         w.stage = stage;
-        w.role = role;
+        w.quoted = false;
         for (;;) {
             char c = line[i];
             if (!c || is_space(c) || is_meta(c)) break;
             if (c == '\'') {
+                w.quoted = true;
                 ++i;
                 while (line[i] && line[i] != '\'') {
                     if (!put(line[i])) return false;
@@ -219,12 +215,14 @@ struct Builder {
                 if (!line[i]) return fail(Error::Unterminated);
                 ++i;
             } else if (c == '"') {
+                w.quoted = true;
                 if (!double_quoted()) return false;
             } else if (c == '\\') {
+                w.quoted = true;
                 if (!line[i + 1]) return fail(Error::Unterminated);
                 if (!put(line[i + 1])) return false;
                 i += 2;
-            } else if (c == '$') {
+            } else if (variable_ahead()) {
                 if (!variable()) return false;
             } else if (c == '*') {
                 if (!put(MARK_STAR)) return false;
@@ -268,7 +266,7 @@ inline Error parse(const char* line, Parsed& out) {
     u32 stage = 0;
     bool stage_open = true;
     u32 pipe_first_stage = 0;
-    out.stages[0] = Stage{0, false, false};
+    out.stages[0] = Stage{0};
     out.stage_count = 1;
 
     auto close_pipe = [&](Link following) -> bool {
@@ -292,7 +290,7 @@ inline Error parse(const char* line, Parsed& out) {
             return false;
         }
         stage = out.stage_count;
-        out.stages[out.stage_count++] = Stage{0, false, false};
+        out.stages[out.stage_count++] = Stage{0};
         stage_open = true;
         return true;
     };
@@ -302,58 +300,34 @@ inline Error parse(const char* line, Parsed& out) {
         char c = line[b.i];
         if (!c) break;
         if (c == '#') break;
-        if (c == ';') {
-            if (!close_pipe(Link::Seq)) return b.err;
-            pipe_first_stage = out.stage_count;
-            ++b.i;
-            if (!open_stage()) return b.err;
-            continue;
+        Link following = Link::First;
+        u32 width = 0;
+        if (c == ';') { following = Link::Seq; width = 1; }
+        else if ((c == '=' || c == '!') && line[b.i + 1] == '>' && (!line[b.i + 2] || detail::is_space(line[b.i + 2]))) {
+            following = c == '=' ? Link::Then : Link::Else;
+            width = 2;
         }
-        if (c == '&') {
-            if (line[b.i + 1] != '&') { b.fail(Error::BadOperator); return b.err; }
-            if (!close_pipe(Link::And)) return b.err;
+        if (width) {
+            if (!close_pipe(following)) return b.err;
             pipe_first_stage = out.stage_count;
-            b.i += 2;
+            b.i += width;
             if (!open_stage()) return b.err;
             continue;
         }
         if (c == '|') {
-            if (line[b.i + 1] == '|') {
-                if (!close_pipe(Link::Or)) return b.err;
-                pipe_first_stage = out.stage_count;
-                b.i += 2;
-                if (!open_stage()) return b.err;
-                continue;
-            }
             if (out.stages[stage].args == 0) { b.fail(Error::EmptyCommand); return b.err; }
             ++b.i;
             if (!open_stage()) return b.err;
             continue;
         }
-        if (c == '<' || c == '>') {
-            Role role = Role::In;
-            ++b.i;
-            if (c == '>') {
-                role = Role::Out;
-                if (line[b.i] == '>') { role = Role::Append; ++b.i; }
-            }
-            while (detail::is_space(line[b.i])) ++b.i;
-            char t = line[b.i];
-            if (!t || detail::is_meta(t)) { b.fail(Error::BadRedirect); return b.err; }
-            Stage& st = out.stages[stage];
-            if ((role == Role::In && st.has_in) || (role != Role::In && st.has_out)) { b.fail(Error::BadRedirect); return b.err; }
-            if (!b.word(stage, role)) return b.err;
-            if (role == Role::In) st.has_in = true; else st.has_out = true;
-            continue;
-        }
-        if (!b.word(stage, Role::Arg)) return b.err;
+        if (!b.word(stage)) return b.err;
         ++out.stages[stage].args;
     }
     if (stage_open) {
         Stage& st = out.stages[stage];
         if (st.args > 0) {
             if (!close_pipe(Link::First)) return b.err;
-        } else if (st.has_in || st.has_out || stage > pipe_first_stage || next_link == Link::And || next_link == Link::Or) {
+        } else if (stage > pipe_first_stage || next_link == Link::Then || next_link == Link::Else) {
             b.fail(Error::EmptyCommand);
             return b.err;
         }

@@ -1,4 +1,4 @@
-#include <cosmos/helm.hpp>
+#include <cosmos/helm_rows.hpp>
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/corona.hpp>
 #include <cosmos/input.hpp>
@@ -299,6 +299,14 @@ void loop(void*) {
             redraw(w, *e, m.cols);
             continue;
         }
+        if (k.sym == input::Sym::PageUp || k.sym == input::Sym::PageDown ||
+            (k.shift() && (k.sym == input::Sym::Up || k.sym == input::Sym::Down))) {
+            const bool back = k.sym == input::Sym::PageUp || k.sym == input::Sym::Up;
+            const i32 step = k.sym == input::Sym::PageUp || k.sym == input::Sym::PageDown
+                ? static_cast<i32>(m.rows > 2 ? m.rows - 2 : 1) : 1;
+            corona::scroll_view(back ? step : -step);
+            continue;
+        }
         if (k.sym == input::Sym::Tab) {
             tab = true;
             handle_tab(*sh, w, *e, m.cols);
@@ -337,11 +345,11 @@ void loop(void*) {
             else if (k.cp == 'd' && l.len == 0) {
                 w.str("\n  use ");
                 w.rgb(palette::ICE);
-                w.str("poweroff");
+                w.str("sunset");
                 w.reset();
                 w.str(" or ");
                 w.rgb(palette::ICE);
-                w.str("reboot");
+                w.str("restart");
                 w.reset();
                 w.put('\n');
             } else edited = false;
@@ -358,22 +366,25 @@ void loop(void*) {
     }
 }
 
-int cmd_history(Shell&, Io& io, u32, char**) {
+int cmd_recall(Shell&, Io& io, u32, char**) {
     Editor* e = g_editor;
     if (!e) return 0;
+    rows::Table& t = *io.out_rows;
+    rows::begin(t);
+    rows::add_column(t, "n", rows::Kind::Int);
+    rows::add_column(t, "command", rows::Kind::Text);
+    t.body = 1;
     for (u32 i = e->history_count; i >= 1; --i) {
-        io.out.rgb(palette::MIST);
-        io.out.pad_num(e->history_count - i + 1, 4);
-        io.out.str("  ");
-        io.out.reset();
-        io.out.str(recall(*e, i));
-        io.out.put('\n');
+        u32 r = rows::add_row(t);
+        if (r == ~0u) break;
+        rows::set_num(t, r, 0, e->history_count - i + 1);
+        rows::set_text(t, r, 1, recall(*e, i));
     }
     return 0;
 }
 
 constexpr Command COMMANDS[] = {
-    {"history", "history", "the commands typed in this shell", &cmd_history},
+    {"recall", "recall", "the commands typed in this shell, as rows", &cmd_recall},
 };
 
 constexpr Table TABLE{"editor", COMMANDS, sizeof(COMMANDS) / sizeof(COMMANDS[0])};

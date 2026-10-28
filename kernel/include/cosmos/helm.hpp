@@ -7,6 +7,8 @@
 
 namespace helm {
 
+namespace rows { struct Table; }
+
 namespace palette {
 constexpr u32 AMBER = 0xFFB347;
 constexpr u32 EMBER = 0xFF7B3A;
@@ -143,21 +145,36 @@ struct Shell {
 void init(Shell& sh, Sink terminal, bool color, u32 cols, const char* start_realm);
 void shutdown(Shell& sh);
 
+struct Named {
+    const char* key;
+    const char* value;
+};
+
 struct Io {
     Writer& out;
     Writer& err;
     const u8* in;
     u64 in_size;
     bool has_in;
+    const rows::Table* in_rows;
+    rows::Table* out_rows;
+    const Named* named;
+    u32 named_count;
 };
 
 using CommandFn = int (*)(Shell& sh, Io& io, u32 argc, char** argv);
+
+constexpr u32 CMD_ROWS = 1u << 0;
+constexpr u32 CMD_ANY = 1u << 1;
+constexpr u32 CMD_LITERAL = 1u << 2;
 
 struct Command {
     const char* name;
     const char* usage;
     const char* summary;
     CommandFn fn;
+    const char* keys = "";
+    u32 flags = 0;
 };
 
 struct Table {
@@ -185,6 +202,7 @@ int run_line(Shell& sh, const char* line);
 const char* var_get(const Shell& sh, const char* name);
 bool var_set(Shell& sh, const char* name, const char* value);
 bool var_unset(Shell& sh, const char* name);
+bool var_reserved(const char* name);
 
 bool glob_match(const char* pattern, const char* name);
 void mark_wildcards(const char* in, char* out, u32 cap);
@@ -202,23 +220,21 @@ struct Completion {
 bool complete(Shell& sh, const char* line, u32 cursor, Completion* out);
 void release(Completion& c);
 
-struct Options {
-    u32 argc;
-    char** argv;
-    u32 index;
-    u32 pos;
-    const char* value;
-    char bad;
-};
+enum class Flag : u8 { Absent, Yes, No, Bad };
 
-Options options_begin(u32 argc, char** argv);
-int next_option(Options& o, const char* flags, const char* valued);
+const char* opt(const Io& io, const char* key);
+Flag opt_flag(const Io& io, const char* key);
+bool opt_yes(const Io& io, const char* key);
+bool opt_u64(const Io& io, const char* key, u64* out);
+bool opt_bool(Io& io, const char* key, bool* out);
+bool opt_num(Io& io, const char* key, u64* out);
 
 bool parse_u64(const char* s, u64* out);
 
 using InputFn = void (*)(const char* name, const u8* data, u64 size, void* ctx);
-int for_each_input(Shell& sh, Io& io, Options& o, InputFn fn, void* ctx);
+int for_each_input(Shell& sh, Io& io, u32 argc, char** argv, u32 first, InputFn fn, void* ctx);
 
+void write_safe(Writer& w, const u8* data, u64 size);
 void print_status(Io& io, const char* what, const char* subject, nebula::Status st);
 void print_error(Io& io, const char* message);
 int code_of(nebula::Status st);

@@ -11,6 +11,7 @@
 #include <cosmos/helm.hpp>
 #include <cosmos/lens_text.hpp>
 #include <cosmos/helm_parse.hpp>
+#include <cosmos/helm_rows.hpp>
 
 extern "C" {
 int printf(const char*, ...);
@@ -151,6 +152,7 @@ public:
 static FakeSys g_fake_sys;
 
 namespace hp = helm::parse;
+namespace hr = helm::rows;
 
 static hp::Parsed g_parsed;
 static hp::Error parse_line(const char* line) { return hp::parse(line, g_parsed); }
@@ -167,44 +169,43 @@ static void test_parser() {
     CHECK(parse_line("") == hp::Error::Ok && g_parsed.pipe_count == 0, "empty line");
     CHECK(parse_line("   \t ") == hp::Error::Ok && g_parsed.pipe_count == 0, "blank line");
     CHECK(parse_line("# nothing") == hp::Error::Ok && g_parsed.pipe_count == 0, "comment only");
-    CHECK(parse_line("ls -l docs") == hp::Error::Ok && g_parsed.word_count == 3 && word_is(0, "ls") && word_is(2, "docs"), "plain words");
-    CHECK(parse_line("echo 'a  b' \"c  d\"") == hp::Error::Ok && g_parsed.word_count == 3 && word_is(1, "a  b") && word_is(2, "c  d"), "quotes keep spaces");
-    CHECK(parse_line("echo a\\ b") == hp::Error::Ok && g_parsed.word_count == 2 && word_is(1, "a b"), "escaped space");
-    CHECK(parse_line("echo ''") == hp::Error::Ok && g_parsed.word_count == 2 && g_parsed.words[1].len == 0, "empty quoted word");
-    CHECK(parse_line("echo \"\\u{20B9} \\u{1F600}\"") == hp::Error::Ok && word_is(1, "\xE2\x82\xB9 \xF0\x9F\x98\x80"), "unicode escapes");
-    CHECK(parse_line("echo \"\\u{D800}\"") == hp::Error::BadEscape, "surrogate escape refused");
-    CHECK(parse_line("echo \"\\u{110000}\"") == hp::Error::BadEscape, "out of range escape refused");
-    CHECK(parse_line("echo \"\\u{1B}\"") == hp::Error::BadEscape, "control escape refused");
-    CHECK(parse_line("echo \"\\u20B9\"") == hp::Error::BadEscape, "escape without braces refused");
-    CHECK(parse_line("echo \"a\\nb\\tc\"") == hp::Error::Ok && word_is(1, "a\nb\tc"), "newline and tab escapes");
-    CHECK(parse_line("echo \"unterminated") == hp::Error::Unterminated, "unterminated double quote");
-    CHECK(parse_line("echo 'unterminated") == hp::Error::Unterminated, "unterminated single quote");
-    CHECK(parse_line("echo trailing\\") == hp::Error::Unterminated, "trailing backslash");
+    CHECK(parse_line("chart depth: 2 docs") == hp::Error::Ok && g_parsed.word_count == 4 && word_is(0, "chart") && word_is(1, "depth:") && word_is(3, "docs"), "plain words");
+    CHECK(parse_line("say 'a  b' \"c  d\"") == hp::Error::Ok && g_parsed.word_count == 3 && word_is(1, "a  b") && word_is(2, "c  d"), "quotes keep spaces");
+    CHECK(parse_line("say a\\ b") == hp::Error::Ok && g_parsed.word_count == 2 && word_is(1, "a b"), "escaped space");
+    CHECK(parse_line("say ''") == hp::Error::Ok && g_parsed.word_count == 2 && g_parsed.words[1].len == 0 && g_parsed.words[1].quoted, "empty quoted word");
+    CHECK(parse_line("say 'depth:' depth:") == hp::Error::Ok && g_parsed.words[1].quoted && !g_parsed.words[2].quoted, "quoting is recorded for option detection");
+    CHECK(parse_line("say \"\\u{20B9} \\u{1F600}\"") == hp::Error::Ok && word_is(1, "\xE2\x82\xB9 \xF0\x9F\x98\x80"), "unicode escapes");
+    CHECK(parse_line("say \"\\u{D800}\"") == hp::Error::BadEscape, "surrogate escape refused");
+    CHECK(parse_line("say \"\\u{110000}\"") == hp::Error::BadEscape, "out of range escape refused");
+    CHECK(parse_line("say \"\\u{1B}\"") == hp::Error::BadEscape, "control escape refused");
+    CHECK(parse_line("say \"\\u20B9\"") == hp::Error::BadEscape, "escape without braces refused");
+    CHECK(parse_line("say \"a\\nb\\tc\"") == hp::Error::Ok && word_is(1, "a\nb\tc"), "newline and tab escapes");
+    CHECK(parse_line("say \"unterminated") == hp::Error::Unterminated, "unterminated double quote");
+    CHECK(parse_line("say 'unterminated") == hp::Error::Unterminated, "unterminated single quote");
+    CHECK(parse_line("say trailing\\") == hp::Error::Unterminated, "trailing backslash");
     CHECK(parse_line("a | b | c") == hp::Error::Ok && g_parsed.pipe_count == 1 && g_parsed.pipes[0].stage_count == 3, "three stage pipe");
-    CHECK(parse_line("a ; b && c || d") == hp::Error::Ok && g_parsed.pipe_count == 4 &&
-              g_parsed.pipes[1].link == hp::Link::Seq && g_parsed.pipes[2].link == hp::Link::And && g_parsed.pipes[3].link == hp::Link::Or, "connectors");
+    CHECK(parse_line("a ; b => c !> d") == hp::Error::Ok && g_parsed.pipe_count == 4 && g_parsed.pipes[0].link == hp::Link::First &&
+              g_parsed.pipes[1].link == hp::Link::Seq && g_parsed.pipes[2].link == hp::Link::Then && g_parsed.pipes[3].link == hp::Link::Else, "connectors");
     CHECK(parse_line("a;") == hp::Error::Ok && g_parsed.pipe_count == 1, "trailing semicolon");
-    CHECK(parse_line("a &&") == hp::Error::EmptyCommand, "dangling and");
-    CHECK(parse_line("a ||") == hp::Error::EmptyCommand, "dangling or");
+    CHECK(parse_line("a =>") == hp::Error::EmptyCommand, "dangling then");
+    CHECK(parse_line("a !>") == hp::Error::EmptyCommand, "dangling else");
     CHECK(parse_line("a |") == hp::Error::EmptyCommand, "dangling pipe");
     CHECK(parse_line("| a") == hp::Error::EmptyCommand, "leading pipe");
     CHECK(parse_line("; a") == hp::Error::EmptyCommand, "leading semicolon");
+    CHECK(parse_line("=> a") == hp::Error::EmptyCommand, "leading then");
     CHECK(parse_line("a ;; b") == hp::Error::EmptyCommand, "double semicolon");
-    CHECK(parse_line("a & b") == hp::Error::BadOperator, "single ampersand");
-    CHECK(parse_line("a >") == hp::Error::BadRedirect, "redirect without target");
-    CHECK(parse_line("a > > b") == hp::Error::BadRedirect, "redirect into operator");
-    CHECK(parse_line("a > x > y") == hp::Error::BadRedirect, "two output redirects");
-    CHECK(parse_line("> x") == hp::Error::EmptyCommand, "redirect without command");
-    CHECK(parse_line("a > x < y") == hp::Error::Ok, "input and output redirect");
-    CHECK(parse_line("a >> x") == hp::Error::Ok && g_parsed.words[1].role == hp::Role::Append, "append role");
-    CHECK(parse_line("echo a # tail") == hp::Error::Ok && g_parsed.word_count == 2, "comment after words");
-    CHECK(parse_line("echo a#b") == hp::Error::Ok && word_is(1, "a#b"), "hash inside a word");
-    CHECK(parse_line("echo \"x # y\"") == hp::Error::Ok && word_is(1, "x # y"), "hash inside quotes");
-    CHECK(parse_line("echo a\x01") == hp::Error::BadText, "control byte in line");
-    CHECK(parse_line("echo \xFF") == hp::Error::BadText, "invalid UTF-8 in line");
-    CHECK(parse_line("echo \xC3") == hp::Error::BadText, "truncated UTF-8 in line");
-    CHECK(parse_line("echo \xEF\xBF\xBD") == hp::Error::Ok, "a literal replacement character is fine");
-    CHECK(parse_line("echo caf\xC3\xA9 \xE2\x82\xB9\xCE\xA9") == hp::Error::Ok && word_is(1, "caf\xC3\xA9") && word_is(2, "\xE2\x82\xB9\xCE\xA9"), "unicode words");
+    CHECK(parse_line("a => => b") == hp::Error::EmptyCommand, "double then");
+    CHECK(parse_line("where size => 3") == hp::Error::Ok && g_parsed.pipe_count == 2, "a standalone arrow always separates commands");
+    CHECK(parse_line("where size '=>' 3") == hp::Error::Ok && g_parsed.pipe_count == 1 && g_parsed.word_count == 4, "a quoted arrow is a word");
+    CHECK(parse_line("a >b =>c !=d x&y <z") == hp::Error::Ok && g_parsed.pipe_count == 1 && g_parsed.word_count == 6, "no other punctuation is special");
+    CHECK(parse_line("say a # tail") == hp::Error::Ok && g_parsed.word_count == 2, "comment after words");
+    CHECK(parse_line("say a#b") == hp::Error::Ok && word_is(1, "a#b"), "hash inside a word");
+    CHECK(parse_line("say \"x # y\"") == hp::Error::Ok && word_is(1, "x # y"), "hash inside quotes");
+    CHECK(parse_line("say a\x01") == hp::Error::BadText, "control byte in line");
+    CHECK(parse_line("say \xFF") == hp::Error::BadText, "invalid UTF-8 in line");
+    CHECK(parse_line("say \xC3") == hp::Error::BadText, "truncated UTF-8 in line");
+    CHECK(parse_line("say \xEF\xBF\xBD") == hp::Error::Ok, "a literal replacement character is fine");
+    CHECK(parse_line("say caf\xC3\xA9 \xE2\x82\xB9\xCE\xA9") == hp::Error::Ok && word_is(1, "caf\xC3\xA9") && word_is(2, "\xE2\x82\xB9\xCE\xA9"), "unicode words");
     char big[1100];
     for (int i = 0; i < 1099; ++i) big[i] = 'a';
     big[1099] = 0;
@@ -220,10 +221,13 @@ static void test_parser() {
     stages[n++] = 'x';
     stages[n] = 0;
     CHECK(parse_line(stages) == hp::Error::TooMany, "more than 16 stages");
-    CHECK(parse_line("echo $x ${y} $? $ \"$z\" '$w'") == hp::Error::Ok && g_parsed.word_count == 7, "variable forms parse");
-    CHECK(parse_line("echo ${") == hp::Error::BadEscape, "broken brace variable");
-    CHECK(parse_line("echo *.txt a?c") == hp::Error::Ok && g_parsed.words[1].len == 5 && g_parsed.text(g_parsed.words[1])[0] == hp::MARK_STAR, "wildcards marked");
-    CHECK(parse_line("echo '*.txt' \"*.txt\" \\*") == hp::Error::Ok && g_parsed.text(g_parsed.words[1])[0] == '*' && g_parsed.text(g_parsed.words[2])[0] == '*' && g_parsed.text(g_parsed.words[3])[0] == '*', "quoted wildcards are literal");
+    CHECK(parse_line("say @x @{y} @status @ \"@z\" '@w'") == hp::Error::Ok && g_parsed.word_count == 7, "value forms parse");
+    CHECK(parse_line("say @{") == hp::Error::BadEscape, "broken brace value");
+    CHECK(parse_line("say @{}") == hp::Error::BadEscape, "empty brace value");
+    CHECK(parse_line("say me@example.com $HOME ${x}") == hp::Error::Ok && word_is(1, "me@example.com") && word_is(2, "$HOME") && word_is(3, "${x}"), "an @ inside a word and a dollar are plain text");
+    CHECK(parse_line("say a\\@b \"c\\@d\"") == hp::Error::Ok && word_is(1, "a@b") && word_is(2, "c@d"), "escaped at sign");
+    CHECK(parse_line("say *.txt a?c") == hp::Error::Ok && g_parsed.words[1].len == 5 && g_parsed.text(g_parsed.words[1])[0] == hp::MARK_STAR, "wildcards marked");
+    CHECK(parse_line("say '*.txt' \"*.txt\" \\*") == hp::Error::Ok && g_parsed.text(g_parsed.words[1])[0] == '*' && g_parsed.text(g_parsed.words[2])[0] == '*' && g_parsed.text(g_parsed.words[3])[0] == '*', "quoted wildcards are literal");
 }
 
 static bool completes_to(const char* line, const char* insert, u32 count) {
@@ -238,190 +242,215 @@ static bool completes_to(const char* line, const char* insert, u32 count) {
 
 static void test_shell() {
     printf("-- shell on ram\n");
-    CHECK(out_is("echo hello", "hello\n"), "echo");
-    CHECK(out_is("echo -n hi", "hi"), "echo -n");
-    CHECK(out_is("echo 'a  b'   \"c  d\"", "a  b c  d\n"), "quotes preserved");
-    CHECK(out_is("echo \"caf\\u{e9} \\u{20B9}\"", "caf\xC3\xA9 \xE2\x82\xB9\n"), "unicode escapes");
-    CHECK(out_is("echo caf\xC3\xA9 \xCE\xA9\xE2\x82\xB9", "caf\xC3\xA9 \xCE\xA9\xE2\x82\xB9\n"), "unicode passthrough");
-    CHECK(out_is("set name world; echo hello $name ${name}s", "hello world worlds\n"), "variables");
-    CHECK(out_is("set a=1 2 3; echo \"[$a]\"", "[1 2 3]\n"), "set joins values");
-    CHECK(out_is("echo '$name'", "$name\n"), "single quotes block expansion");
-    CHECK(out_is("echo $undefined-x", "-x\n"), "undefined variable is empty");
-    CHECK(out_is("unset name; echo [$name]", "[]\n"), "unset");
-    CHECK(out_is("true; echo $?", "0\n"), "status zero");
-    CHECK(out_is("false; echo $?", "1\n"), "status one");
-    CHECK(out_is("nosuchcommand; echo $?", "  unknown command: nosuchcommand\n  try help\n127\n"), "unknown command status");
-    CHECK(out_is("true && echo yes", "yes\n"), "and runs");
-    CHECK(out_is("false && echo yes", ""), "and skips");
-    CHECK(out_is("false || echo rescued", "rescued\n"), "or runs");
-    CHECK(out_is("true || echo never", ""), "or skips");
-    CHECK(out_is("false && echo a || echo b", "b\n"), "and then or");
-    CHECK(out_is("echo $cwd", "ram:/\n"), "cwd variable");
-    CHECK(out_has("echo 'a", "unterminated quote") && g_status == 2, "syntax error status");
+    CHECK(out_is("say hello", "hello\n"), "say");
+    CHECK(out_is("say hi newline: no", "hi"), "an option after the words");
+    CHECK(out_is("say newline: no hi", "hi"), "an option before the words");
+    CHECK(out_is("say 'a  b'   \"c  d\"", "a  b c  d\n"), "quotes preserved");
+    CHECK(out_is("say \"caf\\u{e9} \\u{20B9}\"", "caf\xC3\xA9 \xE2\x82\xB9\n"), "unicode escapes");
+    CHECK(out_is("say caf\xC3\xA9 \xCE\xA9\xE2\x82\xB9", "caf\xC3\xA9 \xCE\xA9\xE2\x82\xB9\n"), "unicode passthrough");
+    CHECK(out_is("bind name world; say hello @name @{name}s", "hello world worlds\n"), "bound values");
+    CHECK(out_is("bind a 1 2 3; say \"[@a]\"", "[1 2 3]\n"), "bind joins values");
+    CHECK(out_is("say '@name'", "@name\n"), "single quotes block expansion");
+    CHECK(out_is("say me@example.com", "me@example.com\n"), "an @ inside a word is not a value");
+    CHECK(out_is("say $HOME ${x}", "$HOME ${x}\n"), "a dollar means nothing here");
+    CHECK(out_is("say @undefined-x", "-x\n"), "unbound value is empty");
+    CHECK(out_is("unbind name; say [@name]", "[]\n"), "unbind");
+    CHECK(out_is("bind star '*.txt'; say @star", "*.txt\n"), "a bound wildcard stays literal in say");
+    CHECK(out_is("ok; say @status", "0\n"), "status zero");
+    CHECK(out_is("fail; say @status", "1\n"), "status one");
+    CHECK(out_is("nosuchcommand; say @status", "  unknown command: nosuchcommand\n  try help\n127\n"), "unknown command status");
+    CHECK(out_has("bind status 5", "cannot be bound") && g_status == 1, "reserved name");
+    CHECK(out_has("bind here x", "cannot be bound") && g_status == 1, "reserved name here");
+    CHECK(out_is("ok => say yes", "yes\n"), "then runs");
+    CHECK(out_is("fail => say yes", ""), "then skips");
+    CHECK(out_is("fail !> say rescued", "rescued\n"), "else runs");
+    CHECK(out_is("ok !> say never", ""), "else skips");
+    CHECK(out_is("fail => say a !> say b", "b\n"), "then and else");
+    CHECK(out_is("ok => fail !> say c", "c\n"), "else after a failed then");
+    CHECK(out_is("say @here", "ram:/\n"), "here value");
+    CHECK(out_has("say 'a", "unterminated quote") && g_status == 2, "syntax error status");
 
-    CHECK(out_is("echo hi > f.txt; cat f.txt", "hi\n"), "redirect and cat");
-    CHECK(out_is("echo more >> f.txt; cat f.txt", "hi\nmore\n"), "append");
-    CHECK(out_is("echo over > f.txt; cat f.txt", "over\n"), "overwrite");
-    CHECK(out_is("cat < f.txt", "over\n"), "input redirect");
-    CHECK(out_is("echo b > s.txt; echo a >> s.txt; echo c >> s.txt; sort s.txt", "a\nb\nc\n"), "sort");
-    CHECK(out_is("cat s.txt | sort -r", "c\nb\na\n"), "pipe into sort -r");
-    CHECK(out_is("cat s.txt | sort | head -n 2", "a\nb\n"), "three stage pipe");
-    CHECK(out_is("cat s.txt | grep b", "b\n"), "pipe into grep");
-    CHECK(out_is("cat s.txt | count -l", "       3\n"), "pipe into count");
-    CHECK(out_is("echo x | cat > piped.txt; cat piped.txt", "x\n"), "pipe then redirect");
-    CHECK(out_has("cat < missing.txt", "cannot read missing.txt: not found") && g_status == 1, "missing input file");
-    CHECK(out_has("echo x > nodir/f", "cannot write nodir/f: not found") && g_status == 1, "redirect into missing directory");
-    CHECK(out_has("echo x > *.txt", "wildcards are not allowed in redirection targets"), "wildcard redirect target");
-    CHECK(out_has("echo x > sys:/version", "read-only realm"), "redirect into read-only realm");
-    CHECK(out_has("cat", "no input") && g_status == 1, "cat without input");
+    CHECK(out_is("say hi | etch f.txt; beacon f.txt", "hi\n"), "etch and beacon");
+    CHECK(out_is("say more | etch f.txt append: yes; beacon f.txt", "hi\nmore\n"), "append");
+    CHECK(out_is("say over | etch f.txt; beacon f.txt", "over\n"), "overwrite");
+    CHECK(out_is("say b | etch s.txt; say a | etch s.txt append: yes; say c | etch s.txt append: yes; beacon s.txt | order", "a\nb\nc\n"), "order text");
+    CHECK(out_is("beacon s.txt | order down: yes", "c\nb\na\n"), "order down");
+    CHECK(out_is("beacon s.txt | order | first 2", "a\nb\n"), "three stage pipe");
+    CHECK(out_is("beacon s.txt | seek b | pick text", "b\n"), "seek then pick");
+    CHECK(out_is("say x | beacon | etch piped.txt; beacon piped.txt", "x\n"), "pipe through beacon then etch");
+    CHECK(out_has("beacon", "no input") && g_status == 1, "beacon without input");
+    CHECK(out_has("etch f", "nothing to write") && g_status == 1, "etch without input");
+    CHECK(out_has("say x | etch nodir/f", "cannot write nodir/f: not found") && g_status == 1, "etch into a missing directory");
+    CHECK(out_has("say x | etch sys:/version", "read-only realm"), "etch into a read-only realm");
+    CHECK(out_has("say x | etch", "usage: etch") && g_status == 2, "etch needs a file");
+    CHECK(out_has("say x | etch append: maybe f", "yes or no") && g_status == 2, "bad yes/no value");
 
-    CHECK(out_is("echo \"caf\\u{e9} \\u{20B9}\" > \"caf\xC3\xA9 \xE2\x82\xB9.txt\"; cat caf\xC3\xA9\\ \xE2\x82\xB9.txt", "caf\xC3\xA9 \xE2\x82\xB9\n"), "unicode file name end to end");
-    CHECK(out_is("echo 1 > \"\xCE\xA9mega\"; ls | grep mega", "\xCE\xA9mega\n"), "ls into grep with unicode");
-    CHECK(out_has("echo 1 > \"bad\\u{202E}name\"", "invalid name"), "bidi override refused in names");
+    CHECK(out_is("say \"caf\\u{e9} \\u{20B9}\" | etch \"caf\xC3\xA9 \xE2\x82\xB9.txt\"; beacon caf\xC3\xA9\\ \xE2\x82\xB9.txt", "caf\xC3\xA9 \xE2\x82\xB9\n"), "unicode file name end to end");
+    CHECK(out_is("say 1 | etch \"\xCE\xA9mega\"; chart | where name ~ '*mega' | pick name", "\xCE\xA9mega\n"), "chart into where with unicode");
+    CHECK(out_has("say 1 | etch \"bad\\u{202E}name\"", "invalid name"), "bidi override refused in names");
 
-    sh("rm -f *");
-    CHECK(out_is("touch a.txt b.txt c.log; ls | cat", "a.txt\nb.txt\nc.log\n"), "touch and ls");
-    CHECK(out_is("echo *.txt", "a.txt b.txt\n"), "glob star");
-    CHECK(out_is("echo ?.log", "c.log\n"), "glob question mark");
-    CHECK(out_is("echo '*.txt'", "*.txt\n"), "quoted glob literal");
-    CHECK(out_is("echo *.zip", "  no match: *.zip\n") && g_status == 1, "glob without match is an error");
-    CHECK(out_is("echo x/*.txt", "  cannot expand x/*.txt: not found\n"), "glob in missing directory");
-    CHECK(out_has("echo */a", "wildcards are only allowed in the last path component"), "glob in directory part refused");
-    CHECK(out_is("echo ram:*", "ram:a.txt ram:b.txt ram:c.log\n"), "glob after a realm prefix");
-    CHECK(out_is("mkdir -p d/e; touch d/e/x1 d/e/x2; echo d/e/x?", "d/e/x1 d/e/x2\n"), "glob in subdirectory");
-    sh("touch caf\xC3\xA9 caff cafe; ");
-    CHECK(out_is("echo caf?", "cafe caff caf\xC3\xA9\n"), "question mark matches one character, not one byte");
-    CHECK(out_is("echo c*\xC3\xA9", "caf\xC3\xA9\n"), "star with unicode tail");
-    sh("rm -f caf*");
+    sh("fade tree: yes missing: yes *");
+    CHECK(out_is("spark a.txt b.txt c.log; chart | pick name", "a.txt\nb.txt\nc.log\n"), "spark and chart");
+    CHECK(out_is("say *.txt", "a.txt b.txt\n"), "glob star");
+    CHECK(out_is("say ?.log", "c.log\n"), "glob question mark");
+    CHECK(out_is("say '*.txt'", "*.txt\n"), "quoted glob literal");
+    CHECK(out_is("say *.zip", "  no match: *.zip\n") && g_status == 1, "glob without match is an error");
+    CHECK(out_is("say x/*.txt", "  cannot expand x/*.txt: not found\n"), "glob in missing directory");
+    CHECK(out_has("say */a", "wildcards are only allowed in the last path component"), "glob in directory part refused");
+    CHECK(out_is("say ram:*", "ram:a.txt ram:b.txt ram:c.log\n"), "glob after a realm prefix");
+    CHECK(out_is("plant parents: yes d/e; spark d/e/x1 d/e/x2; say d/e/x?", "d/e/x1 d/e/x2\n"), "glob in subdirectory");
+    sh("spark caf\xC3\xA9 caff cafe");
+    CHECK(out_is("say caf?", "cafe caff caf\xC3\xA9\n"), "question mark matches one character, not one byte");
+    CHECK(out_is("say c*\xC3\xA9", "caf\xC3\xA9\n"), "star with unicode tail");
+    sh("fade missing: yes caf*");
 
-    CHECK(out_is("pwd", "ram:/\n"), "pwd");
-    CHECK(out_is("cd d; pwd", "ram:/d\n"), "cd");
-    CHECK(out_is("cd e; pwd; cd ..; cd ..; pwd", "ram:/d/e\nram:/\n"), "cd up");
-    CHECK(out_is("cd d; cd -; pwd", "ram:/\n"), "cd back");
-    CHECK(out_has("cd a.txt", "not a directory") && g_status == 1, "cd into a file");
-    CHECK(out_has("cd nowhere", "not found"), "cd into nothing");
-    CHECK(out_is("cd sys:; pwd; cd", "sys:/\n"), "cd to realm");
-    sh("cd ram:/");
-    CHECK(out_is("pwd", "ram:/\n"), "back in ram");
+    CHECK(out_is("here", "ram:/\n"), "here");
+    CHECK(out_is("go d; here", "ram:/d\n"), "go");
+    CHECK(out_is("go e; here; go ..; go ..; here", "ram:/d/e\nram:/\n"), "go up");
+    CHECK(out_is("go d; back; here", "ram:/\n"), "back");
+    CHECK(out_is("back; here; back; here", "ram:/d\nram:/\n"), "back swaps with the last place");
+    CHECK(out_has("go a.txt", "not a directory") && g_status == 1, "go into a file");
+    CHECK(out_has("go nowhere", "not found"), "go into nothing");
+    CHECK(out_is("go sys:; here; go", "sys:/\n"), "go to a realm");
+    sh("go ram:/");
+    CHECK(out_is("here", "ram:/\n"), "back in ram");
 
-    CHECK(out_is("mkdir tmp; cd tmp; touch inner; cd ..; ls tmp | cat", "inner\n"), "ls of a directory");
-    CHECK(out_has("mkdir tmp", "already exists"), "mkdir twice");
-    CHECK(out_has("rm tmp", "is a directory"), "rm refuses directories");
-    CHECK(out_has("rmdir tmp", "not empty"), "rmdir refuses full directories");
-    CHECK(out_is("rm -r tmp; ls | grep -c tmp", "0\n"), "rm -r");
-    CHECK(out_is("rm -f nothing-here; echo $?", "0\n"), "rm -f ignores missing");
-    CHECK(out_has("rm nothing-here", "not found") && g_status == 1, "rm missing");
-    CHECK(out_has("rm -r /", "not allowed"), "rm -r of the root is refused");
-    CHECK(out_has("rm -r ram:/", "not allowed"), "rm -r of a realm root is refused");
+    CHECK(out_is("plant tmp; go tmp; spark inner; go ..; chart tmp | pick name", "inner\n"), "chart of a directory");
+    CHECK(out_has("plant tmp", "already exists"), "plant twice");
+    CHECK(out_has("fade tmp", "is not empty") && g_status == 1, "fade refuses full directories");
+    CHECK(out_has("fade tree: yes tmp; chart | where name = tmp", "0 rows"), "fade tree");
+    CHECK(out_is("fade missing: yes nothing-here; say @status", "0\n"), "fade missing: yes");
+    CHECK(out_has("fade nothing-here", "not found") && g_status == 1, "fade of nothing");
+    CHECK(out_has("fade tree: yes /", "not allowed"), "fading the root is refused");
+    CHECK(out_has("fade tree: yes ram:/", "not allowed"), "fading a realm root is refused");
+    CHECK(out_has("fade -r x", "cannot fade -r"), "dash words are plain paths");
 
-    CHECK(out_is("echo data > src; cp src dst; cat dst", "data\n"), "cp");
-    CHECK(out_has("cp src dst", "already exists; use -f"), "cp refuses to overwrite");
-    CHECK(out_is("echo new > src; cp -f src dst; cat dst", "new\n"), "cp -f");
-    CHECK(out_is("mkdir box; cp src box; cat box/src", "new\n"), "cp into directory");
-    CHECK(out_has("cp box box2", "is a directory: use cp -r"), "cp refuses directories without -r");
-    CHECK(out_is("cp -r box box2; cat box2/src", "new\n"), "cp -r");
-    CHECK(out_is("cp -r box box2; cat box2/box/src", "new\n"), "cp -r into an existing directory nests the copy");
-    CHECK(out_has("cp -r box box2", "never merged"), "cp -r onto an existing copy is refused");
-    CHECK(out_has("cp src a.txt b.txt", "must be an existing directory"), "several sources need a directory");
-    CHECK(out_is("mkdir many; cp src dst a.txt many; ls many | count -l", "       3\n"), "several sources");
-    CHECK(out_is("mv src moved; cat moved", "new\n"), "mv");
-        CHECK(out_has("cat src", "not found"), "old name is gone");
-    CHECK(out_has("mv moved dst", "already exists; use -f"), "mv refuses to overwrite");
-    CHECK(out_is("mv -f moved dst; cat dst", "new\n"), "mv -f");
-    CHECK(out_is("mv dst box; cat box/dst", "new\n"), "mv into directory");
-    CHECK(out_is("mv box renamed; cat renamed/dst", "new\n"), "mv a directory");
-    CHECK(out_has("mv renamed renamed/inside", "not supported"), "mv a directory into itself");
+    CHECK(out_is("say data | etch src; twin src dst; beacon dst", "data\n"), "twin");
+    CHECK(out_has("twin src dst", "already exists; add replace: yes"), "twin refuses to overwrite");
+    CHECK(out_is("say new | etch src; twin src dst replace: yes; beacon dst", "new\n"), "twin replace");
+    CHECK(out_is("plant box; twin src box; beacon box/src", "new\n"), "twin into directory");
+    CHECK(out_has("twin box box2", "is a directory; add tree: yes"), "twin refuses directories without tree");
+    CHECK(out_is("twin tree: yes box box2; beacon box2/src", "new\n"), "twin tree");
+    CHECK(out_is("twin tree: yes box box2; beacon box2/box/src", "new\n"), "twin tree into an existing directory nests the copy");
+    CHECK(out_has("twin tree: yes box box2", "never merged"), "twin tree onto an existing copy is refused");
+    CHECK(out_has("twin src a.txt b.txt", "must be an existing directory"), "several sources need a directory");
+    CHECK(out_is("plant many; twin src dst a.txt many; chart many | tally | etch c.out; beacon c.out", "rows\n   3\n"), "several sources");
+    CHECK(out_is("drift src moved; beacon moved", "new\n"), "drift");
+    CHECK(out_has("beacon src", "not found"), "old name is gone");
+    CHECK(out_has("drift moved dst", "already exists; add replace: yes"), "drift refuses to overwrite");
+    CHECK(out_is("drift replace: yes moved dst; beacon dst", "new\n"), "drift replace");
+    CHECK(out_is("drift dst box; beacon box/dst", "new\n"), "drift into directory");
+    CHECK(out_is("drift box renamed; beacon renamed/dst", "new\n"), "drift a directory");
+    CHECK(out_has("drift renamed renamed/inside", "not supported"), "drift a directory into itself");
+    CHECK(out_has("twin onlyone", "usage: twin") && g_status == 2, "usage error status");
 
-    CHECK(out_has("stat a.txt", "kind     file"), "stat file");
-    CHECK(out_has("stat renamed", "directory"), "stat directory");
-    CHECK(out_has("stat sys:/version", "read-only"), "stat read-only realm");
-    CHECK(out_has("ls -l renamed | cat", "dst"), "ls -l");
-    CHECK(out_has("ls -l a.txt", "a.txt"), "ls -l of a file");
-    CHECK(out_has("tree renamed", "dst"), "tree");
-    CHECK(out_has("mkdir -p t1/t2/t3; touch t1/t2/t3/leaf; tree -L 2 t1 | cat", "t2") && !contains(g_out, "leaf"), "tree depth limit");
-    CHECK(out_has("tree t1 | cat", "\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 leaf"), "tree draws branches");
-    CHECK(out_is("tree -d t1 | cat", "t1\n\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 t2\n    \xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 t3\n2 directories\n"), "tree -d");
-    CHECK(out_is("find t1 -name 'l*'", "t1/t2/t3/leaf\n"), "find by name");
-    CHECK(out_is("find t1 -type d", "t1/t2\nt1/t2/t3\n"), "find by type");
-    CHECK(out_is("find t1 -name nothing", "") && g_status == 1, "find with no hits");
+    CHECK(out_has("probe a.txt", "writable"), "probe file");
+    CHECK(out_has("probe renamed", "dir"), "probe directory");
+    CHECK(out_has("probe sys:/version", "read-only"), "probe read-only realm");
+    CHECK(out_has("probe nothing", "cannot probe nothing: not found") && g_status == 1, "probe missing");
+    CHECK(out_is("probe a.txt renamed | pick kind", "file\ndir\n"), "probe rows");
+    CHECK(out_has("chart renamed", "dst"), "chart");
+    CHECK(out_has("plant parents: yes t1/t2/t3; spark t1/t2/t3/leaf; outline depth: 2 t1", "t2") && !contains(g_out, "leaf"), "outline depth limit");
+    CHECK(out_has("outline t1", "\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 leaf"), "outline draws branches");
+    CHECK(out_is("outline only: dir t1", "t1\n\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 t2/\n    \xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 t3/\n2 directories\n"), "outline only dirs");
+    CHECK(out_is("chart depth: 9 t1 | pick name", "t2\nt2/t3\nt2/t3/leaf\n"), "chart depth lists relative names");
+    CHECK(out_is("chart depth: 9 only: dir t1 | pick name", "t2\nt2/t3\n"), "chart only: dir");
+    CHECK(out_is("chart depth: 9 t1 | where name ~ *leaf | pick name", "t2/t3/leaf\n"), "where with an unquoted wildcard stays literal");
+    CHECK(out_is("chart depth: 9 t1 | where kind = file | pick name", "t2/t3/leaf\n"), "where on a text column");
+    CHECK(out_has("chart t1 | where nothing = 1", "no column 'nothing'") && g_status == 1, "where on a missing column");
+    CHECK(out_has("chart", "name") && contains(g_out, "kind") && contains(g_out, "size") && contains(g_out, "changed") && contains(g_out, "rows"), "chart prints a table with a header and a count");
     CHECK(out_has("realms", "disk"), "realms");
-    CHECK(out_has("df", "snap"), "df");
+    CHECK(out_has("realms", "snap"), "realms lists snap");
+    CHECK(out_is("realms | where realm = sys | pick access", "read-only\n"), "realms rows are typed and filterable");
 
-    CHECK(out_is("echo \"one\\ntwo\\nthree\\nfour\" > lines; head -n 2 lines", "one\ntwo\n"), "head");
-    CHECK(out_is("tail -n 2 lines", "three\nfour\n"), "tail");
-    CHECK(out_is("tail -n 10 lines | count -l", "       4\n"), "tail more than available");
-    CHECK(out_is("grep o lines", "one\ntwo\nfour\n"), "grep");
-    CHECK(out_is("grep -v o lines", "three\n"), "grep -v");
-    CHECK(out_is("grep -c o lines", "3\n"), "grep -c");
-    CHECK(out_is("grep -n thr lines", "3:three\n"), "grep -n");
-    CHECK(out_is("grep -i ONE lines", "one\n"), "grep -i");
-    CHECK(out_is("grep zzz lines", "") && g_status == 1, "grep with no match");
-    CHECK(out_is("echo \"caf\\u{e9}\" | grep \"\\u{e9}\"", "caf\xC3\xA9\n"), "grep a Unicode needle");
-    CHECK(out_is("count lines", "       4       4      19 lines\n"), "count all");
-    CHECK(out_is("echo \"\\u{20B9}\\u{20B9}\" | count -m", "       3\n"), "count characters includes the newline");
-    CHECK(out_is("echo \"\\u{20B9}\\u{20B9}\" | count -c", "       7\n"), "count bytes");
-    CHECK(out_is("echo \"b\\na\\nb\\nc\\nb\" | sort -u", "a\nb\nc\n"), "sort -u");
-    CHECK(out_is("echo \"10\\n9\\n100\\n-5\" | sort -n", "-5\n9\n10\n100\n"), "sort -n");
-    CHECK(out_is("echo \"a\\na\\nb\\na\" | uniq", "a\nb\na\n"), "uniq");
-    CHECK(out_is("echo \"a\\na\\nb\" | uniq -c", "     2 a\n     1 b\n"), "uniq -c");
-    CHECK(out_is("echo AB | hex", "00000000  41 42 0a                                          AB.\n"), "hex");
-    CHECK(out_is("echo AB | hex -s 1 -n 1", "00000001  42                                                B\n"), "hex window");
-    CHECK(out_is("cat -n lines | head -n 1", "     1  one\n"), "cat -n");
+    CHECK(out_is("say \"one\\ntwo\\nthree\\nfour\" | etch lines; beacon lines | first 2", "one\ntwo\n"), "first");
+    CHECK(out_is("beacon lines | last 2", "three\nfour\n"), "last");
+    CHECK(out_is("beacon lines | last 10 | tally | etch c.out; beacon c.out", "rows\n   4\n"), "last more than available");
+    CHECK(out_is("seek o lines | pick text", "one\ntwo\nfour\n"), "seek");
+    CHECK(out_is("seek not: yes o lines | pick text", "three\n"), "seek not");
+    CHECK(out_is("seek thr lines | pick line | etch c.out; beacon c.out", "line\n   3\n"), "seek reports line numbers");
+    CHECK(out_is("seek fold: yes ONE lines | pick text", "one\n"), "seek fold");
+    CHECK(out_is("seek count: yes o lines | etch c.out; beacon c.out", "matches\n      3\n"), "seek count");
+    CHECK(out_has("seek zzz lines", "0 rows") && g_status == 1, "seek with no match");
+    CHECK(out_is("say \"caf\\u{e9}\" | seek \"\\u{e9}\" | pick text", "caf\xC3\xA9\n"), "seek a Unicode needle");
+    CHECK(out_is("say one | etch other.txt; seek o lines other.txt | pick file | distinct", "lines\nother.txt\n"), "several files add a file column");
+    CHECK(out_has("seek", "usage: seek") && g_status == 2, "seek needs text");
+    CHECK(out_has("tally lines | etch c.out; beacon c.out", "19"), "tally a file");
+    CHECK(out_is("say \"\\u{20B9}\\u{20B9}\" | tally | etch c.out; beacon c.out", "lines  words  chars  bytes\n    1      1      3      7\n"), "tally text counts characters and bytes");
+    CHECK(out_is("say \"10\\n9\\n100\\n-5\" | order number: yes", "-5\n9\n10\n100\n"), "order number: yes");
+    CHECK(out_is("say \"b\\na\\nb\\nc\\nb\" | order | distinct", "a\nb\nc\n"), "order then distinct");
+    CHECK(out_is("say \"a\\na\\nb\\na\" | distinct", "a\nb\n"), "distinct keeps the first of every value, adjacent or not");
+    CHECK(out_is("say \"a\\nb\\na\" | tally by: text | where text = a | pick rows | etch c.out; beacon c.out", "rows\n   2\n"), "tally by a column of text");
+    CHECK(out_is("say AB | prism", "00000000  41 42 0a                                          AB.\n"), "prism");
+    CHECK(out_is("say AB | prism from: 1 take: 1", "00000001  42                                                B\n"), "prism window");
+    CHECK(out_is("beacon numbered: yes lines | first 1", "     1  one\n"), "beacon numbered");
 
-    CHECK(out_is("echo \"echo from script\\nset v 7\\necho v=\\$v\" > s.hm; run s.hm", "from script\nv=7\n"), "run a script");
-    CHECK(out_has("echo \"echo one\\nfalse\\necho two\" > bad.hm; run bad.hm", "stopped at line 2") && !contains(g_out, "two"), "script stops on failure");
-    CHECK(out_has("run -k bad.hm", "two"), "run -k continues");
-    CHECK(out_has("echo \"run loop.hm\" > loop.hm; run loop.hm", "nested too deeply"), "script recursion is bounded");
+    CHECK(out_is("say \"say from script\\nbind v 7\\nsay v=\\@v\" | etch s.hm; launch s.hm", "from script\nv=7\n"), "launch a script");
+    CHECK(out_has("say \"say one\\nfail\\nsay two\" | etch bad.hm; launch bad.hm", "stopped at line 2") && !contains(g_out, "two"), "script stops on failure");
+    CHECK(out_has("launch keep: yes bad.hm", "two"), "launch keep: yes continues");
+    CHECK(out_has("say \"launch loop.hm\" | etch loop.hm; launch loop.hm", "nested too deeply"), "script recursion is bounded");
 
     CHECK(out_has("help", "files and realms"), "help lists tables");
-    CHECK(out_has("help ls", "ls [-l]"), "help for one command");
-    CHECK(out_has("help syntax", "keys"), "help syntax");
+    CHECK(out_has("help chart", "chart [path]  depth: N"), "help for one command");
+    CHECK(out_has("help syntax", "options") && contains(g_out, "=>") && contains(g_out, "@name"), "help syntax");
     CHECK(out_has("help nosuch", "no such command") && g_status == 1, "help for nothing");
-    CHECK(out_has("ls -z", "usage: ls") && g_status == 2, "bad option");
-    CHECK(out_has("cp onlyone", "usage: cp") && g_status == 2, "usage error status");
+    CHECK(out_has("chart dpth: 2", "does not take the option dpth:") && contains(g_out, "depth: only:") && g_status == 1, "unknown option names the valid ones");
+    CHECK(out_has("go foo:", "go does not take the option foo:") && contains(g_out, "it takes none"), "a command without options says so");
+    CHECK(out_has("chart depth:", "depth: needs a value") && g_status == 1, "option without a value");
+    CHECK(out_has("chart depth: 2 depth: 3", "given twice"), "option given twice");
+    CHECK(out_has("chart depth: 0", "depth: takes a number from 1 to 16") && g_status == 2, "option range");
+    CHECK(out_has("chart depth: many", "takes a whole number") && g_status == 2, "option number");
+    CHECK(out_has("chart only: both", "only: takes dir or file") && g_status == 2, "option choice");
+    CHECK(out_is("say 'hello:'", "hello:\n"), "a quoted key word is plain text");
+    CHECK(out_has("say hello:", "does not take the option hello:"), "an unquoted unknown key word is refused");
+    CHECK(out_has("cat x", "unknown command: cat"), "unix names are gone");
 
-    CHECK(out_is("cat sys:/version", "Aphelion\n"), "sys realm readable");
+    CHECK(out_is("beacon sys:/version", "Aphelion\n"), "sys realm readable");
 }
 
 static void test_completion() {
     printf("-- completion\n");
-    sh("rm -r -f *; touch alpha.txt alps beta; mkdir apple; touch \"with space.txt\"");
-    CHECK(completes_to("ca", "cat ", 1), "command prefix");
-    CHECK(completes_to("cd al", "alp", 2), "two files with a common prefix");
-    CHECK(completes_to("cd app", "apple/", 1), "unique directory gets a slash");
-    CHECK(completes_to("cat be", "beta ", 1), "unique file gets a space");
-    CHECK(completes_to("cat alpha.t", "alpha.txt ", 1), "unique extension");
-    CHECK(completes_to("cat with", "with\\ space.txt ", 1), "spaces are escaped");
-    CHECK(completes_to("cat \"with", "\"with space.txt\" ", 1), "completion inside quotes");
-    CHECK(completes_to("echo hi | gre", "grep ", 1), "command after a pipe");
-    CHECK(completes_to("cat x; unse", "unset ", 1), "command after a semicolon");
-    CHECK(completes_to("cat < be", "beta ", 1), "path after a redirect");
-    CHECK(completes_to("cat sys:/ver", "sys:/version ", 1), "path in another realm");
-    CHECK(completes_to("cat sys:", "sys:version ", 1), "completing right after a realm colon");
-    CHECK(completes_to("cd sn", "snap:/", 1), "realm name completes with a slash");
-    { helm::Completion e; CHECK(!helm::complete(*g_sh, "cat apple/", 10, &e), "empty directory has nothing to offer"); }
+    sh("fade tree: yes missing: yes *; spark alpha.txt alps beta; plant apple; spark \"with space.txt\"");
+    CHECK(completes_to("bea", "beacon ", 1), "command prefix");
+    CHECK(completes_to("go al", "alp", 2), "two files with a common prefix");
+    CHECK(completes_to("go app", "apple/", 1), "unique directory gets a slash");
+    CHECK(completes_to("beacon be", "beta ", 1), "unique file gets a space");
+    CHECK(completes_to("beacon alpha.t", "alpha.txt ", 1), "unique extension");
+    CHECK(completes_to("beacon with", "with\\ space.txt ", 1), "spaces are escaped");
+    CHECK(completes_to("beacon \"with", "\"with space.txt\" ", 1), "completion inside quotes");
+    CHECK(completes_to("say hi | pri", "prism ", 1), "command after a pipe");
+    CHECK(completes_to("say x; unb", "unbind ", 1), "command after a semicolon");
+    CHECK(completes_to("say x => bin", "bind ", 1), "command after then");
+    CHECK(completes_to("say x !> unb", "unbind ", 1), "command after else");
+    CHECK(completes_to("chart depth: 2 ap", "apple/", 1), "path after an option");
+    CHECK(completes_to("beacon sys:/ver", "sys:/version ", 1), "path in another realm");
+    CHECK(completes_to("beacon sys:", "sys:version ", 1), "completing right after a realm colon");
+    CHECK(completes_to("go sn", "snap:/", 1), "realm name completes with a slash");
+    { helm::Completion e; CHECK(!helm::complete(*g_sh, "beacon apple/", 13, &e), "empty directory has nothing to offer"); }
     helm::Completion c;
-    CHECK(!helm::complete(*g_sh, "cat zzz", 7, &c), "no candidates");
-    sh("touch caf\xC3\xA9 cafz");
-    CHECK(completes_to("cat caf", "caf", 2), "common prefix stops before a multibyte split");
-    { helm::Completion e; bool ok = helm::complete(*g_sh, "cat caf\xC3", 8, &e); CHECK(ok && same(e.insert, "caf\xC3\xA9 ") && e.count == 1, "partial UTF-8 still completes"); if (ok) helm::release(e); }
-    sh("rm -r -f *");
+    CHECK(!helm::complete(*g_sh, "beacon zzz", 10, &c), "no candidates");
+    sh("spark caf\xC3\xA9 cafz");
+    CHECK(completes_to("beacon caf", "caf", 2), "common prefix stops before a multibyte split");
+    { helm::Completion e; bool ok = helm::complete(*g_sh, "beacon caf\xC3", 11, &e); CHECK(ok && same(e.insert, "caf\xC3\xA9 ") && e.count == 1, "partial UTF-8 still completes"); if (ok) helm::release(e); }
+    sh("spark 'at@sign' 'hash#tag'");
+    CHECK(completes_to("beacon at", "at\\@sign ", 1), "an at sign in a name is escaped");
+    sh("fade tree: yes missing: yes *");
 }
 
 static void test_lens_location() {
     printf("-- lens-backed location\n");
-    CHECK(out_is("mkdir -p ram:/lt/a/b; cd ram:/lt/a/b; pwd", "ram:/lt/a/b\n"), "pwd after cd into a nested directory");
-    CHECK(out_is("cd ../..; pwd", "ram:/lt\n"), "cd .. walks up the parent lenses");
-    CHECK(out_is("echo hi > a/f; cat a/f", "hi\n"), "relative path from the current lens");
-    CHECK(out_is("cd a/b; cat ../f; cd -; pwd", "hi\nram:/lt\n"), "relative read through .. and cd -");
-    CHECK(out_is("cd ../../../..; pwd", "ram:/\n"), "cd above the root stops at the root");
-    CHECK(out_has("cd ram:/lt; touch ./c:d; ls", "c:d"), "a file name with a colon");
-    CHECK(out_has("stat sys:/version", "sys, read-only"), "a probe reports its read-only realm");
-    CHECK(out_has("echo x > sys:/version", "read-only"), "a write to a probe is refused");
-    CHECK(out_is("cd ram:/lt/a; mv ../a ../a2; pwd", "ram:/lt/a2\n"), "moving the current directory: the prompt follows it");
-    CHECK(out_is("cat f", "hi\n"), "and relative paths still work");
-    CHECK(out_is("rm -r ../a2; pwd", "ram:/lt\n"), "removing the current directory climbs to what survives");
-    sh("cd ram:/; rm -r ram:/lt");
+    CHECK(out_is("plant parents: yes ram:/lt/a/b; go ram:/lt/a/b; here", "ram:/lt/a/b\n"), "here after go into a nested directory");
+    CHECK(out_is("go ../..; here", "ram:/lt\n"), "go .. walks up the parent lenses");
+    CHECK(out_is("say hi | etch a/f; beacon a/f", "hi\n"), "relative path from the current lens");
+    CHECK(out_is("go a/b; beacon ../f; back; here", "hi\nram:/lt\n"), "relative read through .. and back");
+    CHECK(out_is("go ../../../..; here", "ram:/\n"), "go above the root stops at the root");
+    CHECK(out_has("go ram:/lt; spark ./c:d; chart", "c:d"), "a file name with a colon");
+    CHECK(out_has("probe sys:/version", "read-only"), "a probe reports its read-only realm");
+    CHECK(out_has("say x | etch sys:/version", "read-only"), "a write to a probe is refused");
+    CHECK(out_is("go ram:/lt/a; drift ../a ../a2; here", "ram:/lt/a2\n"), "moving the current directory: the prompt follows it");
+    CHECK(out_is("beacon f", "hi\n"), "and relative paths still work");
+    CHECK(out_is("fade tree: yes ../a2; here", "ram:/lt\n"), "removing the current directory climbs to what survives");
+    sh("go ram:/; fade tree: yes ram:/lt");
 }
 
 static u32 g_poll_calls;
@@ -434,90 +463,94 @@ static void test_interrupt_and_limits() {
     CHECK(lens::text::write_file(g_sh->cursor, "big.txt", big, sizeof(big)) == nebula::Status::Ok, "write big file");
     g_sh->interrupt_poll = &poll_always;
     g_poll_calls = 0;
-    sh("grep 0 big.txt | count -l");
+    sh("seek 0 big.txt | tally");
     CHECK(g_status == 130 && contains(g_out, "interrupted") && g_poll_calls >= 1, "interrupt stops a pipeline and reports it");
-    CHECK(!contains(g_out, "     200"), "nothing downstream ran after the interrupt");
-    sh("sort big.txt");
-    CHECK(g_status == 130, "interrupt during sort");
-    sh("tree .");
-    CHECK(g_status == 130 || g_status == 0, "tree notices the poll or has nothing to walk");
+    CHECK(!contains(g_out, "rows"), "nothing downstream ran after the interrupt");
+    sh("beacon big.txt | last 200");
+    CHECK(g_status == 130, "interrupt during a row command");
+    sh("outline .");
+    CHECK(g_status == 130 || g_status == 0, "outline notices the poll or has nothing to walk");
     g_sh->interrupt_poll = nullptr;
     g_sh->aborted = false;
-    CHECK(out_is("echo ok", "ok\n"), "shell works after an interrupt");
-    sh("rm big.txt");
+    CHECK(out_is("say ok", "ok\n"), "shell works after an interrupt");
+    sh("fade big.txt");
 
-    sh("echo x > a");
+    sh("say x | etch a");
     char line[1024];
     u32 n = 0;
-    const char* pre = "echo ";
+    const char* pre = "say ";
     for (u32 i = 0; pre[i]; ++i) line[n++] = pre[i];
     for (u32 i = 0; i < 520; ++i) line[n++] = 'z';
     line[n] = 0;
     sh(line);
     CHECK(contains(g_out, "too long") || g_status == 0, "very long word handled");
 
-    sh("set v1 1; set v2 2; set v3 3");
+    sh("bind v1 1; bind v2 2; bind v3 3");
     char vline[64];
     bool all = true;
     for (int i = 0; i < 30; ++i) {
-        vline[0] = 's'; vline[1] = 'e'; vline[2] = 't'; vline[3] = ' '; vline[4] = 'q';
-        vline[5] = static_cast<char>('a' + i % 26);
-        vline[6] = static_cast<char>('a' + i / 26);
-        vline[7] = ' '; vline[8] = '1'; vline[9] = 0;
+        vline[0] = 'b'; vline[1] = 'i'; vline[2] = 'n'; vline[3] = 'd'; vline[4] = ' '; vline[5] = 'q';
+        vline[6] = static_cast<char>('a' + i % 26);
+        vline[7] = static_cast<char>('a' + i / 26);
+        vline[8] = ' '; vline[9] = '1'; vline[10] = 0;
         sh(vline);
         if (g_status != 0) all = false;
     }
-    CHECK(!all, "variable table is bounded");
-    CHECK(out_has("set 1bad x", "cannot set"), "bad variable name");
-    sh("unset v1 v2 v3");
+    CHECK(!all, "bound name table is bounded");
+    CHECK(out_has("bind 1bad x", "cannot bind"), "bad bound name");
+    CHECK(out_is("bind | where name = v2 | pick value", "2\n"), "bind lists names as rows");
+    sh("unbind v1 v2 v3");
     for (int i = 0; i < 30; ++i) {
-        char u[32] = "unset q";
-        u[7] = static_cast<char>('a' + i % 26);
-        u[8] = static_cast<char>('a' + i / 26);
-        u[9] = 0;
+        char u[32] = "unbind q";
+        u[8] = static_cast<char>('a' + i % 26);
+        u[9] = static_cast<char>('a' + i / 26);
+        u[10] = 0;
         sh(u);
     }
 }
 
 static void test_disk() {
-    printf("-- disk and snapshots from the shell\n");
-    sh("cd disk:/; rm -r -f *");
-    CHECK(out_is("pwd", "disk:/\n"), "cd disk");
-    CHECK(out_is("mkdir -p proj/src; echo v1 > proj/src/main; echo n1 > notes", ""), "build a tree on disk");
-    CHECK(out_has("snapshot", "snapshot 1 taken"), "take a snapshot");
-    CHECK(out_has("snapshot list", "snap:/"), "list snapshots");
-    CHECK(out_is("echo v2 > proj/src/main; cat snap:/1/proj/src/main", "v1\n"), "snapshot keeps the old contents");
-    CHECK(out_has("ls snap:/ | cat", "1"), "snapshots are listed as directories");
-    CHECK(out_is("cp -r snap:/1/proj restored; cat restored/src/main", "v1\n"), "restore a tree from a snapshot");
-    CHECK(out_has("rm snap:/1/notes", "read-only") && g_status == 1, "snapshots cannot be modified");
-    CHECK(out_is("cp notes ram:/n.copy; cat ram:/n.copy", "n1\n"), "copy disk to ram");
-    CHECK(out_is("mv ram:/n.copy disk:/n.moved; cat disk:/n.moved; ls ram:/ | grep -c n.copy", "n1\n0\n"), "move across realms");
-    CHECK(out_has("check", "volume is consistent"), "check");
-    CHECK(out_has("check -d", "volume is consistent"), "deep check");
-    CHECK(out_is("sync; echo $?", "0\n"), "sync");
-    CHECK(out_has("snapshot rm 99", "not found") && g_status == 1, "delete missing snapshot");
-    CHECK(out_is("snapshot rm 1; ls snap:/ | grep -c 1", "0\n"), "delete snapshot");
+    printf("-- disk and epochs from the shell\n");
+    sh("go disk:/; fade tree: yes missing: yes *");
+    CHECK(out_is("here", "disk:/\n"), "go disk");
+    CHECK(out_is("plant parents: yes proj/src; say v1 | etch proj/src/main; say n1 | etch notes", ""), "build a tree on disk");
+    CHECK(out_has("epoch take", "epoch 1 taken"), "take an epoch");
+    CHECK(out_has("epoch list", "snap:/1"), "list epochs");
+    CHECK(out_has("epoch", "1 row"), "epoch lists by default");
+    CHECK(out_is("say v2 | etch proj/src/main; beacon snap:/1/proj/src/main", "v1\n"), "an epoch keeps the old contents");
+    CHECK(out_has("chart snap:/ | pick name", "1"), "epochs are listed as directories");
+    CHECK(out_is("twin tree: yes snap:/1/proj restored; beacon restored/src/main", "v1\n"), "restore a tree from an epoch");
+    CHECK(out_has("fade snap:/1/notes", "read-only") && g_status == 1, "epochs cannot be modified");
+    CHECK(out_is("twin notes ram:/n.copy; beacon ram:/n.copy", "n1\n"), "twin disk to ram");
+    CHECK(out_is("drift ram:/n.copy disk:/n.moved; beacon disk:/n.moved", "n1\n"), "drift across realms");
+    CHECK(out_has("chart ram:/ | where name = n.copy", "0 rows"), "the drifted file left ram");
+    CHECK(out_has("audit", "volume is consistent"), "audit");
+    CHECK(out_has("audit deep: yes", "volume is consistent"), "deep audit");
+    CHECK(out_is("settle; say @status", "0\n"), "settle");
+    CHECK(out_has("epoch drop 99", "not found") && g_status == 1, "drop a missing epoch");
+    CHECK(out_has("epoch drop 1; epoch", "0 rows"), "drop an epoch");
+    CHECK(out_has("epoch bogus", "usage: epoch") && g_status == 2, "epoch usage");
     nebula::disk_set_mounted(false);
-    CHECK(out_has("ls disk:/", "not available"), "unmounted disk reports unavailable");
-    CHECK(out_has("snapshot", "no disk volume"), "snapshot without a volume");
+    CHECK(out_has("chart disk:/", "not available"), "unmounted disk reports unavailable");
+    CHECK(out_has("epoch take", "no disk volume"), "epoch without a volume");
     nebula::disk_set_mounted(true);
-    CHECK(out_has("mkfs erase", "refusing to erase") && g_status == 1, "mkfs refuses a mounted volume");
+    CHECK(out_has("kindle erase", "refusing to erase") && g_status == 1, "kindle refuses a mounted volume");
     nebula::disk_set_mounted(false);
     nebula::disk_set_confirmed_only(true);
-    CHECK(out_has("mkfs erase", "typed confirmation") && g_status == 1, "mkfs refuses when the disk needs a typed confirmation");
+    CHECK(out_has("kindle erase", "typed confirmation") && g_status == 1, "kindle refuses when the disk needs a typed confirmation");
     nebula::disk_set_confirmed_only(false);
-    CHECK(out_has("mkfs", "usage: mkfs erase") && g_status == 2, "mkfs needs the erase word");
-    CHECK(out_has("mkfs wipe", "usage: mkfs erase") && g_status == 2, "mkfs rejects other words");
+    CHECK(out_has("kindle", "usage: kindle erase") && g_status == 2, "kindle needs the erase word");
+    CHECK(out_has("kindle wipe", "usage: kindle erase") && g_status == 2, "kindle rejects other words");
     mem::fill(g_disk, 0xAB, 64 * 512);
-    CHECK(out_has("mkfs erase", "refusing to touch it") && g_status == 1, "mkfs refuses a foreign disk");
+    CHECK(out_has("kindle erase", "refusing to touch it") && g_status == 1, "kindle refuses a foreign disk");
     CHECK(g_disk[0] == 0xAB && g_disk[64 * 512 - 1] == 0xAB, "the refused disk was left untouched");
     mem::zero(g_disk, 64 * 512);
-    CHECK(out_has("mkfs erase", "new Stellar volume created") && g_status == 0, "mkfs formats a blank disk");
-    CHECK(nebula::disk_is_mounted(), "mkfs leaves the volume mounted");
-    CHECK(out_is("ls disk:/ | grep -c .", "0\n"), "the new volume is empty");
-    CHECK(out_is("echo fresh > disk:/f; cat disk:/f", "fresh\n"), "the new volume is writable");
-    CHECK(out_has("check", "volume is consistent"), "the new volume checks clean");
-    sh("rm -r -f *; cd ram:/");
+    CHECK(out_has("kindle erase", "new Stellar volume created") && g_status == 0, "kindle formats a blank disk");
+    CHECK(nebula::disk_is_mounted(), "kindle leaves the volume mounted");
+    CHECK(out_has("chart disk:/", "0 rows"), "the new volume is empty");
+    CHECK(out_is("say fresh | etch disk:/f; beacon disk:/f", "fresh\n"), "the new volume is writable");
+    CHECK(out_has("audit", "volume is consistent"), "the new volume audits clean");
+    sh("fade tree: yes missing: yes *; go ram:/");
 }
 
 class TestConsole final : public lens::Stream {
@@ -555,60 +588,141 @@ static void test_console_lens() {
     CHECK(lens::close(d, narrowed.value()).ok(), "and closes");
 }
 
-static void test_rows() {
-    printf("-- rows\n");
-    static const char rows_text[] =
-        "task.1: state=running ring=0 core=0 switches=40 name=helm\n"
-        "task.2: state=sleeping ring=3 core=1 switches=500 name=net rx\n"
-        "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"
-        "task.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n";
-    sh("cd ram:/");
-    CHECK(lens::text::write_file(g_sh->cursor, "t.txt", rows_text, sizeof(rows_text) - 1) == nebula::Status::Ok, "write the rows");
+static void test_row_values() {
+    printf("-- row values\n");
+    u64 v = 0;
+    CHECK(hr::parse_value(hr::Kind::Int, "-42", &v) && static_cast<i64>(v) == -42, "negative int");
+    CHECK(!hr::parse_value(hr::Kind::Int, "4x", &v) && !hr::parse_value(hr::Kind::Int, "", &v) && !hr::parse_value(hr::Kind::Int, "-", &v), "bad ints");
+    CHECK(hr::parse_value(hr::Kind::Size, "2KiB", &v) && v == 2048, "KiB size");
+    CHECK(hr::parse_value(hr::Kind::Size, "2kb", &v) && v == 2048, "kb is binary too");
+    CHECK(hr::parse_value(hr::Kind::Size, "3M", &v) && v == 3ull << 20, "M size");
+    CHECK(hr::parse_value(hr::Kind::Size, "17", &v) && v == 17, "bare size");
+    CHECK(hr::parse_value(hr::Kind::Size, "17B", &v) && v == 17, "B size");
+    CHECK(!hr::parse_value(hr::Kind::Size, "2XB", &v) && !hr::parse_value(hr::Kind::Size, "KiB", &v), "bad sizes");
+    CHECK(!hr::parse_value(hr::Kind::Size, "99999999999TiB", &v), "size overflow refused");
+    CHECK(hr::parse_value(hr::Kind::Time, "2026-10-01", &v) && v == 1790812800000ull, "date");
+    u64 w = 0;
+    CHECK(hr::parse_value(hr::Kind::Time, "2026-10-01 12:30", &w) && w == v + (12 * 3600 + 30 * 60) * 1000ull, "date and minute");
+    CHECK(hr::parse_value(hr::Kind::Time, "2026-10-01T12:30:15", &w) && w == v + (12 * 3600 + 30 * 60 + 15) * 1000ull, "date, minute and second");
+    CHECK(!hr::parse_value(hr::Kind::Time, "2026-10-01 12", &w), "an hour without a minute is refused");
+    CHECK(!hr::parse_value(hr::Kind::Time, "2026-13-01", &w) && !hr::parse_value(hr::Kind::Time, "2026-02-30", &w) && !hr::parse_value(hr::Kind::Time, "1969-12-31", &w), "impossible dates");
+    CHECK(!hr::parse_value(hr::Kind::Time, "2026-10", &w) && !hr::parse_value(hr::Kind::Time, "tomorrow", &w), "partial dates");
+    CHECK(hr::parse_value(hr::Kind::Flag, "yes", &v) && v == 1 && hr::parse_value(hr::Kind::Flag, "Off", &v) && v == 0, "flags");
+    CHECK(!hr::parse_value(hr::Kind::Flag, "maybe", &v), "bad flag");
 
-    const char* t2 = "task.2: state=sleeping ring=3 core=1 switches=500 name=net rx\n";
-    const char* t3 = "task.3: state=ready ring=3 core=1 switches=7 name=disk\n";
-    char both[256];
-    __builtin_snprintf(both, sizeof(both), "%s%s", t2, t3);
-    CHECK(out_is("cat t.txt | where core == 1 | cat", both), "where on a pipe keeps the matching rows");
-    CHECK(out_is("where core == 1 t.txt | cat", both), "where on a file");
-    CHECK(out_is("where core eq 1 t.txt | cat", both), "word operators work where symbols would redirect");
+    hr::Table t;
+    hr::begin(t);
+    CHECK(hr::add_column(t, "name", hr::Kind::Text) && hr::add_column(t, "n", hr::Kind::Int) && hr::add_column(t, "size", hr::Kind::Size), "columns");
+    const char* names[] = {"b", "a", "c", "a"};
+    i64 nums[] = {3, -1, 2, 7};
+    for (int i = 0; i < 4; ++i) {
+        u32 r = hr::add_row(t);
+        hr::set_text(t, r, 0, names[i]);
+        hr::set_num(t, r, 1, static_cast<u64>(nums[i]));
+        if (i == 1) hr::set_null(t, r, 2); else hr::set_num(t, r, 2, 100u * (i + 1));
+    }
+    CHECK(!hr::add_column(t, "late", hr::Kind::Text), "no columns after rows");
+    hr::Table sorted;
+    u32 by_n = 1;
+    CHECK(hr::sort_rows(sorted, t, &by_n, 1, false, false), "sort");
+    CHECK(static_cast<i64>(hr::num_at(sorted, 0, 1)) == -1 && static_cast<i64>(hr::num_at(sorted, 3, 1)) == 7, "ints sort signed");
+    hr::Table down;
+    u32 by_size = 2;
+    CHECK(hr::sort_rows(down, t, &by_size, 1, true, false), "sort down");
+    CHECK(hr::is_null(down, 3, 2) && hr::num_at(down, 0, 2) == 400, "nulls sort last even descending");
+    hr::Table stable;
+    u32 by_name = 0;
+    CHECK(hr::sort_rows(stable, t, &by_name, 1, false, false), "sort by text");
+    CHECK(static_cast<i64>(hr::num_at(stable, 0, 1)) == -1 && static_cast<i64>(hr::num_at(stable, 1, 1)) == 7, "the sort is stable");
+    char cell[64];
+    hr::format_cell(t, 0, 2, cell, sizeof(cell));
+    CHECK(same(cell, "100 B"), "size formatting");
+    hr::format_cell(t, 1, 2, cell, sizeof(cell));
+    CHECK(same(cell, "-"), "null formatting");
+    hr::set_num(t, 0, 2, 1536);
+    hr::format_cell(t, 0, 2, cell, sizeof(cell));
+    CHECK(same(cell, "1.5 KiB"), "KiB formatting");
+    hr::release(t);
+    hr::release(sorted);
+    hr::release(down);
+    hr::release(stable);
 
-    char swapped[256];
-    __builtin_snprintf(swapped, sizeof(swapped), "%s%s", t3, t2);
-    char big[256];
-    __builtin_snprintf(big, sizeof(big), "%stask.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n", t2);
-    CHECK(out_is("where switches gt 100 t.txt | cat", big), "numbers compare as numbers, not text");
-    CHECK(out_is("where switches '>' 100 t.txt | cat", big), "a quoted symbol is an operator, not a redirect");
-    CHECK(out_is("where name == 'net rx' t.txt | cat", t2), "a value with a space");
-    CHECK(out_is("where id == task.3 t.txt | cat", t3), "the row key is the id field");
-    CHECK(out_is("where state ~ 'sl*' t.txt | cat", big), "glob match");
-    CHECK(out_is("where state != sleeping t.txt | cat", "task.1: state=running ring=0 core=0 switches=40 name=helm\n" "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"), "not equal");
-    CHECK(out_is("where nothing == 1 t.txt | cat", ""), "a field no row has matches nothing");
+    hr::Table text;
+    const char raw[] = "one\ntwo\n\nlast";
+    CHECK(hr::from_text(text, reinterpret_cast<const u8*>(raw), sizeof(raw) - 1) && text.rows == 4 && text.body == 0, "text becomes one row per line");
+    u32 n = 0;
+    CHECK(same(hr::text_at(text, 2, 0, &n), "") && n == 0 && same(hr::text_at(text, 3, 0, &n), "last"), "empty and final lines");
+    hr::release(text);
 
-    CHECK(out_is("sort -k switches t.txt | cat",
-                 "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"
-                 "task.1: state=running ring=0 core=0 switches=40 name=helm\n"
-                 "task.2: state=sleeping ring=3 core=1 switches=500 name=net rx\n"
-                 "task.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n"), "sort -k sorts by a numeric field");
-    CHECK(out_is("sort -r -k switches t.txt | head -n 1 | cat", "task.4: state=sleeping ring=0 core=2 switches=1200 name=timer\n"), "sort -r -k");
-    CHECK(out_is("sort -k name t.txt | head -n 2 | cat",
-                 "task.3: state=ready ring=3 core=1 switches=7 name=disk\n"
-                 "task.1: state=running ring=0 core=0 switches=40 name=helm\n"), "sort -k by a text field");
-    CHECK(out_is("cat t.txt | where core == 1 | sort -k switches | cat", swapped), "the full pipeline");
-    CHECK(out_is("cat t.txt | where core == 1 | sort -r -k switches | head -n 1 | cat", t2), "where then sort then head");
+    hr::Table limited;
+    hr::begin(limited);
+    hr::add_column(limited, "x", hr::Kind::Text);
+    static char chunk[1 << 16];
+    for (u32 i = 0; i < sizeof(chunk); ++i) chunk[i] = 'x';
+    bool refused = false;
+    for (u32 i = 0; i < 200 && !refused; ++i) {
+        u32 r = hr::add_row(limited);
+        if (r == ~0u) { refused = true; break; }
+        hr::set_text(limited, r, 0, chunk, sizeof(chunk));
+        if (limited.failed) refused = true;
+    }
+    CHECK(refused && limited.failed, "a table stops growing at its byte limit");
+    hr::release(limited);
+}
 
-    CHECK(out_is("pick -f t.txt core name | head -n 2 | cat", "task.1: core=0 name=helm\ntask.2: core=1 name=net rx\n"), "pick keeps the named fields in the order given");
-    CHECK(out_is("pick -f t.txt name core | head -n 1 | cat", "task.1: name=helm core=0\n"), "and in that order");
-    CHECK(out_is("where core == 1 t.txt | pick name | cat", "task.2: name=net rx\ntask.3: name=disk\n"), "pick after where");
+static void test_typed_rows() {
+    printf("-- typed rows\n");
+    sh("go ram:/; fade tree: yes missing: yes rt; plant rt; go rt");
+    static char two_k[2000];
+    static char five_k[5000];
+    for (u32 i = 0; i < sizeof(two_k); ++i) two_k[i] = 'a';
+    for (u32 i = 0; i < sizeof(five_k); ++i) five_k[i] = 'b';
+    CHECK(lens::text::write_file(g_sh->cursor, "m2k", two_k, sizeof(two_k)) == nebula::Status::Ok, "write m2k");
+    CHECK(lens::text::write_file(g_sh->cursor, "m5k", five_k, sizeof(five_k)) == nebula::Status::Ok, "write m5k");
+    CHECK(lens::text::write_file(g_sh->cursor, "tiny", "abc", 3) == nebula::Status::Ok, "write tiny");
+    CHECK(out_is("plant sub", ""), "make a directory");
 
-    const char* shown = sh("where core == 1 t.txt");
-    CHECK(contains(shown, "id") && contains(shown, "switches") && contains(shown, "net rx") && contains(shown, "2 rows"), "a terminal gets a table with a header and a row count");
+    CHECK(out_is("chart | pick name", "sub\nm2k\nm5k\ntiny\n"), "chart lists names");
+    CHECK(out_is("chart | where size > 1KiB | pick name", "m2k\nm5k\n"), "sizes compare as sizes");
+    CHECK(out_is("chart | where size >= 5000 | pick name", "m5k\n"), "plain numbers are bytes");
+    CHECK(out_is("chart | where size < 10 | pick name", "tiny\n"), "directories have no size and never match");
+    CHECK(out_is("chart | where size gt 1KiB | where size le 2000 | pick name", "m2k\n"), "word operators and chained where");
+    CHECK(out_is("chart | where kind = dir | pick name", "sub\n"), "where on kind");
+    CHECK(out_is("chart | where kind != dir | tally | etch ram:/c.out; beacon ram:/c.out", "rows\n   3\n"), "tally counts rows");
+    CHECK(out_is("chart | order size down: yes | first 1 | pick name", "m5k\n"), "order a size column down");
+    CHECK(out_is("chart | order size | first 1 | pick name", "tiny\n"), "order a size column up");
+    CHECK(out_is("chart | order size down: yes | last 1 | pick name", "sub\n"), "nulls are always last");
+    CHECK(out_is("chart | order name down: yes | first 1 | pick name", "tiny\n"), "order text down");
+    CHECK(out_is("chart | where changed > 2000-01-01 | tally | etch ram:/c.out; beacon ram:/c.out", "rows\n   4\n"), "times compare as times");
+    CHECK(out_has("chart | where changed < 2000-01-01", "0 rows"), "an empty result says so");
+    CHECK(out_is("chart | where changed > '2000-01-01 00:00' | where changed < 2100-01-01 | tally | etch ram:/c.out; beacon ram:/c.out", "rows\n   4\n"), "a time with a clock part");
+    CHECK(out_is("chart | tally by: kind | where kind = file | pick rows | etch ram:/c.out; beacon ram:/c.out", "rows\n   3\n"), "tally by a column");
+    CHECK(out_is("chart | pick name | seek m | pick text", "m2k\nm5k\n"), "rows flatten into text for a text command");
+    CHECK(out_is("chart | pick name | beacon", "sub\nm2k\nm5k\ntiny\n"), "beacon of rows prints the name column");
+    CHECK(out_is("chart | etch ram:/listing; beacon ram:/listing", "sub\nm2k\nm5k\ntiny\n"), "etch of rows writes the name column");
+    CHECK(out_is("chart | where name ~ 'm*' | pick name size | pick name", "m2k\nm5k\n"), "pick then pick");
+    CHECK(out_is("chart | where name ~ m* | pick name", "m2k\nm5k\n"), "unquoted wildcard in where is literal");
+    CHECK(out_is("chart | distinct kind | pick kind", "dir\nfile\n"), "distinct keeps the first row of each value");
+    CHECK(out_has("chart | where size > 1XB", "not a valid size") && g_status == 2, "bad size value");
+    CHECK(out_has("chart | where changed > yesterday", "not a valid time") && g_status == 2, "bad time value");
+    CHECK(out_has("chart | where size ~ 1*", "text columns only") && g_status == 2, "glob on a number");
+    CHECK(out_has("chart | where nothing = 1", "no column 'nothing'") && g_status == 1, "missing column lists the real ones");
+    CHECK(contains(g_out, "name kind size changed"), "and names them");
+    CHECK(out_has("chart | where size", "usage: where") && g_status == 2, "where needs three words");
+    CHECK(out_has("chart | where size between 1", "usage: where") && g_status == 2, "unknown operator");
+    CHECK(out_has("where size > 1", "no rows") && g_status == 1, "where with nothing piped in");
+    CHECK(out_has("chart | first x", "usage: first") && g_status == 2, "first needs a number");
+    CHECK(out_has("chart | pick", "usage: pick") && g_status == 2, "pick needs columns");
+    CHECK(out_has("chart | pick nothing", "no column 'nothing'") && g_status == 1, "pick of a missing column");
+
+    const char* shown = sh("chart");
+    CHECK(contains(shown, "name") && contains(shown, "kind") && contains(shown, "size") && contains(shown, "changed"), "a table has a header");
+    CHECK(contains(shown, "1.9 KiB") && contains(shown, "4.8 KiB") && contains(shown, "3 B"), "sizes are readable");
+    CHECK(contains(shown, "sub/") && contains(shown, "4 rows"), "directories are marked and rows counted");
     printf("%s", shown);
-    CHECK(contains(sh("where core == 9 t.txt"), "") && same(sh("where core == 9 t.txt"), ""), "no matches, no table");
-    CHECK(g_status == 0, "no matches is not an error");
-    CHECK(same(sh("where core"), "") == false && g_status == 2, "where needs three words");
-    CHECK(g_status == 2 && contains(sh("where core between 1 t.txt"), "usage"), "an unknown operator is a usage error");
-    sh("rm t.txt");
+    shown = sh("chart | where size > 1KiB");
+    CHECK(contains(shown, "2 rows") && !contains(shown, "tiny"), "a filtered table counts its rows");
+    sh("go ram:/; fade tree: yes rt");
 }
 
 int main() {
@@ -634,13 +748,14 @@ int main() {
     helm::init(shell, helm::Sink{&sink_write, nullptr}, false, 40, "ram");
 
     test_parser();
+    test_row_values();
     test_shell();
     test_completion();
     test_lens_location();
     test_interrupt_and_limits();
     test_disk();
     test_console_lens();
-    test_rows();
+    test_typed_rows();
     helm::shutdown(shell);
 
     printf("%d checks, %d failed\n", g_checks, g_fail);

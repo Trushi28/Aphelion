@@ -335,6 +335,9 @@ static void boot_console_buffer(const BootState& s) {
                         static_cast<u64>(cm.cols), static_cast<u64>(cm.rows), static_cast<u64>(cm.cell_w), static_cast<u64>(cm.cell_h),
                         cm.fb_width, cm.fb_height,
                         buffered ? "RAM backbuffer on (the write-combined framebuffer is only ever written)" : "no backbuffer, drawing straight to the framebuffer");
+        u32 history = fb::enable_scrollback();
+        if (history) serial::printf("[console] scrollback holds %lu lines\n", static_cast<u64>(history));
+        else serial::writeln("[console] scrollback unavailable, PageUp does nothing");
         bool console_ok = corona::selftest();
         serial::printf("[selftest] console: %s\n", console_ok ? "ok" : "MISMATCH");
     }

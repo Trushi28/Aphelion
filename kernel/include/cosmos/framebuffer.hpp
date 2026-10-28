@@ -12,6 +12,7 @@ struct Info {
 
 bool init(const Info& info);
 bool enable_backbuffer();
+u32 enable_scrollback();
 void clear(u32 rgb);
 void put_pixel(u64 x, u64 y, u32 rgb);
 void putc(char c, u32 fg, u32 bg);

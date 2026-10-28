@@ -20,6 +20,10 @@ void Terminal::init(Cell* storage, u32 cols, u32 rows, const Palette& palette) {
     palette_ = palette;
     autowrap_ = true;
     cursor_visible_ = true;
+    if (hist_cols_ != cols_) hist_cap_ = 0;
+    hist_head_ = 0;
+    hist_count_ = 0;
+    view_ = 0;
     reset();
     clear_all();
 }
@@ -99,9 +103,16 @@ void Terminal::move_to(u32 col, u32 row) {
 void Terminal::fill(u32 col0, u32 row0, u32 col1, u32 row1) {
     Cell b = blank();
     for (u32 r = row0; r <= row1 && r < rows_; ++r) {
-        for (u32 c = col0; c <= col1 && c < cols_; ++c) at(c, r) = b;
-
-        mark_span(r, col0 > 0 ? col0 - 1 : 0, col1 + 2 < cols_ ? col1 + 2 : cols_);
+        u32 lo = cols_, hi = 0;
+        for (u32 c = col0; c <= col1 && c < cols_; ++c) {
+            Cell& cl = at(c, r);
+            if (cl.glyph == b.glyph && cl.fg == b.fg && cl.bg == b.bg) continue;
+            cl = b;
+            if (c < lo) lo = c;
+            hi = c;
+        }
+        if (lo >= cols_) continue;
+        mark_span(r, lo > 0 ? lo - 1 : 0, hi + 2 < cols_ ? hi + 2 : cols_);
     }
 }
 
@@ -119,6 +130,7 @@ void Terminal::scroll_up(u32 n) {
     if (n > height) n = height;
 
     mark_cursor();
+    if (hist_cap_ && top_ == 0 && bottom_ == rows_ - 1) push_history(n);
     for (u32 r = top_; r + n <= bottom_; ++r)
         mem::move(&at(0, r), &at(0, r + n), cols_ * sizeof(Cell));
     Cell b = blank();
@@ -140,6 +152,48 @@ void Terminal::scroll_up(u32 n) {
     } else {
         for (u32 r = top_; r <= bottom_; ++r) mark_row(r);
     }
+}
+
+void Terminal::push_history(u32 n) {
+    for (u32 i = 0; i < n; ++i) {
+        mem::copy(hist_ + static_cast<usize>(hist_head_) * cols_, &at(0, i), cols_ * sizeof(Cell));
+        hist_head_ = hist_head_ + 1 == hist_cap_ ? 0 : hist_head_ + 1;
+        if (hist_count_ < hist_cap_) ++hist_count_;
+    }
+}
+
+void Terminal::set_history(Cell* storage, u32 lines) {
+    hist_ = storage;
+    hist_cap_ = storage ? lines : 0;
+    hist_cols_ = cols_;
+    hist_head_ = 0;
+    hist_count_ = 0;
+    view_ = 0;
+}
+
+bool Terminal::scroll_view(i32 lines) {
+    i64 target = static_cast<i64>(view_) + lines;
+    if (target < 0) target = 0;
+    if (target > static_cast<i64>(hist_count_)) target = hist_count_;
+    if (static_cast<u32>(target) == view_) return false;
+    view_ = static_cast<u32>(target);
+    mark_all_dirty();
+    return true;
+}
+
+bool Terminal::snap_to_live() {
+    if (view_ == 0) return false;
+    view_ = 0;
+    mark_all_dirty();
+    return true;
+}
+
+const Cell& Terminal::view_cell(u32 col, u32 row) const {
+    if (view_ == 0) return cell(col, row);
+    u32 line = hist_count_ + row - view_;
+    if (line >= hist_count_) return cell(col, line - hist_count_);
+    u32 idx = (hist_head_ + hist_cap_ - hist_count_ + line) % hist_cap_;
+    return hist_[static_cast<usize>(idx) * cols_ + col];
 }
 
 void Terminal::scroll_down(u32 n) {
@@ -513,10 +567,12 @@ void Terminal::put_byte(u8 b) {
 }
 
 void Terminal::write(const char* s, u32 n) {
+    if (view_ && n) snap_to_live();
     for (u32 i = 0; i < n; ++i) put_byte(static_cast<u8>(s[i]));
 }
 
 void Terminal::write(const char* s) {
+    if (view_ && *s) snap_to_live();
     while (*s) put_byte(static_cast<u8>(*s++));
 }
 

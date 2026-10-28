@@ -47,8 +47,8 @@ built in, described under [Goals](#goals).
 - PS/2 keyboard and serial input through one key-event queue, a kernel log ring and ACPI/keyboard-controller reboot
 - Nebula, a non-POSIX namespace: `realm:/path` names over RAM, the Stellar disk, read-only snapshots and live kernel
   state, with Unicode names, partial I/O over whole-file Stellar handles and cross-realm copy
-- Helm, the shell: pipes, redirection, globs, variables, scripts, tab completion, history, Ctrl-C, Unicode editing and
-  about fifty commands for files, text, snapshots and the system
+- Helm, the shell: typed rows flowing through pipes, named `key: value` options, `=>` and `!>` links, globs, `@name`
+  values, scripts, tab completion, history, Ctrl-C, Unicode editing and about fifty Aphelion-named commands
 - Two boot entries from one ISO: a shell and a test suite
 - RTC wall clock plus a tick counter, so files carry real modification times
 
@@ -138,11 +138,11 @@ What this means in practice:
 - Two sticks written from the same ISO cannot be told apart, so with both plugged in neither gets a window.
 - Hubs, UAS-only drives, 4096-byte-sector drives and USB keyboards are not supported yet. Use the laptop's own
   keyboard (PS/2 or the serial console) for the shell.
-- `poweroff` uses the ACPI S5 sleep state (the `_S5_` package is read from the DSDT without an AML interpreter) and falls
+- `sunset` uses the ACPI S5 sleep state (the `_S5_` package is read from the DSDT without an AML interpreter) and falls
   back to the QEMU, Bochs and VirtualBox ports under a hypervisor. It is untested on real hardware.
-- The `make run*` targets let QEMU behave like a machine: `reboot` restarts the guest and `poweroff` exits QEMU. To keep a
+- The `make run*` targets let QEMU behave like a machine: `restart` restarts the guest and `sunset` exits QEMU. To keep a
   crashed guest on screen instead, run `make run QEMU_EXIT="-no-reboot -no-shutdown"`; QEMU then shows "paused" after a
-  clean `poweroff` too, which is the flag, not a crash.
+  clean `sunset` too, which is the flag, not a crash.
 
 `make run-usb` and `make run-uefi-usb` boot the usb profile in QEMU from an emulated xHCI stick (`build/usb.img`,
 the ISO padded to `USB_IMG_SIZE`, 256M by default).
@@ -160,18 +160,33 @@ The shell boots as `aphelion <location> ▸`. Locations look like `ram:/notes`, 
 | `sys` | read-only text files: `version uptime memory cpus tasks realms storage log` |
 
 ```
-echo café ₹ Ω > ram:/greeting
-cat ram:/greeting | grep -i CAFÉ
-cp -r snap:/1/proj disk:/restored
-mkfs erase
-snapshot
-find disk:/ -name '*.txt'
+say café ₹ Ω | etch ram:/greeting
+beacon ram:/greeting | seek fold: yes CAFÉ
+chart disk:/ depth: 4 | where size > 1MiB | order size down: yes | first 5
+twin tree: yes snap:/1/proj disk:/restored
+epoch take
+chart snap:/ | where changed > 2026-10-01
+kindle erase
 help
 ```
 
-The disk is mounted in shell mode when it already holds a Stellar volume and is never formatted automatically.
-`mkfs erase` creates an empty volume, and only on a disk that is blank or already carries a Stellar superblock, so a
-disk with someone else's data is refused. `help syntax` lists the pipe, redirect, glob and variable rules.
+Helm does not follow the POSIX shell. Commands carry Aphelion names (`chart` lists, `beacon` shows a file, `probe`
+inspects, `spark` creates, `plant` makes a directory, `fade` removes, `twin` copies, `drift` moves, `seek` searches
+text, `orbit` and `suns` show Orbital, `epoch` freezes the disk, `restart` and `sunset` end the session).
+Options are named, `key: value`, and may sit anywhere after the command: `chart depth: 3 only: dir`,
+`fade tree: yes`. A word that ends in a colon is an option only for a command that declares it, or a realm name;
+quote it to use it as plain text. Commands such as `chart`, `probe`, `realms`, `orbit`, `suns` and `memory` produce
+typed rows (text, numbers, sizes such as `2KiB`, times such as `2026-10-01`, yes/no) and `where`, `pick`, `order`,
+`first`, `last`, `distinct` and `tally` filter, sort and count them by column, so a size compares as a size and a time
+as a time. Text piped into a row command becomes one row per line, and rows piped into a text command become their
+text column. `etch FILE` writes what arrives to a file (`append: yes` adds to it); there are no redirect operators.
+`a ; b` runs both, `a => b` runs `b` only after success and `a !> b` only after failure. Bound values are `@name`,
+`@{name}`, `@status` and `@here`. A terminal shows rows as an aligned table with a row count.
+
+The disk is mounted in shell mode when it already holds a Stellar volume, and a completely blank disk is formatted at
+boot. `kindle erase` creates an empty volume only on a disk that is blank or already carries a Stellar superblock, so a
+disk with someone else's data is refused. `help syntax` lists the option, row, combining, quoting and value rules.
+
 
 Limits worth knowing: files are capped at 16 MiB and partial writes are buffered in memory until `sync`, close or
 exit; a pipe stage's output is capped at 8 MiB; globs work in the last path component only; variables are never word

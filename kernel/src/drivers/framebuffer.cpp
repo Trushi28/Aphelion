@@ -11,6 +11,8 @@ namespace fb {
 namespace {
 
 constexpr usize MAX_BACKBUFFER_BYTES = 96ull << 20;
+constexpr u32 SCROLLBACK_LINES = 2000;
+constexpr usize MAX_SCROLLBACK_BYTES = 12ull << 20;
 constexpr u32 LINE_MAX = 512;
 
 struct Out {
@@ -45,6 +47,19 @@ bool enable_backbuffer() {
         return false;
     }
     return true;
+}
+
+u32 enable_scrollback() {
+    usize per_line = corona::scrollback_bytes_per_line();
+    if (per_line == 0 || !kheap::ready()) return 0;
+    usize lines = SCROLLBACK_LINES;
+    if (lines * per_line > MAX_SCROLLBACK_BYTES) lines = MAX_SCROLLBACK_BYTES / per_line;
+    if (lines == 0) return 0;
+    void* mem = kheap::alloc(lines * per_line);
+    if (!mem) return 0;
+    u32 got = corona::enable_scrollback(static_cast<term::Cell*>(mem), lines * per_line);
+    if (got == 0) kheap::free(mem);
+    return got;
 }
 
 bool ready() { return corona::ready(); }

@@ -283,6 +283,81 @@ static void term_tests() {
     expect(g_t.cursor_row() == 0 && term::cell_cp(g_t.cell(g_t.cols() - 1, 0)) == 'w', "term: with autowrap off the last column is overwritten");
 }
 
+static term::Cell g_hist[20 * 64];
+
+static Str view_row(u32 r) {
+    Str s;
+    u32 n = 0, last = 0;
+    char tmp[64];
+    for (u32 c = 0; c < g_t.cols() && n + 1 < sizeof(tmp); ++c) {
+        u32 cp = term::cell_cp(g_t.view_cell(c, r));
+        tmp[n++] = cp ? static_cast<char>(cp) : ' ';
+        if (cp != ' ' && cp != 0) last = n;
+    }
+    tmp[last] = 0;
+    snprintf(s.b, sizeof(s.b), "%s", tmp);
+    return s;
+}
+
+static void history_tests() {
+    fresh(10, 3);
+    g_t.set_history(g_hist, 5);
+    g_t.write("a\nb\nc\nd\ne\nf");
+    expect(g_t.history_count() == 3 && row(0) == "d" && row(2) == "f", "history: lines that scroll off the top are kept");
+    expect(!g_t.scroll_view(-1) && g_t.view_offset() == 0, "history: there is nothing below the live screen");
+    expect(g_t.scroll_view(1) && g_t.view_offset() == 1, "history: scrolling back moves the view");
+    expect(view_row(0) == "c" && view_row(1) == "d" && view_row(2) == "e", "history: one line back shows the last kept line on top");
+    expect(g_t.scroll_view(50) && g_t.view_offset() == 3, "history: the view stops at the oldest line");
+    expect(view_row(0) == "a" && view_row(1) == "b" && view_row(2) == "c", "history: the oldest lines are intact");
+    expect(!g_t.scroll_view(1), "history: scrolling past the oldest line changes nothing");
+    expect(g_t.scroll_view(-2) && view_row(0) == "c" && view_row(2) == "e", "history: scrolling forward again");
+    g_t.write("!");
+    expect(g_t.view_offset() == 0 && row(2) == "f!", "history: new output returns the view to the bottom");
+    expect(g_t.row_dirty(0) && g_t.row_dirty(2), "history: returning to the bottom redraws every row");
+
+    fresh(10, 3);
+    g_t.set_history(g_hist, 5);
+    char line[16];
+    for (int i = 0; i < 12; ++i) {
+        snprintf(line, sizeof(line), "l%d\n", i);
+        g_t.write(line);
+    }
+    expect(g_t.history_count() == 5, "history: the ring never holds more than its capacity");
+    g_t.scroll_view(100);
+    expect(g_t.view_offset() == 5 && view_row(0) == "l5" && view_row(1) == "l6" && view_row(2) == "l7", "history: a wrapped ring still reads oldest first");
+    g_t.scroll_view(-1);
+    expect(view_row(0) == "l6" && view_row(2) == "l8", "history: reading across the wrap point");
+    g_t.snap_to_live();
+    expect(g_t.view_offset() == 0 && row(0) == "l10", "history: snapping returns to the live rows");
+
+    fresh(10, 6);
+    g_t.set_history(g_hist, 8);
+    g_t.write("\x1b[2;4r\x1b[2;1Ha\nb\nc\nd\ne");
+    expect(g_t.history_count() == 0, "history: scrolling inside a region keeps nothing");
+    g_t.write("\x1b[r\x1b[6;1H\nx");
+    expect(g_t.history_count() == 1, "history: a full-screen scroll keeps the line that left");
+
+    fresh(10, 3);
+    g_t.set_history(g_hist, 5);
+    g_t.write("a\nb\nc\nd\ne");
+    g_t.init(g_grid, 10, 3, test_palette());
+    expect(g_t.history_count() == 0 && g_t.view_offset() == 0, "history: reinitialising the terminal forgets it");
+
+    fresh(10, 3);
+    g_t.clear_dirty();
+    g_t.write("\x1b[2J");
+    expect(!g_t.any_dirty(), "term: clearing a blank screen redraws nothing");
+    g_t.write("ab");
+    g_t.clear_dirty();
+    g_t.write("\x1b[2J");
+    expect(g_t.row_dirty(0) && !g_t.row_dirty(1) && !g_t.row_dirty(2), "term: clearing redraws only the rows that held something");
+    g_t.write("\x1b[H");
+    g_t.clear_dirty();
+    g_t.write("\x1b[1;32m\x1b[2K");
+    expect(g_t.row_dirty(0), "term: erasing with a different colour still redraws");
+    g_t.init(g_grid, 10, 3, test_palette());
+}
+
 struct Screen {
     u32 w, h;
     Vec<u32> fbuf;
@@ -483,6 +558,76 @@ static void render_tests() {
     }
 }
 
+static void scrollback_render_tests() {
+    Screen s(800, 480, true);
+    Vec<term::Cell> mem;
+    mem.assign(static_cast<size_t>(200) * 86, term::Cell{});
+    u32 lines = corona::enable_scrollback(mem.data(), mem.size() * sizeof(term::Cell));
+    expect(lines == 200, "corona: scrollback sizes itself from the memory it is given");
+    expect(corona::scrollback_bytes_per_line() == 86 * sizeof(term::Cell), "corona: one history line costs one row of cells");
+
+    for (int i = 0; i < 100; ++i) {
+        char line[64];
+        snprintf(line, sizeof(line), "scroll line %d\n", i);
+        corona::write(line);
+    }
+    expect(corona::scrollback_lines() == 78 && corona::view_offset() == 0, "corona: lines that scrolled away are counted");
+    Vec<u32> live = s.visible();
+    u32 amber_live = 0;
+    for (size_t i = 0; i < live.size(); ++i) if (live[i] == 0xFFB347) ++amber_live;
+    expect(amber_live > 0, "corona: the cursor shows at the bottom");
+
+    bool steps_equal = true;
+    const i32 moves[] = {1, 5, 21, 30, -3, -40, 100, 2, -1, -200};
+    for (i32 mv : moves) {
+        corona::scroll_view(mv);
+        Vec<u32> inc = s.visible();
+        if (inc != full_redraw_snapshot(s)) { printf("  view differs after moving %d\n", mv); steps_equal = false; }
+    }
+    expect(steps_equal, "corona: every scroll step equals a full redraw");
+    expect(corona::view_offset() == 0 && s.visible() == live, "corona: scrolling back to the bottom restores the exact live screen");
+
+    corona::scroll_view(10);
+    Vec<u32> back = s.visible();
+    u32 amber_back = 0;
+    for (size_t i = 0; i < back.size(); ++i) if (back[i] == 0xFFB347) ++amber_back;
+    expect(back != live && amber_back == 0, "corona: the view differs from the live screen and the cursor is hidden");
+    bool matches = true;
+    for (size_t i = 0; i < back.size(); ++i) if (back[i] != s.back[i]) { matches = false; break; }
+    expect(matches, "corona: the screen shows what the backbuffer holds while scrolled back");
+
+    corona::write("x");
+    expect(corona::view_offset() == 0, "corona: output snaps the view to the bottom");
+    Vec<u32> after = s.visible();
+    expect(after == full_redraw_snapshot(s), "corona: the snapped screen equals a full redraw");
+
+    expect(!corona::scroll_view(-1) && corona::snap_to_live() == false, "corona: nothing to do at the bottom");
+    corona::scroll_view(7);
+    expect(corona::snap_to_live() && corona::view_offset() == 0, "corona: snap_to_live returns to the bottom");
+
+    unsigned seed = 99;
+    bool eq = true;
+    for (int trial = 0; trial < 30 && eq; ++trial) {
+        Str stream;
+        random_stream(stream, seed, 80);
+        corona::write(stream.c_str(), static_cast<u32>(stream.size()));
+        if (trial % 3 == 0) corona::scroll_view(1 + trial);
+        if (s.visible() != full_redraw_snapshot(s)) { printf("  scrollback trial %d differs\n", trial); eq = false; }
+    }
+    expect(eq, "corona: random output with scrolling and scrollback equals a full redraw");
+
+    corona::write("\x1b[0m\x1b[r\x1b[?7h\x1b[2J\x1b[H\x1b[?25h");
+    corona::write("\x1b[41m  \x1b[0mX");
+    const u32 ox = (800 - 86 * 9) / 2, oy = (480 - 23 * 20) / 2;
+    bool red = true;
+    for (u32 y = 0; y < 20; ++y)
+        for (u32 x = 0; x < 18; ++x)
+            if (s.at(ox + x, oy + y) != 0xFF6B7A) red = false;
+    expect(red, "corona: a run of coloured blanks fills exactly its cells");
+    expect(s.at(ox + 36, oy + 0) == 0x0A0A14 && s.at(ox - 1, oy + 5) == 0x0A0A14, "corona: and nothing around it");
+    expect(s.visible() == full_redraw_snapshot(s), "corona: the run survives a full redraw");
+}
+
 static int ink_of(const u8* g, u32 n) {
     int total = 0;
     for (u32 i = 0; i < n; ++i) total += corona::font::coverage(g, i);
@@ -581,5 +726,7 @@ int main() {
     font_tests();
     term_tests();
     render_tests();
+    history_tests();
+    scrollback_render_tests();
     return g_failures ? 1 : 0;
 }

@@ -131,6 +131,17 @@ void render_cell(u32* dst, u64 pitch, const term::Cell& c, bool cursor) {
     }
 }
 
+void fill_px(u32* dst, u32 value, u64 count) {
+#ifdef CORONA_HOST_TEST
+    for (u64 i = 0; i < count; ++i) dst[i] = value;
+#else
+    u64 pairs = count >> 1;
+    u64 pattern = (static_cast<u64>(value) << 32) | value;
+    asm volatile("rep stosq" : "+D"(dst), "+c"(pairs) : "a"(pattern) : "memory");
+    if (count & 1) *dst = value;
+#endif
+}
+
 u32* fb_row(u64 y) {
     return reinterpret_cast<u32*>(const_cast<u8*>(g_info.base) + y * g_info.pitch);
 }
@@ -159,6 +170,12 @@ void fill_surface(u32 rgb) {
     }
 }
 
+bool plain_blank(const term::Cell& c) {
+    u32 attr = term::cell_attr(c);
+    if (attr & (term::REVERSE | term::UNDERLINE)) return false;
+    return (attr & term::WIDE_TAIL) || term::cell_cp(c) == 0 || term::cell_cp(c) == ' ';
+}
+
 void draw_row(u32 row, bool cursor_visible, u32 cursor_col, u32 cursor_row) {
     const font::Face& f = *g_face;
     u64 y = g_origin_y + static_cast<u64>(row) * f.cell_h;
@@ -166,12 +183,31 @@ void draw_row(u32 row, bool cursor_visible, u32 cursor_col, u32 cursor_row) {
     u32 last = g_term.dirty_end(row);
     if (last > g_cols) last = g_cols;
     if (first >= last) return;
-    for (u32 col = first; col < last; ++col) {
+    auto is_cursor = [&](u32 col) { return cursor_visible && row == cursor_row && col == cursor_col; };
+    u32 col = first;
+    while (col < last) {
+        const term::Cell& c = g_term.view_cell(col, row);
+        if (!is_cursor(col) && plain_blank(c)) {
+            u32 end = col + 1;
+            while (end < last && !is_cursor(end)) {
+                const term::Cell& n = g_term.view_cell(end, row);
+                if (!plain_blank(n) || n.bg != c.bg) break;
+                ++end;
+            }
+            u32 pixel = pack(c.bg);
+            u64 x = g_origin_x + static_cast<u64>(col) * f.cell_w;
+            u64 width = static_cast<u64>(end - col) * f.cell_w;
+            for (u32 line = 0; line < f.cell_h; ++line) {
+                u32* dst = g_back ? g_back + (y + line) * g_pitch_px + x : fb_row(y + line) + x;
+                fill_px(dst, pixel, width);
+            }
+            col = end;
+            continue;
+        }
         u64 x = g_origin_x + static_cast<u64>(col) * f.cell_w;
-        bool cur = cursor_visible && row == cursor_row && col == cursor_col;
-        const term::Cell& c = g_term.cell(col, row);
-        if (g_back) render_cell(g_back + y * g_pitch_px + x, g_pitch_px, c, cur);
-        else render_cell(fb_row(y) + x, g_info.pitch / 4, c, cur);
+        if (g_back) render_cell(g_back + y * g_pitch_px + x, g_pitch_px, c, is_cursor(col));
+        else render_cell(fb_row(y) + x, g_info.pitch / 4, c, is_cursor(col));
+        ++col;
     }
     if (g_back) copy_span_to_fb(y, f.cell_h, g_origin_x + static_cast<u64>(first) * f.cell_w, static_cast<u64>(last - first) * f.cell_w);
 }
@@ -193,7 +229,7 @@ void flush_locked() {
             g_term.mark_all_dirty();
         }
     }
-    bool cur_vis = g_term.cursor_visible();
+    bool cur_vis = g_term.cursor_visible() && g_term.view_offset() == 0;
     u32 cc = g_term.cursor_col();
     u32 cr = g_term.cursor_row();
     for (u32 r = 0; r < g_rows; ++r) {
@@ -243,6 +279,39 @@ bool init(const fb::Info& info, const u8* font_blob, usize font_length) {
 }
 
 bool ready() { return g_ready; }
+
+usize scrollback_bytes_per_line() { return g_ready ? static_cast<usize>(g_cols) * sizeof(term::Cell) : 0; }
+
+u32 enable_scrollback(term::Cell* memory, usize bytes) {
+    Guard g;
+    if (!g_ready || !memory) return 0;
+    usize per_line = static_cast<usize>(g_cols) * sizeof(term::Cell);
+    usize lines = bytes / per_line;
+    if (lines > 0xFFFFFF) lines = 0xFFFFFF;
+    if (lines == 0) return 0;
+    g_term.set_history(memory, static_cast<u32>(lines));
+    return static_cast<u32>(lines);
+}
+
+bool scroll_view(i32 lines) {
+    if (!g_ready) return false;
+    Guard g;
+    bool moved = g_term.scroll_view(lines);
+    if (moved) flush_locked();
+    return moved;
+}
+
+bool snap_to_live() {
+    if (!g_ready) return false;
+    Guard g;
+    bool moved = g_term.snap_to_live();
+    if (moved) flush_locked();
+    return moved;
+}
+
+u32 scrollback_lines() { return g_ready ? g_term.history_count() : 0; }
+
+u32 view_offset() { return g_ready ? g_term.view_offset() : 0; }
 
 usize backbuffer_bytes_needed() { return g_ready ? static_cast<usize>(g_info.width) * g_info.height * 4 : 0; }
 
