@@ -128,13 +128,13 @@ expect(serial, "window formatted and mounted", "the window being formatted after
 send(serial, "storage init erase %s\r" % mib)
 expect(serial, "already holds a Stellar volume", "a second erase being refused")
 
-send(serial, "reboot\r")
+send(serial, "restart\r")
 end = time.time() + 40
 while time.time() < end and proc.poll() is None:
     pump(serial, 0.3)
 if proc.poll() is None:
     proc.kill()
-    fail("the machine did not reset after the reboot command")
+    fail("the machine did not reset after the restart command")
 
 proc, serial = launch("two")
 mark = len(transcript)
@@ -165,5 +165,5 @@ if digest(iso) != iso_before:
 
 with open(log_path, "wb") as f:
     f.write(transcript)
-print("ok: usb storage window found on the booted stick, decoy untouched, image intact, formatted on confirmation and mounted again after reboot")
+print("ok: usb storage window found on the booted stick, decoy untouched, image intact, formatted on confirmation and mounted again after restart")
 PY
