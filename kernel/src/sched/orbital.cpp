@@ -81,6 +81,8 @@ static u32 g_exit_next = 0;
 static cpu::Spinlock g_exit_lock;
 static WaitQueue g_exit_queue;
 
+static void reap_zombies();
+
 enum class Leave { Requeue, Die, Park };
 
 static void copy_name(char* out, const char* name) {
@@ -109,6 +111,7 @@ static void retire_dying() {
 static void finish_switch() {
     g_lock[apic::id()].unlock();
     retire_dying();
+    reap_zombies();
 }
 
 static bool claim(Satellite* s, u32 epoch) {
