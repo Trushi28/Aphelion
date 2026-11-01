@@ -36,6 +36,7 @@
 #include <cosmos/clock.hpp>
 #include <cosmos/civil.hpp>
 #include <cosmos/boot_tests.hpp>
+#include <cosmos/userland.hpp>
 
 extern "C" char __kernel_start[];
 extern "C" char __kernel_end[];
@@ -111,6 +112,7 @@ static u32 init_gdt_idt(bool is_bsp) {
     u32 core_idx = is_bsp ? 0 : static_cast<u32>(__atomic_fetch_add(&g_next_core_idx, 1, __ATOMIC_SEQ_CST));
     gdt::init(core_idx);
     idt::init();
+    userland::init_core(core_idx);
     return core_idx;
 }
 
@@ -659,5 +661,6 @@ extern "C" NORETURN void kernel_main() {
     else boot_start_shell(s);
     orbital::spawn("reclaim", &reclaim_task, nullptr);
     if (s.test_mode) orbital::spawn_selftest();
+    if (s.test_mode) userland::spawn_selftest();
     orbital::start_core();
 }

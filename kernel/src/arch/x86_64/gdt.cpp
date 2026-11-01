@@ -16,6 +16,7 @@ struct PACKED Table {
 struct alignas(16) CoreState {
     Table gdt;
     Tss tss;
+    CoreLocal local;
 };
 
 struct Seen { u64 gdt_base, tss_base, ist1, ist2; };
@@ -76,6 +77,8 @@ void init(u32 core) {
     set_entry(c.gdt.ucode, 0, 0xFFFFF, 0xFA, 0xA0);
 
     __builtin_memset(&c.tss, 0, sizeof(c.tss));
+    __builtin_memset(&c.local, 0, sizeof(c.local));
+    c.local.core = core;
     c.tss.ist1 = df_top(core);
     c.tss.ist2 = nmi_top(core);
     c.tss.iomap_base = sizeof(Tss);
@@ -131,7 +134,17 @@ static Tss* current_tss() {
     return reinterpret_cast<Tss*>(base);
 }
 
-void set_kernel_stack(u64 top) { current_tss()->rsp0 = top; }
+static CoreLocal* current_local() {
+    CoreState* state = reinterpret_cast<CoreState*>(reinterpret_cast<u64>(current_tss()) - __builtin_offsetof(CoreState, tss));
+    return &state->local;
+}
+
+void set_kernel_stack(u64 top) {
+    current_tss()->rsp0 = top;
+    current_local()->kernel_rsp = top;
+}
+
+CoreLocal* core_local(u32 core) { return core < MAX_CORES ? &g_core[core].local : nullptr; }
 u64 kernel_stack() { return current_tss()->rsp0; }
 
 bool guard_ist_stacks() {

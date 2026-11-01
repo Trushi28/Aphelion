@@ -22,6 +22,7 @@ struct PACKED Descriptor { u16 limit; u64 base; };
 
 alignas(16) static Gate g_idt[256];
 static Handler g_handlers[256];
+static Handler g_user_fault;
 
 static void set_gate(u8 vec, u64 isr, u16 selector, u8 ist, u8 type_attr) {
     g_idt[vec].offset_low  = isr & 0xFFFF;
@@ -68,13 +69,17 @@ static void default_panic(Frame* f) {
     cpu::hang();
 }
 
+static bool user_fault_vector(u64 v) { return v < 32 && v != 2 && v != 8 && v != 18; }
+
 extern "C" void isr_dispatch(Frame* f) {
+    if ((f->cs & 3) == 3 && user_fault_vector(f->vector) && g_user_fault) g_user_fault(f);
     Handler h = g_handlers[f->vector];
     if (h) h(f);
     else default_panic(f);
 }
 
 void set_handler(u8 vector, Handler h) { g_handlers[vector] = h; }
+void set_user_fault_handler(Handler h) { g_user_fault = h; }
 
 static void spurious_handler(Frame*) {}
 

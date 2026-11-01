@@ -35,6 +35,16 @@ struct PACKED Tss {
 
 static_assert(sizeof(Tss) == 104, "TSS layout must match the x86_64 spec exactly");
 
+struct CoreLocal {
+    u64 user_rsp;
+    u64 kernel_rsp;
+    u64 core;
+    u64 reserved;
+};
+
+constexpr u64 LOCAL_USER_RSP_OFFSET = 0;
+constexpr u64 LOCAL_KERNEL_RSP_OFFSET = 8;
+
 constexpr u16 KCODE_SEL = 0x08;
 constexpr u16 KDATA_SEL = 0x10;
 constexpr u16 TSS_SEL   = 0x28;
@@ -50,6 +60,7 @@ constexpr u64 IST_STRIDE = IST_GUARD_BYTES + IST_STACK_BYTES;
 void init(u32 core_index);
 void set_kernel_stack(u64 top);
 u64 kernel_stack();
+CoreLocal* core_local(u32 core);
 bool guard_ist_stacks();
 bool ist_guards_ok();
 bool in_ist_guard(u64 addr);

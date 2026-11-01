@@ -17,15 +17,30 @@ isr%1:
     jmp isr_common
 %endmacro
 
+%macro ISR_NOERR_P 1
+global isr%1
+isr%1:
+    push 0
+    push %1
+    jmp isr_paranoid
+%endmacro
+
+%macro ISR_ERR_P 1
+global isr%1
+isr%1:
+    push %1
+    jmp isr_paranoid
+%endmacro
+
 ISR_NOERR 0
 ISR_NOERR 1
-ISR_NOERR 2
+ISR_NOERR_P 2
 ISR_NOERR 3
 ISR_NOERR 4
 ISR_NOERR 5
 ISR_NOERR 6
 ISR_NOERR 7
-ISR_ERR   8
+ISR_ERR_P 8
 ISR_NOERR 9
 ISR_ERR   10
 ISR_ERR   11
@@ -35,7 +50,7 @@ ISR_ERR   14
 ISR_NOERR 15
 ISR_NOERR 16
 ISR_ERR   17
-ISR_NOERR 18
+ISR_NOERR_P 18
 ISR_NOERR 19
 ISR_NOERR 20
 ISR_ERR   21
@@ -63,6 +78,10 @@ ISR_NOERR 49
 ISR_NOERR 255
 
 isr_common:
+    test qword [rsp + 24], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
     push rax
     push rbx
     push rcx
@@ -82,6 +101,61 @@ isr_common:
     mov rdi, rsp
     call isr_dispatch
 
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 16
+    test qword [rsp + 8], 3
+    jz .to_kernel
+    swapgs
+.to_kernel:
+    iretq
+
+isr_paranoid:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    xor ebx, ebx
+    mov ecx, 0xC0000101
+    rdmsr
+    test edx, edx
+    js .gs_is_kernel
+    swapgs
+    mov ebx, 1
+.gs_is_kernel:
+    mov rdi, rsp
+    call isr_dispatch
+
+    test ebx, ebx
+    jz .gs_unchanged
+    swapgs
+.gs_unchanged:
     pop r15
     pop r14
     pop r13

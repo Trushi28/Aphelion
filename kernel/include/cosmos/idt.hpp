@@ -15,6 +15,7 @@ using Handler = void (*)(Frame*);
 
 void init();
 void set_handler(u8 vector, Handler h);
+void set_user_fault_handler(Handler h);
 
 constexpr u8 VEC_APIC_TIMER = 0x20;
 constexpr u8 VEC_VIRTIO_BLK = 0x22;

@@ -46,6 +46,7 @@ struct Satellite : mlfq::Account {
     bool has_deadline = false;
     EntryFn entry = nullptr;
     void* arg = nullptr;
+    void* owner = nullptr;
     const char* name = nullptr;
     Satellite* next = nullptr;
 };

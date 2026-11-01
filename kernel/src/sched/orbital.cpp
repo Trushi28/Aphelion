@@ -258,6 +258,7 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     s->name = name;
     s->entry = entry;
     s->arg = arg;
+    s->owner = nullptr;
     mlfq::enter(*s, ring);
     s->in_use = true;
 
