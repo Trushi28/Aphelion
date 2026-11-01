@@ -450,7 +450,10 @@ bool test_fpu_isolation(bool* fpu_checked) {
         g_workers[i] = {};
         g_workers[i].id = i;
         g_workers[i].space = i == SPACE_WORKER ? space : nullptr;
-        ok = ok && spawn_in("fpu-worker", &fpu_worker, &g_workers[i], g_workers[i].space);
+        if (!spawn_in("fpu-worker", &fpu_worker, &g_workers[i], g_workers[i].space)) {
+            serial::printf("[sched] fpu worker %u could not be spawned (satellite pool exhausted?)\n", i);
+            ok = false;
+        }
     }
     u32 finished = 0;
     u64 end = clock::uptime_ms() + RUN_MS + GIVE_UP_MS;

@@ -553,13 +553,22 @@ Satellite* spawn(const char* name, EntryFn entry, void* arg) {
     return spawn_in(name, entry, arg, nullptr);
 }
 
-Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space) {
+static Satellite* take_pool_slot() {
     g_pool_lock.lock();
     Satellite* s = nullptr;
     for (auto& cand : g_pool) if (!cand.in_use) { s = &cand; break; }
-    if (!s) { g_pool_lock.unlock(); return nullptr; }
-    s->in_use = true;
+    if (s) s->in_use = true;
     g_pool_lock.unlock();
+    return s;
+}
+
+Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space) {
+    Satellite* s = take_pool_slot();
+    if (!s) {
+        reap_zombies();
+        s = take_pool_slot();
+    }
+    if (!s) return nullptr;
 
     if (!build_satellite(s, name, entry, arg, 0, &satellite_trampoline)) {
         g_pool_lock.lock();
