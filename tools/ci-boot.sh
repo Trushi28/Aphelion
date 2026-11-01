@@ -8,6 +8,7 @@ LIMIT="${BOOT_TIMEOUT:-120}"
 LOG_DIR="${LOG_DIR:-build/ci-logs}"
 PASS="fresh"
 LOG=""
+DIED_EARLY=0
 
 mkdir -p "$LOG_DIR"
 IMG="$(mktemp)"
@@ -28,6 +29,20 @@ DISK="$(disk_args "$IMG")"
 
 fail() {
     echo "FAIL ($DISK_KIND, $CORES core(s), $PASS boot): $1"
+    if [ "$DIED_EARLY" = 1 ]; then
+        echo "QEMU exited on its own before the self-tests finished (guest reset, triple fault or power-off)"
+        if [ -s "$LOG.err" ]; then
+            echo "QEMU printed this on stderr:"
+            head -n 20 "$LOG.err"
+        fi
+        if [ ! -s "$LOG" ]; then
+            echo "the serial log is empty, so the kernel never wrote anything"
+        fi
+    fi
+    if [ -s "$LOG.qemu" ] && grep -q 'Triple fault' "$LOG.qemu"; then
+        echo "QEMU reports a guest triple fault; CPU state at the reset:"
+        grep -m1 -B 80 'Triple fault' "$LOG.qemu" | head -60
+    fi
     grep -v '^\[demo\]' "$LOG.clean" | tail -40
     exit 1
 }
@@ -57,7 +72,8 @@ boot() {
     : > "$LOG"
     started="$(date +%s)"
     qemu-system-x86_64 -M q35 -cpu max -m 256M -smp "$CORES" \
-        -cdrom "$ISO" $DISK -serial "file:$LOG" -display none -no-reboot >/dev/null 2>&1 &
+        -cdrom "$ISO" $DISK -serial "file:$LOG" -display none -no-reboot \
+        -d int,cpu_reset,guest_errors -D "$LOG.qemu" >/dev/null 2>"$LOG.err" &
     qpid=$!
     waited=0
     while kill -0 "$qpid" 2>/dev/null && [ "$waited" -lt "$LIMIT" ]; do
@@ -65,6 +81,8 @@ boot() {
         sleep 1
         waited=$((waited + 1))
     done
+    DIED_EARLY=0
+    if ! kill -0 "$qpid" 2>/dev/null && ! finished; then DIED_EARLY=1; fi
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
     tr -d '\r' < "$LOG" > "$LOG.clean"

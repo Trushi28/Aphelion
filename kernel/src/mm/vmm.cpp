@@ -515,6 +515,7 @@ u64 space_cpumask(const Space* space) { return space ? space->cpumask : 0; }
 
 void activate(Space* space) {
     Space* target = space ? space : &g_core;
+    if (target != &g_core && (!valid_user(target) || !target->root_phys)) die("activating an invalid address space");
     u64 flags = cpu::irq_save();
     u32 me = tlb::core_index();
     bool tracked = me < tlb::MAX_CORES;

@@ -224,7 +224,7 @@ static bool premap_slot(u32 slot) {
 }
 
 static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void* arg,
-                             int ring, void (*trampoline)()) {
+                             int ring, void (*trampoline)(), constellation::Space* space) {
     u32 slot = slot_of(s);
     u8* stack_virt;
     if (g_slot_ready[slot]) {
@@ -239,7 +239,7 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     s->stack_base = stack_virt;
     s->stack_size = universe::PAGE_SIZE << STACK_ORDER;
     s->kstack_top = reinterpret_cast<u64>(stack_virt) + s->stack_size;
-    s->space = nullptr;
+    s->space = space;
     s->state = State::Ready;
     s->wake_at = 0;
     s->switches = 0;
@@ -293,16 +293,19 @@ static void reap_zombies() {
     g_zombie_lock.unlock();
     cpu::irq_restore(f);
 
+    bool reaped = false;
     while (z) {
         Satellite* next_z = z->next;
         serial::printf("[orbital] reaping satellite '%s' (%s)\n", z->name,
                         z->guarded ? "stack slot returned" : "freeing its stack");
         if (!z->guarded) universe::free(reinterpret_cast<u64>(z->stack_base) - g_hhdm, STACK_ORDER);
         g_pool_lock.lock();
-        z->in_use = false;
+        __atomic_store_n(&z->in_use, false, __ATOMIC_RELEASE);
         g_pool_lock.unlock();
+        reaped = true;
         z = next_z;
     }
+    if (reaped) g_exit_queue.wake_all();
 }
 
 static void arrive(Satellite* old, Satellite* next) {
@@ -536,7 +539,7 @@ void init_core() {
         serial::printf("[orbital] FATAL: local APIC id %u is beyond the %u cores the scheduler tracks\n", me, MAX_CORES);
         cpu::hang();
     }
-    build_satellite(&g_idle[me], "idle", &idle_entry, nullptr, NUM_RINGS - 1, &satellite_trampoline);
+    build_satellite(&g_idle[me], "idle", &idle_entry, nullptr, NUM_RINGS - 1, &satellite_trampoline, nullptr);
     apic::start_timer_periodic(idt::VEC_APIC_TIMER, g_ticks_per_period, 4);
 
     u32 n = __atomic_load_n(&g_core_count, __ATOMIC_ACQUIRE);
@@ -557,12 +560,15 @@ static Satellite* take_pool_slot() {
     g_pool_lock.lock();
     Satellite* s = nullptr;
     for (auto& cand : g_pool) if (!cand.in_use) { s = &cand; break; }
-    if (s) s->in_use = true;
+    if (s) {
+        s->id = 0;
+        s->in_use = true;
+    }
     g_pool_lock.unlock();
     return s;
 }
 
-Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space) {
+Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space, u32* id_out) {
     Satellite* s = take_pool_slot();
     if (!s) {
         reap_zombies();
@@ -570,15 +576,15 @@ Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::S
     }
     if (!s) return nullptr;
 
-    if (!build_satellite(s, name, entry, arg, 0, &satellite_trampoline)) {
+    if (!build_satellite(s, name, entry, arg, 0, &satellite_trampoline, space)) {
         g_pool_lock.lock();
-        s->in_use = false;
+        __atomic_store_n(&s->in_use, false, __ATOMIC_RELEASE);
         g_pool_lock.unlock();
         return nullptr;
     }
-    s->space = space;
     s->id = __atomic_add_fetch(&g_next_id, 1u, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_spawned, 1ull, __ATOMIC_RELAXED);
+    if (id_out) *id_out = s->id;
     u64 f = cpu::irq_save();
     place(s, apic::id());
     cpu::irq_restore(f);
@@ -966,6 +972,26 @@ JoinResult join(u32 id, i32* status, u64 timeout_ms) {
     if (!done) return JoinResult::TimedOut;
     if (w.result == JoinResult::Exited && status) *status = w.status;
     return w.result;
+}
+
+namespace {
+
+struct ReapWait { u32 id; };
+
+bool satellite_reaped(void* p) {
+    u32 id = static_cast<ReapWait*>(p)->id;
+    for (auto& s : g_pool) {
+        if (__atomic_load_n(&s.in_use, __ATOMIC_ACQUIRE) && s.id == id) return false;
+    }
+    return true;
+}
+
+}
+
+bool wait_reaped(u32 id, u64 timeout_ms) {
+    if (!id) return false;
+    ReapWait w{ id };
+    return g_exit_queue.wait_until_for(&satellite_reaped, &w, timeout_ms);
 }
 
 NORETURN void start_core() {

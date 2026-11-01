@@ -90,7 +90,7 @@ bool selftest();
 void init_core();
 
 Satellite* spawn(const char* name, EntryFn entry, void* arg);
-Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space);
+Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::Space* space, u32* id_out = nullptr);
 
 Satellite* current();
 u32 current_id();
@@ -103,6 +103,7 @@ u32 cores(CoreInfo* out, u32 max);
 Stats stats();
 
 JoinResult join(u32 id, i32* status, u64 timeout_ms);
+bool wait_reaped(u32 id, u64 timeout_ms);
 
 class WaitQueue {
 public:

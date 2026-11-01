@@ -22,6 +22,7 @@ constexpr u64 PAGE = universe::PAGE_SIZE;
 struct Process {
     bool in_use;
     u32 pid;
+    u32 task_id;
     char name[orbital::NAME_BYTES];
     constellation::Space* space;
     u64 frames[MAX_FRAMES];
@@ -89,6 +90,7 @@ Process* acquire_slot() {
     cpu::irq_restore(f);
     if (!found) return nullptr;
     found->pid = __atomic_add_fetch(&g_next_pid, 1u, __ATOMIC_RELAXED);
+    found->task_id = 0;
     found->name[0] = 0;
     found->space = nullptr;
     found->frame_count = 0;
@@ -151,6 +153,10 @@ bool build(Process* p, const Image& img) {
 }
 
 bool teardown(Process* p) {
+    if (p->task_id) {
+        if (!orbital::wait_reaped(p->task_id, orbital::FOREVER)) return false;
+        p->task_id = 0;
+    }
     if (p->space) {
         for (u32 spins = 0; constellation::space_cpumask(p->space) != 0; ++spins) {
             if (spins > 5000) return false;
@@ -282,7 +288,11 @@ Process* launch(const char* name, const Image& image) {
     u32 n = 0;
     for (; name && name[n] && n + 1 < orbital::NAME_BYTES; ++n) p->name[n] = name[n];
     p->name[n] = 0;
-    if (!build(p, image) || !orbital::spawn_in(p->name, &process_main, p, p->space)) {
+    if (!build(p, image)) {
+        if (teardown(p)) release_slot(p);
+        return nullptr;
+    }
+    if (!orbital::spawn_in(p->name, &process_main, p, p->space, &p->task_id)) {
         if (teardown(p)) release_slot(p);
         return nullptr;
     }
