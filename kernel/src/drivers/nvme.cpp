@@ -120,6 +120,10 @@ static inline void wreg32(u32 off, u32 v) { *reinterpret_cast<volatile u32*>(g_r
 static inline u64 reg64(u32 off) {
     return static_cast<u64>(reg32(off)) | (static_cast<u64>(reg32(off + 4)) << 32);
 }
+static inline void wait_step(u64 spins) {
+    if (g_use_irq && spins > 2000) { cpu::sti_halt(); cpu::cli(); }
+    else asm volatile("pause" ::: "memory");
+}
 static inline void wreg64(u32 off, u64 v) {
     wreg32(off, static_cast<u32>(v));
     wreg32(off + 4, static_cast<u32>(v >> 32));
@@ -196,6 +200,7 @@ static bool execute(Queue& q, Sqe& cmd) {
     for (u64 spins = 0; spins < COMMAND_SPINS; ++spins) {
         if ((q.cq[q.cq_head].status & 1u) == q.phase) { done = true; break; }
         if (g_use_irq) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
+        wait_step(spins);
     }
     if (!done) {
         cpu::irq_restore(irq_flags);
@@ -257,6 +262,7 @@ static bool drain_io(u32 pending) {
     u64 irq_flags = cpu::irq_save();
     while (pending > 0) {
         if ((g_io.cq[g_io.cq_head].status & 1u) != g_io.phase) {
+            wait_step(waits);
             if (g_use_irq) { cpu::sti_halt(); cpu::cli(); } else cpu::io_wait();
             if (++waits > COMMAND_SPINS) {
                 cpu::irq_restore(irq_flags);
