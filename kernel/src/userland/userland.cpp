@@ -1,6 +1,8 @@
 #include <cosmos/userland.hpp>
 #include <cosmos/userabi.hpp>
 #include <cosmos/usercopy.hpp>
+#include <cosmos/usergs.hpp>
+#include <cosmos/ringabort.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/gdt.hpp>
@@ -27,6 +29,8 @@ struct Process {
     constellation::Space* space;
     u64 frames[MAX_FRAMES];
     u32 frame_count;
+    u64 poisoned[ringabort::MAX_POISON];
+    u32 poisoned_count;
     u64 entry;
     u64 stack_top;
     orbital::WaitQueue done;
@@ -50,7 +54,12 @@ Process g_procs[MAX_PROCESSES];
 cpu::Spinlock g_table_lock;
 volatile u32 g_next_pid = 0;
 volatile u64 g_frames_live = 0;
+volatile u64 g_frames_quarantined = 0;
 volatile bool g_supported = false;
+volatile u32 g_nmi_expected = 0;
+volatile u64 g_nmi_from_user = 0;
+volatile u64 g_nmi_absorbed = 0;
+u64 g_phys_mask = 0;
 
 struct SpaceReader {
     static constexpr u64 LIMIT = constellation::USER_LIMIT;
@@ -94,6 +103,7 @@ Process* acquire_slot() {
     found->name[0] = 0;
     found->space = nullptr;
     found->frame_count = 0;
+    found->poisoned_count = 0;
     found->entry = 0;
     found->stack_top = 0;
     found->exited = 0;
@@ -108,6 +118,20 @@ void release_slot(Process* p) {
     p->in_use = false;
     g_table_lock.unlock();
     cpu::irq_restore(f);
+}
+
+bool is_poisoned(const Process* p, u64 frame) {
+    for (u32 i = 0; i < p->poisoned_count; ++i) {
+        if (p->poisoned[i] == frame) return true;
+    }
+    return false;
+}
+
+bool owns_frame(const Process* p, u64 frame) {
+    for (u32 i = 0; i < p->frame_count; ++i) {
+        if ((p->frames[i] & ringabort::FRAME_MASK) == frame) return true;
+    }
+    return false;
 }
 
 bool take_frame(Process* p, u64* phys) {
@@ -164,7 +188,11 @@ bool teardown(Process* p) {
         }
     }
     for (u32 i = 0; i < p->frame_count; ++i) {
-        universe::free(p->frames[i], 0);
+        if (is_poisoned(p, p->frames[i])) {
+            __atomic_add_fetch(&g_frames_quarantined, 1ull, __ATOMIC_RELAXED);
+        } else {
+            universe::free(p->frames[i], 0);
+        }
         __atomic_sub_fetch(&g_frames_live, 1ull, __ATOMIC_RELAXED);
     }
     p->frame_count = 0;
@@ -210,6 +238,14 @@ i64 sys_debug_write(idt::Frame* f) {
     return static_cast<i64>(len);
 }
 
+i64 sys_set_gs_base(idt::Frame* f) {
+    if (!usergs::base_ok(f->rdi, userabi::USER_LIMIT)) return userabi::ERR_INVAL;
+    cpu::wrmsr(usergs::MSR_KERNEL_GS_BASE, f->rdi);
+    return 0;
+}
+
+i64 sys_get_gs_base(idt::Frame*) { return static_cast<i64>(cpu::rdmsr(usergs::MSR_KERNEL_GS_BASE)); }
+
 using SysFn = i64 (*)(idt::Frame*);
 
 const SysFn g_table[userabi::SYS_COUNT] = {
@@ -217,7 +253,11 @@ const SysFn g_table[userabi::SYS_COUNT] = {
     &sys_yield,
     &sys_gettid,
     &sys_debug_write,
+    &sys_set_gs_base,
+    &sys_get_gs_base,
 };
+
+static_assert(userabi::USER_LIMIT == constellation::USER_LIMIT, "the native ABI and the VMM must agree on the user limit");
 
 void on_user_fault(idt::Frame* f) {
     Process* p = current_process();
@@ -230,6 +270,86 @@ void on_user_fault(idt::Frame* f) {
     serial::printf("[userland] pid %u '%s' took exception %lu (error %lx) at rip=%p cr2=%p: terminated\n",
                     p->pid, p->name, f->vector, f->error_code, f->rip, cr2);
     terminate(p, userabi::fault_status(f->vector));
+}
+
+u64 compute_phys_mask() {
+    u32 a, b, c, d;
+    u32 bits = 36;
+    cpu::cpuid(0x80000000u, 0, &a, &b, &c, &d);
+    if (a >= 0x80000008u) {
+        cpu::cpuid(0x80000008u, 0, &a, &b, &c, &d);
+        bits = a & 0xFF;
+    }
+    return ringabort::phys_mask(bits);
+}
+
+void acknowledge_platform_nmi() {
+    u8 reason = cpu::in8(ringabort::NMI_PORT);
+    if (reason == 0xFF) return;
+    if (reason & ringabort::NMI_SERR) {
+        cpu::out8(ringabort::NMI_PORT, ringabort::nmi_latch_assert(reason, ringabort::NMI_CLEAR_SERR));
+        cpu::out8(ringabort::NMI_PORT, ringabort::nmi_latch_release(reason, ringabort::NMI_CLEAR_SERR));
+        serial::writeln("[userland] NMI from ring 3: platform system-error latch (SERR) cleared");
+    }
+    if (reason & ringabort::NMI_IOCHK) {
+        cpu::out8(ringabort::NMI_PORT, ringabort::nmi_latch_assert(reason, ringabort::NMI_CLEAR_IOCHK));
+        cpu::out8(ringabort::NMI_PORT, ringabort::nmi_latch_release(reason, ringabort::NMI_CLEAR_IOCHK));
+        serial::writeln("[userland] NMI from ring 3: platform I/O-check latch (IOCHK) cleared");
+    }
+}
+
+bool user_machine_check(Process* p) {
+    ringabort::Mce m{};
+    m.mcg_status = cpu::rdmsr(ringabort::MSR_MCG_STATUS);
+    u32 banks = static_cast<u32>(cpu::rdmsr(ringabort::MSR_MCG_CAP) & 0xFF);
+    m.banks = banks < ringabort::MAX_BANKS ? banks : ringabort::MAX_BANKS;
+    m.phys_mask = g_phys_mask;
+    for (u32 i = 0; i < m.banks; ++i) {
+        u32 base = ringabort::MSR_MC0_STATUS + i * ringabort::MSR_BANK_STRIDE;
+        m.status[i] = cpu::rdmsr(base);
+        if (m.status[i] & ringabort::STATUS_ADDRV) m.addr[i] = cpu::rdmsr(base + 1);
+    }
+    ringabort::Verdict v = ringabort::judge_machine_check(true, m, [p](u64 frame) { return owns_frame(p, frame); });
+    if (v.action != ringabort::Action::Kill) return false;
+
+    for (u32 i = 0; i < v.poisoned; ++i) p->poisoned[p->poisoned_count++] = v.frames[i];
+    for (u32 i = 0; i < m.banks; ++i) {
+        if (m.status[i] & ringabort::STATUS_VAL)
+            cpu::wrmsr(ringabort::MSR_MC0_STATUS + i * ringabort::MSR_BANK_STRIDE, 0);
+    }
+    cpu::wrmsr(ringabort::MSR_MCG_STATUS, 0);
+    serial::printf("[userland] pid %u '%s' hit an uncorrectable memory error in %u of its own frame(s), first %p: terminated, frame(s) quarantined\n",
+                    p->pid, p->name, v.poisoned, v.frames[0]);
+    terminate(p, userabi::fault_status(18));
+}
+
+bool on_user_abort(idt::Frame* f) {
+    Process* p = current_process();
+    if (!p) return false;
+    switch (f->vector) {
+    case 2:
+        __atomic_add_fetch(&g_nmi_from_user, 1ull, __ATOMIC_RELAXED);
+        acknowledge_platform_nmi();
+        return true;
+    case 8:
+        serial::printf("[userland] pid %u '%s' took a double fault at rip=%p: terminated\n", p->pid, p->name, f->rip);
+        terminate(p, userabi::fault_status(8));
+    case 18:
+        return user_machine_check(p);
+    default:
+        return false;
+    }
+}
+
+bool on_kernel_nmi(idt::Frame*) {
+    u32 left = __atomic_load_n(&g_nmi_expected, __ATOMIC_RELAXED);
+    while (left) {
+        if (__atomic_compare_exchange_n(&g_nmi_expected, &left, left - 1, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_add_fetch(&g_nmi_absorbed, 1ull, __ATOMIC_RELAXED);
+            return true;
+        }
+    }
+    return false;
 }
 
 }
@@ -271,7 +391,10 @@ void init_core(u32 core) {
     }
     if (core == 0) {
         g_supported = true;
+        g_phys_mask = compute_phys_mask();
         idt::set_user_fault_handler(&on_user_fault);
+        idt::set_user_abort_handler(&on_user_abort);
+        idt::set_kernel_nmi_handler(&on_kernel_nmi);
     }
     cpu::wrmsr(MSR_EFER, cpu::rdmsr(MSR_EFER) | EFER_SCE);
     cpu::wrmsr(MSR_STAR, STAR_VALUE);
@@ -312,6 +435,7 @@ bool reap(Process* p) {
 }
 
 u32 pid_of(const Process* p) { return p->pid; }
+u32 task_of(const Process* p) { return p->task_id; }
 
 u32 cores_used(const Process* p) {
     u64 m = p->core_mask;
@@ -321,6 +445,11 @@ u32 cores_used(const Process* p) {
 }
 
 u64 frames_live() { return __atomic_load_n(&g_frames_live, __ATOMIC_RELAXED); }
+u64 frames_quarantined() { return __atomic_load_n(&g_frames_quarantined, __ATOMIC_RELAXED); }
+
+void expect_nmis(u32 count) { __atomic_store_n(&g_nmi_expected, count, __ATOMIC_RELEASE); }
+u64 nmis_from_user() { return __atomic_load_n(&g_nmi_from_user, __ATOMIC_RELAXED); }
+u64 nmis_absorbed() { return __atomic_load_n(&g_nmi_absorbed, __ATOMIC_RELAXED); }
 
 u32 live_processes() {
     u32 n = 0;

@@ -19,11 +19,12 @@ struct alignas(16) CoreState {
     CoreLocal local;
 };
 
-struct Seen { u64 gdt_base, tss_base, ist1, ist2; };
+struct Seen { u64 gdt_base, tss_base, ist1, ist2, ist3; };
 
 alignas(16) static CoreState g_core[MAX_CORES];
 alignas(4096) static u8 g_df_stack[MAX_CORES][IST_STRIDE];
 alignas(4096) static u8 g_nmi_stack[MAX_CORES][IST_STRIDE];
+alignas(4096) static u8 g_mce_stack[MAX_CORES][IST_STRIDE];
 static Seen g_seen[MAX_CORES];
 static volatile u64 g_seen_mask = 0;
 
@@ -43,8 +44,10 @@ static void set_entry(Entry& e, u32 base, u32 limit, u8 access, u8 gran) {
 
 static u64 df_top(u32 core) { return reinterpret_cast<u64>(&g_df_stack[core][IST_STRIDE]); }
 static u64 nmi_top(u32 core) { return reinterpret_cast<u64>(&g_nmi_stack[core][IST_STRIDE]); }
+static u64 mce_top(u32 core) { return reinterpret_cast<u64>(&g_mce_stack[core][IST_STRIDE]); }
 static u64 df_guard(u32 core) { return reinterpret_cast<u64>(&g_df_stack[core][0]); }
 static u64 nmi_guard(u32 core) { return reinterpret_cast<u64>(&g_nmi_stack[core][0]); }
+static u64 mce_guard(u32 core) { return reinterpret_cast<u64>(&g_mce_stack[core][0]); }
 
 static void record_loaded_state(u32 core) {
     Descriptor loaded{};
@@ -61,6 +64,7 @@ static void record_loaded_state(u32 core) {
         const auto* t = reinterpret_cast<const Tss*>(s.tss_base);
         s.ist1 = t->ist1;
         s.ist2 = t->ist2;
+        s.ist3 = t->ist3;
     }
     g_seen[core] = s;
     __atomic_or_fetch(&g_seen_mask, 1ull << core, __ATOMIC_SEQ_CST);
@@ -81,6 +85,7 @@ void init(u32 core) {
     c.local.core = core;
     c.tss.ist1 = df_top(core);
     c.tss.ist2 = nmi_top(core);
+    c.tss.ist3 = mce_top(core);
     c.tss.iomap_base = sizeof(Tss);
 
     u64 tss_base = reinterpret_cast<u64>(&c.tss);
@@ -114,12 +119,12 @@ bool selftest() {
         const Seen& a = g_seen[i];
         if (a.gdt_base != reinterpret_cast<u64>(&g_core[i].gdt)) return false;
         if (a.tss_base != reinterpret_cast<u64>(&g_core[i].tss)) return false;
-        if (a.ist1 != df_top(i) || a.ist2 != nmi_top(i)) return false;
+        if (a.ist1 != df_top(i) || a.ist2 != nmi_top(i) || a.ist3 != mce_top(i)) return false;
         for (u32 j = 0; j < i; ++j) {
             if (!(mask & (1ull << j))) continue;
             const Seen& b = g_seen[j];
             if (a.gdt_base == b.gdt_base || a.tss_base == b.tss_base) return false;
-            if (a.ist1 == b.ist1 || a.ist2 == b.ist2) return false;
+            if (a.ist1 == b.ist1 || a.ist2 == b.ist2 || a.ist3 == b.ist3) return false;
         }
     }
     return true;
@@ -152,6 +157,7 @@ bool guard_ist_stacks() {
     for (u32 c = 0; c < MAX_CORES; ++c) {
         ok = ok && constellation::unmap(df_guard(c), IST_GUARD_BYTES);
         ok = ok && constellation::unmap(nmi_guard(c), IST_GUARD_BYTES);
+        ok = ok && constellation::unmap(mce_guard(c), IST_GUARD_BYTES);
     }
     return ok;
 }
@@ -159,9 +165,11 @@ bool guard_ist_stacks() {
 bool ist_guards_ok() {
     constellation::Mapping m{};
     for (u32 c = 0; c < MAX_CORES; ++c) {
-        if (constellation::translate(df_guard(c), &m) || constellation::translate(nmi_guard(c), &m)) return false;
+        if (constellation::translate(df_guard(c), &m) || constellation::translate(nmi_guard(c), &m) ||
+            constellation::translate(mce_guard(c), &m)) return false;
         if (!constellation::translate(df_top(c) - 8, &m) || !(m.flags & constellation::WRITABLE)) return false;
         if (!constellation::translate(nmi_top(c) - 8, &m) || !(m.flags & constellation::WRITABLE)) return false;
+        if (!constellation::translate(mce_top(c) - 8, &m) || !(m.flags & constellation::WRITABLE)) return false;
         if (!constellation::translate(df_guard(c) + IST_GUARD_BYTES, &m)) return false;
     }
     return true;
@@ -171,6 +179,7 @@ bool in_ist_guard(u64 addr) {
     for (u32 c = 0; c < MAX_CORES; ++c) {
         if (addr >= df_guard(c) && addr < df_guard(c) + IST_GUARD_BYTES) return true;
         if (addr >= nmi_guard(c) && addr < nmi_guard(c) + IST_GUARD_BYTES) return true;
+        if (addr >= mce_guard(c) && addr < mce_guard(c) + IST_GUARD_BYTES) return true;
     }
     return false;
 }

@@ -10,10 +10,20 @@
 #include <cosmos/gdt.hpp>
 #include <cosmos/fpu.hpp>
 #include <cosmos/runq.hpp>
+#include <cosmos/usergs.hpp>
 
 extern "C" void switch_context(u64* old_rsp_out, u64 new_rsp);
 
 namespace orbital {
+
+namespace {
+
+struct KernelGsMsr {
+    u64 read() { return cpu::rdmsr(usergs::MSR_KERNEL_GS_BASE); }
+    void write(u64 v) { cpu::wrmsr(usergs::MSR_KERNEL_GS_BASE, v); }
+};
+
+}
 
 constexpr int MAX_SATELLITES = 64;
 constexpr int STACK_ORDER = 3;
@@ -243,6 +253,7 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     s->stack_size = universe::PAGE_SIZE << STACK_ORDER;
     s->kstack_top = reinterpret_cast<u64>(stack_virt) + s->stack_size;
     s->space = space;
+    s->user_gs = 0;
     s->state = State::Ready;
     s->wake_at = 0;
     s->switches = 0;
@@ -317,6 +328,8 @@ static void arrive(Satellite* old, Satellite* next) {
         fpu::restore(next->fpu);
     }
     gdt::set_kernel_stack(next->kstack_top);
+    KernelGsMsr gs;
+    usergs::switch_to(gs, old->space != nullptr, &old->user_gs, next->space != nullptr, next->user_gs);
     if (next->space != old->space) constellation::activate(next->space);
     ++old->switches;
     old->state = old->state == State::Running ? State::Ready : old->state;

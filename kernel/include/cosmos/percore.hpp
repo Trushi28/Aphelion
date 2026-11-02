@@ -12,6 +12,7 @@ bool nx_enabled();
 bool wc_enabled();
 bool smep_enabled();
 bool smap_enabled();
+bool mce_enabled();
 
 u32 cores_seen();
 bool selftest();

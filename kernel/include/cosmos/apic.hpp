@@ -19,6 +19,7 @@ u32  read_timer_current();
 void send_init_ipi(u32 target_apic_id);
 void send_startup_ipi(u32 target_apic_id, u8 vector);
 void send_ipi(u32 target_apic_id, u8 vector);
+void send_nmi(u32 target_apic_id);
 
 u64 xapic_mmio_phys_base();
 

@@ -129,6 +129,19 @@ void send_startup_ipi(u32 target_apic_id, u8 vector) {
     }
 }
 
+void send_nmi(u32 target_apic_id) {
+    constexpr u32 NMI_ASSERT = (1u << 14) | (0b100u << 8);
+    constexpr u32 DELIVERY_PENDING = 1u << 12;
+    if (g_use_x2apic) {
+        u64 icr = (static_cast<u64>(target_apic_id) << 32) | NMI_ASSERT;
+        cpu::wrmsr(MSR_X2APIC_ICR, icr);
+    } else {
+        while (xapic_read(REG_ICR_LOW) & DELIVERY_PENDING) asm volatile("pause" ::: "memory");
+        xapic_write(REG_ICR_HIGH, target_apic_id << 24);
+        xapic_write(REG_ICR_LOW, NMI_ASSERT);
+    }
+}
+
 void send_ipi(u32 target_apic_id, u8 vector) {
     constexpr u32 FIXED_ASSERT = 1u << 14;
     constexpr u32 DELIVERY_PENDING = 1u << 12;

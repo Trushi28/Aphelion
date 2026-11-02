@@ -12,10 +12,13 @@ struct PACKED Frame {
 };
 
 using Handler = void (*)(Frame*);
+using AbortHandler = bool (*)(Frame*);
 
 void init();
 void set_handler(u8 vector, Handler h);
 void set_user_fault_handler(Handler h);
+void set_user_abort_handler(AbortHandler h);
+void set_kernel_nmi_handler(AbortHandler h);
 
 constexpr u8 VEC_APIC_TIMER = 0x20;
 constexpr u8 VEC_VIRTIO_BLK = 0x22;

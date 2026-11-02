@@ -51,6 +51,7 @@ constexpr u16 TSS_SEL   = 0x28;
 
 constexpr int IST_DOUBLE_FAULT = 1;
 constexpr int IST_NMI          = 2;
+constexpr int IST_MCE          = 3;
 
 constexpr u32 MAX_CORES = 64;
 constexpr u64 IST_STACK_BYTES = 4096;

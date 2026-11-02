@@ -1,6 +1,7 @@
 #include <cosmos/userland.hpp>
 #include <cosmos/userabi.hpp>
 #include <cosmos/orbital.hpp>
+#include <cosmos/apic.hpp>
 #include <cosmos/serial.hpp>
 
 #define BLOB_DECL(name) extern "C" const u8 ublob_##name[]; extern "C" const u8 ublob_##name##_end[]
@@ -16,6 +17,11 @@ BLOB_DECL(badptr);
 BLOB_DECL(registers);
 BLOB_DECL(worker);
 BLOB_DECL(datapage);
+BLOB_DECL(gsbase);
+BLOB_DECL(gsbad);
+BLOB_DECL(gsiso);
+BLOB_DECL(gszero);
+BLOB_DECL(nmispin);
 
 namespace userland {
 
@@ -23,6 +29,7 @@ namespace {
 
 constexpr u64 WAIT_MS = 30000;
 constexpr u32 WORKERS = 6;
+constexpr u32 SNAPSHOT_MAX = 64;
 
 struct Case {
     const char* name;
@@ -45,6 +52,9 @@ const Case g_cases[] = {
     CASE(badptr, 0, 0),
     CASE(registers, 0, 0),
     CASE(datapage, 1, userabi::fault_status(14)),
+    CASE(gsbase, 1, 0),
+    CASE(gsbad, 0, 0),
+    CASE(gszero, 0, 0),
 };
 
 Image image_of(const u8* begin, const u8* end, u32 data_pages) {
@@ -95,6 +105,75 @@ bool run_workers() {
     return ok;
 }
 
+bool run_gs_mix() {
+    constexpr u32 COUNT = 6;
+    Process* procs[COUNT];
+    bool ok = true;
+    for (u32 i = 0; i < COUNT; ++i) {
+        bool isolated = (i & 1) == 0;
+        const Image img = isolated ? image_of(ublob_gsiso, ublob_gsiso_end, 1) : image_of(ublob_gszero, ublob_gszero_end, 0);
+        procs[i] = launch(isolated ? "gsiso" : "gszero", img);
+        if (!procs[i]) ok = false;
+    }
+    for (u32 i = 0; i < COUNT; ++i) {
+        if (!procs[i]) continue;
+        i32 status = -1;
+        bool finished = wait(procs[i], &status, WAIT_MS);
+        if (!finished || status != 0) {
+            serial::printf("[userland] gs process %u: %s, status %d\n", i, finished ? "wrong status" : "did not finish", status);
+            ok = false;
+        }
+        if (finished && !reap(procs[i])) ok = false;
+    }
+    serial::printf("[userland] user GS base kept per thread across %u concurrent processes: %s\n", COUNT, ok ? "ok" : "failed");
+    return ok;
+}
+
+bool run_nmi() {
+    orbital::CoreInfo cores[16];
+    u32 core_count = orbital::cores(cores, 16);
+    if (core_count < 2) {
+        serial::writeln("[userland] NMI from ring 3: skipped (needs at least two cores, an NMI to the sender's own core would land in ring 0)");
+        return true;
+    }
+    Process* p = launch("nmispin", image_of(ublob_nmispin, ublob_nmispin_end, 0));
+    if (!p) {
+        serial::writeln("[userland] NMI case could not be launched");
+        return false;
+    }
+    u32 task = task_of(p);
+    u64 user_before = nmis_from_user();
+    u64 absorbed_before = nmis_absorbed();
+    u32 sent = 0;
+    expect_nmis(0);
+    for (u32 attempt = 0; attempt < 400; ++attempt) {
+        i32 status;
+        if (wait(p, &status, 0)) break;
+        orbital::SatelliteInfo infos[SNAPSHOT_MAX];
+        u32 n = orbital::snapshot(infos, SNAPSHOT_MAX);
+        for (u32 i = 0; i < n; ++i) {
+            if (infos[i].id != task || infos[i].state != orbital::State::Running || infos[i].core == apic::id()) continue;
+            expect_nmis(1);
+            apic::send_nmi(infos[i].core);
+            ++sent;
+            break;
+        }
+        orbital::sleep_ms(3);
+    }
+    i32 status = -1;
+    bool finished = wait(p, &status, WAIT_MS);
+    expect_nmis(0);
+    bool reaped = finished && reap(p);
+    u64 in_ring3 = nmis_from_user() - user_before;
+    u64 in_ring0 = nmis_absorbed() - absorbed_before;
+    bool ok = finished && status == 0 && reaped;
+    serial::printf("[userland] NMI from ring 3: %u sent, %lu landed in ring 3, %lu landed in ring 0 and were absorbed, process status %d%s\n",
+                    sent, in_ring3, in_ring0, status, ok ? "" : "  <-- wrong");
+    if (ok && in_ring3 == 0)
+        serial::writeln("[userland] NMI from ring 3: inconclusive, no NMI happened to land in ring 3 on this run");
+    return ok;
+}
+
 void orchestrator(void*) {
     if (!supported()) {
         serial::writeln("[selftest] userland: skipped");
@@ -103,7 +182,10 @@ void orchestrator(void*) {
     bool ok = true;
     for (const Case& c : g_cases) ok = run_case(c) && ok;
     ok = run_workers() && ok;
+    ok = run_gs_mix() && ok;
+    ok = run_nmi() && ok;
     ok = ok && frames_live() == 0 && live_processes() == 0;
+    ok = ok && frames_quarantined() == 0;
     serial::printf("[userland] frames still held: %lu, processes still live: %u\n", frames_live(), live_processes());
     serial::printf("[selftest] userland: %s\n", ok ? "ok" : "MISMATCH");
 }

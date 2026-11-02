@@ -23,6 +23,8 @@ struct PACKED Descriptor { u16 limit; u64 base; };
 alignas(16) static Gate g_idt[256];
 static Handler g_handlers[256];
 static Handler g_user_fault;
+static AbortHandler g_user_abort;
+static AbortHandler g_kernel_nmi;
 
 static void set_gate(u8 vec, u64 isr, u16 selector, u8 ist, u8 type_attr) {
     g_idt[vec].offset_low  = isr & 0xFFFF;
@@ -69,10 +71,17 @@ static void default_panic(Frame* f) {
     cpu::hang();
 }
 
-static bool user_fault_vector(u64 v) { return v < 32 && v != 2 && v != 8 && v != 18; }
+static bool user_abort_vector(u64 v) { return v == 2 || v == 8 || v == 18; }
+
+static bool user_fault_vector(u64 v) { return v < 32 && !user_abort_vector(v); }
 
 extern "C" void isr_dispatch(Frame* f) {
-    if ((f->cs & 3) == 3 && user_fault_vector(f->vector) && g_user_fault) g_user_fault(f);
+    if ((f->cs & 3) == 3) {
+        if (user_fault_vector(f->vector) && g_user_fault) g_user_fault(f);
+        if (user_abort_vector(f->vector) && g_user_abort && g_user_abort(f)) return;
+    } else if (f->vector == 2 && g_kernel_nmi && g_kernel_nmi(f)) {
+        return;
+    }
     Handler h = g_handlers[f->vector];
     if (h) h(f);
     else default_panic(f);
@@ -80,6 +89,8 @@ extern "C" void isr_dispatch(Frame* f) {
 
 void set_handler(u8 vector, Handler h) { g_handlers[vector] = h; }
 void set_user_fault_handler(Handler h) { g_user_fault = h; }
+void set_user_abort_handler(AbortHandler h) { g_user_abort = h; }
+void set_kernel_nmi_handler(AbortHandler h) { g_kernel_nmi = h; }
 
 static void spurious_handler(Frame*) {}
 
@@ -103,6 +114,7 @@ void init() {
         u8 ist = 0;
         if (v == 8) ist = gdt::IST_DOUBLE_FAULT;
         if (v == 2) ist = gdt::IST_NMI;
+        if (v == 18) ist = gdt::IST_MCE;
         set_gate(static_cast<u8>(v), isr_stub_table[v], gdt::KCODE_SEL, ist, TYPE_INTR64);
     }
     for (int v = 32; v < 40; ++v)
