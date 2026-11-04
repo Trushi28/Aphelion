@@ -43,6 +43,10 @@ fail() {
         echo "QEMU reports a guest triple fault; CPU state at the reset:"
         grep -m1 -B 80 'Triple fault' "$LOG.qemu" | head -60
     fi
+    if [ -s "$LOG.clean" ] && grep -q 'MISMATCH' "$LOG.clean"; then
+        echo "Self-test mismatch details:"
+        grep -n -C 1 'MISMATCH' "$LOG.clean" || true
+    fi
     grep -v '^\[demo\]' "$LOG.clean" | tail -40
     exit 1
 }
