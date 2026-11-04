@@ -77,11 +77,13 @@ ISR_NOERR 48
 ISR_NOERR 49
 ISR_NOERR 255
 
+global isr_common
 isr_common:
     test qword [rsp + 24], 3
     jz .from_kernel
     swapgs
 .from_kernel:
+    lfence
     push rax
     push rbx
     push rcx
@@ -124,6 +126,7 @@ isr_common:
 .to_kernel:
     iretq
 
+global isr_paranoid
 isr_paranoid:
     push rax
     push rbx
@@ -149,6 +152,7 @@ isr_paranoid:
     swapgs
     mov ebx, 1
 .gs_is_kernel:
+    lfence
     mov rdi, rsp
     call isr_dispatch
 

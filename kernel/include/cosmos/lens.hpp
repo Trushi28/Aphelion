@@ -120,6 +120,7 @@ public:
 
     virtual void retain() = 0;
     virtual void release() = 0;
+    virtual u32 type() const { return 0; }
 };
 
 void stream_event();
@@ -135,6 +136,29 @@ struct Wait {
 };
 
 Result<u32> await(Domain& d, Wait* waits, u32 count, u64 timeout_ms);
+
+using CancelFn = bool (*)(void* ctx);
+
+constexpr u32 MAX_WAITS = 32;
+
+Result<u32> acquire(Domain& d, Wait* waits, u32 count, Stream** streams);
+void unpin(Stream** streams, u32 count);
+Result<u32> await_streams(Stream** streams, Wait* waits, u32 count, u64 timeout_ms, CancelFn cancel, void* ctx);
+
+struct Parcel {
+    bool valid;
+    bool read_only;
+    Rights rights;
+    nebula::Realm* realm;
+    nebula::Node node;
+    Stream* stream;
+    char label[nebula::NAME_BYTES + 1];
+};
+
+Done detach(Domain& d, Lens l, Rights rights, Parcel* out);
+Result<Lens> attach(Domain& d, Parcel& p);
+void discard(Parcel& p);
+u32 free_slots(const Domain& d);
 
 class Batch {
 public:

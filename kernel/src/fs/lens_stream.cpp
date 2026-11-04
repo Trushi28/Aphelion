@@ -125,12 +125,15 @@ struct AwaitCtx {
     Wait* waits;
     Stream** streams;
     u32 count;
+    CancelFn cancel;
+    void* cancel_ctx;
 };
 
 Readiness filtered(Stream* s, Readiness want) { return s->ready() & (want | Ready::Hangup); }
 
 bool any_ready(void* p) {
     AwaitCtx* c = static_cast<AwaitCtx*>(p);
+    if (c->cancel && c->cancel(c->cancel_ctx)) return true;
     for (u32 i = 0; i < c->count; ++i)
         if (filtered(c->streams[i], c->waits[i].want).any()) return true;
     return false;
@@ -195,21 +198,34 @@ Done make_pipe(Domain& d, usize capacity, Lens* read_end, Lens* write_end) {
     return Done::success();
 }
 
-Result<u32> await(Domain& d, Wait* waits, u32 count, u64 timeout_ms) {
-    constexpr u32 MAX_WAITS = 32;
-    if (count == 0 || count > MAX_WAITS || !waits) return Result<u32>::fail(Status::InvalidPath);
-    Stream* streams[MAX_WAITS];
+Result<u32> acquire(Domain& d, Wait* waits, u32 count, Stream** streams) {
+    if (count == 0 || count > MAX_WAITS || !waits || !streams) return Result<u32>::fail(Status::InvalidPath);
+    u32 pinned = 0;
     for (u32 i = 0; i < count; ++i) {
         waits[i].got = Readiness();
         Result<Slot*> sr = slot_of(d, waits[i].lens);
-        if (!sr.ok()) return Result<u32>::fail(sr.status());
-        Slot* s = sr.value();
-        if (s->kind != NodeKind::Stream) return Result<u32>::fail(Status::Unsupported);
-        if (waits[i].want.has(Ready::Readable) && !s->rights.has(Right::Read)) return Result<u32>::fail(Status::Denied);
-        if (waits[i].want.has(Ready::Writable) && !s->rights.has_any(Right::Write | Right::Append)) return Result<u32>::fail(Status::Denied);
-        streams[i] = s->stream;
+        Status failure = Status::Ok;
+        if (!sr.ok()) failure = sr.status();
+        else if (sr.value()->kind != NodeKind::Stream) failure = Status::Unsupported;
+        else if (waits[i].want.has(Ready::Readable) && !sr.value()->rights.has(Right::Read)) failure = Status::Denied;
+        else if (waits[i].want.has(Ready::Writable) && !sr.value()->rights.has_any(Right::Write | Right::Append)) failure = Status::Denied;
+        if (failure != Status::Ok) {
+            unpin(streams, pinned);
+            return Result<u32>::fail(failure);
+        }
+        streams[i] = sr.value()->stream;
+        streams[i]->retain();
+        ++pinned;
     }
-    AwaitCtx ctx{waits, streams, count};
+    return Result<u32>::success(count);
+}
+
+void unpin(Stream** streams, u32 count) {
+    for (u32 i = 0; i < count; ++i) streams[i]->release();
+}
+
+Result<u32> await_streams(Stream** streams, Wait* waits, u32 count, u64 timeout_ms, CancelFn cancel, void* cancel_ctx) {
+    AwaitCtx ctx{waits, streams, count, cancel, cancel_ctx};
     if (!any_ready(&ctx) && timeout_ms != 0) {
         const bool forever = timeout_ms == orbital::FOREVER;
         const u64 deadline = forever ? 0 : deadline_after(clock::uptime_ms(), timeout_ms);
@@ -224,6 +240,7 @@ Result<u32> await(Domain& d, Wait* waits, u32 count, u64 timeout_ms) {
             if (!forever && clock::uptime_ms() >= deadline) break;
         }
     }
+    if (cancel && cancel(cancel_ctx)) return Result<u32>::fail(Status::Cancelled);
     u32 ready = 0;
     for (u32 i = 0; i < count; ++i) {
         waits[i].got = filtered(streams[i], waits[i].want);
@@ -231,6 +248,15 @@ Result<u32> await(Domain& d, Wait* waits, u32 count, u64 timeout_ms) {
     }
     if (ready == 0) return Result<u32>::fail(Status::TimedOut);
     return Result<u32>::success(ready);
+}
+
+Result<u32> await(Domain& d, Wait* waits, u32 count, u64 timeout_ms) {
+    Stream* streams[MAX_WAITS];
+    Result<u32> pinned = acquire(d, waits, count, streams);
+    if (!pinned.ok()) return pinned;
+    Result<u32> r = await_streams(streams, waits, count, timeout_ms, nullptr, nullptr);
+    unpin(streams, count);
+    return r;
 }
 
 }

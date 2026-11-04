@@ -9,7 +9,19 @@ constexpr u64 SYS_GETTID = 2;
 constexpr u64 SYS_DEBUG_WRITE = 3;
 constexpr u64 SYS_SET_GS_BASE = 4;
 constexpr u64 SYS_GET_GS_BASE = 5;
-constexpr u64 SYS_COUNT = 6;
+constexpr u64 SYS_SET_FS_BASE = 6;
+constexpr u64 SYS_GET_FS_BASE = 7;
+constexpr u64 SYS_THREAD_CREATE = 8;
+constexpr u64 SYS_THREAD_EXIT = 9;
+constexpr u64 SYS_THREAD_JOIN = 10;
+constexpr u64 SYS_HANDLE_CLOSE = 11;
+constexpr u64 SYS_HANDLE_INFO = 12;
+constexpr u64 SYS_HANDLE_NARROW = 13;
+constexpr u64 SYS_CHANNEL_CREATE = 14;
+constexpr u64 SYS_CHANNEL_SEND = 15;
+constexpr u64 SYS_CHANNEL_RECV = 16;
+constexpr u64 SYS_HANDLE_WAIT = 17;
+constexpr u64 SYS_COUNT = 18;
 
 constexpr i64 ERR_NOSYS = -1;
 constexpr i64 ERR_FAULT = -2;
@@ -24,6 +36,11 @@ constexpr i32 FAULT_STATUS_FLOOR = FAULT_STATUS_BASE - 31;
 constexpr i32 fault_status(u64 vector) { return FAULT_STATUS_BASE - static_cast<i32>(vector & 31); }
 constexpr bool is_fault_status(i32 status) { return status <= FAULT_STATUS_BASE && status >= FAULT_STATUS_FLOOR; }
 constexpr u64 fault_vector(i32 status) { return static_cast<u64>(FAULT_STATUS_BASE - status); }
+
+constexpr i32 STATUS_KILLED = -512;
+
+constexpr u32 MAX_LIVE_THREADS = 8;
+constexpr u32 MAX_THREADS_TOTAL = 16;
 
 constexpr u64 USER_LIMIT = 0x0000800000000000ull;
 

@@ -25,6 +25,7 @@ struct Satellite : mlfq::Account {
     u64 kstack_top = 0;
     constellation::Space* space = nullptr;
     u64 user_gs = 0;
+    u64 user_fs = 0;
     State state = State::Ready;
     u64 wake_at = 0;
     u64 switches = 0;

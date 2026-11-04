@@ -3,7 +3,11 @@
 #include <cosmos/usercopy.hpp>
 #include <cosmos/usergs.hpp>
 #include <cosmos/ringabort.hpp>
+#include <cosmos/entrycheck.hpp>
+#include <cosmos/procgroup.hpp>
+#include <cosmos/handleabi.hpp>
 #include <stdio.h>
+#include <pthread.h>
 
 static int g_failures = 0;
 
@@ -104,8 +108,13 @@ static void copy_tests() {
 }
 
 static void abi_tests() {
-    static_assert(userabi::SYS_COUNT == 6, "the native table has six entries in this series");
+    static_assert(userabi::SYS_COUNT == 18, "the native table has eighteen entries in this series");
+    static_assert(userabi::SYS_THREAD_CREATE == 8 && userabi::SYS_THREAD_EXIT == 9 && userabi::SYS_THREAD_JOIN == 10, "the thread calls follow the FS ones");
+    static_assert(!userabi::is_fault_status(userabi::STATUS_KILLED), "a kill is not mistaken for a fault");
+    static_assert(userabi::MAX_LIVE_THREADS <= userabi::MAX_THREADS_TOTAL && userabi::MAX_THREADS_TOTAL < procgroup::LIVE_MAX, "the thread limits fit the group word");
     static_assert(userabi::SYS_SET_GS_BASE == 4 && userabi::SYS_GET_GS_BASE == 5, "the GS base calls keep their numbers");
+    static_assert(userabi::SYS_SET_FS_BASE == 6 && userabi::SYS_GET_FS_BASE == 7, "the FS base calls follow the GS ones");
+    static_assert(usergs::MSR_FS_BASE == 0xC0000100 && usergs::MSR_KERNEL_GS_BASE == 0xC0000102, "the two base MSRs are the architectural ones");
     static_assert(userabi::USER_LIMIT == 0x0000800000000000ull, "the user limit is the bottom of the canonical hole");
     static_assert(userabi::is_fault_status(userabi::fault_status(14)), "a fault status is recognised");
     static_assert(!userabi::is_fault_status(0) && !userabi::is_fault_status(42) && !userabi::is_fault_status(-1),
@@ -255,6 +264,49 @@ static void gs_model_test() {
     expect(!leaked, "gs model: every user thread always runs with its own base after any switch");
     expect(!kernel_dirty, "gs model: a kernel thread never runs with a user base left in the MSR");
     expect(!lost, "gs model: a base set by a thread is saved exactly when it is switched out");
+}
+
+static void fs_gs_pair_model_test() {
+    constexpr u32 CORES = 4;
+    constexpr u32 THREADS = 12;
+    constexpr u32 STEPS = 300000;
+    struct Pair { FakeMsr gs; FakeMsr fs; };
+    struct Thr { bool user; u64 gs_slot; u64 fs_slot; u64 gs_want; u64 fs_want; int on_core; };
+    Pair msr[CORES];
+    Thr t[THREADS];
+    int running[CORES];
+    for (u32 i = 0; i < THREADS; ++i) t[i] = { (i % 3) != 0, 0, 0, 0, 0, -1 };
+    for (u32 c = 0; c < CORES; ++c) running[c] = -1;
+    u64 rng = 0xD1B54A32D192ED03ull;
+    bool crossed = false, leaked = false, dirty = false;
+    for (u32 step = 0; step < STEPS; ++step) {
+        u32 c = static_cast<u32>(next_random(rng) % CORES);
+        u32 pick = static_cast<u32>(next_random(rng) % THREADS);
+        if (t[pick].on_core >= 0) continue;
+        int old = running[c];
+        bool old_user = old >= 0 && t[old].user;
+        u64 dg = 0, df = 0;
+        usergs::switch_to(msr[c].gs, old_user, old >= 0 ? &t[old].gs_slot : &dg, t[pick].user, t[pick].gs_slot);
+        usergs::switch_to(msr[c].fs, old_user, old >= 0 ? &t[old].fs_slot : &df, t[pick].user, t[pick].fs_slot);
+        if (old >= 0) t[old].on_core = -1;
+        t[pick].on_core = static_cast<int>(c);
+        running[c] = static_cast<int>(pick);
+        if (t[pick].user) {
+            if (msr[c].gs.value != t[pick].gs_want || msr[c].fs.value != t[pick].fs_want) leaked = true;
+            if (t[pick].gs_want == t[pick].fs_want && t[pick].gs_want != 0) crossed = true;
+        } else if (msr[c].gs.value != 0 || msr[c].fs.value != 0) {
+            dirty = true;
+        }
+        if (t[pick].user && (next_random(rng) & 3) == 0) {
+            u64 g = (next_random(rng) & (userabi::USER_LIMIT - 1)) | 1;
+            u64 f = (next_random(rng) & (userabi::USER_LIMIT - 1)) | 2;
+            if (next_random(rng) & 1) { msr[c].gs.write(g); t[pick].gs_want = g; }
+            else { msr[c].fs.write(f); t[pick].fs_want = f; }
+        }
+    }
+    expect(!leaked, "fs/gs model: each user thread always runs with both of its own bases, whichever one changed last");
+    expect(!dirty, "fs/gs model: a kernel thread never runs with either user base loaded");
+    expect(!crossed, "fs/gs model: writing one base never changes the other");
 }
 
 using ringabort::Action;
@@ -455,13 +507,272 @@ static void abort_policy_tests() {
     }
 }
 
+static void entry_fence_tests() {
+    using entrycheck::Verdict;
+    const u8 good[] = { 0x48, 0x89, 0xE7, 0x0F, 0x01, 0xF8, 0xBB, 0x01, 0, 0, 0, 0x0F, 0xAE, 0xE8, 0x90 };
+    const u8 adjacent[] = { 0x0F, 0x01, 0xF8, 0x0F, 0xAE, 0xE8 };
+    const u8 bare[] = { 0x90, 0x0F, 0x01, 0xF8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    const u8 late[] = { 0x0F, 0x01, 0xF8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x0F, 0xAE, 0xE8 };
+    const u8 before[] = { 0x0F, 0xAE, 0xE8, 0x0F, 0x01, 0xF8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    const u8 none[] = { 0x90, 0x90, 0x90, 0x90 };
+    const u8 cut[] = { 0x90, 0x0F, 0x01, 0xF8, 0x0F };
+    const u8 second[] = { 0x0F, 0x01, 0xF8, 0x0F, 0xAE, 0xE8, 0x90, 0x0F, 0x01, 0xF8, 0x90 };
+    expect(entrycheck::first_swapgs(good, sizeof(good)) == Verdict::Fenced, "entry fence: an lfence a few bytes after swapgs is found");
+    expect(entrycheck::first_swapgs(adjacent, sizeof(adjacent)) == Verdict::Fenced, "entry fence: an lfence right after swapgs is found");
+    expect(entrycheck::first_swapgs(bare, sizeof(bare)) == Verdict::Unfenced, "entry fence: a swapgs with no lfence is reported");
+    expect(entrycheck::first_swapgs(late, sizeof(late)) == Verdict::Unfenced, "entry fence: an lfence beyond the reach does not count");
+    expect(entrycheck::first_swapgs(before, sizeof(before)) == Verdict::Unfenced, "entry fence: an lfence before the swapgs does not count");
+    expect(entrycheck::first_swapgs(none, sizeof(none)) == Verdict::NoSwapgs, "entry fence: code without swapgs is reported as such");
+    expect(entrycheck::first_swapgs(cut, sizeof(cut)) == Verdict::Unfenced, "entry fence: a truncated window never reads past it");
+    expect(entrycheck::first_swapgs(second, sizeof(second)) == Verdict::Fenced, "entry fence: only the first swapgs is judged (the exit swapgs is not fenced)");
+    expect(entrycheck::first_swapgs(good, 2) == Verdict::NoSwapgs, "entry fence: a window shorter than an instruction is safe");
+}
+
+static void procgroup_tests() {
+    using namespace procgroup;
+    u64 w = 0;
+    expect(finished(w), "group: a zeroed word is not a running group");
+    expect(!try_enter(&w, 8), "group: nothing can join a group that never started");
+    expect(!request_exit(&w, 5), "group: a group that never started cannot be told to exit");
+    start(&w);
+    expect(live(load(&w)) == 1 && !dying(load(&w)) && !finished(load(&w)), "group: a started group has one live thread");
+    expect(try_enter(&w, 3) && try_enter(&w, 3), "group: threads join up to the limit");
+    expect(!try_enter(&w, 3), "group: the limit is enforced");
+    expect(live(load(&w)) == 3, "group: three threads are live");
+    Leave l = leave(&w, 7);
+    expect(!l.last && live(load(&w)) == 2, "group: a thread leaving while others remain is not the last");
+    expect(request_exit(&w, -512), "group: the first exit request wins");
+    expect(!request_exit(&w, 9), "group: a second exit request is refused");
+    expect(status(load(&w)) == -512 && dying(load(&w)), "group: the winning status is kept");
+    expect(!try_enter(&w, 8), "group: nothing can join a dying group");
+    l = leave(&w, 11);
+    expect(!l.last && !finished(load(&w)), "group: a leave in a dying group with others left is not last");
+    l = leave(&w, 13);
+    expect(l.last && l.status == -512 && finished(load(&w)), "group: the last leaver of a dying group reports the winning status");
+    expect(status(load(&w)) == -512, "group: the finished word keeps that status");
+    expect(!request_exit(&w, 1), "group: a finished group refuses a late kill");
+    expect(!try_enter(&w, 8), "group: a finished group refuses new threads");
+    expect(!leave(&w, 3).last, "group: leaving a finished group changes nothing");
+
+    start(&w);
+    try_enter(&w, 4);
+    leave(&w, 5);
+    l = leave(&w, 42);
+    expect(l.last && l.status == 42 && !dying(load(&w)), "group: with no exit request the last thread's own status is the result");
+
+    start(&w);
+    request_exit(&w, userabi::fault_status(14));
+    l = leave(&w, 0);
+    expect(l.last && l.status == userabi::fault_status(14), "group: a fault status survives the round trip");
+    expect(pack(2, true, -1) == ((2ull << 32) | (1ull << 48) | 0xFFFFFFFFull), "group: the word layout is fixed");
+    expect(status(pack(1, false, -1)) == -1 && live(pack(1, false, -1)) == 1, "group: a negative status does not leak into the count");
+
+    constexpr u64 L = 0x0000800000000000ull;
+    expect(entry_ok(0x400000, 0x7FFFFFF00000, L), "thread args: ordinary values are accepted");
+    expect(!entry_ok(0, 0x1000, L), "thread args: a zero entry is refused");
+    expect(!entry_ok(0x400000, 0, L), "thread args: a zero stack is refused");
+    expect(!entry_ok(L, 0x1000, L), "thread args: an entry at the canonical hole is refused");
+    expect(!entry_ok(0x400000, L, L), "thread args: a stack at the canonical hole is refused");
+    expect(!entry_ok(0xFFFF800000000000ull, 0x1000, L), "thread args: a kernel-half entry is refused");
+    expect(!entry_ok(0x400000, 0xFFFFFFFFFFFFFFF0ull, L), "thread args: a kernel-half stack is refused");
+    expect(entry_ok(L - 1, L - 1, L), "thread args: the last user byte is accepted");
+}
+
+static void procgroup_model_test() {
+    using namespace procgroup;
+    u64 state = 0x243F6A8885A308D3ull;
+    auto next = [&]() { state = state * 6364136223846793005ull + 1442695040888963407ull; return static_cast<u32>(state >> 33); };
+    bool ok = true;
+    for (u32 round = 0; round < 2000 && ok; ++round) {
+        u64 w = 0;
+        start(&w);
+        u32 m_live = 1;
+        bool m_dying = false, m_done = false;
+        i32 m_status = 0;
+        const u32 limit = 1 + next() % 6;
+        for (u32 step = 0; step < 40 && ok; ++step) {
+            switch (next() % 3) {
+            case 0: {
+                bool want = !m_done && !m_dying && m_live < limit;
+                bool got = try_enter(&w, limit);
+                if (want != got) ok = false;
+                if (want) ++m_live;
+                break;
+            }
+            case 1: {
+                i32 v = static_cast<i32>(next() % 2000) - 1000;
+                bool want = !m_done && !m_dying;
+                bool got = request_exit(&w, v);
+                if (want != got) ok = false;
+                if (want) { m_dying = true; m_status = v; }
+                break;
+            }
+            default: {
+                i32 own = static_cast<i32>(next() % 2000) - 1000;
+                Leave r = leave(&w, own);
+                if (m_done) { if (r.last) ok = false; break; }
+                --m_live;
+                bool want_last = m_live == 0;
+                if (want_last) {
+                    m_done = true;
+                    if (!m_dying) m_status = own;
+                    if (!r.last || r.status != m_status) ok = false;
+                } else if (r.last) ok = false;
+                break;
+            }
+            }
+            u64 cur = load(&w);
+            if (live(cur) != m_live || dying(cur) != m_dying || finished(cur) != m_done) ok = false;
+            if ((m_dying || m_done) && status(cur) != m_status) ok = false;
+        }
+    }
+    expect(ok, "group model: 2000 random sequences agree with a plain model");
+}
+
+struct GroupStress {
+    u64 word;
+    u32 limit;
+    u32 lasts;
+    u32 winners;
+    i32 winner_value;
+    u32 entered;
+    u32 left;
+};
+
+struct GroupWorker {
+    GroupStress* shared;
+    u32 seed;
+    i32 own;
+};
+
+static void* group_worker(void* arg) {
+    GroupWorker* me = static_cast<GroupWorker*>(arg);
+    GroupStress* g = me->shared;
+    u32 state = me->seed;
+    auto next = [&]() { state = state * 1664525u + 1013904223u; return state >> 8; };
+    for (u32 i = 0; i < 200; ++i) {
+        switch (next() % 3) {
+        case 0:
+            if (procgroup::try_enter(&g->word, g->limit)) {
+                __atomic_add_fetch(&g->entered, 1u, __ATOMIC_RELAXED);
+                procgroup::Leave l = procgroup::leave(&g->word, 0);
+                __atomic_add_fetch(&g->left, 1u, __ATOMIC_RELAXED);
+                if (l.last) __atomic_add_fetch(&g->lasts, 1u, __ATOMIC_RELAXED);
+            }
+            break;
+        case 1:
+            if (next() % 40 == 0) {
+                i32 v = me->own + 1000;
+                if (procgroup::request_exit(&g->word, v)) {
+                    __atomic_add_fetch(&g->winners, 1u, __ATOMIC_RELAXED);
+                    g->winner_value = v;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    procgroup::Leave l = procgroup::leave(&g->word, me->own);
+    __atomic_add_fetch(&g->left, 1u, __ATOMIC_RELAXED);
+    if (l.last) __atomic_add_fetch(&g->lasts, 1u, __ATOMIC_RELAXED);
+    return nullptr;
+}
+
+static void procgroup_stress_test() {
+    bool ok = true;
+    for (u32 round = 0; round < 300 && ok; ++round) {
+        constexpr u32 THREADS = 6;
+        GroupStress g{};
+        g.limit = 8;
+        procgroup::start(&g.word);
+        GroupWorker workers[THREADS];
+        pthread_t ids[THREADS];
+        for (u32 i = 0; i < THREADS - 1; ++i) {
+            if (!procgroup::try_enter(&g.word, 64)) ok = false;
+        }
+        for (u32 i = 0; i < THREADS; ++i) {
+            workers[i] = { &g, round * 31 + i * 7919 + 1, static_cast<i32>(i + 1) };
+            pthread_create(&ids[i], nullptr, &group_worker, &workers[i]);
+        }
+        for (u32 i = 0; i < THREADS; ++i) pthread_join(ids[i], nullptr);
+        u64 final_word = procgroup::load(&g.word);
+        if (!procgroup::finished(final_word)) ok = false;
+        if (g.lasts != 1) ok = false;
+        if (g.entered + THREADS != g.left) ok = false;
+        if (g.winners > 1) ok = false;
+        if (g.winners == 1 && procgroup::status(final_word) != g.winner_value) ok = false;
+        if (g.winners == 0 && (procgroup::status(final_word) < 1 || procgroup::status(final_word) > static_cast<i32>(THREADS))) ok = false;
+    }
+    expect(ok, "group stress: 300 rounds of 6 racing threads end with one last leaver and a consistent status");
+}
+
+static void handle_abi_tests() {
+    using lens::Status;
+    static_assert(userabi::SYS_HANDLE_CLOSE == 11 && userabi::SYS_HANDLE_WAIT == 17, "the handle calls follow the thread ones");
+    static_assert(userabi::SYS_CHANNEL_CREATE == userabi::SYS_HANDLE_NARROW + 1 && userabi::SYS_CHANNEL_SEND == userabi::SYS_CHANNEL_CREATE + 1 &&
+                  userabi::SYS_CHANNEL_RECV == userabi::SYS_CHANNEL_SEND + 1, "the channel calls are consecutive");
+    static_assert(sizeof(handleabi::WaitEntry) == 16, "a wait entry is 16 bytes");
+    static_assert(handleabi::WAIT_READABLE == 1 && handleabi::WAIT_WRITABLE == 2 && handleabi::WAIT_HANGUP == 4, "wait bits match the Lens readiness bits");
+
+    bool all_mapped = true;
+    bool ok_only_zero = true;
+    for (i32 v = 0; v <= static_cast<i32>(Status::Cancelled); ++v) {
+        i64 e = handleabi::error_of(static_cast<Status>(v));
+        if (v == 0 ? e != 0 : e >= 0) ok_only_zero = false;
+        if (e < handleabi::ERR_CANCELLED) all_mapped = false;
+    }
+    expect(ok_only_zero, "errors: Ok maps to zero and every other status to a negative number");
+    expect(all_mapped, "errors: every status maps to a defined error code");
+    expect(handleabi::error_of(Status::NotReady) == handleabi::ERR_AGAIN, "errors: NotReady is AGAIN");
+    expect(handleabi::error_of(Status::Closed) == handleabi::ERR_CLOSED, "errors: Closed is CLOSED");
+    expect(handleabi::error_of(Status::Denied) == handleabi::ERR_DENIED, "errors: Denied is DENIED");
+    expect(handleabi::error_of(Status::BadLens) == handleabi::ERR_BADHANDLE && handleabi::error_of(Status::StaleLens) == handleabi::ERR_BADHANDLE,
+           "errors: bad and stale handles are BADHANDLE");
+    expect(handleabi::error_of(Status::TooLarge) == handleabi::ERR_TOOBIG, "errors: TooLarge is TOOBIG");
+    expect(handleabi::error_of(Status::TimedOut) == handleabi::ERR_TIMEDOUT, "errors: TimedOut is TIMEDOUT");
+    expect(handleabi::error_of(Status::Cancelled) == handleabi::ERR_CANCELLED, "errors: Cancelled is CANCELLED");
+    expect(handleabi::error_of(Status::TableFull) == userabi::ERR_LIMIT && handleabi::error_of(Status::NoMemory) == userabi::ERR_LIMIT,
+           "errors: a full table and no memory are LIMIT");
+    expect(handleabi::error_of(Status::Unsupported) == userabi::ERR_INVAL && handleabi::error_of(Status::Busy) == userabi::ERR_INVAL,
+           "errors: a wrong object type and a repeated handle are INVAL");
+
+    i64 codes[] = { userabi::ERR_NOSYS, userabi::ERR_FAULT, userabi::ERR_INVAL, userabi::ERR_LIMIT, handleabi::ERR_AGAIN, handleabi::ERR_CLOSED,
+                    handleabi::ERR_DENIED, handleabi::ERR_BADHANDLE, handleabi::ERR_TOOBIG, handleabi::ERR_TIMEDOUT, handleabi::ERR_CANCELLED };
+    bool distinct = true;
+    for (u32 i = 0; i < sizeof(codes) / sizeof(codes[0]); ++i) {
+        if (codes[i] != -1 - static_cast<i64>(i)) distinct = false;
+        for (u32 j = i + 1; j < sizeof(codes) / sizeof(codes[0]); ++j) if (codes[i] == codes[j]) distinct = false;
+    }
+    expect(distinct, "errors: the eleven codes are -1 through -11 with no repeats");
+
+    u64 info = handleabi::info_pack(0x103, 3);
+    expect(info == 0x30103 && handleabi::info_rights(info) == 0x103 && handleabi::info_kind(info) == 3, "info: rights and kind pack and unpack");
+    expect(handleabi::info_pack(lens::RIGHTS_ALL_BITS, 255) > 0, "info: the largest value stays positive as a return value");
+    i64 packed = handleabi::recv_pack(256, 4);
+    expect(packed > 0 && handleabi::recv_bytes(packed) == 256 && handleabi::recv_handles(packed) == 4, "recv: bytes and handle count pack and unpack");
+    expect(handleabi::recv_pack(0, 0) == 0, "recv: an empty message is zero");
+    expect(handleabi::recv_pack(0xFFFFFFFFu, 0x7FFFFFFFu) > 0, "recv: even extreme values never look like an error");
+    expect(handleabi::wait_want_ok(1) && handleabi::wait_want_ok(7) && !handleabi::wait_want_ok(0) && !handleabi::wait_want_ok(8) && !handleabi::wait_want_ok(0x100),
+           "wait: only the three readiness bits are accepted, and at least one");
+    expect(lens::RIGHTS_ALL_BITS == 0x1FF, "rights: the nine rights occupy the low nine bits");
+    expect(static_cast<u16>(lens::Right::Read) == 1 && static_cast<u16>(lens::Right::Write) == 2 && static_cast<u16>(lens::Right::Delegate) == 0x100,
+           "rights: the bit values the ring-3 test programs assume");
+}
+
 int main() {
+    entry_fence_tests();
     range_tests();
     copy_tests();
     abi_tests();
     gs_base_tests();
     gs_model_test();
+    fs_gs_pair_model_test();
     abort_policy_tests();
+    procgroup_tests();
+    procgroup_model_test();
+    procgroup_stress_test();
+    handle_abi_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

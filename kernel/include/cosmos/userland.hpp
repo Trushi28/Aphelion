@@ -1,5 +1,6 @@
 #pragma once
 #include <cosmos/types.hpp>
+#include <cosmos/lens_channel.hpp>
 
 namespace userland {
 
@@ -16,11 +17,16 @@ bool supported();
 void init_core(u32 core_index);
 
 Process* launch(const char* name, const Image& image);
+Process* launch_with(const char* name, const Image& image, lens::Table& from, lens::Lens handle);
 bool wait(Process* p, i32* status, u64 timeout_ms);
 bool reap(Process* p);
+bool kill(Process* p);
 
 u32 pid_of(const Process* p);
 u32 task_of(const Process* p);
+u32 live_threads(const Process* p);
+u32 live_handles(Process* p);
+u32 threads_created(const Process* p);
 u32 cores_used(const Process* p);
 u64 frames_live();
 u64 frames_quarantined();

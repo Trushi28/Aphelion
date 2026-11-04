@@ -91,12 +91,12 @@ user_enter:
     push qword RFLAGS_INITIAL
     push qword USER_CODE_SEL
     push rdi
+    mov rdi, rdx
     xor eax, eax
     xor ebx, ebx
     xor ecx, ecx
     xor edx, edx
     xor esi, esi
-    xor edi, edi
     xor ebp, ebp
     xor r8d, r8d
     xor r9d, r9d

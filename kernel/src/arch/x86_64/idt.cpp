@@ -24,6 +24,7 @@ alignas(16) static Gate g_idt[256];
 static Handler g_handlers[256];
 static Handler g_user_fault;
 static AbortHandler g_user_abort;
+static Handler g_user_return;
 static AbortHandler g_kernel_nmi;
 
 static void set_gate(u8 vec, u64 isr, u16 selector, u8 ist, u8 type_attr) {
@@ -85,11 +86,13 @@ extern "C" void isr_dispatch(Frame* f) {
     Handler h = g_handlers[f->vector];
     if (h) h(f);
     else default_panic(f);
+    if ((f->cs & 3) == 3 && g_user_return) g_user_return(f);
 }
 
 void set_handler(u8 vector, Handler h) { g_handlers[vector] = h; }
 void set_user_fault_handler(Handler h) { g_user_fault = h; }
 void set_user_abort_handler(AbortHandler h) { g_user_abort = h; }
+void set_user_return_handler(Handler h) { g_user_return = h; }
 void set_kernel_nmi_handler(AbortHandler h) { g_kernel_nmi = h; }
 
 static void spurious_handler(Frame*) {}

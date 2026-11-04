@@ -3,6 +3,7 @@
 
 namespace usergs {
 
+constexpr u32 MSR_FS_BASE = 0xC0000100;
 constexpr u32 MSR_KERNEL_GS_BASE = 0xC0000102;
 
 constexpr bool base_ok(u64 base, u64 limit) { return base < limit; }

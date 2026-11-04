@@ -23,6 +23,11 @@ struct KernelGsMsr {
     void write(u64 v) { cpu::wrmsr(usergs::MSR_KERNEL_GS_BASE, v); }
 };
 
+struct FsMsr {
+    u64 read() { return cpu::rdmsr(usergs::MSR_FS_BASE); }
+    void write(u64 v) { cpu::wrmsr(usergs::MSR_FS_BASE, v); }
+};
+
 }
 
 constexpr int MAX_SATELLITES = 64;
@@ -254,6 +259,7 @@ static bool build_satellite(Satellite* s, const char* name, EntryFn entry, void*
     s->kstack_top = reinterpret_cast<u64>(stack_virt) + s->stack_size;
     s->space = space;
     s->user_gs = 0;
+    s->user_fs = 0;
     s->state = State::Ready;
     s->wake_at = 0;
     s->switches = 0;
@@ -330,6 +336,8 @@ static void arrive(Satellite* old, Satellite* next) {
     gdt::set_kernel_stack(next->kstack_top);
     KernelGsMsr gs;
     usergs::switch_to(gs, old->space != nullptr, &old->user_gs, next->space != nullptr, next->user_gs);
+    FsMsr fs;
+    usergs::switch_to(fs, old->space != nullptr, &old->user_fs, next->space != nullptr, next->user_fs);
     if (next->space != old->space) constellation::activate(next->space);
     ++old->switches;
     old->state = old->state == State::Running ? State::Ready : old->state;

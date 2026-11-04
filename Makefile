@@ -264,7 +264,7 @@ LENS_SRC    := $(KDIR)/src/fs/lens.cpp $(KDIR)/src/fs/lens_ops.cpp
 unit_inc_nebula   := -I$(KDIR)/include
 unit_src_nebula   := $(FS_CORE_SRC) $(KDIR)/src/fs/nebula_selftest.cpp tools/nebula_host_test.cpp
 unit_inc_lens     := -I$(KDIR)/include
-unit_src_lens     := $(FS_CORE_SRC) $(LENS_SRC) $(KDIR)/src/fs/lens_epoch.cpp $(KDIR)/src/fs/lens_batch.cpp $(KDIR)/src/fs/lens_stream.cpp $(KDIR)/src/fs/lens_text.cpp $(KDIR)/src/fs/realm_sys.cpp tools/lens_host_test.cpp
+unit_src_lens     := $(FS_CORE_SRC) $(LENS_SRC) $(KDIR)/src/fs/lens_epoch.cpp $(KDIR)/src/fs/lens_batch.cpp $(KDIR)/src/fs/lens_stream.cpp $(KDIR)/src/fs/lens_channel.cpp $(KDIR)/src/fs/lens_text.cpp $(KDIR)/src/fs/realm_sys.cpp tools/lens_host_test.cpp
 unit_inc_helm     := -I$(KDIR)/include
 unit_src_helm     := $(FS_CORE_SRC) $(LENS_SRC) $(KDIR)/src/fs/lens_text.cpp $(KDIR)/src/shell/helm_core.cpp $(KDIR)/src/shell/helm_builtin.cpp $(KDIR)/src/shell/helm_fs.cpp $(KDIR)/src/shell/helm_text.cpp $(KDIR)/src/shell/helm_rows.cpp $(KDIR)/src/fs/lens_stream.cpp tools/helm_host_test.cpp
 
@@ -313,7 +313,7 @@ test-sched:
 
 test-userland:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_userland) $(unit_src_userland) -o $(BUILD)/userland_host_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined $(unit_inc_userland) $(unit_src_userland) -o $(BUILD)/userland_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/userland_host_test
 
 test-acpi:

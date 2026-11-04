@@ -7,12 +7,159 @@ default rel
 %define SYS_DEBUG_WRITE 3
 %define SYS_SET_GS_BASE 4
 %define SYS_GET_GS_BASE 5
+%define SYS_SET_FS_BASE 6
+%define SYS_GET_FS_BASE 7
+%define SYS_THREAD_CREATE 8
+%define SYS_THREAD_EXIT 9
+%define SYS_THREAD_JOIN 10
+%define SYS_HANDLE_CLOSE 11
+%define SYS_HANDLE_INFO 12
+%define SYS_HANDLE_NARROW 13
+%define SYS_CHANNEL_CREATE 14
+%define SYS_CHANNEL_SEND 15
+%define SYS_CHANNEL_RECV 16
+%define SYS_HANDLE_WAIT 17
+%define INFO_END 0x30103
+%define DATA 0x800000
+%define STK0 0x801100
 
 %macro EXIT 1
     mov edi, %1
     xor eax, eax
     syscall
     ud2
+%endmacro
+
+%macro SYSC 1
+    mov eax, %1
+    syscall
+%endmacro
+
+%macro EXPECT 3
+    mov r9, %2
+    cmp %1, r9
+    je %%ok
+    EXIT %3
+%%ok:
+%endmacro
+
+%macro FILLX 1
+    lea rax, [r12 + %1]
+    mov [rsp - 128], rax
+    mov [rsp - 120], rax
+    movdqu xmm %+ %1, [rsp - 128]
+%endmacro
+
+%macro FILLY 1
+    lea rax, [r12 + %1]
+    mov [rsp - 128], rax
+    mov [rsp - 120], rax
+    not rax
+    mov [rsp - 112], rax
+    mov [rsp - 104], rax
+    vmovdqu ymm %+ %1, [rsp - 128]
+%endmacro
+
+%macro VERIFYX 1
+    movdqu [rsp - 128], xmm %+ %1
+    lea rax, [r12 + %1]
+    cmp rax, [rsp - 128]
+    je %%lo
+    EXIT (1 + %1)
+%%lo:
+    cmp rax, [rsp - 120]
+    je %%hi
+    EXIT (17 + %1)
+%%hi:
+%endmacro
+
+%macro VERIFYY 1
+    vmovdqu [rsp - 128], ymm %+ %1
+    lea rax, [r12 + %1]
+    cmp rax, [rsp - 128]
+    je %%a
+    EXIT (1 + %1)
+%%a:
+    cmp rax, [rsp - 120]
+    je %%b
+    EXIT (17 + %1)
+%%b:
+    not rax
+    cmp rax, [rsp - 112]
+    je %%c
+    EXIT (33 + %1)
+%%c:
+    cmp rax, [rsp - 104]
+    je %%d
+    EXIT (49 + %1)
+%%d:
+%endmacro
+
+%macro VECPRELUDE 0
+    SYSC SYS_GETTID
+    mov r13, rax
+    mov r12, rax
+    mov r9, 0x9E3779B97F4A7C15
+    imul r12, r9
+    mov ecx, 0x037F
+    mov edx, 0x027F
+    test r13b, 1
+    cmovnz ecx, edx
+    mov r15d, ecx
+    mov [rsp - 160], cx
+    fldcw [rsp - 160]
+    mov r14d, 0x1F80
+    mov eax, r13d
+    and eax, 3
+    shl eax, 13
+    or r14d, eax
+    mov [rsp - 164], r14d
+    ldmxcsr [rsp - 164]
+    mov ebp, r13d
+    and ebp, 0xFFFF
+    add ebp, 0x100000
+    mov [rsp - 176], rbp
+    fild qword [rsp - 176]
+%endmacro
+
+%macro VECSPIN 1
+    mov qword [rsp - 8], 40
+%%round:
+    SYSC SYS_YIELD
+    mov ecx, 300000
+%%spin:
+    dec ecx
+    jnz %%spin
+    %1
+    dec qword [rsp - 8]
+    jnz %%round
+%endmacro
+
+%macro VECSCALARS 0
+    fnstcw [rsp - 160]
+    movzx eax, word [rsp - 160]
+    EXPECT rax, r15, 80
+    stmxcsr [rsp - 164]
+    mov eax, [rsp - 164]
+    EXPECT rax, r14, 81
+%endmacro
+
+%macro VECSSE_CHECK 0
+%assign n 0
+%rep 16
+    VERIFYX n
+%assign n n+1
+%endrep
+    VECSCALARS
+%endmacro
+
+%macro VECAVX_CHECK 0
+%assign n 0
+%rep 16
+    VERIFYY n
+%assign n n+1
+%endrep
+    VECSCALARS
 %endmacro
 
 %macro CHECK 2
@@ -447,5 +594,816 @@ BLOB nmispin
 .bad:
     EXIT 1
 ENDBLOB nmispin
+
+align 16
+BLOB fsbase
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, 0, 1
+    SYSC SYS_GET_GS_BASE
+    EXPECT rax, 0, 2
+    mov edi, 0x00800080
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, 0, 3
+    mov edi, 0x00800040
+    SYSC SYS_SET_GS_BASE
+    EXPECT rax, 0, 4
+    mov rax, 0x1122334455667788
+    mov [fs:0], rax
+    mov rdx, 0x8877665544332211
+    mov [gs:0], rdx
+    mov rbx, [fs:0]
+    EXPECT rbx, 0x1122334455667788, 5
+    mov rbx, [gs:0]
+    EXPECT rbx, 0x8877665544332211, 6
+    mov ecx, 0x00800080
+    mov rbx, [rcx]
+    EXPECT rbx, 0x1122334455667788, 7
+    mov ecx, 0x00800040
+    mov rbx, [rcx]
+    EXPECT rbx, 0x8877665544332211, 8
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, 0x00800080, 9
+    SYSC SYS_GET_GS_BASE
+    EXPECT rax, 0x00800040, 10
+    mov qword [rsp - 8], 40
+.round:
+    SYSC SYS_YIELD
+    mov ecx, 300000
+.spin:
+    dec ecx
+    jnz .spin
+    mov rbx, [fs:0]
+    EXPECT rbx, 0x1122334455667788, 11
+    mov rbx, [gs:0]
+    EXPECT rbx, 0x8877665544332211, 12
+    dec qword [rsp - 8]
+    jnz .round
+    xor edi, edi
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, 0, 13
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, 0, 14
+    SYSC SYS_GET_GS_BASE
+    EXPECT rax, 0x00800040, 15
+    EXIT 0
+ENDBLOB fsbase
+
+align 16
+BLOB fsbad
+    mov rdi, 0x0000800000000000
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, -3, 1
+    mov rdi, 0xFFFF800000000000
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, -3, 2
+    mov rdi, -1
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, -3, 3
+    mov rdi, 0xFFFF7FFFFFFFFFFF
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, -3, 4
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, 0, 5
+    mov rdi, 0x00007FFFFFFFFFFF
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, 0, 6
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, 0x00007FFFFFFFFFFF, 7
+    SYSC SYS_GET_GS_BASE
+    EXPECT rax, 0, 8
+    xor edi, edi
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, 0, 9
+    EXIT 0
+ENDBLOB fsbad
+
+align 16
+BLOB fsiso
+    SYSC SYS_GETTID
+    mov r13, rax
+    mov r12, rax
+    and r12d, 0xFF
+    shl r12d, 3
+    add r12d, 0x00800000
+    lea r14d, [r12 + 0x800]
+    mov r15, r13
+    not r15
+    mov rdi, r12
+    SYSC SYS_SET_GS_BASE
+    EXPECT rax, 0, 1
+    mov rdi, r14
+    SYSC SYS_SET_FS_BASE
+    EXPECT rax, 0, 2
+    mov [gs:0], r13
+    mov [fs:0], r15
+    mov qword [rsp - 8], 40
+.round:
+    SYSC SYS_YIELD
+    mov ecx, 300000
+.spin:
+    dec ecx
+    jnz .spin
+    mov rbx, [gs:0]
+    EXPECT rbx, r13, 3
+    mov rbx, [fs:0]
+    EXPECT rbx, r15, 4
+    SYSC SYS_GET_GS_BASE
+    EXPECT rax, r12, 5
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, r14, 6
+    dec qword [rsp - 8]
+    jnz .round
+    EXIT 0
+ENDBLOB fsiso
+
+align 16
+BLOB fszero
+    mov qword [rsp - 8], 40
+.round:
+    SYSC SYS_GET_FS_BASE
+    EXPECT rax, 0, 1
+    SYSC SYS_GET_GS_BASE
+    EXPECT rax, 0, 2
+    SYSC SYS_YIELD
+    mov ecx, 300000
+.spin:
+    dec ecx
+    jnz .spin
+    dec qword [rsp - 8]
+    jnz .round
+    EXIT 0
+ENDBLOB fszero
+
+align 16
+BLOB vecsse
+    VECPRELUDE
+%assign n 0
+%rep 16
+    FILLX n
+%assign n n+1
+%endrep
+    VECSPIN VECSSE_CHECK
+    fistp qword [rsp - 176]
+    mov rax, [rsp - 176]
+    EXPECT rax, rbp, 82
+    EXIT 0
+ENDBLOB vecsse
+
+align 16
+BLOB vecavx
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    mov eax, ecx
+    and eax, 0x18000000
+    cmp eax, 0x18000000
+    jne .none
+    xor ecx, ecx
+    xgetbv
+    and eax, 6
+    cmp eax, 6
+    jne .none
+    VECPRELUDE
+%assign n 0
+%rep 16
+    FILLY n
+%assign n n+1
+%endrep
+    VECSPIN VECAVX_CHECK
+    fistp qword [rsp - 176]
+    mov rax, [rsp - 176]
+    EXPECT rax, rbp, 82
+    EXIT 0
+.none:
+    EXIT 78
+ENDBLOB vecavx
+
+%macro TSPAWNL 3
+    lea rdi, [rel %1]
+    mov rsi, %2
+    xor edx, edx
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg %%ok
+    EXIT %3
+%%ok:
+%endmacro
+
+%macro TEXIT 1
+    mov edi, %1
+    mov eax, SYS_THREAD_EXIT
+    syscall
+    ud2
+%endmacro
+
+%macro TREFUSED 3
+    mov rdi, %1
+    mov rsi, %2
+    xor edx, edx
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    cmp rax, -3
+    je %%ok
+    EXIT %3
+%%ok:
+%endmacro
+
+%macro TSPAWN 1
+    mov rdi, r13
+    mov rsi, STK0 + %1 * 0x100
+    mov edx, 100 + %1
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg %%ok
+    EXIT 20 + %1
+%%ok:
+    mov [r15 + 0x10 + %1 * 8], rax
+%endmacro
+
+%macro TJOINEXPECT 2
+    mov rdi, [r15 + 0x10 + %1 * 8]
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    cmp rax, %2
+    je %%ok
+    EXIT 30 + %1
+%%ok:
+%endmacro
+
+%macro TIDMATCH 1
+    mov rax, [r15 + 0x100 + %1 * 8]
+    cmp rax, [r15 + 0x10 + %1 * 8]
+    je %%ok
+    EXIT 50 + %1
+%%ok:
+%endmacro
+
+%macro DIFFER 3
+    mov rax, %1
+    cmp rax, %2
+    jne %%ok
+    EXIT %3
+%%ok:
+%endmacro
+
+%macro RAXZERO 1
+    test rax, rax
+    jz %%ok
+    TEXIT %1
+%%ok:
+%endmacro
+
+%macro JOINBAD 2
+    mov rdi, %1
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    cmp rax, -3
+    je %%ok
+    EXIT %2
+%%ok:
+%endmacro
+
+align 16
+BLOB threads
+    mov r15, DATA
+    lea r13, [rel .child]
+    SYSC SYS_GETTID
+    mov r14, rax
+    SYSC SYS_GET_GS_BASE
+    test rax, rax
+    jnz .bad1
+    SYSC SYS_GET_FS_BASE
+    test rax, rax
+    jnz .bad2
+    TREFUSED 0, STK0, 3
+    TREFUSED r13, 0, 4
+    TREFUSED r13, 0x0000800000000000, 5
+    TREFUSED 0xFFFF800000000000, STK0, 6
+    TREFUSED r13, 0xFFFFFFFFFFFFFFF0, 7
+    TSPAWN 0
+    TSPAWN 1
+    TSPAWN 2
+    TJOINEXPECT 0, 50
+    TJOINEXPECT 1, 51
+    TJOINEXPECT 2, 52
+    TJOINEXPECT 0, 50
+    SYSC SYS_GET_GS_BASE
+    test rax, rax
+    jnz .bad9
+    SYSC SYS_GET_FS_BASE
+    test rax, rax
+    jnz .bad10
+    TIDMATCH 0
+    TIDMATCH 1
+    TIDMATCH 2
+    DIFFER [r15 + 0x10], r14, 60
+    DIFFER [r15 + 0x18], r14, 61
+    DIFFER [r15 + 0x20], r14, 62
+    DIFFER [r15 + 0x10], [r15 + 0x18], 63
+    DIFFER [r15 + 0x10], [r15 + 0x20], 64
+    DIFFER [r15 + 0x18], [r15 + 0x20], 65
+    JOINBAD r14, 70
+    JOINBAD 0xFFFF, 71
+    JOINBAD 0, 72
+    JOINBAD 0x100000001, 73
+    EXIT 0
+.bad1:
+    EXIT 1
+.bad2:
+    EXIT 2
+.bad9:
+    EXIT 9
+.bad10:
+    EXIT 10
+.child:
+    mov r12, rdi
+    mov r15, DATA
+    SYSC SYS_GET_GS_BASE
+    RAXZERO 1001
+    SYSC SYS_GET_FS_BASE
+    RAXZERO 1002
+    lea rdi, [r12 + 0x900000]
+    SYSC SYS_SET_GS_BASE
+    RAXZERO 1003
+    lea rdi, [r12 + 0xA00000]
+    SYSC SYS_SET_FS_BASE
+    RAXZERO 1004
+    mov r13, 60
+.spin:
+    SYSC SYS_YIELD
+    dec r13
+    jnz .spin
+    SYSC SYS_GET_GS_BASE
+    lea rbx, [r12 + 0x900000]
+    cmp rax, rbx
+    je .gs_ok
+    TEXIT 1005
+.gs_ok:
+    SYSC SYS_GET_FS_BASE
+    lea rbx, [r12 + 0xA00000]
+    cmp rax, rbx
+    je .fs_ok
+    TEXIT 1006
+.fs_ok:
+    SYSC SYS_GETTID
+    mov rbx, r12
+    sub rbx, 100
+    mov [r15 + 0x100 + rbx * 8], rax
+    mov edi, r12d
+    sub edi, 50
+    mov eax, SYS_THREAD_EXIT
+    syscall
+    ud2
+ENDBLOB threads
+
+align 16
+BLOB lastexit
+    TSPAWNL .child, STK0, 1
+    mov rdi, rax
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    cmp rax, 21
+    je .joined
+    EXIT 2
+.joined:
+    TEXIT 44
+.child:
+    TEXIT 21
+ENDBLOB lastexit
+
+align 16
+BLOB lastchild
+    SYSC SYS_GETTID
+    mov rbx, rax
+    lea rdi, [rel .child]
+    mov rsi, STK0
+    mov rdx, rbx
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg .made
+    EXIT 1
+.made:
+    TEXIT 5
+.child:
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    cmp rax, 5
+    je .gone
+    TEXIT 900
+.gone:
+    TEXIT 66
+ENDBLOB lastchild
+
+align 16
+BLOB groupexit
+    TSPAWNL .yielder, STK0, 1
+    TSPAWNL .busy, STK0 + 0x100, 2
+    mov r13, 300
+.wait:
+    SYSC SYS_YIELD
+    dec r13
+    jnz .wait
+    EXIT 33
+.yielder:
+    SYSC SYS_YIELD
+    jmp .yielder
+.busy:
+    jmp .busy
+ENDBLOB groupexit
+
+align 16
+BLOB threadfault
+    TSPAWNL .crash, STK0, 1
+.loop:
+    SYSC SYS_YIELD
+    jmp .loop
+.crash:
+    ud2
+ENDBLOB threadfault
+
+align 16
+BLOB spinner
+    TSPAWNL .yielder, STK0, 1
+    TSPAWNL .busy, STK0 + 0x100, 2
+.main:
+    jmp .main
+.yielder:
+    SYSC SYS_YIELD
+    jmp .yielder
+.busy:
+    jmp .busy
+ENDBLOB spinner
+
+align 16
+BLOB joinhang
+    TSPAWNL .busy, STK0, 1
+    mov rdi, rax
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    EXIT 2
+.busy:
+    jmp .busy
+ENDBLOB joinhang
+
+align 16
+BLOB threadlimit
+    mov r15, DATA
+    lea r13, [rel .waiter]
+    xor r12d, r12d
+.fill:
+    mov rdi, r13
+    mov rsi, r12
+    shl rsi, 8
+    add rsi, STK0
+    xor edx, edx
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jle .filled
+    mov [r15 + 0x10 + r12 * 8], rax
+    inc r12
+    cmp r12, 12
+    jb .fill
+    EXIT 1
+.filled:
+    cmp rax, -4
+    je .refused
+    EXIT 2
+.refused:
+    cmp r12, 7
+    je .seven
+    EXIT 3
+.seven:
+    mov qword [r15], 1
+    xor ebx, ebx
+.joinall:
+    mov rdi, [r15 + 0x10 + rbx * 8]
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    cmp rax, 7
+    je .joined
+    EXIT 4
+.joined:
+    inc rbx
+    cmp rbx, 7
+    jb .joinall
+    xor r12d, r12d
+.more:
+    mov rdi, r13
+    mov rsi, STK0
+    xor edx, edx
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jle .exhausted
+    mov rdi, rax
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    cmp rax, 7
+    je .again
+    EXIT 5
+.again:
+    inc r12
+    cmp r12, 20
+    jb .more
+    EXIT 6
+.exhausted:
+    cmp rax, -4
+    je .limit
+    EXIT 7
+.limit:
+    cmp r12, 8
+    je .done
+    EXIT 8
+.done:
+    EXIT 0
+.waiter:
+    mov rax, DATA
+    cmp qword [rax], 0
+    jne .go
+    SYSC SYS_YIELD
+    jmp .waiter
+.go:
+    TEXIT 7
+ENDBLOB threadlimit
+
+%macro SC 7
+    mov rdi, %2
+    mov rsi, %3
+    mov rdx, %4
+    mov r10, %5
+    mov r8, %6
+    mov r9, %7
+    mov eax, %1
+    syscall
+%endmacro
+
+%macro MEM32 3
+    cmp dword [r15 + %1], %2
+    je %%ok
+    EXIT %3
+%%ok:
+%endmacro
+
+%macro MEM8 3
+    cmp byte [r15 + %1], %2
+    je %%ok
+    EXIT %3
+%%ok:
+%endmacro
+
+align 16
+BLOB chanecho
+    mov r15, DATA
+    mov r14, rdi
+    SC SYS_CHANNEL_RECV, r14, DATA, 256, DATA+0x200, 4, 1
+    EXPECT rax, 0x100000005, 1
+    MEM32 0, 0x72726163, 2
+    MEM8 4, 'y', 3
+    mov r12, [r15 + 0x200]
+    SC SYS_HANDLE_INFO, r12, 0, 0, 0, 0, 0
+    EXPECT rax, INFO_END, 4
+    mov dword [r15 + 0x100], 0x21616976
+    SC SYS_CHANNEL_SEND, r12, DATA+0x100, 4, 0, 0, 0
+    EXPECT rax, 0, 5
+    mov dword [r15 + 0x108], 0x6B636162
+    mov [r15 + 0x210], r12
+    SC SYS_CHANNEL_SEND, r14, DATA+0x108, 4, DATA+0x210, 1, 0
+    EXPECT rax, 0, 6
+    SC SYS_HANDLE_INFO, r12, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 7
+    SC SYS_CHANNEL_SEND, r14, DATA+0x108, 4, DATA+0x210, 1, 0
+    EXPECT rax, -8, 8
+    EXIT 0
+ENDBLOB chanecho
+
+align 16
+BLOB chanwait
+    mov r15, DATA
+    mov r14, rdi
+    lea rdi, [rel .waiter]
+    mov rsi, STK0
+    mov rdx, r14
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg .made
+    EXIT 1
+.made:
+    SC SYS_CHANNEL_RECV, r14, DATA, 256, 0, 0, 1
+    EXIT 2
+.waiter:
+    mov r15, DATA
+    mov [r15 + 0x400], rdi
+    mov dword [r15 + 0x408], 1
+    mov dword [r15 + 0x40C], 0
+    SC SYS_HANDLE_WAIT, DATA+0x400, 1, -1, 0, 0, 0
+    EXIT 3
+ENDBLOB chanwait
+
+align 16
+BLOB peer_a
+    mov r15, DATA
+    mov r14, rdi
+    SC SYS_CHANNEL_RECV, r14, DATA, 256, DATA+0x200, 4, 1
+    EXPECT rax, 0x100000002, 1
+    mov r12, [r15 + 0x200]
+    mov dword [r15 + 0x100], 0x676E6970
+    SC SYS_CHANNEL_SEND, r12, DATA+0x100, 4, 0, 0, 0
+    EXPECT rax, 0, 2
+    SC SYS_CHANNEL_RECV, r12, DATA+0x120, 64, 0, 0, 1
+    EXPECT rax, 4, 3
+    MEM32 0x120, 0x676E6F70, 4
+    EXIT 0
+ENDBLOB peer_a
+
+align 16
+BLOB peer_b
+    mov r15, DATA
+    mov r14, rdi
+    SC SYS_CHANNEL_RECV, r14, DATA, 256, DATA+0x200, 4, 1
+    EXPECT rax, 0x100000002, 1
+    mov r12, [r15 + 0x200]
+    SC SYS_CHANNEL_RECV, r12, DATA+0x120, 64, 0, 0, 1
+    EXPECT rax, 4, 2
+    MEM32 0x120, 0x676E6970, 3
+    mov dword [r15 + 0x100], 0x676E6F70
+    SC SYS_CHANNEL_SEND, r12, DATA+0x100, 4, 0, 0, 0
+    EXPECT rax, 0, 4
+    EXIT 0
+ENDBLOB peer_b
+
+align 16
+BLOB chanlimits
+    mov r15, DATA
+    SC SYS_HANDLE_INFO, 0, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 1
+    SC SYS_HANDLE_INFO, 0x7777777700000099, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 2
+    SC SYS_CHANNEL_CREATE, 0xFFFF800000000000, 0, 0, 0, 0, 0
+    EXPECT rax, -2, 3
+    SC SYS_CHANNEL_CREATE, DATA+0x300, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 4
+    mov r14, [r15 + 0x300]
+    mov r13, [r15 + 0x308]
+    SC SYS_HANDLE_INFO, r14, 0, 0, 0, 0, 0
+    EXPECT rax, INFO_END, 5
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 257, 0, 0, 0
+    EXPECT rax, -9, 6
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 0, DATA+0x210, 5, 0
+    EXPECT rax, -9, 7
+    mov [r15 + 0x210], r14
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, DATA+0x210, 1, 0
+    EXPECT rax, -3, 8
+    mov [r15 + 0x210], r13
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, DATA+0x210, 1, 0
+    EXPECT rax, -3, 9
+    SC SYS_HANDLE_NARROW, r14, 1, DATA+0x310, 0, 0, 0
+    EXPECT rax, 0, 10
+    mov rbx, [r15 + 0x310]
+    SC SYS_CHANNEL_SEND, rbx, DATA+0x500, 1, 0, 0, 0
+    EXPECT rax, -7, 11
+    SC SYS_HANDLE_NARROW, r13, 3, DATA+0x318, 0, 0, 0
+    EXPECT rax, 0, 12
+    mov rbp, [r15 + 0x318]
+    mov [r15 + 0x210], rbp
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, DATA+0x210, 1, 0
+    EXPECT rax, -7, 13
+    SC SYS_HANDLE_INFO, rbp, 0, 0, 0, 0, 0
+    EXPECT rax, 0x30003, 14
+    SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 15
+    SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 16
+    SC SYS_HANDLE_CLOSE, rbp, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 17
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0, 0, 0
+    EXPECT rax, -5, 18
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 100, 0, 0, 0
+    EXPECT rax, 0, 19
+    SC SYS_CHANNEL_RECV, r13, DATA, 8, 0, 0, 0
+    EXPECT rax, -9, 20
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0, 0, 0
+    EXPECT rax, 100, 21
+    SC SYS_CHANNEL_SEND, r14, 0xFFFF800000000000, 4, 0, 0, 0
+    EXPECT rax, -2, 22
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 5, 0, 0, 0
+    EXPECT rax, 0, 23
+    SC SYS_CHANNEL_RECV, r13, 0xFFFF800000000000, 8, 0, 0, 0
+    EXPECT rax, -2, 24
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0, 0, 0
+    EXPECT rax, 5, 25
+    SC SYS_CHANNEL_CREATE, DATA+0x340, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 26
+    mov rbx, [r15 + 0x340]
+    mov [r15 + 0x210], rbx
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 3, DATA+0x210, 1, 0
+    EXPECT rax, 0, 27
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0xFFFF800000000000, 4, 0
+    EXPECT rax, -2, 28
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, DATA+0x220, 4, 0
+    EXPECT rax, 0x100000003, 29
+    mov rbx, [r15 + 0x220]
+    SC SYS_CHANNEL_SEND, rbx, DATA+0x500, 2, 0, 0, 0
+    EXPECT rax, 0, 30
+    mov rbx, [r15 + 0x348]
+    SC SYS_CHANNEL_RECV, rbx, DATA, 256, 0, 0, 0
+    EXPECT rax, 2, 31
+    mov rbx, [r15 + 0x340]
+    SC SYS_HANDLE_INFO, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 32
+    xor r12d, r12d
+.fill:
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, 0, 0, 0
+    EXPECT rax, 0, 33
+    inc r12
+    cmp r12, 16
+    jb .fill
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, 0, 0, 0
+    EXPECT rax, -5, 34
+    xor r12d, r12d
+.drain:
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0, 0, 0
+    EXPECT rax, 1, 35
+    inc r12
+    cmp r12, 16
+    jb .drain
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0, 0, 0
+    EXPECT rax, -5, 36
+    mov [r15 + 0x400], r13
+    mov dword [r15 + 0x408], 1
+    mov dword [r15 + 0x40C], 0
+    SC SYS_HANDLE_WAIT, DATA+0x400, 1, 0, 0, 0, 0
+    EXPECT rax, -10, 37
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, 0, 0, 0
+    EXPECT rax, 0, 38
+    SC SYS_HANDLE_WAIT, DATA+0x400, 1, 0, 0, 0, 0
+    EXPECT rax, 1, 39
+    cmp dword [r15 + 0x40C], 1
+    je .got
+    EXIT 40
+.got:
+    mov dword [r15 + 0x408], 0
+    SC SYS_HANDLE_WAIT, DATA+0x400, 1, 0, 0, 0, 0
+    EXPECT rax, -3, 41
+    SC SYS_HANDLE_WAIT, DATA+0x400, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 42
+    SC SYS_HANDLE_WAIT, DATA+0x400, 33, 0, 0, 0, 0
+    EXPECT rax, -3, 43
+    SC SYS_HANDLE_WAIT, 0xFFFF800000000000, 1, 0, 0, 0, 0
+    EXPECT rax, -2, 44
+    SC SYS_CHANNEL_RECV, r13, DATA, 256, 0, 0, 0
+    EXPECT rax, 1, 45
+    xor r12d, r12d
+.make:
+    mov rbx, r12
+    shl rbx, 4
+    add rbx, DATA+0x800
+    SC SYS_CHANNEL_CREATE, rbx, 0, 0, 0, 0, 0
+    cmp rax, -4
+    je .full
+    test rax, rax
+    jz .made
+    EXIT 46
+.made:
+    inc r12
+    cmp r12, 64
+    jb .make
+    EXIT 47
+.full:
+    cmp r12, 40
+    jae .enough
+    EXIT 48
+.enough:
+    xor ebp, ebp
+.release:
+    mov rbx, rbp
+    shl rbx, 4
+    mov rbx, [r15 + rbx + 0x800]
+    SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 49
+    mov rbx, rbp
+    shl rbx, 4
+    mov rbx, [r15 + rbx + 0x808]
+    SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 50
+    inc rbp
+    cmp rbp, r12
+    jb .release
+    SC SYS_CHANNEL_CREATE, DATA+0x300, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 51
+    mov r14, [r15 + 0x300]
+    mov r13, [r15 + 0x308]
+    SC SYS_HANDLE_CLOSE, r13, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 52
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, 0, 0, 0
+    EXPECT rax, -6, 53
+    SC SYS_CHANNEL_RECV, r14, DATA, 256, 0, 0, 0
+    EXPECT rax, -6, 54
+    EXIT 0
+ENDBLOB chanlimits
 
 section .note.GNU-stack noalloc noexec nowrite

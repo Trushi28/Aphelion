@@ -261,20 +261,71 @@ Result<Lens> delegate(Domain& from, Lens src, Domain& to, Rights rights) {
     return alloc_slot(to, realm, node, node, rights, ro, 0, label, s->stream);
 }
 
-Done close(Domain& d, Lens l) {
-    Result<Slot*> sr = slot_of(d, l);
-    if (!sr.ok()) return Done::fail(sr.status());
-    Slot* s = sr.value();
-    Status st = Status::Ok;
-    if (s->buffer.used) st = from_nebula(nebula::file_close(s->buffer));
+namespace {
+
+Stream* retire_slot(Domain& d, Slot* s) {
     Stream* stream = s->stream;
     u32 gen = s->generation;
     *s = Slot{};
     s->generation = gen;
     s->retired = gen == 0xFFFFFFFFu;
     if (d.live) --d.live;
+    return stream;
+}
+
+}
+
+Done close(Domain& d, Lens l) {
+    Result<Slot*> sr = slot_of(d, l);
+    if (!sr.ok()) return Done::fail(sr.status());
+    Slot* s = sr.value();
+    Status st = Status::Ok;
+    if (s->buffer.used) st = from_nebula(nebula::file_close(s->buffer));
+    Stream* stream = retire_slot(d, s);
     if (stream) stream->release();
     return st == Status::Ok ? Done::success() : Done::fail(st);
+}
+
+Done detach(Domain& d, Lens l, Rights rights, Parcel* out) {
+    Result<Slot*> sr = slot_of(d, l);
+    if (!sr.ok()) return Done::fail(sr.status());
+    Slot* s = sr.value();
+    if (!s->rights.has(Right::Delegate)) return Done::fail(Status::Denied);
+    if (!rights.subset_of(s->rights)) return Done::fail(Status::Denied);
+    if (s->buffer.used) {
+        Status st = from_nebula(nebula::file_close(s->buffer));
+        if (st != Status::Ok) return Done::fail(st);
+    }
+    out->valid = true;
+    out->read_only = s->read_only;
+    out->rights = rights;
+    out->realm = s->realm;
+    out->node = s->node;
+    out->stream = s->stream;
+    copy_label(out->label, s->label, text_len(s->label));
+    retire_slot(d, s);
+    return Done::success();
+}
+
+Result<Lens> attach(Domain& d, Parcel& p) {
+    if (!p.valid) return Result<Lens>::fail(Status::BadLens);
+    Result<Lens> r = alloc_slot(d, p.realm, p.node, p.node, p.rights, p.read_only, 0, p.label, p.stream);
+    if (!r.ok()) return r;
+    if (p.stream) p.stream->release();
+    p = Parcel{};
+    return r;
+}
+
+void discard(Parcel& p) {
+    if (p.valid && p.stream) p.stream->release();
+    p = Parcel{};
+}
+
+u32 free_slots(const Domain& d) {
+    u32 n = 0;
+    for (u32 i = 0; i < MAX_LENSES; ++i)
+        if (!d.slots[i].used && !d.slots[i].retired) ++n;
+    return n;
 }
 
 void close_all(Domain& d) {

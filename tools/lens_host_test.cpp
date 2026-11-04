@@ -9,6 +9,7 @@
 #include <cosmos/nebula.hpp>
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/lens.hpp>
+#include <cosmos/lens_channel.hpp>
 #include <cosmos/lens_text.hpp>
 
 extern "C" {
@@ -72,10 +73,11 @@ u64 alloc(int order) { return reinterpret_cast<u64>(aligned_alloc(4096, PAGE_SIZ
 void free(u64, int) {}
 }
 
+static long g_heap_live = 0;
 namespace kheap {
-void* alloc(usize n) { return malloc(n ? n : 1); }
-void* alloc_zeroed(usize n) { return calloc(n ? n : 1, 1); }
-void free(void* p) { ::free(p); }
+void* alloc(usize n) { __atomic_add_fetch(&g_heap_live, 1, __ATOMIC_RELAXED); return malloc(n ? n : 1); }
+void* alloc_zeroed(usize n) { __atomic_add_fetch(&g_heap_live, 1, __ATOMIC_RELAXED); return calloc(n ? n : 1, 1); }
+void free(void* p) { if (p) __atomic_sub_fetch(&g_heap_live, 1, __ATOMIC_RELAXED); ::free(p); }
 }
 
 static u64 g_clock = 1000;
@@ -2281,6 +2283,378 @@ static void test_cursor() {
     free(cp);
 }
 
+
+static lens::Table* new_table() { return static_cast<lens::Table*>(calloc(1, sizeof(lens::Table))); }
+
+static void drop_table(lens::Table* t) {
+    lens::close_all(t->domain);
+    free(t);
+}
+
+static lens::Done chan_send(lens::Table& t, Lens ch, const char* text, const Lens* h = nullptr, u32 n = 0) {
+    return lens::channel::send(t, ch, txt(text), h, n);
+}
+
+static lens::Result<lens::channel::Received> chan_recv(lens::Table& t, Lens ch, char* out, usize cap, Lens* h = nullptr, u32 hcap = 0, bool block = false) {
+    return lens::channel::receive(t, ch, lens::Bytes(reinterpret_cast<u8*>(out), cap), h, hcap, block, nullptr, nullptr);
+}
+
+static bool chan_text_is(const char* got, u32 n, const char* want) {
+    u32 w = 0;
+    while (want[w]) ++w;
+    if (w != n) return false;
+    for (u32 i = 0; i < n; ++i) if (got[i] != want[i]) return false;
+    return true;
+}
+
+static void test_channel_basics() {
+    lens::test_unseal();
+    long before = g_heap_live;
+    lens::Table* t = new_table();
+    Lens a, b;
+    CHECK(lens::channel::create(*t, &a, &b).ok(), "a channel with two ends");
+    CHECK(lens::live_count(t->domain) == 2, "the pair takes two slots");
+    CHECK(lens::rights_of(t->domain, a).value() == lens::channel::END_RIGHTS, "an end can read, write and be delegated");
+    CHECK(lens::kind_of(t->domain, a).value() == lens::NodeKind::Stream, "an end is a stream");
+
+    char buf[lens::channel::MAX_BYTES];
+    CHECK_L(chan_recv(*t, b, buf, sizeof(buf)), Status::NotReady, "a nonblocking receive on an empty channel");
+    CHECK(chan_send(*t, a, "hello").ok(), "send a message");
+    CHECK(chan_send(*t, a, "world!").ok(), "send a second");
+    auto r1 = chan_recv(*t, b, buf, sizeof(buf));
+    CHECK(r1.ok() && chan_text_is(buf, r1.value().bytes, "hello") && r1.value().handles == 0, "messages arrive in order, first");
+    auto r2 = chan_recv(*t, b, buf, sizeof(buf));
+    CHECK(r2.ok() && chan_text_is(buf, r2.value().bytes, "world!"), "second");
+    CHECK_L(chan_recv(*t, a, buf, sizeof(buf)), Status::NotReady, "the sender's own inbox stays empty");
+
+    CHECK(chan_send(*t, b, "back").ok(), "the other direction works");
+    auto r3 = chan_recv(*t, a, buf, sizeof(buf));
+    CHECK(r3.ok() && chan_text_is(buf, r3.value().bytes, "back"), "and arrives on the first end");
+
+    CHECK(lens::channel::send(*t, a, lens::ConstBytes(nullptr, 0), nullptr, 0).ok(), "an empty message is a valid signal");
+    auto r4 = chan_recv(*t, b, buf, sizeof(buf));
+    CHECK(r4.ok() && r4.value().bytes == 0 && r4.value().handles == 0, "and arrives empty");
+
+    u8 big[lens::channel::MAX_BYTES + 1] = {};
+    CHECK_L(lens::channel::send(*t, a, lens::ConstBytes(big, sizeof(big)), nullptr, 0), Status::TooLarge, "a message over the limit is refused");
+    CHECK(lens::channel::send(*t, a, lens::ConstBytes(big, lens::channel::MAX_BYTES), nullptr, 0).ok(), "a message at the limit is accepted");
+    char small[8];
+    CHECK_L(chan_recv(*t, b, small, sizeof(small)), Status::TooLarge, "a buffer that is too small is reported");
+    auto r5 = chan_recv(*t, b, buf, sizeof(buf));
+    CHECK(r5.ok() && r5.value().bytes == lens::channel::MAX_BYTES, "and the message was not consumed by that attempt");
+
+    for (u32 i = 0; i < lens::channel::QUEUE_DEPTH; ++i) CHECK(chan_send(*t, a, "x").ok(), "fill the queue");
+    CHECK_L(chan_send(*t, a, "x"), Status::NotReady, "a full queue refuses another message");
+    CHECK(chan_recv(*t, b, buf, sizeof(buf)).ok(), "receiving makes room");
+    CHECK(chan_send(*t, a, "x").ok(), "so a send fits again");
+
+    Lens fake;
+    CHECK_L(chan_send(*t, fake, "x"), Status::BadLens, "the null lens is not a channel");
+    Lens p_r, p_w;
+    CHECK(lens::make_pipe(t->domain, 64, &p_r, &p_w).ok(), "a pipe for the type check");
+    CHECK_L(chan_send(*t, p_w, "x"), Status::Unsupported, "a pipe end is not a channel");
+    CHECK_L(chan_recv(*t, p_r, buf, sizeof(buf)), Status::Unsupported, "nor to receive from");
+
+    Lens ro = lens::narrow(t->domain, a, Right::Read).value();
+    CHECK_L(chan_send(*t, ro, "x"), Status::Denied, "sending needs the Write right");
+    Lens wo = lens::narrow(t->domain, b, Right::Write).value();
+    CHECK_L(chan_recv(*t, wo, buf, sizeof(buf)), Status::Denied, "receiving needs the Read right");
+
+    drop_table(t);
+    CHECK(g_heap_live == before, "closing every handle frees every channel and message");
+}
+
+static void test_channel_handles() {
+    lens::test_unseal();
+    long before = g_heap_live;
+    lens::Table* t = new_table();
+    Lens a, b, c, d;
+    CHECK(lens::channel::create(*t, &a, &b).ok() && lens::channel::create(*t, &c, &d).ok(), "two channels");
+    char buf[lens::channel::MAX_BYTES];
+
+    CHECK(chan_send(*t, a, "carry", &c, 1).ok(), "send a message carrying one handle");
+    CHECK(!lens::is_live(t->domain, c), "the sender no longer holds the handle: it moved");
+    Lens got[lens::channel::MAX_HANDLES];
+    auto r = chan_recv(*t, b, buf, sizeof(buf), got, lens::channel::MAX_HANDLES);
+    CHECK(r.ok() && r.value().handles == 1 && chan_text_is(buf, r.value().bytes, "carry"), "the receiver gets the bytes and one handle");
+    CHECK(lens::is_live(t->domain, got[0]) && !(got[0] == c), "the new handle is live and is a different value");
+    CHECK(lens::rights_of(t->domain, got[0]).value() == lens::channel::END_RIGHTS, "it kept its rights");
+    CHECK(chan_send(*t, got[0], "through").ok(), "the moved handle still works as one end of channel two");
+    auto r2 = chan_recv(*t, d, buf, sizeof(buf));
+    CHECK(r2.ok() && chan_text_is(buf, r2.value().bytes, "through"), "the message arrives at the other end");
+
+    CHECK_L(chan_send(*t, a, "self", &a, 1), Status::Unsupported, "a channel cannot be sent over itself");
+    CHECK_L(chan_send(*t, a, "peer", &b, 1), Status::Unsupported, "nor can its other end");
+    CHECK(lens::is_live(t->domain, a) && lens::is_live(t->domain, b), "a refused send leaves both handles alone");
+
+    Lens dup[2] = { d, d };
+    CHECK_L(chan_send(*t, a, "dup", dup, 2), Status::Busy, "the same handle twice is refused");
+    CHECK(lens::is_live(t->domain, d), "and nothing moved");
+
+    Lens stale = got[0];
+    CHECK(lens::close(t->domain, got[0]).ok(), "close the moved handle");
+    Lens mixed[2] = { d, stale };
+    auto sf = chan_send(*t, a, "mixed", mixed, 2);
+    CHECK(!sf.ok() && lens::is_live(t->domain, d), "a stale handle in the list refuses the whole send and moves nothing");
+
+    Lens nodel = lens::narrow(t->domain, d, Right::Read | Right::Write).value();
+    CHECK_L(chan_send(*t, a, "nodel", &nodel, 1), Status::Denied, "a handle without Delegate cannot be sent");
+    CHECK(lens::is_live(t->domain, nodel), "and it stays");
+    Lens ordered[2] = { d, nodel };
+    CHECK_L(chan_send(*t, a, "ordered", ordered, 2), Status::Denied, "a bad handle later in the list refuses the send");
+    CHECK(lens::is_live(t->domain, d) && lens::is_live(t->domain, nodel), "and the earlier handle keeps its value, nothing was moved and put back");
+
+    Lens five[5];
+    CHECK_L(lens::channel::send(*t, a, txt("five"), five, 5), Status::TooLarge, "more than four handles is refused");
+
+    Lens p_r, p_w;
+    CHECK(lens::make_pipe(t->domain, 64, &p_r, &p_w).ok(), "a pipe");
+    CHECK(chan_send(*t, a, "pipe", &p_w, 1).ok(), "a pipe end can ride a channel");
+    Lens pg[1];
+    auto pr = chan_recv(*t, b, buf, sizeof(buf), pg, 1);
+    CHECK(pr.ok() && lens::write(t->domain, pg[0], 0, txt("data")).ok(), "and still writes");
+    char pb[8];
+    auto pread = lens::read(t->domain, p_r, 0, lens::Bytes(reinterpret_cast<u8*>(pb), sizeof(pb)));
+    CHECK(pread.ok() && pread.value() == 4, "into the pipe whose read end stayed behind");
+
+    CHECK(chan_send(*t, a, "two", dup, 0).ok(), "an empty handle list is fine");
+    CHECK(chan_recv(*t, b, buf, sizeof(buf)).ok(), "drain");
+
+    CHECK(chan_send(*t, a, "need room", &d, 1).ok(), "queue a handle for the table-full test");
+    Lens filler[lens::MAX_LENSES];
+    u32 filled = 0;
+    while (lens::free_slots(t->domain) > 0) {
+        auto m = lens::narrow(t->domain, a, Right::Read);
+        if (!m.ok()) break;
+        filler[filled++] = m.value();
+    }
+    Lens space[1];
+    CHECK_L(chan_recv(*t, b, buf, sizeof(buf), space, 1), Status::TableFull, "a receive with no room for the handle fails");
+    CHECK(lens::close(t->domain, filler[--filled]).ok(), "free one slot");
+    auto again = chan_recv(*t, b, buf, sizeof(buf), space, 1);
+    CHECK(again.ok() && again.value().handles == 1, "and now the message, still queued, arrives");
+
+    CHECK_L(chan_recv(*t, b, buf, sizeof(buf), nullptr, 0), Status::NotReady, "drained");
+    CHECK(chan_send(*t, a, "h", &space[0], 1).ok(), "queue one more handle");
+    CHECK_L(chan_recv(*t, b, buf, sizeof(buf), nullptr, 0), Status::TooLarge, "a message with handles needs room for them");
+    for (u32 i = 0; i < filled; ++i) CHECK(lens::close(t->domain, filler[i]).ok(), "release filler");
+
+    drop_table(t);
+    CHECK(g_heap_live == before, "no allocation outlives the table");
+}
+
+static void test_channel_across_tables() {
+    lens::test_unseal();
+    long before = g_heap_live;
+    lens::Table* t1 = new_table();
+    lens::Table* t2 = new_table();
+    Lens a, b;
+    CHECK(lens::channel::create(*t1, &a, &b).ok(), "a channel in the first table");
+    lens::Parcel parcel;
+    CHECK(lens::detach(t1->domain, b, lens::channel::END_RIGHTS, &parcel).ok(), "detach one end");
+    CHECK(!lens::is_live(t1->domain, b), "it left the first table");
+    auto moved = lens::attach(t2->domain, parcel);
+    CHECK(moved.ok() && !parcel.valid, "and joined the second");
+    Lens b2 = moved.value();
+
+    Lens c, d;
+    CHECK(lens::channel::create(*t1, &c, &d).ok(), "a second channel in the first table");
+    CHECK(chan_send(*t1, a, "gift", &d, 1).ok(), "table one sends an end of it");
+    char buf[lens::channel::MAX_BYTES];
+    Lens got[1];
+    auto r = chan_recv(*t2, b2, buf, sizeof(buf), got, 1);
+    CHECK(r.ok() && r.value().handles == 1, "table two receives the end");
+    CHECK(chan_send(*t2, got[0], "thanks").ok(), "and talks to table one through it");
+    auto back = chan_recv(*t1, c, buf, sizeof(buf));
+    CHECK(back.ok() && chan_text_is(buf, back.value().bytes, "thanks"), "which arrives in the first table");
+
+    CHECK(lens::close(t2->domain, got[0]).ok(), "table two closes its end");
+    CHECK_L(chan_recv(*t1, c, buf, sizeof(buf)), Status::Closed, "table one sees the hang-up");
+    CHECK_L(chan_send(*t1, c, "x"), Status::Closed, "and cannot send");
+
+    lens::Parcel denied;
+    Lens ro = lens::narrow(t1->domain, a, Right::Read).value();
+    CHECK_L(lens::detach(t1->domain, ro, Right::Read, &denied), Status::Denied, "detach needs Delegate");
+    CHECK_L(lens::detach(t1->domain, a, Right::Read | Right::Write | Right::Unlink, &denied), Status::Denied, "detach cannot add rights");
+    CHECK(lens::is_live(t1->domain, a), "a refused detach changes nothing");
+
+    drop_table(t1);
+    CHECK_L(chan_recv(*t2, b2, buf, sizeof(buf)), Status::Closed, "when a table dies its channel ends hang up");
+    drop_table(t2);
+    CHECK(g_heap_live == before, "everything is freed once both tables are gone");
+}
+
+static void test_channel_close_semantics() {
+    lens::test_unseal();
+    long before = g_heap_live;
+    lens::Table* t = new_table();
+    Lens a, b, c, d;
+    CHECK(lens::channel::create(*t, &a, &b).ok() && lens::channel::create(*t, &c, &d).ok(), "two channels");
+    char buf[lens::channel::MAX_BYTES];
+
+    CHECK(chan_send(*t, b, "last words").ok(), "queue a message for a");
+    CHECK(lens::close(t->domain, b).ok(), "close the sender");
+    auto r = chan_recv(*t, a, buf, sizeof(buf));
+    CHECK(r.ok() && chan_text_is(buf, r.value().bytes, "last words"), "a queued message survives its sender closing");
+    CHECK_L(chan_recv(*t, a, buf, sizeof(buf)), Status::Closed, "then the receiver learns of the hang-up");
+    CHECK_L(chan_send(*t, a, "x"), Status::Closed, "sending to a closed peer fails");
+    lens::Wait hw{ a, lens::Readiness(lens::Ready::Readable) | lens::Readiness(lens::Ready::Writable), lens::Readiness() };
+    auto hup = lens::await(t->domain, &hw, 1, 0);
+    CHECK(hup.ok() && hw.got.has(lens::Ready::Hangup) && hw.got.has(lens::Ready::Readable) && !hw.got.has(lens::Ready::Writable),
+          "a hung-up end polls as readable and hung up, never writable");
+    CHECK(lens::close(t->domain, a).ok(), "close the other end");
+
+    Lens e, f;
+    CHECK(lens::channel::create(*t, &e, &f).ok(), "a third channel");
+    CHECK(chan_send(*t, e, "pending", &d, 1).ok(), "queue a handle for f");
+    CHECK(lens::close(t->domain, f).ok(), "close f without receiving");
+    CHECK_L(chan_recv(*t, c, buf, sizeof(buf)), Status::Closed, "the queued handle was released, so its peer saw the hang-up");
+    drop_table(t);
+    CHECK(g_heap_live == before, "no leak from a discarded queue");
+}
+
+static bool cancel_always(void*) { return true; }
+static int g_cancel_flag = 0;
+static bool cancel_flag(void*) { return __atomic_load_n(&g_cancel_flag, __ATOMIC_ACQUIRE) != 0; }
+
+struct ChanFeed {
+    lens::Table* table;
+    Lens ch;
+    u32 delay_us;
+    const char* text;
+};
+
+static void* chan_feeder(void* p) {
+    ChanFeed* f = static_cast<ChanFeed*>(p);
+    usleep(f->delay_us);
+    (void)chan_send(*f->table, f->ch, f->text);
+    return nullptr;
+}
+
+static void* chan_canceler(void*) {
+    usleep(30000);
+    __atomic_store_n(&g_cancel_flag, 1, __ATOMIC_RELEASE);
+    return nullptr;
+}
+
+static void test_channel_blocking() {
+    lens::test_unseal();
+    long before = g_heap_live;
+    lens::Table* t = new_table();
+    Lens a, b;
+    CHECK(lens::channel::create(*t, &a, &b).ok(), "a channel");
+    char buf[lens::channel::MAX_BYTES];
+
+    auto c = lens::channel::receive(*t, b, lens::Bytes(reinterpret_cast<u8*>(buf), sizeof(buf)), nullptr, 0, true, &cancel_always, nullptr);
+    CHECK_L(c, Status::Cancelled, "a blocking receive honours a cancel that is already set");
+
+    ChanFeed feed{ t, a, 20000, "late" };
+    pthread_t th;
+    pthread_create(&th, nullptr, &chan_feeder, &feed);
+    auto r = chan_recv(*t, b, buf, sizeof(buf), nullptr, 0, true);
+    pthread_join(th, nullptr);
+    CHECK(r.ok() && chan_text_is(buf, r.value().bytes, "late"), "a blocked receive wakes when a message arrives");
+
+    g_cancel_flag = 0;
+    pthread_t cancel_thread;
+    pthread_create(&cancel_thread, nullptr, &chan_canceler, nullptr);
+    auto stopped = lens::channel::receive(*t, b, lens::Bytes(reinterpret_cast<u8*>(buf), sizeof(buf)), nullptr, 0, true, &cancel_flag, nullptr);
+    pthread_join(cancel_thread, nullptr);
+    CHECK_L(stopped, Status::Cancelled, "a blocked receive is released by a later cancel");
+
+    lens::Wait w{ b, lens::Readiness(lens::Ready::Readable), lens::Readiness() };
+    lens::Stream* streams[1];
+    CHECK(lens::acquire(t->domain, &w, 1, streams).ok(), "pin a stream for waiting");
+    CHECK(lens::close(t->domain, b).ok(), "closing the handle while it is pinned is safe");
+    CHECK(streams[0]->ready().has(lens::Ready::Writable), "the pinned stream is still alive and can be queried");
+    lens::unpin(streams, 1);
+    CHECK(lens::acquire(t->domain, &w, 1, streams).status() == Status::StaleLens, "a closed handle can no longer be pinned");
+    drop_table(t);
+    CHECK(g_heap_live == before, "no leak");
+}
+
+struct StressArgs {
+    lens::Table* mine;
+    Lens up;
+    u32 id;
+};
+
+static constexpr u32 STRESS_SENDERS = 4;
+static constexpr u32 STRESS_PER_SENDER = 150;
+
+static void* stress_sender(void* p) {
+    StressArgs* a = static_cast<StressArgs*>(p);
+    for (u32 i = 0; i < STRESS_PER_SENDER; ++i) {
+        Lens x, y;
+        while (!lens::channel::create(*a->mine, &x, &y).ok()) sched_yield();
+        char tag[3] = { static_cast<char>('A' + a->id), static_cast<char>('a' + (i % 26)), 0 };
+        (void)chan_send(*a->mine, y, tag);
+        for (;;) {
+            lens::Done d = chan_send(*a->mine, a->up, "h", &x, 1);
+            if (d.ok()) break;
+            if (d.status() != Status::NotReady) break;
+            sched_yield();
+        }
+        (void)lens::close(a->mine->domain, y);
+    }
+    return nullptr;
+}
+
+static void test_channel_stress() {
+    lens::test_unseal();
+    long before = g_heap_live;
+    lens::Table* hub = new_table();
+    lens::Table* senders[STRESS_SENDERS];
+    Lens hub_ends[STRESS_SENDERS];
+    StressArgs args[STRESS_SENDERS];
+    bool setup = true;
+    for (u32 i = 0; i < STRESS_SENDERS; ++i) {
+        senders[i] = new_table();
+        Lens hub_side, far_side;
+        setup = setup && lens::channel::create(*hub, &hub_side, &far_side).ok();
+        lens::Parcel parcel;
+        setup = setup && lens::detach(hub->domain, far_side, lens::channel::END_RIGHTS, &parcel).ok();
+        auto moved = lens::attach(senders[i]->domain, parcel);
+        setup = setup && moved.ok();
+        hub_ends[i] = hub_side;
+        args[i] = StressArgs{ senders[i], moved.value(), i };
+    }
+    CHECK(setup, "a hub with one channel per sender");
+    pthread_t th[STRESS_SENDERS];
+    for (u32 i = 0; i < STRESS_SENDERS; ++i) pthread_create(&th[i], nullptr, &stress_sender, &args[i]);
+
+    u32 got_count[STRESS_SENDERS] = {};
+    u32 total = 0;
+    u32 idle = 0;
+    bool intact = true;
+    while (total < STRESS_SENDERS * STRESS_PER_SENDER && idle < 20000) {
+        bool progressed = false;
+        for (u32 i = 0; i < STRESS_SENDERS; ++i) {
+            char buf[lens::channel::MAX_BYTES];
+            Lens got[lens::channel::MAX_HANDLES];
+            auto r = chan_recv(*hub, hub_ends[i], buf, sizeof(buf), got, lens::channel::MAX_HANDLES);
+            if (!r.ok()) continue;
+            progressed = true;
+            if (r.value().handles != 1) { intact = false; continue; }
+            char tag[8];
+            auto m = chan_recv(*hub, got[0], tag, sizeof(tag));
+            u32 want = got_count[i] % 26;
+            if (!m.ok() || m.value().bytes != 2 || tag[0] != static_cast<char>('A' + i) || tag[1] != static_cast<char>('a' + want)) intact = false;
+            ++got_count[i];
+            ++total;
+            (void)lens::close(hub->domain, got[0]);
+        }
+        if (progressed) idle = 0;
+        else { ++idle; usleep(100); }
+    }
+    for (u32 i = 0; i < STRESS_SENDERS; ++i) pthread_join(th[i], nullptr);
+    CHECK(intact, "every message carried one working handle, and each sender's messages stayed in order");
+    CHECK(total == STRESS_SENDERS * STRESS_PER_SENDER, "all handles sent from four racing tables arrived");
+    for (u32 i = 0; i < STRESS_SENDERS; ++i) drop_table(senders[i]);
+    drop_table(hub);
+    CHECK(g_heap_live == before, "after four racing senders nothing leaks");
+}
+
 int main() {
     g_sectors = 131072;
     g_disk = static_cast<u8*>(calloc(g_sectors, 512));
@@ -2328,6 +2702,13 @@ int main() {
     test_pipe_shared_ends();
     test_mutex_ownership();
     test_console_stream_and_await();
+    printf("-- channels\n");
+    test_channel_basics();
+    test_channel_handles();
+    test_channel_across_tables();
+    test_channel_close_semantics();
+    test_channel_blocking();
+    test_channel_stress();
     printf("-- cursor\n");
     test_cursor();
     printf("-- batch\n");
