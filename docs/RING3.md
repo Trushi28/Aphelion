@@ -20,6 +20,8 @@ This series lets the kernel run unprivileged code in its own address space, ente
 | `IST_MCE` stack, `CR4.MCE` | `gdt.cpp`, `percore.cpp` |
 | Threads in a process, group exit and external kill | `procgroup.hpp`, `userland.cpp`, `idt.cpp` (return-to-user hook) |
 | Per-process handle table, channels that carry handles, handle syscalls | `lens_channel.hpp`, `lens_channel.cpp`, `lens.cpp` (`detach`, `attach`), `lens_stream.cpp` (`acquire`, `await_streams`), `handleabi.hpp`, `userland.cpp` |
+| Memory objects, per-process region table, `vm_map`, `vm_unmap`, `vm_protect` | `memobj.hpp`, `memobj.cpp`, `vmregion.hpp`, `userland.cpp` |
+| Page tables freed when a user range is unmapped | `vmm.cpp` (`reclaim_tables`) |
 | Ring-3 test programs (including x87, SSE and AVX state checks) and orchestrator | `blobs.asm`, `userland_selftest.cpp` |
 | Host tests for copy, ABI and GS-switch rules | `tools/userland_host_test.cpp` (`make test-userland`) |
 
@@ -55,16 +57,21 @@ Number in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, result in `rax`. Eve
 | 9 | thread_exit | status | does not return |
 | 10 | thread_join | thread id | the joined thread's exit status, or -3 for an unknown id, the caller itself or an id above 32 bits |
 | 11 | handle_close | handle | 0, or -8 for a bad or stale handle |
-| 12 | handle_info | handle | `(kind << 16) | rights`, kind 3 being a stream, or -8 |
+| 12 | handle_info | handle | `(subtype << 24) | (kind << 16) | rights`, kind 3 being a stream, subtype 1 a channel end and 2 a memory object (0 for files), or -8 |
 | 13 | handle_narrow | handle, rights mask, pointer to a u64 | 0, the new handle is stored through the pointer; its rights are the old ones ANDed with the mask |
 | 14 | channel_create | pointer to two u64 | 0, the two ends are stored through the pointer |
 | 15 | channel_send | channel, bytes, length (at most 256), handles, count (at most 4) | 0, or an error |
 | 16 | channel_recv | channel, buffer, capacity, handle array, handle capacity, flags (bit 0 blocks) | `(handles << 32) | bytes`, or an error |
 | 17 | handle_wait | pointer to entries `{handle u64, want u32, got u32}`, count (1 to 32), timeout in ms (all ones waits forever) | how many entries are ready, with `got` filled in, or an error |
+| 18 | vmo_create | pages (1 to 4096), flags (must be 0), pointer to a u64 | 0, the handle is stored through the pointer, with rights read, write, execute and delegate. -3 for zero pages or non-zero flags, -9 above 4096 pages, -4 when the system-wide budget of 16384 pages or the handle table is full |
+| 19 | vm_map | memory object handle, address (0 chooses), offset in pages, pages, protection | the address mapped, or an error. Protection is 1 read, 3 read-write or 5 read-execute |
+| 20 | vm_unmap | address, pages | 0, or -13 if any page of the range is not mapped (nothing is changed) |
+| 21 | vm_protect | address, pages, protection | 0, or -13 if any page of the range is not mapped, -7 if the new protection is beyond what the mapping may have (nothing is changed) |
+| 22 | vmo_size | memory object handle | the size in pages, or -3 for a handle that is not a memory object |
 
 The GS and FS bases are per thread and independent of each other. A new thread reads 0 for both. A base need not point at mapped memory; an access through `gs:` or `fs:` to an unmapped address faults like any other. A Linux ELF executor uses FS for thread-local storage and a Windows PE host uses GS for the TEB, so both are native.
 
-Errors: -1 no such call, -2 bad pointer, -3 bad argument, -4 limit, -5 would block, -6 peer closed, -7 right missing, -8 bad or stale handle, -9 message or buffer too big, -10 timed out, -11 cancelled.
+Errors: -1 no such call, -2 bad pointer, -3 bad argument, -4 limit, -5 would block, -6 peer closed, -7 right missing or protection refused, -8 bad or stale handle, -9 message or buffer too big, -10 timed out, -11 cancelled, -12 address range already mapped, -13 address range not mapped.
 
 ## Handles and channels (H1)
 
@@ -74,17 +81,17 @@ A channel is a pair of ends. Each end can read, write and be delegated. A messag
 
 What is guaranteed:
 - A send either moves every handle or none. Bad, stale, repeated or non-delegable handles refuse the whole send and every handle stays where it was with its old value.
-- A receive either delivers the bytes and every handle or leaves the message queued. A buffer that is too small (-9), a table without room for the handles (-4) and a bad pointer (-2) all leave the message in the queue. The destination buffers are probed for writability before anything is consumed; this is sound because the address space never changes while a process runs.
+- A receive either delivers the bytes and every handle or leaves the message queued. A buffer that is too small (-9), a table without room for the handles (-4) and a bad pointer (-2) all leave the message in the queue. The destination buffers are probed for writability before anything is consumed; this is sound because every kernel copy into or out of user memory holds the process's address-space lock, which `vm_map`, `vm_unmap` and `vm_protect` also hold.
 - A message that was queued when its sender closed is still delivered. When the last reference to an end goes away, the messages waiting for that end are discarded and the handles inside them are released, so their peers see the hang-up.
 - A receiver blocked in `channel_recv` or `handle_wait` is woken by `kill` and by a fatal fault in a sibling thread. The stream is pinned while a thread waits, so another thread closing the handle cannot free it underneath the waiter.
 
 The kernel uses the same objects. `lens::Table` pairs a domain with its lock, `lens::channel::create/send/receive` take a table, and `userland::launch_with(name, image, table, handle)` moves one handle out of a kernel table into the new process and passes its value to the first thread in `rdi`. The handle is consumed even if the launch then fails.
 
-Limits: a message carries 4 handles at most, so a service that has to hand over more must send several messages. There is no flow control beyond the 16-message queue. Cycles longer than one channel (end A of channel 1 queued on channel 2 whose only other end is queued on channel 1) leak, as they do in other capability kernels; the direct case is refused. Handles for files and memory objects come with H2 and H3, so today every handle a process can hold is a channel end.
+Limits: a message carries 4 handles at most, so a service that has to hand over more must send several messages. There is no flow control beyond the 16-message queue. Cycles longer than one channel (end A of channel 1 queued on channel 2 whose only other end is queued on channel 1) leak, as they do in other capability kernels; the direct case is refused. Memory objects (H2) are the second kind of handle; files, pipes and process handles (H3) are the next.
 
 ## Threads, group exit and kill
 
-A process is a group of threads that share one address space. Process creation starts one thread at the image entry. `thread_create` starts another at an entry point with the stack pointer the caller supplies and one argument in `rdi`, with every other register zero and FS and GS bases zero. The stack must already be mapped: the address space is built once and never changes while the process runs, which is what makes sharing it between cores safe without a lock. Until memory objects exist, a thread stack therefore lives in the data pages.
+A process is a group of threads that share one address space. Process creation starts one thread at the image entry. `thread_create` starts another at an entry point with the stack pointer the caller supplies and one argument in `rdi`, with every other register zero and FS and GS bases zero. The stack must already be mapped. It can be in the data pages or in memory mapped with `vm_map`; a thread whose stack pointer points at unmapped memory faults at its first push and the process dies.
 
 Limits: 8 threads alive at once and 16 created over the life of a process (a finished thread's slot is not reused, because teardown has to wait for every thread's kernel stack). Both report -4. The kernel's thread pool is shared, so `thread_create` also reports -4 when the pool is empty.
 
@@ -118,7 +125,59 @@ Page-table frames and kernel memory are not in the process's frame list, so an e
 
 ## User address space
 
-Code at `0x400000` (read and execute), optional data at `0x800000` (read, write, no execute), a 32 KiB stack ending at `0x7FFFFFF00000` with an unmapped page below it. W^X is enforced by `constellation::space_map`.
+Code at `0x400000` (read and execute), optional data at `0x800000` (read, write, no execute), a 32 KiB stack ending at `0x7FFFFFF00000` with an unmapped page below it. These are built at launch and cannot be unmapped or changed from ring 3. W^X is enforced by `constellation::space_map`.
+
+## Memory objects and mappings (H2)
+
+A memory object is a fixed number of zeroed physical pages (up to 4096, 16 MiB) allocated when it is created, with a reference count. It is a Lens stream, so it lives in the handle table, moves over channels and narrows like any other handle. Rights: Read allows mapping, Write allows writable mappings, Execute allows executable mappings, Delegate allows sending the handle. A handle without Read cannot be mapped. `handle_narrow` can hand out a read-only view of the same pages.
+
+Mappings live in the window `0x100000000000` to `0x7F0000000000`. Address 0 asks the kernel to choose (first fit from the bottom of the window); a non-zero address is exact, must be page aligned and inside the window, and is refused with -12 if any page of it is mapped, so a loader that wants a preferred base can try it and fall back to relocating. A process can have 64 mappings and 8192 mapped pages (32 MiB) at once; beyond that `vm_map` reports -4. Partial `vm_unmap` and `vm_protect` split a mapping, and `vm_protect` merges neighbours that become identical again, so toggling the protection of part of a mapping and restoring it does not use up the 64.
+
+Protection is checked per mapping. Read-write (3) and read-execute (5) are accepted; write plus execute (7) is refused with -7, and so is anything the handle's rights do not cover. A page mapped read-write can be flipped to read-execute with `vm_protect` once code has been written to it (a JIT or loader pattern) and back. Executing a read-write page, or writing to a read-execute page, faults. `vm_protect` can never exceed the rights of the handle the mapping was made from, even if the handle is closed afterwards.
+
+A mapping holds its own reference to the object, so closing every handle does not unmap anything, and the pages are freed when the last mapping in any process and the last handle are gone. Process exit releases all of a process's mappings. A process that is killed while its only reference to 16 pages is a mapping gives them back (the `vmspin` test checks this against `memobj::live_pages()`).
+
+How it is made safe with several threads and cores. Each process has one address-space mutex. `vm_map`, `vm_unmap` and `vm_protect` take it, and so does every kernel copy to or from user memory, so a copy never sees a page vanish between its probe and its write, and a freed frame is never written through the direct map. `vm_unmap` removes the page-table entries and shoots down every core that has the space loaded before it drops its references, so a frame cannot be freed while another core can still reach it through a cached translation (`vmshoot` checks this: a second thread touches a page, the first unmaps it, and the second must then fault). The lock order is handle table, then address space. Empty page tables are returned when a range is unmapped, so mapping and unmapping at scattered fixed addresses does not use up memory.
+
+Limits and things that are deliberately not done:
+- W^X is a property of each mapping, not of the memory. A memory object with both a Write handle and an Execute handle can be mapped writable through one and executable through the other. Hand out handles narrowed to what each party needs; a loader that wants the stronger rule should keep the Write handle for itself and give out Execute-only ones after it has finished writing.
+- Memory is allocated when the object is created, not on first touch, and there is no page-fault handler: touching a page that is not mapped kills the process. The budget is 16384 pages (64 MiB) over all memory objects in the system. One process can use all of it.
+- There is no way to map less than a page, to map with no access, or to share a mapping copy-on-write.
+- A machine check in a memory-object frame kills the process and quarantines the frame only when the address-space mutex is free at that instant; if another thread of the same process is inside `vm_map` or `vm_unmap` the frame is not recognised and the kernel panics, as it does for any frame it cannot attribute.
+- A thread stack in mapped memory has no guard page unless the program leaves a gap itself.
+
+## Files, pipes and processes from files (H3)
+
+A file or directory handle is a Lens like any other, so a process can only reach what it was handed. `file_open` and `file_create` take a directory handle and a relative path; the result can never be wider than the directory handle (rights are checked as a subset), `..`, absolute paths and a realm prefix are refused with -3, and a handle given to a process is the root of everything it can name. The new syscalls, 23 to 32:
+
+| nr | call | arguments | result |
+|---|---|---|---|
+| 23 | `file_open` | dir, path, path_len, rights, out | 0, handle in `*out` |
+| 24 | `file_read` | handle, offset, buf, len | bytes read, 0 at end of file or when a pipe's writer is gone |
+| 25 | `file_write` | handle, offset, buf, len | bytes written |
+| 26 | `file_stat` | handle, out | 0, 32-byte record: size, mtime_ms, kind (0 file, 1 directory, 2 stream), links, flags |
+| 27 | `file_create` | dir, path, path_len, rights, flags, out | 0; flag 1 makes a directory and `out` is not written |
+| 28 | `dir_entry` | dir, index, out | 0 and a 280-byte record, or 1 when `index` is past the end |
+| 29 | `pipe_create` | capacity, out[2] | 0, read end then write end |
+| 30 | `process_create` | file, arg handle or 0, out, flags (0) | 0, process handle in `*out` |
+| 31 | `process_status` | process handle, out | 0 and the status as a 64-bit value, or -5 while it runs |
+| 32 | `process_kill` | process handle | 0, or -6 if it is already ending |
+
+New error codes: -14 for an image that fails validation, -15 not found, -16 wrong kind of object (a directory where a file is needed or the reverse). Everything else uses the codes from H1 and H2; -12 is "already exists" here too. A transfer moves at most 1024 bytes per call and returns the count, so callers loop. Pipes never block: an empty read or a full write returns -5, and `handle_wait` is how a process sleeps until a pipe is readable or writable. A pipe's read end carries Read and the write end carries Write, so the direction cannot be reversed by a process that holds only one end. A closed write end gives readers end-of-file once the buffer is drained; a closed read end makes writes return -6.
+
+`process_create` reads an APX v1 image from a file handle that has both Read and Execute, validates it completely (below), builds the address space and starts one thread. The only handle the new process gets is the argument handle, which is moved out of the caller (it needs the Delegate right), and it arrives in `rdi`; a channel end is the usual choice and everything else is negotiated over it. The caller gets a process handle (Read, Write, Delegate). `handle_wait` on it reports Readable and Hangup once the process has exited, `process_status` returns the exit status (a kill gives -512, a fault gives -256 minus the vector), and `process_kill` ends it. Closing the last handle to a process kills it, as in Zircon, so there is no fire-and-forget spawn; a parent that wants a child to outlive it must hand the process handle to someone else first. Exited processes whose handles are gone are freed lazily by `sweep_detached()`, which `process_create` runs first, so the 16 process slots are not used up by finished children; the kernel self-test also calls it.
+
+APX v1 is a 64-byte header followed by a code section and an optional initial-data section. Little-endian fields: magic `APX1`, version 1, header size 64, flags (must be 0), code offset, code size, entry offset into the code, data pages, data offset, data size, total file size, CRC-32 of everything after the header, and 20 reserved bytes that must be zero. Code goes at `0x400000` read and execute, data pages at `0x800000` read and write, with the initial bytes copied in and the rest zero. The parser (`kernel/include/cosmos/apx.hpp`) refuses a wrong magic, version, header size, flags or reserved bytes; a zero or oversized code section; an entry outside the code; more than 64 data pages or initial data larger than its pages; unaligned sections (16 bytes); sections that overlap or lie outside the file; a file size that differs from the header or from the end of the last section; and a checksum mismatch. Padding between sections is allowed and is covered by the checksum. The limits are 64 code pages and 64 data pages (raised from 16 and 8), so an image is at most 524,352 bytes. The whole file is read into a kernel buffer, validated, copied into fresh frames and freed.
+
+Limits and things that are deliberately not done:
+- The checksum detects accidents, not tampering. There is no signature, so Execute on a file is the only gate on what can run.
+- File syscalls hold the caller's handle-table lock while the filesystem works, so a slow disk stalls the process's other handle operations (not other processes).
+- `dir_entry` lists the whole directory on every call and picks the entry at `index`, so a full walk is quadratic, the order is whatever the realm returns, and entries added or removed during a walk can be skipped or repeated.
+- A pipe read copies out of the pipe before it copies into the caller's buffer; the buffer is probed first, but if another thread unmaps it in between those bytes are lost.
+- Writing past the end of a file leaves the result to the realm.
+- A process can create children until the 16 process slots are gone, and there is no per-process quota. Child threads and memory are limited per process as before.
+- The child gets no environment, arguments or working directory beyond the one handle.
+- Nothing from R2.3 through H3 has been booted by me. The syscall handlers, `process_create` on real cores, kill-on-close from a dying parent and the lazy sweeper have been compiled and linked, and the ring-3 programs have run under an emulator against a model of the syscalls, but only your boots count.
 
 ## Verifying on your machine
 
@@ -127,7 +186,7 @@ Code at `0x400000` (read and execute), optional data at `0x800000` (read, write,
 3. Expected serial lines:
    - `[user N] hello from ring 3`
    - one `[userland] pid N 'name' took exception ...: terminated` line for each of null, readkernel, jumpkernel, privileged, divzero, datapage and threadfault
-   - `[userland] case 'name': status S, expected E` for twenty-two cases, none marked `<-- wrong status`
+   - `[userland] case 'name': status S, expected E` for thirty-one cases, none marked `<-- wrong status`
    - `[userland] 6 concurrent processes: all exited cleanly`
    - `[userland] lfence after the conditional swapgs: ordinary entry yes, paranoid entry yes`
    - `[userland] user GS and FS bases kept per thread across 8 concurrent processes: ok`
@@ -135,9 +194,17 @@ Code at `0x400000` (read and execute), optional data at `0x800000` (read, write,
    - `[userland] handle passing kernel -> ring 3 -> kernel: status 0, handle moved out of the sender, used by the receiver, returned`
    - `[userland] kill of a process blocked in channel receive and handle wait: 2 threads were blocked, status -512 after N ms, its channel hung up`
    - `[userland] two ring-3 processes talk over a channel the kernel handed each one an end of: statuses 0 and 0`
+   - `[userland] shared memory object: kernel-made, handed to ring 3 as read-write and read-only handles: status 0, the process's write is visible to the kernel`
+   - `[userland] memory object freed once the last handle and mapping are gone: yes`
+   - `[userland] kill of a process whose only reference to 16 pages is a mapping: status -512, 16 pages held, 0 left after teardown`
+   - `[userland] process started from an APX file in the RAM realm: status 42`
+   - `[userland] initial data from the image is in place and the rest of the data page is zero: status 66`
+   - six `[userland] launching ...: error E, expected E` lines (no execute right -7, one flipped byte -14, shorter than a header -14, empty file -14, a directory -16, a handle that does not exist -8), none marked `<-- wrong`
+   - `[userland] file and pipe syscalls from ring 3 on a directory handle: status 0, the file holds the data: yes, the nested file exists: yes`
+   - `[userland] a process that spawns children from files, waits on them, kills one, and leaves two running: status 0, 4 children were reaped by the sweeper, nothing left: yes`
    - `[userland] kill 'spinner': 3 of 3 thread(s) were running, process ended with status -512 after N ms` for each of five kills (spinner and joinhang, some at once, some after a pause), none marked `<-- wrong`, then `[userland] kill of a process that already exited: refused, status stays 42`
    - With two or more cores: `[userland] NMI from ring 3: N sent, A landed in ring 3, B landed in ring 0 and were absorbed, process status 0`. With one core: `NMI from ring 3: skipped`. If A is 0 the next line says `inconclusive`
-   - `[userland] frames still held: 0, processes still live: 0`
+   - `[userland] frames still held: 0, processes still live: 0` followed by `[userland] memory objects still alive: 0, pages 0`
    - `[selftest] userland: ok`
 
 ## Where a first boot is most likely to fail
@@ -151,7 +218,9 @@ Code at `0x400000` (read and execute), optional data at `0x800000` (read, write,
 
 - The kernel half of H1 (the syscalls, the handle close at process exit, `launch_with`) has been compiled and linked and its logic exercised on the host (`make test-lens`, `make test-userland`) and, for the ring-3 programs, under an emulator against a model of the syscalls. It has not been booted by me.
 - A #DF or #MC that kills a process closes its handle table on the IST stack with interrupts off. That is harmless unless a channel lock is held by another core at that instant, in which case the exit path waits for it on that stack. Ordinary faults, syscalls and kills re-enable interrupts first.
-- Memory is fixed at launch: no `mmap`, so a thread stack must sit in the data pages and the thread count is capped at 16 per process.
+- The kernel half of H2 (memory objects, the region table, the three mapping syscalls, the address-space mutex, MCE attribution) has been compiled and linked, its policy and the VMM page-table reclamation are covered by host tests with mutation checks, and the ring-3 programs ran under an emulator against a model of the syscalls. The syscall handlers themselves, the shootdown on real cores and the mutex under contention have not been booted by me. `vmshoot` and `vmrace` only mean something on two or more cores.
+- The kernel half of H3 (the file and pipe syscalls, `process_create`, the process handle, the sweeper, APX loading) has been compiled and linked; the APX parser and the ABI helpers are covered by host tests (an independent oracle checks every truncation, every single-byte and single-bit change and 400,000 random header rewrites, and mutation checks on the parser) and the C++ and Python packers produce identical images. The ring-3 programs ran under an emulator against a model of the syscalls. The handlers themselves have not been booted by me.
+- The thread count is capped at 16 per process.
 - A kill has no inter-processor interrupt behind it, so its latency is bounded by the timer tick and by scheduling, not by a fixed number.
 - The thread and kill tests were run on the host only as assembly logic under an emulator against a model of the syscalls; the kernel side (`userland.cpp`, the return hook, `user_enter` with an argument) has been compiled and linked but not booted by me.
 - `CR4.FSGSBASE` is off, so ring 3 cannot use `wrgsbase`. Turning it on needs a different test than the GS sign in the paranoid entry, because user code could then put a kernel-half value in GS.

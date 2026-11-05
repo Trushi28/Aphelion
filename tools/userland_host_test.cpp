@@ -6,6 +6,9 @@
 #include <cosmos/entrycheck.hpp>
 #include <cosmos/procgroup.hpp>
 #include <cosmos/handleabi.hpp>
+#include <cosmos/vmregion.hpp>
+#include <cosmos/apx.hpp>
+#include <cosmos/fileabi.hpp>
 #include <stdio.h>
 #include <pthread.h>
 
@@ -108,7 +111,7 @@ static void copy_tests() {
 }
 
 static void abi_tests() {
-    static_assert(userabi::SYS_COUNT == 18, "the native table has eighteen entries in this series");
+    static_assert(userabi::SYS_COUNT == 33, "the native table has thirty-three entries in this series");
     static_assert(userabi::SYS_THREAD_CREATE == 8 && userabi::SYS_THREAD_EXIT == 9 && userabi::SYS_THREAD_JOIN == 10, "the thread calls follow the FS ones");
     static_assert(!userabi::is_fault_status(userabi::STATUS_KILLED), "a kill is not mistaken for a fault");
     static_assert(userabi::MAX_LIVE_THREADS <= userabi::MAX_THREADS_TOTAL && userabi::MAX_THREADS_TOTAL < procgroup::LIVE_MAX, "the thread limits fit the group word");
@@ -707,6 +710,316 @@ static void procgroup_stress_test() {
     expect(ok, "group stress: 300 rounds of 6 racing threads end with one last leaver and a consistent status");
 }
 
+
+struct RefOps {
+    int refs[16] = {};
+    void retain(void* o) { ++refs[reinterpret_cast<usize>(o)]; }
+    void release(void* o) { --refs[reinterpret_cast<usize>(o)]; }
+};
+
+struct Cell {
+    int obj;
+    u32 offset;
+    u32 prot;
+    u32 max;
+    bool operator==(const Cell&) const = default;
+};
+
+struct PageModel {
+    static constexpr u32 SLOTS = 1024;
+    bool present[SLOTS] = {};
+    Cell cell[SLOTS] = {};
+    u32 total = 0;
+
+    u32 count(u64 page) const { return page < SLOTS && present[page] ? 1 : 0; }
+    u32 size() const { return total; }
+    void set(u64 page, const Cell& c) {
+        if (!present[page]) ++total;
+        present[page] = true;
+        cell[page] = c;
+    }
+    void erase(u64 page) {
+        if (present[page]) --total;
+        present[page] = false;
+    }
+    Cell* find(u64 page) { return page < SLOTS && present[page] ? &cell[page] : nullptr; }
+    bool operator==(const PageModel& o) const {
+        if (total != o.total) return false;
+        for (u32 i = 0; i < SLOTS; ++i) {
+            if (present[i] != o.present[i]) return false;
+            if (present[i] && !(cell[i] == o.cell[i])) return false;
+        }
+        return true;
+    }
+};
+
+static u64 page_of(u64 va) { return (va - vmregion::WINDOW_BASE) / vmregion::PAGE; }
+static u64 va_of(u64 page) { return vmregion::WINDOW_BASE + page * vmregion::PAGE; }
+
+template <u32 N>
+static PageModel expand(const vmregion::Map<N>& m) {
+    PageModel out;
+    for (u32 i = 0; i < m.count(); ++i) {
+        const vmregion::Region& r = m.at(i);
+        for (u32 k = 0; k < r.pages; ++k)
+            out.set(page_of(r.base) + k, Cell{ static_cast<int>(reinterpret_cast<usize>(r.object)), r.offset + k, r.prot, r.max });
+    }
+    return out;
+}
+
+template <u32 N>
+static bool refs_match(const vmregion::Map<N>& m, const RefOps& ops) {
+    int entries[16] = {};
+    for (u32 i = 0; i < m.count(); ++i) ++entries[reinterpret_cast<usize>(m.at(i).object)];
+    for (int id = 0; id < 16; ++id)
+        if (ops.refs[id] != entries[id]) return false;
+    return true;
+}
+
+template <u32 N>
+static bool fully_merged(const vmregion::Map<N>& m) {
+    for (u32 i = 0; i + 1 < m.count(); ++i)
+        if (vmregion::mergeable(m.at(i), m.at(i + 1))) return false;
+    return true;
+}
+
+static u32 rng_next(u64& s) {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return static_cast<u32>(s >> 11);
+}
+
+static void vmregion_basic_tests() {
+    using namespace vmregion;
+    expect(check_prot(PROT_READ, PROT_ALL) == Status::Ok, "vmregion: read is a valid protection");
+    expect(check_prot(PROT_READ | PROT_WRITE, PROT_ALL) == Status::Ok, "vmregion: read-write is valid");
+    expect(check_prot(PROT_READ | PROT_EXEC, PROT_ALL) == Status::Ok, "vmregion: read-execute is valid");
+    expect(check_prot(PROT_READ | PROT_WRITE | PROT_EXEC, PROT_ALL) == Status::Denied, "vmregion: write plus execute is denied");
+    expect(check_prot(PROT_WRITE, PROT_ALL) == Status::Invalid, "vmregion: write without read is invalid");
+    expect(check_prot(0, PROT_ALL) == Status::Invalid, "vmregion: no access is invalid");
+    expect(check_prot(PROT_READ | 8, PROT_ALL) == Status::Invalid, "vmregion: unknown bits are invalid");
+    expect(check_prot(PROT_READ | PROT_WRITE, PROT_READ) == Status::Denied, "vmregion: beyond the handle's maximum is denied");
+    expect(check_prot(PROT_READ, PROT_READ) == Status::Ok, "vmregion: equal to the maximum is fine");
+
+    expect(range_ok(WINDOW_BASE, 1), "vmregion: the first window page is valid");
+    expect(!range_ok(WINDOW_BASE - PAGE, 1), "vmregion: below the window is refused");
+    expect(!range_ok(WINDOW_END, 1), "vmregion: at the window end is refused");
+    expect(range_ok(WINDOW_END - PAGE, 1), "vmregion: the last window page is valid");
+    expect(!range_ok(WINDOW_END - PAGE, 2), "vmregion: running past the window end is refused");
+    expect(!range_ok(WINDOW_BASE + 1, 1), "vmregion: an unaligned base is refused");
+    expect(!range_ok(WINDOW_BASE, 0), "vmregion: zero pages is refused");
+    expect(!range_ok(WINDOW_BASE, MAX_MAPPED_PAGES + 1), "vmregion: more than the process limit is refused");
+    expect(!range_ok(~0ull & ~(PAGE - 1), 1), "vmregion: the top of the address space is refused");
+    expect(!range_ok(WINDOW_BASE, 0xFFFFFFFFull), "vmregion: a huge page count cannot wrap");
+
+    RefOps ops;
+    Map<> m;
+    u64 at = 0;
+    expect(m.find_gap(4, &at) == Status::Ok && at == WINDOW_BASE, "vmregion: an empty map hands out the window base");
+    ops.refs[1] = 1;
+    expect(m.insert({ WINDOW_BASE, 4, 0, PROT_READ, PROT_ALL, reinterpret_cast<void*>(1) }) == Status::Ok, "vmregion: first insert");
+    expect(m.find_gap(2, &at) == Status::Ok && at == WINDOW_BASE + 4 * PAGE, "vmregion: the next gap follows the first region");
+    expect(m.check_free(WINDOW_BASE + 3 * PAGE, 1) == Status::Exists, "vmregion: overlapping the last page is refused");
+    expect(m.check_free(WINDOW_BASE + 4 * PAGE, 1) == Status::Ok, "vmregion: the page after is free");
+    expect(m.check_free(WINDOW_BASE - PAGE, 2) == Status::Invalid, "vmregion: straddling the window start is invalid");
+    expect(m.insert({ WINDOW_BASE + 2 * PAGE, 1, 0, PROT_READ, PROT_ALL, reinterpret_cast<void*>(1) }) == Status::Exists, "vmregion: inserting inside is refused");
+    expect(m.insert({ WINDOW_BASE + 8 * PAGE, 1, 0, PROT_READ | PROT_WRITE | PROT_EXEC, PROT_ALL, reinterpret_cast<void*>(1) }) == Status::Invalid,
+           "vmregion: an invalid protection is refused at insert");
+    expect(m.insert({ WINDOW_BASE + 8 * PAGE, 1, 0, PROT_READ | PROT_WRITE, PROT_READ, reinterpret_cast<void*>(1) }) == Status::Invalid,
+           "vmregion: a protection above the maximum is refused at insert");
+    expect(m.find(WINDOW_BASE + 3 * PAGE + 5) && !m.find(WINDOW_BASE + 4 * PAGE), "vmregion: lookup respects the region end");
+    expect(m.unmap(WINDOW_BASE + 8 * PAGE, 1, ops) == Status::NotMapped, "vmregion: unmapping nothing reports not mapped");
+    expect(m.unmap(WINDOW_BASE + 3 * PAGE, 2, ops) == Status::NotMapped && m.count() == 1 && m.mapped_pages() == 4,
+           "vmregion: a range with a hole is refused and changes nothing");
+    expect(m.protect(WINDOW_BASE + 3 * PAGE, 2, PROT_READ, ops) == Status::NotMapped, "vmregion: protecting across a hole is refused");
+    expect(m.unmap(WINDOW_BASE + PAGE, 2, ops) == Status::Ok && m.count() == 2 && m.mapped_pages() == 2 && ops.refs[1] == 2,
+           "vmregion: punching a hole splits one region in two and takes a reference");
+    expect(m.at(0).pages == 1 && m.at(1).base == WINDOW_BASE + 3 * PAGE && m.at(1).offset == 3, "vmregion: the right half keeps its object offset");
+    m.clear(ops);
+    expect(m.count() == 0 && m.mapped_pages() == 0 && ops.refs[1] == 0, "vmregion: clear releases every reference");
+}
+
+template <u32 N>
+static void vmregion_model_run(u32 seed_index, u32 steps, u32 span, u32 max_len) {
+    using namespace vmregion;
+    u64 rng = 0x9E3779B97F4A7C15ull ^ (static_cast<u64>(seed_index) * 0xD1B54A32D192ED03ull);
+    RefOps ops;
+    Map<N> m;
+    PageModel model;
+    bool agree = true;
+    bool refs_ok = true;
+    bool merged_ok = true;
+    bool consistent_ok = true;
+    u32 limits = 0;
+    u32 done[6] = {};
+    for (u32 step = 0; step < steps && agree; ++step) {
+        u32 op = rng_next(rng) % 10;
+        u32 pages = 1 + rng_next(rng) % max_len;
+        u64 base_page = rng_next(rng) % span;
+        u64 base = va_of(base_page);
+        if (op < 4) {
+            int obj = 1 + static_cast<int>(rng_next(rng) % 5);
+            u32 max = PROT_READ | ((rng_next(rng) & 1) ? PROT_WRITE : 0) | ((rng_next(rng) & 1) ? PROT_EXEC : 0);
+            u32 choices[3] = { PROT_READ, PROT_READ | PROT_WRITE, PROT_READ | PROT_EXEC };
+            u32 prot = choices[rng_next(rng) % 3];
+            u32 offset = rng_next(rng) % 40;
+            bool fixed = rng_next(rng) & 1;
+            if (!fixed) {
+                u64 gap = 0;
+                Status g = m.find_gap(pages, &gap);
+                u64 expect_page = 0;
+                for (;; ++expect_page) {
+                    bool free_run = true;
+                    for (u32 k = 0; k < pages && free_run; ++k)
+                        if (model.count(expect_page + k)) { free_run = false; expect_page += k; }
+                    if (free_run) break;
+                }
+                if (g != Status::Ok || gap != va_of(expect_page)) agree = false;
+                base = gap;
+            }
+            ops.refs[obj]++;
+            Region r{ base, pages, offset, prot, max, reinterpret_cast<void*>(static_cast<usize>(obj)) };
+            Status want = Status::Ok;
+            for (u32 k = 0; k < pages && want == Status::Ok; ++k)
+                if (model.count(page_of(base) + k)) want = Status::Exists;
+            if (want == Status::Ok && check_prot(prot, max) != Status::Ok) want = Status::Invalid;
+            Status got = m.insert(r);
+            if (got == Status::Limit) {
+                ++limits;
+                ops.refs[obj]--;
+            } else {
+                if (got != want) agree = false;
+                if (got == Status::Ok) {
+                    for (u32 k = 0; k < pages; ++k) model.set(page_of(base) + k, Cell{ obj, offset + k, prot, max });
+                } else {
+                    ops.refs[obj]--;
+                }
+            }
+            ++done[0];
+        } else if (op < 7) {
+            bool whole = true;
+            for (u32 k = 0; k < pages; ++k) whole = whole && model.count(base_page + k);
+            Status got = m.unmap(base, pages, ops);
+            if (got == Status::Limit) {
+                ++limits;
+            } else {
+                if (got != (whole ? Status::Ok : Status::NotMapped)) agree = false;
+                if (got == Status::Ok)
+                    for (u32 k = 0; k < pages; ++k) model.erase(base_page + k);
+            }
+            ++done[1];
+        } else if (op < 9) {
+            u32 choices[5] = { PROT_READ, PROT_READ | PROT_WRITE, PROT_READ | PROT_EXEC, PROT_READ | PROT_WRITE | PROT_EXEC, PROT_WRITE };
+            u32 prot = choices[rng_next(rng) % 5];
+            bool whole = true;
+            bool allowed = true;
+            for (u32 k = 0; k < pages; ++k) {
+                Cell* c = model.find(base_page + k);
+                if (!c) { whole = false; continue; }
+                if (prot & ~c->max) allowed = false;
+            }
+            Status want = check_prot(prot, PROT_ALL);
+            if (want == Status::Ok) want = !whole ? Status::NotMapped : (allowed ? Status::Ok : Status::Denied);
+            Status got = m.protect(base, pages, prot, ops);
+            if (got == Status::Limit) {
+                ++limits;
+            } else {
+                if (got != want) agree = false;
+                if (got == Status::Ok) {
+                    for (u32 k = 0; k < pages; ++k) model.find(base_page + k)->prot = prot;
+                    if (!fully_merged(m)) merged_ok = false;
+                }
+            }
+            ++done[2];
+        } else {
+            const Region* r = m.find(base);
+            Cell* c = model.find(base_page);
+            if ((r != nullptr) != (c != nullptr)) agree = false;
+            else if (r && static_cast<int>(reinterpret_cast<usize>(r->object)) != c->obj) agree = false;
+            ++done[3];
+        }
+        if (!(expand(m) == model)) agree = false;
+        if (!refs_match(m, ops)) refs_ok = false;
+        if (!m.consistent()) consistent_ok = false;
+        if (m.mapped_pages() != model.size()) agree = false;
+    }
+    char label[128];
+    snprintf(label, sizeof(label), "vmregion: model run %u (%u regions max) agrees page by page", seed_index, N);
+    expect(agree, label);
+    expect(refs_ok, "vmregion: references always equal the number of entries");
+    expect(consistent_ok, "vmregion: entries stay sorted, disjoint and valid");
+    expect(merged_ok, "vmregion: protect leaves no mergeable neighbours");
+    expect(done[0] && done[1] && done[2], "vmregion: every operation kind ran");
+    m.clear(ops);
+    bool zero = true;
+    for (int id = 0; id < 16; ++id) zero = zero && ops.refs[id] == 0;
+    expect(zero, "vmregion: clearing releases everything the run took");
+    if (N < 16) expect(limits > 0, "vmregion: a small table hits its limit and stays consistent");
+}
+
+static void vmregion_limit_tests() {
+    using namespace vmregion;
+    RefOps ops;
+    Map<4> m;
+    void* obj = reinterpret_cast<void*>(1);
+    for (u32 i = 0; i < 4; ++i) {
+        ops.refs[1]++;
+        expect(m.insert({ WINDOW_BASE + i * 2 * PAGE, 1, 0, PROT_READ, PROT_ALL, obj }) == Status::Ok, "vmregion: filling the table");
+    }
+    ops.refs[1]++;
+    expect(m.insert({ WINDOW_BASE + 100 * PAGE, 1, 0, PROT_READ, PROT_ALL, obj }) == Status::Limit, "vmregion: a full table refuses another region");
+    ops.refs[1]--;
+    Map<4> one;
+    RefOps ops2;
+    ops2.refs[1] = 1;
+    one.insert({ WINDOW_BASE, 10, 0, PROT_READ, PROT_ALL, obj });
+    ops2.refs[1] = 1;
+    expect(one.protect(WINDOW_BASE + 9 * PAGE, 1, PROT_READ | PROT_WRITE, ops2) == Status::Ok && one.count() == 2, "vmregion: protecting the last page splits off one entry");
+    expect(one.protect(WINDOW_BASE + 7 * PAGE, 1, PROT_READ | PROT_WRITE, ops2) == Status::Ok && one.count() == 4, "vmregion: protecting a middle page splits into three");
+    expect(one.protect(WINDOW_BASE + 4 * PAGE, 1, PROT_READ | PROT_WRITE, ops2) == Status::Limit && one.count() == 4,
+           "vmregion: a split that would exceed the table is refused untouched");
+    expect(ops2.refs[1] == 4, "vmregion: references equal entries at the limit");
+    one.protect(WINDOW_BASE + 9 * PAGE, 1, PROT_READ, ops2);
+    one.protect(WINDOW_BASE + 7 * PAGE, 1, PROT_READ, ops2);
+    expect(one.count() == 1 && ops2.refs[1] == 1 && one.at(0).pages == 10, "vmregion: restoring the protection merges the region back");
+
+    Map<2> two;
+    RefOps ops3;
+    ops3.refs[1] = 1;
+    two.insert({ WINDOW_BASE, 10, 0, PROT_READ, PROT_ALL, obj });
+    expect(two.protect(WINDOW_BASE + 3 * PAGE, 2, PROT_READ | PROT_WRITE, ops3) == Status::Limit && two.count() == 1 && ops3.refs[1] == 1,
+           "vmregion: a middle protect needing two extra entries is refused untouched");
+    expect(two.unmap(WINDOW_BASE + 3 * PAGE, 2, ops3) == Status::Ok && two.count() == 2 && ops3.refs[1] == 2,
+           "vmregion: a hole needing one extra entry fits");
+    expect(two.unmap(WINDOW_BASE + 6 * PAGE, 1, ops3) == Status::Limit && two.count() == 2 && ops3.refs[1] == 2,
+           "vmregion: a second hole is refused untouched");
+    expect(two.unmap(WINDOW_BASE, 3, ops3) == Status::Ok && two.count() == 1 && ops3.refs[1] == 1, "vmregion: trimming the front needs no extra entry");
+
+    Map<8> adj;
+    RefOps ops4;
+    ops4.refs[1] = 2;
+    adj.insert({ WINDOW_BASE, 2, 0, PROT_READ, PROT_ALL, obj });
+    adj.insert({ WINDOW_BASE + 2 * PAGE, 2, 2, PROT_READ, PROT_ALL, obj });
+    expect(adj.count() == 2, "vmregion: insert alone does not merge");
+    expect(adj.protect(WINDOW_BASE, 4, PROT_READ, ops4) == Status::Ok && adj.count() == 1 && ops4.refs[1] == 1 && adj.at(0).pages == 4,
+           "vmregion: a no-op protect merges contiguous neighbours");
+    ops4.refs[2] = 1;
+    adj.insert({ WINDOW_BASE + 4 * PAGE, 2, 4, PROT_READ, PROT_ALL, reinterpret_cast<void*>(2) });
+    ops4.refs[1]++;
+    adj.insert({ WINDOW_BASE + 6 * PAGE, 2, 7, PROT_READ, PROT_ALL, obj });
+    adj.protect(WINDOW_BASE, 8, PROT_READ, ops4);
+    expect(adj.count() == 3, "vmregion: different objects or non-contiguous offsets never merge");
+    adj.clear(ops4);
+}
+
+static void vmregion_tests() {
+    vmregion_basic_tests();
+    vmregion_limit_tests();
+    for (u32 i = 0; i < 6; ++i) vmregion_model_run<64>(i, 6000, 120, 24);
+    for (u32 i = 0; i < 4; ++i) vmregion_model_run<6>(100 + i, 4000, 40, 8);
+}
+
 static void handle_abi_tests() {
     using lens::Status;
     static_assert(userabi::SYS_HANDLE_CLOSE == 11 && userabi::SYS_HANDLE_WAIT == 17, "the handle calls follow the thread ones");
@@ -755,9 +1068,322 @@ static void handle_abi_tests() {
     expect(handleabi::recv_pack(0xFFFFFFFFu, 0x7FFFFFFFu) > 0, "recv: even extreme values never look like an error");
     expect(handleabi::wait_want_ok(1) && handleabi::wait_want_ok(7) && !handleabi::wait_want_ok(0) && !handleabi::wait_want_ok(8) && !handleabi::wait_want_ok(0x100),
            "wait: only the three readiness bits are accepted, and at least one");
-    expect(lens::RIGHTS_ALL_BITS == 0x1FF, "rights: the nine rights occupy the low nine bits");
+    expect(lens::RIGHTS_ALL_BITS == 0x3FF, "rights: the ten rights occupy the low ten bits");
     expect(static_cast<u16>(lens::Right::Read) == 1 && static_cast<u16>(lens::Right::Write) == 2 && static_cast<u16>(lens::Right::Delegate) == 0x100,
            "rights: the bit values the ring-3 test programs assume");
+    expect(static_cast<u16>(lens::Right::Execute) == 0x200, "rights: execute is bit nine");
+}
+
+static void vm_abi_tests() {
+    using vmregion::Status;
+    expect(userabi::SYS_VMO_CREATE == 18 && userabi::SYS_VM_MAP == 19 && userabi::SYS_VM_UNMAP == 20 && userabi::SYS_VM_PROTECT == 21 &&
+           userabi::SYS_VMO_SIZE == 22 && userabi::SYS_COUNT == 33, "vm abi: syscall numbers 18 to 22");
+    expect(handleabi::ERR_EXISTS == -12 && handleabi::ERR_NOTMAPPED == -13, "vm abi: new error codes continue the series");
+    expect(handleabi::vm_error(Status::Ok) == 0 && handleabi::vm_error(Status::Invalid) == userabi::ERR_INVAL &&
+           handleabi::vm_error(Status::Denied) == handleabi::ERR_DENIED && handleabi::vm_error(Status::Exists) == handleabi::ERR_EXISTS &&
+           handleabi::vm_error(Status::Limit) == userabi::ERR_LIMIT && handleabi::vm_error(Status::NotMapped) == handleabi::ERR_NOTMAPPED,
+           "vm abi: every region status maps to its own code");
+    u64 info = handleabi::info_pack(0x3FF, 3, handleabi::SUBTYPE_MEMOBJ);
+    expect(handleabi::info_rights(info) == 0x3FF && handleabi::info_kind(info) == 3 && handleabi::info_subtype(info) == 2 && info > 0,
+           "vm abi: info carries the stream subtype and stays positive");
+    expect(handleabi::info_pack(0x103, 3) == 0x30103, "vm abi: the subtype defaults to none and the old packing is unchanged");
+
+    expect(vmregion::pte_flags(vmregion::PROT_READ) == vmregion::PTE_NO_EXECUTE, "vm abi: read maps NX");
+    expect(vmregion::pte_flags(vmregion::PROT_READ | vmregion::PROT_WRITE) == (vmregion::PTE_NO_EXECUTE | vmregion::PTE_WRITABLE), "vm abi: read-write maps NX and writable");
+    expect(vmregion::pte_flags(vmregion::PROT_READ | vmregion::PROT_EXEC) == 0, "vm abi: read-execute maps executable and read-only");
+    bool wx = false;
+    for (u32 prot = 0; prot < 16; ++prot) {
+        if (vmregion::check_prot(prot, vmregion::PROT_ALL) != Status::Ok) continue;
+        u64 f = vmregion::pte_flags(prot);
+        if ((f & vmregion::PTE_WRITABLE) && !(f & vmregion::PTE_NO_EXECUTE)) wx = true;
+    }
+    expect(!wx, "vm abi: no accepted protection yields a writable and executable page");
+}
+
+static u64 xs_state = 0x9E3779B97F4A7C15ull;
+static u64 xs() {
+    xs_state ^= xs_state << 13;
+    xs_state ^= xs_state >> 7;
+    xs_state ^= xs_state << 17;
+    return xs_state;
+}
+
+static bool apx_oracle(const u8* b, u64 n) {
+    if (n < 64) return false;
+    auto r32 = [&](int o) { return static_cast<u64>(b[o]) | (static_cast<u64>(b[o + 1]) << 8) | (static_cast<u64>(b[o + 2]) << 16) | (static_cast<u64>(b[o + 3]) << 24); };
+    if (r32(0) != 0x31585041ull) return false;
+    if ((b[4] | (b[5] << 8)) != 1) return false;
+    if ((b[6] | (b[7] << 8)) != 64) return false;
+    for (int i = 44; i < 64; ++i) if (b[i]) return false;
+    u64 flags = r32(8), coff = r32(12), cbytes = r32(16), entry = r32(20), dpages = r32(24), doff = r32(28), dbytes = r32(32), fbytes = r32(36), sum = r32(40);
+    if (flags) return false;
+    if (cbytes == 0 || cbytes > 64ull * 4096) return false;
+    if (dpages > 64) return false;
+    if (dbytes > dpages * 4096) return false;
+    if (entry >= cbytes) return false;
+    if (coff % 16 || doff % 16) return false;
+    if (coff < 64) return false;
+    if (n > 64 + 2ull * 64 * 4096) return false;
+    if (fbytes != n) return false;
+    if (coff + cbytes > n) return false;
+    u64 end = coff + cbytes;
+    if (dbytes == 0) {
+        if (doff != 0) return false;
+    } else {
+        if (doff < 64 || doff + dbytes > n) return false;
+        bool disjoint = doff + dbytes <= coff || doff >= coff + cbytes;
+        if (!disjoint) return false;
+        if (doff + dbytes > end) end = doff + dbytes;
+    }
+    if (end != n) return false;
+    u32 c = 0xFFFFFFFFu;
+    for (u64 i = 64; i < n; ++i) {
+        c ^= b[i];
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return static_cast<u64>(~c) == sum;
+}
+
+static usize apx_build(u8* out, usize cap, u32 code_bytes, u32 entry, u32 dpages, u32 dbytes, u8 seed) {
+    static u8 code[apx::MAX_CODE_BYTES + 16];
+    static u8 data[apx::MAX_DATA_BYTES + 16];
+    for (u32 i = 0; i < code_bytes; ++i) code[i] = static_cast<u8>(seed + i * 7);
+    for (u32 i = 0; i < dbytes; ++i) data[i] = static_cast<u8>(seed ^ (i * 13));
+    usize w = 0;
+    if (!apx::pack(code, code_bytes, entry, dpages, data, dbytes, out, cap, &w)) return 0;
+    return w;
+}
+
+static void apx_tests() {
+    static u8 buf[apx::MAX_FILE_BYTES + 64];
+
+    struct Tiny {
+        u8 bytes[128];
+        usize n;
+    };
+    constexpr Tiny tiny = [] {
+        constexpr u8 tiny_code[4] = { 0x90, 0x90, 0xC3, 0xCC };
+        Tiny t{};
+        apx::pack(tiny_code, 4, 2, 1, nullptr, 0, t.bytes, 128, &t.n);
+        return t;
+    }();
+    static_assert(tiny.n == 68, "a header plus four code bytes");
+    static_assert(apx::parse(tiny.bytes, tiny.n).status == apx::Status::Ok, "a packed image parses at compile time");
+    expect(apx::crc32(reinterpret_cast<const u8*>("123456789"), 9) == 0xCBF43926u, "crc32 matches the standard check value");
+
+    struct Shape { u32 code, entry, dpages, dbytes; };
+    const Shape shapes[] = {
+        { 1, 0, 0, 0 }, { 4096, 4095, 0, 0 }, { 100, 50, 1, 0 }, { 100, 99, 1, 1 }, { 4097, 4096, 2, 4096 },
+        { 17, 3, 8, 8 * 4096 }, { 64 * 4096, 64 * 4096 - 1, 64, 64 * 4096 }, { 64 * 4096, 0, 0, 0 }, { 33, 32, 64, 4095 },
+    };
+    bool all_round = true;
+    for (const Shape& sh : shapes) {
+        usize n = apx_build(buf, sizeof(buf), sh.code, sh.entry, sh.dpages, sh.dbytes, static_cast<u8>(sh.code));
+        apx::Parsed p = apx::parse(buf, n);
+        bool ok = n != 0 && p.status == apx::Status::Ok && p.header.code_bytes == sh.code && p.header.entry_offset == sh.entry &&
+                  p.header.data_pages == sh.dpages && p.header.data_bytes == sh.dbytes && p.header.file_bytes == n &&
+                  p.header.code_offset == 64 && apx_oracle(buf, n);
+        if (ok && sh.dbytes) ok = p.header.data_offset % 16 == 0 && p.header.data_offset >= 64 + sh.code && p.header.data_offset < 64 + sh.code + 16;
+        if (!ok) all_round = false;
+    }
+    expect(all_round, "apx: packed images of every shape parse and match the oracle");
+
+    expect(apx_build(buf, sizeof(buf), 64 * 4096 + 1, 0, 0, 0, 1) != 0 ? apx::parse(buf, apx::pack_size(64 * 4096 + 1, 0)).status == apx::Status::CodeTooLarge : true,
+           "apx: code above the limit is refused");
+
+    usize n = apx_build(buf, sizeof(buf), 300, 17, 2, 120, 5);
+    static u8 good[apx::MAX_FILE_BYTES + 64];
+    for (usize i = 0; i < n; ++i) good[i] = buf[i];
+
+    bool trunc_ok = true;
+    for (usize t = 0; t < n; ++t) {
+        apx::Parsed p = apx::parse(good, t);
+        if (p.status == apx::Status::Ok || apx_oracle(good, t)) trunc_ok = false;
+    }
+    expect(trunc_ok, "apx: every truncation of a valid image is refused");
+
+    bool grow_ok = true;
+    for (usize extra = 1; extra < 40; ++extra) {
+        for (usize i = 0; i < n; ++i) buf[i] = good[i];
+        for (usize i = 0; i < extra; ++i) buf[n + i] = static_cast<u8>(i);
+        if (apx::parse(buf, n + extra).status == apx::Status::Ok) grow_ok = false;
+    }
+    expect(grow_ok, "apx: trailing bytes are refused");
+
+    u64 mismatches = 0, accepted = 0, rejected = 0;
+    for (usize pos = 0; pos < n; ++pos) {
+        for (u32 v = 0; v < 256; ++v) {
+            if (v == good[pos]) continue;
+            for (usize i = 0; i < n; ++i) buf[i] = good[i];
+            buf[pos] = static_cast<u8>(v);
+            bool a = apx::parse(buf, n).status == apx::Status::Ok;
+            bool o = apx_oracle(buf, n);
+            if (a != o) ++mismatches;
+            if (a) ++accepted; else ++rejected;
+            if (pos >= 64 && a) ++mismatches;
+        }
+    }
+    expect(mismatches == 0, "apx: every single-byte mutation agrees with the independent oracle");
+    expect(rejected > accepted, "apx: most single-byte mutations are refused");
+    printf("    (%llu accepted, %llu refused)\n", static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(rejected));
+
+    u64 bit_miss = 0;
+    for (usize pos = 0; pos < n; ++pos) {
+        for (int bit = 0; bit < 8; ++bit) {
+            for (usize i = 0; i < n; ++i) buf[i] = good[i];
+            buf[pos] ^= static_cast<u8>(1u << bit);
+            if ((apx::parse(buf, n).status == apx::Status::Ok) != apx_oracle(buf, n)) ++bit_miss;
+        }
+    }
+    expect(bit_miss == 0, "apx: every single-bit flip agrees with the oracle");
+
+    u64 field_miss = 0, field_ok = 0;
+    for (int round = 0; round < 400000; ++round) {
+        for (usize i = 0; i < n; ++i) buf[i] = good[i];
+        int fields = 1 + static_cast<int>(xs() % 3);
+        for (int f = 0; f < fields; ++f) {
+            int off = static_cast<int>((xs() % 11) * 4);
+            u32 v;
+            switch (xs() % 7) {
+                case 0: v = 0; break;
+                case 1: v = 0xFFFFFFFFu; break;
+                case 2: v = 0xFFFFFFF0u; break;
+                case 3: v = static_cast<u32>(xs()); break;
+                case 4: v = static_cast<u32>(xs() % 0x20000); break;
+                case 5: v = static_cast<u32>(n + (xs() % 5)) - 2; break;
+                default: v = static_cast<u32>(xs() % 600); break;
+            }
+            if (off == 0 && (xs() & 3)) continue;
+            if (off == 4 && (xs() & 3)) continue;
+            apx::wr32(buf + off, v);
+        }
+        if (xs() & 1) {
+            u32 crc = apx::crc32(buf + 64, n - 64);
+            apx::wr32(buf + 40, crc);
+        }
+        bool a = apx::parse(buf, n).status == apx::Status::Ok;
+        bool o = apx_oracle(buf, n);
+        if (a != o) ++field_miss;
+        if (a) ++field_ok;
+    }
+    expect(field_miss == 0, "apx: 400k random header-field rewrites agree with the oracle");
+    expect(field_ok > 0, "apx: the field fuzz reached accepted images");
+
+    u64 rand_miss = 0;
+    for (int round = 0; round < 20000; ++round) {
+        usize len = static_cast<usize>(xs() % 300);
+        for (usize i = 0; i < len; ++i) buf[i] = static_cast<u8>(xs());
+        if (apx::parse(buf, len).status == apx::Status::Ok || apx_oracle(buf, len)) ++rand_miss;
+    }
+    expect(rand_miss == 0, "apx: random garbage is never accepted");
+
+    u64 big_miss = 0;
+    for (int round = 0; round < 250; ++round) {
+        u32 cb = 1 + static_cast<u32>(xs() % (64 * 4096));
+        u32 dp = static_cast<u32>(xs() % 65);
+        u32 db = dp ? static_cast<u32>(xs() % (dp * 4096ull + 1)) : 0;
+        u32 en = static_cast<u32>(xs() % cb);
+        usize w = apx_build(buf, sizeof(buf), cb, en, dp, db, static_cast<u8>(round));
+        if (!w) { ++big_miss; continue; }
+        if (apx::parse(buf, w).status != apx::Status::Ok || !apx_oracle(buf, w)) ++big_miss;
+        if (apx::parse(buf, w - 1).status == apx::Status::Ok) ++big_miss;
+        usize flip = static_cast<usize>(xs() % w);
+        buf[flip] ^= static_cast<u8>(1u << (xs() % 8));
+        if ((apx::parse(buf, w).status == apx::Status::Ok) != apx_oracle(buf, w)) ++big_miss;
+    }
+    expect(big_miss == 0, "apx: 250 random shapes round-trip, refuse truncation, and agree with the oracle after a flip");
+
+    for (usize i = 0; i < n; ++i) buf[i] = good[i];
+    apx::Parsed head = apx::parse_header(buf, 64, n);
+    expect(head.status == apx::Status::Ok, "apx: the header alone validates against the full file size");
+    expect(apx::parse_header(buf, 63, n).status == apx::Status::Truncated, "apx: a short header read is Truncated");
+    expect(apx::parse_header(buf, 64, n + 1).status == apx::Status::SizeMismatch, "apx: a wrong file size is refused");
+    expect(apx::parse_header(buf, 64, 0xFFFFFFFFFFull).status == apx::Status::SizeMismatch, "apx: an enormous file size is refused");
+    const char* names[] = { apx::status_name(apx::Status::Ok), apx::status_name(apx::Status::BadChecksum), apx::status_name(apx::Status::Overlap) };
+    expect(names[0][0] == 'o' && names[1][0] == 'c' && names[2][0] == 's', "apx: status names are populated");
+}
+
+static usize apx_forge(u8* out, usize cap, u32 code_off, u32 code_bytes, u32 entry, u32 dpages, u32 data_off, u32 data_bytes, usize total) {
+    if (total > cap) return 0;
+    for (usize i = 0; i < total; ++i) out[i] = static_cast<u8>(i * 31 + 7);
+    apx::Header h{};
+    h.code_offset = code_off;
+    h.code_bytes = code_bytes;
+    h.entry_offset = entry;
+    h.data_pages = dpages;
+    h.data_offset = data_off;
+    h.data_bytes = data_bytes;
+    h.file_bytes = static_cast<u32>(total);
+    h.checksum = apx::crc32(out + 64, total - 64);
+    apx::encode(h, out);
+    return total;
+}
+
+static void apx_layout_tests() {
+    static u8 big[0x100200];
+    auto st = [&](u32 co, u32 cb, u32 en, u32 dp, u32 doff, u32 db, usize total) {
+        usize n = apx_forge(big, sizeof(big), co, cb, en, dp, doff, db, total);
+        return apx::parse(big, n).status;
+    };
+    expect(st(64, 100, 0, 1, 176, 16, 192) == apx::Status::Ok, "apx layout: code then aligned data is accepted");
+    expect(st(64, 100, 0, 1, 165, 16, 181) == apx::Status::Misaligned, "apx layout: an unaligned data section is refused");
+    expect(st(65, 100, 0, 1, 0, 0, 165) == apx::Status::Misaligned, "apx layout: an unaligned code section is refused");
+    expect(st(64, 100, 0, 1, 16, 16, 164) == apx::Status::BadDataRange, "apx layout: data inside the header is refused");
+    expect(st(128, 100, 0, 0, 0, 0, 228) == apx::Status::Ok, "apx layout: padding between the header and the code is accepted");
+    expect(st(0x100000, 16, 0, 0, 0, 0, 0x100010) == apx::Status::SizeMismatch, "apx layout: a padded file above the size cap is refused");
+    expect(st(64 + 4096, 16, 0, 1, 64, 16, 64 + 4096 + 16) == apx::Status::Ok, "apx layout: data placed before the code is accepted");
+    expect(st(64, 100, 0, 1, 80, 16, 164) == apx::Status::Overlap, "apx layout: data inside the code is refused");
+    expect(st(64, 100, 100, 1, 176, 16, 192) == apx::Status::BadEntry, "apx layout: an entry one past the code is refused");
+    expect(st(64, 100, 99, 1, 176, 16, 192) == apx::Status::Ok, "apx layout: the last code byte is a valid entry");
+    expect(st(64, 100, 0, 0, 176, 16, 192) == apx::Status::DataTooLarge, "apx layout: data without pages is refused");
+    expect(st(64, 100, 0, 1, 0, 0, 164) == apx::Status::Ok, "apx layout: data pages without initial data are accepted");
+    expect(st(64, 100, 0, 1, 64, 0, 164) == apx::Status::BadDataRange, "apx layout: a data offset without data is refused");
+}
+
+static void file_abi_tests() {
+    using lens::Status;
+    static_assert(userabi::SYS_FILE_OPEN == 23 && userabi::SYS_PROCESS_KILL == 32, "syscall numbers 23 to 32");
+    expect(userabi::SYS_FILE_OPEN == 23 && userabi::SYS_FILE_READ == 24 && userabi::SYS_FILE_WRITE == 25 && userabi::SYS_FILE_STAT == 26 &&
+               userabi::SYS_FILE_CREATE == 27 && userabi::SYS_DIR_ENTRY == 28 && userabi::SYS_PIPE_CREATE == 29 &&
+               userabi::SYS_PROCESS_CREATE == 30 && userabi::SYS_PROCESS_STATUS == 31 && userabi::SYS_PROCESS_KILL == 32,
+           "file abi: syscall numbers 23 to 32");
+    expect(fileabi::path_len_ok(1) && fileabi::path_len_ok(255) && !fileabi::path_len_ok(0) && !fileabi::path_len_ok(256) && !fileabi::path_len_ok(~0ull),
+           "file abi: path lengths 1 to 255 only");
+    expect(fileabi::path_text_ok("a/b", 3) && !fileabi::path_text_ok("a\0b", 3) && !fileabi::path_text_ok("a", 0), "file abi: embedded NULs are refused");
+    expect(fileabi::rights_ok(0x3FF) && fileabi::rights_ok(0) && !fileabi::rights_ok(0x400) && !fileabi::rights_ok(0x10000) && !fileabi::rights_ok(1ull << 40),
+           "file abi: only the ten defined rights are accepted");
+    expect(fileabi::clamp_io(0) == 0 && fileabi::clamp_io(1) == 1 && fileabi::clamp_io(1024) == 1024 && fileabi::clamp_io(1025) == 1024 && fileabi::clamp_io(~0ull) == 1024,
+           "file abi: a transfer is clamped to 1024 bytes");
+    expect(fileabi::error_of(Status::NotFound) == fileabi::ERR_NOTFOUND && fileabi::error_of(Status::Exists) == handleabi::ERR_EXISTS &&
+               fileabi::error_of(Status::NotADirectory) == fileabi::ERR_WRONGTYPE && fileabi::error_of(Status::IsADirectory) == fileabi::ERR_WRONGTYPE &&
+               fileabi::error_of(Status::NotAFile) == fileabi::ERR_WRONGTYPE,
+           "file abi: not-found, exists and wrong-type have their own codes");
+    expect(fileabi::error_of(Status::Denied) == handleabi::ERR_DENIED && fileabi::error_of(Status::NotReady) == handleabi::ERR_AGAIN &&
+               fileabi::error_of(Status::Closed) == handleabi::ERR_CLOSED && fileabi::error_of(Status::StaleLens) == handleabi::ERR_BADHANDLE &&
+               fileabi::error_of(Status::NoSpace) == userabi::ERR_LIMIT,
+           "file abi: other statuses keep the handle ABI codes");
+    bool distinct = true;
+    const i64 codes[] = { userabi::ERR_NOSYS, userabi::ERR_FAULT, userabi::ERR_INVAL, userabi::ERR_LIMIT, handleabi::ERR_AGAIN, handleabi::ERR_CLOSED,
+                          handleabi::ERR_DENIED, handleabi::ERR_BADHANDLE, handleabi::ERR_TOOBIG, handleabi::ERR_TIMEDOUT, handleabi::ERR_CANCELLED,
+                          handleabi::ERR_EXISTS, handleabi::ERR_NOTMAPPED, handleabi::ERR_BADIMAGE, fileabi::ERR_NOTFOUND, fileabi::ERR_WRONGTYPE };
+    for (usize i = 0; i < sizeof(codes) / sizeof(codes[0]); ++i)
+        for (usize j = i + 1; j < sizeof(codes) / sizeof(codes[0]); ++j)
+            if (codes[i] == codes[j]) distinct = false;
+    expect(distinct, "file abi: every error code is distinct");
+    expect(fileabi::stat_flags(false, false) == 0 && fileabi::stat_flags(true, false) == fileabi::STAT_READ_ONLY &&
+               fileabi::stat_flags(false, true) == fileabi::STAT_DYNAMIC && fileabi::stat_flags(true, true) == 3,
+           "file abi: stat flags");
+    expect(handleabi::info_subtype(handleabi::info_pack(5, 3, static_cast<u8>(handleabi::SUBTYPE_PROCESS))) == 3, "file abi: the process subtype round-trips through handle_info");
+    expect(fileabi::PROCESS_RIGHTS.has(lens::Right::Read) && fileabi::PROCESS_RIGHTS.has(lens::Right::Write) && fileabi::PROCESS_RIGHTS.has(lens::Right::Delegate) &&
+               !fileabi::PROCESS_RIGHTS.has(lens::Right::Execute),
+           "file abi: a process handle carries read, write and delegate");
+    expect(fileabi::LAUNCH_RIGHTS.has_all(lens::Right::Read | lens::Right::Execute) && !fileabi::LAUNCH_RIGHTS.has(lens::Right::Write),
+           "file abi: launching needs read and execute");
+    expect(sizeof(fileabi::Stat) == 32 && sizeof(fileabi::DirEntry) == 280 && fileabi::MAX_PIPE_BYTES == 65536, "file abi: record sizes");
+    expect(apx::MAX_FILE_BYTES == 64 + 64ull * 4096 * 2, "file abi: the largest image is a header plus the code and data limits");
+    expect(userabi::CODE_BASE + static_cast<u64>(userabi::MAX_CODE_PAGES) * 4096 <= userabi::DATA_BASE &&
+               userabi::DATA_BASE + static_cast<u64>(userabi::MAX_DATA_PAGES) * 4096 < userabi::STACK_TOP - userabi::STACK_PAGES * 4096ull,
+           "file abi: the raised code and data limits still fit their regions");
 }
 
 int main() {
@@ -773,6 +1399,11 @@ int main() {
     procgroup_model_test();
     procgroup_stress_test();
     handle_abi_tests();
+    vmregion_tests();
+    vm_abi_tests();
+    apx_tests();
+    apx_layout_tests();
+    file_abi_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

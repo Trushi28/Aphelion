@@ -19,7 +19,27 @@ default rel
 %define SYS_CHANNEL_SEND 15
 %define SYS_CHANNEL_RECV 16
 %define SYS_HANDLE_WAIT 17
-%define INFO_END 0x30103
+%define SYS_VMO_CREATE 18
+%define SYS_VM_MAP 19
+%define SYS_VM_UNMAP 20
+%define SYS_VM_PROTECT 21
+%define SYS_VMO_SIZE 22
+%define SYS_FILE_OPEN 23
+%define SYS_FILE_READ 24
+%define SYS_FILE_WRITE 25
+%define SYS_FILE_STAT 26
+%define SYS_FILE_CREATE 27
+%define SYS_DIR_ENTRY 28
+%define SYS_PIPE_CREATE 29
+%define SYS_PROCESS_CREATE 30
+%define SYS_PROCESS_STATUS 31
+%define SYS_PROCESS_KILL 32
+%define INFO_PROC 0x3030103
+%define INFO_END 0x1030103
+%define INFO_VMO 0x2030303
+%define INFO_VMO_RO 0x2030001
+%define INFO_VMO_RO_DELEGATE 0x2030101
+%define WIN 0x100000000000
 %define DATA 0x800000
 %define STK0 0x801100
 
@@ -1273,7 +1293,7 @@ BLOB chanlimits
     SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, DATA+0x210, 1, 0
     EXPECT rax, -7, 13
     SC SYS_HANDLE_INFO, rbp, 0, 0, 0, 0, 0
-    EXPECT rax, 0x30003, 14
+    EXPECT rax, 0x1030003, 14
     SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
     EXPECT rax, 0, 15
     SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
@@ -1405,5 +1425,805 @@ BLOB chanlimits
     EXPECT rax, -6, 54
     EXIT 0
 ENDBLOB chanlimits
+
+%macro VMOMK 3
+    SC SYS_VMO_CREATE, %1, 0, DATA+0x300, 0, 0, 0
+    EXPECT rax, 0, %3
+    mov %2, [r15 + 0x300]
+%endmacro
+
+align 16
+BLOB vmbasic
+    mov r15, DATA
+    SC SYS_VMO_CREATE, 0, 0, DATA+0x300, 0, 0, 0
+    EXPECT rax, -3, 1
+    SC SYS_VMO_CREATE, 4097, 0, DATA+0x300, 0, 0, 0
+    EXPECT rax, -9, 2
+    SC SYS_VMO_CREATE, 4, 1, DATA+0x300, 0, 0, 0
+    EXPECT rax, -3, 3
+    SC SYS_VMO_CREATE, 4, 0, 0xFFFF800000000000, 0, 0, 0
+    EXPECT rax, -2, 4
+    VMOMK 4, r14, 5
+    SC SYS_HANDLE_INFO, r14, 0, 0, 0, 0, 0
+    EXPECT rax, INFO_VMO, 6
+    SC SYS_VMO_SIZE, r14, 0, 0, 0, 0, 0
+    EXPECT rax, 4, 7
+    SC SYS_VMO_SIZE, 0x7777777700000099, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 8
+    SC SYS_VM_MAP, r14, 0, 0, 4, 3, 0
+    EXPECT rax, WIN, 9
+    mov r13, rax
+    mov rbx, 0x1122334455667788
+    mov [r13], rbx
+    mov [r13 + 0x3FF8], rbx
+    mov rax, [r13]
+    cmp rax, rbx
+    je .a
+    EXIT 10
+.a:
+    SC SYS_VM_MAP, r14, 0, 0, 4, 1, 0
+    EXPECT rax, WIN+0x4000, 11
+    mov r12, rax
+    mov rax, [r12 + 0x3FF8]
+    cmp rax, rbx
+    je .b
+    EXIT 12
+.b:
+    mov qword [r13 + 0x1000], 0x5A5A5A5A
+    cmp qword [r12 + 0x1000], 0x5A5A5A5A
+    je .c
+    EXIT 13
+.c:
+    SC SYS_VM_MAP, r14, WIN+0x1000, 0, 1, 1, 0
+    EXPECT rax, -12, 14
+    SC SYS_VM_MAP, r14, 0, 0, 1, 7, 0
+    EXPECT rax, -7, 15
+    SC SYS_VM_MAP, r14, 0, 0, 1, 2, 0
+    EXPECT rax, -3, 16
+    SC SYS_VM_MAP, r14, 0, 0, 1, 0, 0
+    EXPECT rax, -3, 17
+    SC SYS_VM_MAP, r14, 0, 0, 1, 8, 0
+    EXPECT rax, -3, 18
+    SC SYS_VM_MAP, r14, 0, 3, 2, 1, 0
+    EXPECT rax, -3, 19
+    SC SYS_VM_MAP, r14, 0, 0, 0, 1, 0
+    EXPECT rax, -3, 20
+    SC SYS_VM_MAP, r14, 0x400000, 0, 1, 1, 0
+    EXPECT rax, -3, 21
+    SC SYS_VM_MAP, r14, WIN+0x20001, 0, 1, 1, 0
+    EXPECT rax, -3, 22
+    SC SYS_VM_MAP, r14, 0x7F0000000000, 0, 1, 1, 0
+    EXPECT rax, -3, 23
+    SC SYS_VM_MAP, 0x7777777700000099, 0, 0, 1, 1, 0
+    EXPECT rax, -8, 24
+    SC SYS_VM_MAP, 0, 0, 0, 1, 1, 0
+    EXPECT rax, -8, 25
+    SC SYS_VM_MAP, r14, WIN+0x20000, 0, 1, 1, 0
+    EXPECT rax, WIN+0x20000, 26
+    SC SYS_VM_UNMAP, WIN+0x20000, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 27
+    SC SYS_CHANNEL_CREATE, DATA+0x320, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 28
+    mov rbx, [r15 + 0x320]
+    SC SYS_VM_MAP, rbx, 0, 0, 1, 1, 0
+    EXPECT rax, -3, 29
+    SC SYS_VMO_SIZE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 30
+    SC SYS_HANDLE_NARROW, r14, 1, DATA+0x330, 0, 0, 0
+    EXPECT rax, 0, 31
+    mov rbx, [r15 + 0x330]
+    SC SYS_HANDLE_INFO, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, INFO_VMO_RO, 32
+    SC SYS_VM_MAP, rbx, 0, 0, 1, 3, 0
+    EXPECT rax, -7, 33
+    SC SYS_VM_MAP, rbx, 0, 0, 1, 5, 0
+    EXPECT rax, -7, 34
+    SC SYS_VM_MAP, rbx, 0, 0, 1, 1, 0
+    EXPECT rax, WIN+0x8000, 35
+    mov rbp, rax
+    SC SYS_VM_PROTECT, rbp, 1, 3, 0, 0, 0
+    EXPECT rax, -7, 36
+    SC SYS_VM_PROTECT, rbp, 1, 1, 0, 0, 0
+    EXPECT rax, 0, 37
+    SC SYS_VM_PROTECT, rbp, 2, 1, 0, 0, 0
+    EXPECT rax, -13, 38
+    SC SYS_VM_PROTECT, r13, 4, 7, 0, 0, 0
+    EXPECT rax, -7, 39
+    SC SYS_VM_PROTECT, r13, 4, 2, 0, 0, 0
+    EXPECT rax, -3, 40
+    SC SYS_VM_PROTECT, r13, 0, 1, 0, 0, 0
+    EXPECT rax, -3, 41
+    mov byte [r13], 0xC3
+    cmp byte [r12], 0xC3
+    je .d
+    EXIT 42
+.d:
+    SC SYS_VM_PROTECT, r13, 1, 5, 0, 0, 0
+    EXPECT rax, 0, 43
+    call r13
+    SC SYS_VM_PROTECT, r13, 1, 3, 0, 0, 0
+    EXPECT rax, 0, 44
+    mov byte [r13], 0x90
+    cmp byte [r12], 0x90
+    je .e
+    EXIT 45
+.e:
+    lea rbx, [r13 + 0x1000]
+    SC SYS_VM_UNMAP, rbx, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 46
+    mov rax, [r13]
+    mov rax, [r13 + 0x2000]
+    SC SYS_VM_UNMAP, rbx, 1, 0, 0, 0, 0
+    EXPECT rax, -13, 47
+    SC SYS_VM_PROTECT, r13, 4, 1, 0, 0, 0
+    EXPECT rax, -13, 48
+    SC SYS_VM_UNMAP, r13, 4, 0, 0, 0, 0
+    EXPECT rax, -13, 49
+    mov rax, [r13 + 0x3FF8]
+    SC SYS_VM_UNMAP, r13, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 50
+    lea rbx, [r13 + 0x2000]
+    SC SYS_VM_UNMAP, rbx, 2, 0, 0, 0, 0
+    EXPECT rax, 0, 51
+    cmp qword [r12 + 0x1000], 0x5A5A5A5A
+    je .f
+    EXIT 52
+.f:
+    SC SYS_HANDLE_CLOSE, r14, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 53
+    SC SYS_VMO_SIZE, r14, 0, 0, 0, 0, 0
+    EXPECT rax, -8, 54
+    mov rbx, [r15 + 0x330]
+    SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 60
+    cmp qword [r12 + 0x1000], 0x5A5A5A5A
+    je .g
+    EXIT 55
+.g:
+    SC SYS_VM_UNMAP, r12, 4, 0, 0, 0, 0
+    EXPECT rax, 0, 56
+    SC SYS_VM_UNMAP, rbp, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 57
+    VMOMK 2, r14, 58
+    SC SYS_VM_MAP, r14, 0, 0, 2, 3, 0
+    EXPECT rax, WIN, 59
+    mov qword [rax + 0x1FF8], 0x77
+    EXIT 0
+ENDBLOB vmbasic
+
+align 16
+BLOB vmnx
+    mov r15, DATA
+    VMOMK 1, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 1, 3, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    mov byte [r13], 0xC3
+    call r13
+    EXIT 3
+ENDBLOB vmnx
+
+align 16
+BLOB vmwro
+    mov r15, DATA
+    VMOMK 1, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 1, 1, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    mov rax, [r13]
+    mov byte [r13], 1
+    EXIT 3
+ENDBLOB vmwro
+
+align 16
+BLOB vmwrx
+    mov r15, DATA
+    VMOMK 1, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 1, 3, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    mov byte [r13], 0xC3
+    SC SYS_VM_PROTECT, r13, 1, 5, 0, 0, 0
+    EXPECT rax, 0, 3
+    call r13
+    mov byte [r13], 0x90
+    EXIT 4
+ENDBLOB vmwrx
+
+align 16
+BLOB vmgone
+    mov r15, DATA
+    VMOMK 2, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 2, 3, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    mov qword [r13 + 0x1000], 0x42
+    SC SYS_VM_UNMAP, r13, 2, 0, 0, 0, 0
+    EXPECT rax, 0, 3
+    mov rax, [r13 + 0x1000]
+    EXIT 4
+ENDBLOB vmgone
+
+align 16
+BLOB vmlimits
+    mov r15, DATA
+    VMOMK 1, r14, 1
+    xor r12d, r12d
+.fill:
+    mov rbx, r12
+    shl rbx, 13
+    mov rax, WIN
+    add rbx, rax
+    SC SYS_VM_MAP, r14, rbx, 0, 1, 1, 0
+    cmp rax, -4
+    je .full
+    cmp rax, rbx
+    je .placed
+    EXIT 2
+.placed:
+    inc r12
+    cmp r12, 100
+    jb .fill
+    EXIT 3
+.full:
+    cmp r12, 64
+    je .exact
+    EXIT 4
+.exact:
+    mov rbx, WIN
+    SC SYS_VM_UNMAP, rbx, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 5
+    mov rbx, WIN
+    SC SYS_VM_MAP, r14, rbx, 0, 1, 1, 0
+    EXPECT rax, WIN, 6
+    xor r12d, r12d
+.drain:
+    mov rbx, r12
+    shl rbx, 13
+    mov rax, WIN
+    add rbx, rax
+    SC SYS_VM_UNMAP, rbx, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 7
+    inc r12
+    cmp r12, 64
+    jb .drain
+    SC SYS_VM_UNMAP, WIN, 1, 0, 0, 0, 0
+    EXPECT rax, -13, 8
+    VMOMK 4096, r13, 9
+    SC SYS_VM_MAP, r13, 0, 0, 4096, 3, 0
+    EXPECT rax, WIN, 10
+    mov rbp, rax
+    mov rbx, 0x600D600D
+    mov [rbp + 0xFFFFF8], rbx
+    VMOMK 4096, r12, 11
+    SC SYS_VM_MAP, r12, 0, 0, 4096, 1, 0
+    EXPECT rax, WIN+0x1000000, 12
+    SC SYS_VM_MAP, r14, 0, 0, 1, 1, 0
+    EXPECT rax, -4, 13
+    SC SYS_VM_UNMAP, rbp, 4096, 0, 0, 0, 0
+    EXPECT rax, 0, 14
+    SC SYS_VM_MAP, r14, 0, 0, 1, 1, 0
+    EXPECT rax, WIN, 15
+    EXIT 0
+ENDBLOB vmlimits
+
+align 16
+BLOB vmstack
+    mov r15, DATA
+    VMOMK 2, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 2, 3, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    lea rdi, [rel .thread]
+    lea rsi, [r13 + 0x2000 - 16]
+    mov rdx, r13
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg .made
+    EXIT 3
+.made:
+    mov r12, rax
+    SC SYS_THREAD_JOIN, r12, 0, 0, 0, 0, 0
+    EXPECT rax, 77, 4
+    cmp dword [r15 + 0x10], 0x600D
+    je .done
+    EXIT 5
+.done:
+    SC SYS_VM_UNMAP, r13, 2, 0, 0, 0, 0
+    EXPECT rax, 0, 6
+    EXIT 0
+.thread:
+    mov r15, DATA
+    call .sub
+    mov dword [r15 + 0x10], 0x600D
+    mov edi, 77
+    mov eax, SYS_THREAD_EXIT
+    syscall
+    ud2
+.sub:
+    push rbx
+    push rdi
+    pop rdi
+    pop rbx
+    ret
+ENDBLOB vmstack
+
+align 16
+BLOB vmshoot
+    mov r15, DATA
+    VMOMK 1, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 1, 3, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    mov [r15 + 0x20], r13
+    lea rdi, [rel .reader]
+    mov rsi, STK0
+    xor edx, edx
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg .made
+    EXIT 3
+.made:
+    mov r12, rax
+.wait:
+    cmp dword [r15], 1
+    je .touched
+    SC SYS_YIELD, 0, 0, 0, 0, 0, 0
+    jmp .wait
+.touched:
+    SC SYS_VM_UNMAP, r13, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 4
+    mov dword [r15 + 4], 1
+    SC SYS_THREAD_JOIN, r12, 0, 0, 0, 0, 0
+    EXIT 6
+.reader:
+    mov r15, DATA
+    mov r13, [r15 + 0x20]
+    mov rax, [r13]
+    mov dword [r15], 1
+.spin:
+    pause
+    cmp dword [r15 + 4], 1
+    jne .spin
+    mov rax, [r13]
+    mov edi, 5
+    mov eax, SYS_THREAD_EXIT
+    syscall
+    ud2
+ENDBLOB vmshoot
+
+align 16
+BLOB vmrace
+    mov r15, DATA
+    SC SYS_CHANNEL_CREATE, DATA+0x300, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 1
+    mov r12, [r15 + 0x300]
+    VMOMK 1, r14, 2
+    lea rdi, [rel .worker]
+    mov rsi, STK0
+    mov rdx, r12
+    mov eax, SYS_THREAD_CREATE
+    syscall
+    test rax, rax
+    jg .made
+    EXIT 3
+.made:
+    mov r13, rax
+    xor ebp, ebp
+.loop:
+    mov rbx, WIN+0x40000
+    SC SYS_VM_MAP, r14, rbx, 0, 1, 3, 0
+    EXPECT rax, WIN+0x40000, 4
+    mov rbx, WIN+0x40000
+    SC SYS_VM_UNMAP, rbx, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 5
+    inc ebp
+    cmp ebp, 3000
+    jb .loop
+.settle:
+    cmp dword [r15 + 0x20], 200
+    jae .stop
+    SC SYS_YIELD, 0, 0, 0, 0, 0, 0
+    jmp .settle
+.stop:
+    mov dword [r15 + 0x10], 1
+    SC SYS_THREAD_JOIN, r13, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 6
+    EXIT 0
+.worker:
+    mov r15, DATA
+    mov r14, rdi
+.again:
+    mov rbx, WIN+0x40000
+    SC SYS_CHANNEL_RECV, r14, rbx, 256, 0, 0, 0
+    cmp rax, -5
+    je .good
+    cmp rax, -2
+    je .good
+    mov edi, 9
+    mov eax, SYS_THREAD_EXIT
+    syscall
+    ud2
+.good:
+    inc dword [r15 + 0x20]
+    cmp dword [r15 + 0x10], 1
+    jne .again
+    xor edi, edi
+    mov eax, SYS_THREAD_EXIT
+    syscall
+    ud2
+ENDBLOB vmrace
+
+align 16
+BLOB vmshare
+    mov r15, DATA
+    mov r14, rdi
+    SC SYS_CHANNEL_RECV, r14, DATA, 256, DATA+0x200, 4, 1
+    EXPECT rax, 0x200000003, 1
+    mov r12, [r15 + 0x200]
+    mov r13, [r15 + 0x208]
+    SC SYS_VMO_SIZE, r12, 0, 0, 0, 0, 0
+    EXPECT rax, 2, 2
+    SC SYS_VM_MAP, r12, 0, 0, 2, 3, 0
+    EXPECT rax, WIN, 3
+    mov rbp, rax
+    mov rbx, 0xA9E110FA9E110FA1
+    cmp [rbp], rbx
+    je .magic
+    EXIT 4
+.magic:
+    mov rbx, 0x5EED5EED5EED5EED
+    mov [rbp + 0x1008], rbx
+    SC SYS_VM_MAP, r13, 0, 0, 2, 1, 0
+    EXPECT rax, WIN+0x2000, 5
+    mov r14, rax
+    mov rbx, 0x5EED5EED5EED5EED
+    cmp [r14 + 0x1008], rbx
+    je .alias
+    EXIT 6
+.alias:
+    SC SYS_VM_MAP, r13, 0, 0, 1, 3, 0
+    EXPECT rax, -7, 7
+    SC SYS_VM_PROTECT, r14, 2, 3, 0, 0, 0
+    EXPECT rax, -7, 8
+    SC SYS_HANDLE_INFO, r13, 0, 0, 0, 0, 0
+    EXPECT rax, INFO_VMO_RO_DELEGATE, 9
+    EXIT 0
+ENDBLOB vmshare
+
+align 16
+BLOB vmspin
+    mov r15, DATA
+    VMOMK 16, r14, 1
+    SC SYS_VM_MAP, r14, 0, 0, 16, 3, 0
+    EXPECT rax, WIN, 2
+    mov r13, rax
+    SC SYS_HANDLE_CLOSE, r14, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 3
+    xor eax, eax
+.spin:
+    mov [r13 + 0xF000], rax
+    inc rax
+    jmp .spin
+ENDBLOB vmspin
+
+align 16
+BLOB fileio
+    mov r15, DATA
+    mov r14, rdi
+    mov rax, 'f.txt'
+    mov [r15 + 0x100], rax
+    mov rax, 'hello'
+    mov [r15 + 0x110], rax
+    mov rax, 'nope.txt'
+    mov [r15 + 0x120], rax
+    mov rax, '../f.txt'
+    mov [r15 + 0x130], rax
+    mov rax, 'sub'
+    mov [r15 + 0x140], rax
+    mov rax, 'sub/g.tx'
+    mov [r15 + 0x150], rax
+    mov byte [r15 + 0x158], 't'
+    SC SYS_FILE_CREATE, r14, DATA+0x100, 5, 3, 0, DATA+0x300
+    EXPECT rax, 0, 1
+    mov r13, [r15 + 0x300]
+    SC SYS_FILE_WRITE, r13, 0, DATA+0x110, 5, 0, 0
+    EXPECT rax, 5, 2
+    SC SYS_FILE_READ, r13, 0, DATA+0x180, 16, 0, 0
+    EXPECT rax, 5, 3
+    MEM32 0x180, 0x6C6C6568, 4
+    MEM8 0x184, 'o', 5
+    SC SYS_FILE_READ, r13, 2, DATA+0x1A0, 16, 0, 0
+    EXPECT rax, 3, 6
+    MEM8 0x1A0, 'l', 7
+    SC SYS_FILE_READ, r13, 5, DATA+0x1C0, 16, 0, 0
+    EXPECT rax, 0, 8
+    SC SYS_FILE_READ, r13, 0, DATA+0x1C0, 0, 0, 0
+    EXPECT rax, 0, 9
+    SC SYS_FILE_READ, r13, 0, 0xFFFF800000000000, 4, 0, 0
+    EXPECT rax, -2, 10
+    SC SYS_FILE_READ, r13, 0, DATA+0x1C0, 5000, 0, 0
+    EXPECT rax, 5, 11
+    SC SYS_FILE_STAT, r13, DATA+0x400, 0, 0, 0, 0
+    EXPECT rax, 0, 12
+    cmp qword [r15 + 0x400], 5
+    je .stat_size
+    EXIT 13
+.stat_size:
+    MEM32 0x410, 0, 14
+    SC SYS_FILE_STAT, r13, 0xFFFF800000000000, 0, 0, 0, 0
+    EXPECT rax, -2, 15
+    SC SYS_FILE_STAT, 0x7777777700000099, DATA+0x400, 0, 0, 0, 0
+    EXPECT rax, -8, 16
+    SC SYS_FILE_CREATE, r14, DATA+0x100, 5, 3, 0, DATA+0x308
+    EXPECT rax, -12, 17
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 5, 1, DATA+0x310, 0
+    EXPECT rax, 0, 18
+    mov r12, [r15 + 0x310]
+    SC SYS_FILE_WRITE, r12, 0, DATA+0x110, 5, 0, 0
+    EXPECT rax, -7, 19
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 5, 0x200, DATA+0x318, 0
+    EXPECT rax, -7, 20
+    SC SYS_FILE_OPEN, r14, DATA+0x120, 8, 1, DATA+0x318, 0
+    EXPECT rax, -15, 21
+    SC SYS_FILE_OPEN, r14, DATA+0x130, 8, 1, DATA+0x318, 0
+    EXPECT rax, -3, 22
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 0, 1, DATA+0x318, 0
+    EXPECT rax, -3, 23
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 256, 1, DATA+0x318, 0
+    EXPECT rax, -3, 24
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 5, 0x400, DATA+0x318, 0
+    EXPECT rax, -3, 25
+    SC SYS_FILE_OPEN, r14, 0xFFFF800000000000, 5, 1, DATA+0x318, 0
+    EXPECT rax, -2, 26
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 5, 1, 0xFFFF800000000000, 0
+    EXPECT rax, -2, 27
+    SC SYS_FILE_CREATE, r14, DATA+0x140, 3, 0, 1, 0
+    EXPECT rax, 0, 28
+    SC SYS_FILE_CREATE, r14, DATA+0x150, 9, 3, 0, DATA+0x328
+    EXPECT rax, 0, 29
+    mov rbx, [r15 + 0x328]
+    SC SYS_HANDLE_CLOSE, rbx, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 30
+    SC SYS_FILE_CREATE, r14, DATA+0x140, 3, 0, 4, 0
+    EXPECT rax, -3, 31
+    xor ebx, ebx
+    xor r12d, r12d
+    xor ebp, ebp
+.enum:
+    SC SYS_DIR_ENTRY, r14, rbx, DATA+0x500, 0, 0, 0
+    cmp rax, 1
+    je .enum_done
+    test rax, rax
+    jz .enum_item
+    EXIT 32
+.enum_item:
+    mov eax, [r15 + 0x510]
+    add r12, rax
+    mov eax, [r15 + 0x514]
+    add rbp, rax
+    inc rbx
+    cmp rbx, 8
+    jb .enum
+    EXIT 33
+.enum_done:
+    cmp rbx, 2
+    je .enum_count
+    EXIT 34
+.enum_count:
+    cmp r12, 1
+    je .enum_kinds
+    EXIT 35
+.enum_kinds:
+    cmp rbp, 8
+    je .enum_names
+    EXIT 36
+.enum_names:
+    SC SYS_DIR_ENTRY, r13, 0, DATA+0x500, 0, 0, 0
+    EXPECT rax, -16, 37
+    SC SYS_DIR_ENTRY, r14, 0, 0xFFFF800000000000, 0, 0, 0
+    EXPECT rax, -2, 38
+    SC SYS_FILE_STAT, r14, DATA+0x400, 0, 0, 0, 0
+    EXPECT rax, 0, 39
+    MEM32 0x410, 1, 40
+    SC SYS_FILE_READ, r14, 0, DATA+0x1C0, 4, 0, 0
+    EXPECT rax, -16, 41
+    SC SYS_PIPE_CREATE, 0, DATA+0x600, 0, 0, 0, 0
+    EXPECT rax, -3, 42
+    SC SYS_PIPE_CREATE, 65537, DATA+0x600, 0, 0, 0, 0
+    EXPECT rax, -3, 43
+    SC SYS_PIPE_CREATE, 64, 0xFFFF800000000000, 0, 0, 0, 0
+    EXPECT rax, -2, 44
+    SC SYS_PIPE_CREATE, 64, DATA+0x600, 0, 0, 0, 0
+    EXPECT rax, 0, 45
+    mov r12, [r15 + 0x600]
+    mov rbp, [r15 + 0x608]
+    SC SYS_FILE_READ, r12, 0, DATA+0x1C0, 16, 0, 0
+    EXPECT rax, -5, 46
+    mov dword [r15 + 0x190], 'ping'
+    SC SYS_FILE_WRITE, rbp, 0, DATA+0x190, 4, 0, 0
+    EXPECT rax, 4, 47
+    SC SYS_FILE_WRITE, r12, 0, DATA+0x190, 4, 0, 0
+    EXPECT rax, -7, 48
+    SC SYS_FILE_READ, rbp, 0, DATA+0x1C0, 4, 0, 0
+    EXPECT rax, -7, 49
+    mov [r15 + 0x700], r12
+    mov dword [r15 + 0x708], 1
+    mov dword [r15 + 0x70C], 0
+    SC SYS_HANDLE_WAIT, DATA+0x700, 1, 0, 0, 0, 0
+    EXPECT rax, 1, 50
+    SC SYS_FILE_READ, r12, 0, DATA+0x1C0, 16, 0, 0
+    EXPECT rax, 4, 51
+    MEM32 0x1C0, 0x676E6970, 52
+    SC SYS_FILE_STAT, r12, DATA+0x400, 0, 0, 0, 0
+    EXPECT rax, 0, 53
+    MEM32 0x410, 2, 54
+    SC SYS_HANDLE_CLOSE, rbp, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 55
+    SC SYS_FILE_READ, r12, 0, DATA+0x1C0, 16, 0, 0
+    EXPECT rax, 0, 56
+    mov dword [r15 + 0x70C], 0
+    SC SYS_HANDLE_WAIT, DATA+0x700, 1, 0, 0, 0, 0
+    EXPECT rax, 1, 57
+    SC SYS_PIPE_CREATE, 64, DATA+0x610, 0, 0, 0, 0
+    EXPECT rax, 0, 58
+    mov r12, [r15 + 0x610]
+    mov rbp, [r15 + 0x618]
+    SC SYS_FILE_WRITE, rbp, 0, DATA+0x800, 100, 0, 0
+    EXPECT rax, 64, 59
+    SC SYS_FILE_WRITE, rbp, 0, DATA+0x800, 100, 0, 0
+    EXPECT rax, -5, 60
+    SC SYS_HANDLE_CLOSE, r12, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 61
+    SC SYS_FILE_WRITE, rbp, 0, DATA+0x800, 1, 0, 0
+    EXPECT rax, -6, 62
+    SC SYS_FILE_WRITE, rbp, 0, 0xFFFF800000000000, 1, 0, 0
+    EXPECT rax, -2, 63
+    EXIT 0
+ENDBLOB fileio
+
+align 16
+BLOB apxchild
+    mov r15, DATA
+    mov r14, rdi
+    cmp dword [r15], 'APXD'
+    je .init_ok
+    EXIT 1
+.init_ok:
+    cmp dword [r15 + 8], 0
+    je .bss_ok
+    EXIT 2
+.bss_ok:
+    cmp dword [r15 + 0x1000], 0
+    je .page_ok
+    EXIT 3
+.page_ok:
+    SC SYS_CHANNEL_SEND, r14, DATA, 4, 0, 0, 0
+    EXPECT rax, 0, 4
+    EXIT 7
+ENDBLOB apxchild
+
+align 16
+BLOB apxspin
+.again:
+    SYSC SYS_YIELD
+    jmp .again
+ENDBLOB apxspin
+
+align 16
+BLOB apxdata
+    mov r15, DATA
+    cmp byte [r15], 'A'
+    je .first
+    EXIT 99
+.first:
+    cmp byte [r15 + 2], 0
+    je .rest
+    EXIT 98
+.rest:
+    movzx edi, byte [r15 + 1]
+    xor eax, eax
+    syscall
+    ud2
+ENDBLOB apxdata
+
+align 16
+BLOB spawner
+    mov r15, DATA
+    mov r14, rdi
+    mov rax, 'child'
+    mov [r15 + 0x100], rax
+    mov rax, 'spin'
+    mov [r15 + 0x110], rax
+    mov rax, 'bad'
+    mov [r15 + 0x120], rax
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 5, 0x201, DATA+0x300, 0
+    EXPECT rax, 0, 1
+    mov r13, [r15 + 0x300]
+    SC SYS_FILE_OPEN, r14, DATA+0x100, 5, 1, DATA+0x308, 0
+    EXPECT rax, 0, 2
+    mov r12, [r15 + 0x308]
+    SC SYS_FILE_OPEN, r14, DATA+0x110, 4, 0x201, DATA+0x310, 0
+    EXPECT rax, 0, 3
+    mov rbp, [r15 + 0x310]
+    SC SYS_FILE_OPEN, r14, DATA+0x120, 3, 0x201, DATA+0x318, 0
+    EXPECT rax, 0, 4
+    mov rbx, [r15 + 0x318]
+    SC SYS_PROCESS_CREATE, r12, 0, DATA+0x330, 0, 0, 0
+    EXPECT rax, -7, 5
+    SC SYS_PROCESS_CREATE, rbx, 0, DATA+0x330, 0, 0, 0
+    EXPECT rax, -14, 6
+    SC SYS_PROCESS_CREATE, r14, 0, DATA+0x330, 0, 0, 0
+    EXPECT rax, -16, 7
+    SC SYS_PROCESS_CREATE, 0x7777777700000099, 0, DATA+0x330, 0, 0, 0
+    EXPECT rax, -8, 8
+    SC SYS_PROCESS_CREATE, r13, 0x7777777700000099, DATA+0x330, 0, 0, 0
+    EXPECT rax, -8, 9
+    SC SYS_PROCESS_CREATE, r13, 0, DATA+0x330, 1, 0, 0
+    EXPECT rax, -3, 10
+    SC SYS_PROCESS_CREATE, r13, 0, 0xFFFF800000000000, 0, 0, 0
+    EXPECT rax, -2, 11
+    SC SYS_CHANNEL_CREATE, DATA+0x340, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 12
+    SC SYS_PROCESS_CREATE, r13, [r15 + 0x348], DATA+0x350, 0, 0, 0
+    EXPECT rax, 0, 13
+    SC SYS_HANDLE_INFO, [r15 + 0x350], 0, 0, 0, 0, 0
+    EXPECT rax, INFO_PROC, 14
+    SC SYS_HANDLE_INFO, [r15 + 0x348], 0, 0, 0, 0, 0
+    EXPECT rax, -8, 15
+    SC SYS_CHANNEL_RECV, [r15 + 0x340], DATA+0x400, 64, 0, 0, 1
+    EXPECT rax, 4, 16
+    MEM32 0x400, 'APXD', 17
+    mov rax, [r15 + 0x350]
+    mov [r15 + 0x700], rax
+    mov dword [r15 + 0x708], 5
+    mov dword [r15 + 0x70C], 0
+    SC SYS_HANDLE_WAIT, DATA+0x700, 1, -1, 0, 0, 0
+    EXPECT rax, 1, 18
+    SC SYS_PROCESS_STATUS, [r15 + 0x350], DATA+0x360, 0, 0, 0, 0
+    EXPECT rax, 0, 19
+    cmp qword [r15 + 0x360], 7
+    je .status_ok
+    EXIT 20
+.status_ok:
+    SC SYS_PROCESS_STATUS, [r15 + 0x340], DATA+0x360, 0, 0, 0, 0
+    EXPECT rax, -3, 21
+    SC SYS_PROCESS_KILL, [r15 + 0x350], 0, 0, 0, 0, 0
+    EXPECT rax, -6, 22
+    SC SYS_HANDLE_CLOSE, [r15 + 0x350], 0, 0, 0, 0, 0
+    EXPECT rax, 0, 23
+    SC SYS_PROCESS_CREATE, rbp, 0, DATA+0x358, 0, 0, 0
+    EXPECT rax, 0, 24
+    SC SYS_PROCESS_STATUS, [r15 + 0x358], DATA+0x360, 0, 0, 0, 0
+    EXPECT rax, -5, 25
+    SC SYS_HANDLE_NARROW, [r15 + 0x358], 1, DATA+0x368, 0, 0, 0
+    EXPECT rax, 0, 26
+    SC SYS_PROCESS_KILL, [r15 + 0x368], 0, 0, 0, 0, 0
+    EXPECT rax, -7, 27
+    SC SYS_PROCESS_KILL, [r15 + 0x358], 0, 0, 0, 0, 0
+    EXPECT rax, 0, 28
+    mov rax, [r15 + 0x358]
+    mov [r15 + 0x700], rax
+    mov dword [r15 + 0x708], 5
+    mov dword [r15 + 0x70C], 0
+    SC SYS_HANDLE_WAIT, DATA+0x700, 1, -1, 0, 0, 0
+    EXPECT rax, 1, 29
+    SC SYS_PROCESS_STATUS, [r15 + 0x358], DATA+0x360, 0, 0, 0, 0
+    EXPECT rax, 0, 30
+    mov rax, -512
+    cmp [r15 + 0x360], rax
+    je .killed_ok
+    EXIT 31
+.killed_ok:
+    SC SYS_PROCESS_KILL, [r15 + 0x358], 0, 0, 0, 0, 0
+    EXPECT rax, -6, 32
+    SC SYS_PROCESS_CREATE, rbp, 0, DATA+0x370, 0, 0, 0
+    EXPECT rax, 0, 33
+    SC SYS_PROCESS_CREATE, rbp, 0, DATA+0x378, 0, 0, 0
+    EXPECT rax, 0, 34
+    EXIT 0
+ENDBLOB spawner
 
 section .note.GNU-stack noalloc noexec nowrite

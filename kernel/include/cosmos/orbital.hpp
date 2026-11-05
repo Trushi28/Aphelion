@@ -177,6 +177,14 @@ public:
         }
         depth_ = 1;
     }
+    bool try_lock() {
+        u64 me = self_token();
+        if (__atomic_load_n(&owner_, __ATOMIC_RELAXED) == me) { ++depth_; return true; }
+        u64 expected = 0;
+        if (!__atomic_compare_exchange_n(&owner_, &expected, me, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return false;
+        depth_ = 1;
+        return true;
+    }
     void unlock() {
         if (!held_by_me()) cpu::hang();
         if (--depth_ == 0) __atomic_store_n(&owner_, 0, __ATOMIC_RELEASE);

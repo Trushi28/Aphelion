@@ -17,7 +17,7 @@ static void test_rights() {
     constexpr Rights rw = Right::Read | Right::Write;
     static_assert(rw.has(Right::Read) && rw.has(Right::Write) && !rw.has(Right::Append), "has");
     static_assert(Rights::none().empty(), "none is empty");
-    static_assert(Rights::all().bits == 0x1FF, "nine rights");
+    static_assert(Rights::all().bits == 0x3FF, "ten rights");
     static_assert(Rights().bits == 0, "default is zero memory");
     static_assert(sizeof(Rights) == 2, "rights is two bytes");
 
@@ -48,18 +48,18 @@ static void test_rights() {
     CHECK(((~a).bits & ~RIGHTS_ALL_BITS) == 0, "complement masked");
 
     CHECK(Rights::from_bits(0xFFFF) == Rights::all(), "from_bits masks high bits");
-    CHECK(Rights::from_bits(0xFE00).empty(), "only undefined bits gives none");
+    CHECK(Rights::from_bits(0xFC00).empty(), "only undefined bits gives none");
 
     u16 seen = 0;
     const Right every[RIGHT_COUNT] = {Right::Read, Right::Write, Right::Append, Right::Enumerate, Right::Create,
-                                      Right::Unlink, Right::Rename, Right::Freeze, Right::Delegate};
+                                      Right::Unlink, Right::Rename, Right::Freeze, Right::Delegate, Right::Execute};
     bool distinct = true;
     for (u32 i = 0; i < RIGHT_COUNT; ++i) {
         u16 v = static_cast<u16>(every[i]);
         if ((v & (v - 1)) != 0 || (seen & v)) distinct = false;
         seen |= v;
     }
-    CHECK(distinct && seen == RIGHTS_ALL_BITS, "nine distinct single-bit rights covering the mask");
+    CHECK(distinct && seen == RIGHTS_ALL_BITS, "ten distinct single-bit rights covering the mask");
 
     Rights acc;
     acc |= Right::Read;
@@ -69,14 +69,14 @@ static void test_rights() {
     CHECK(acc == Rights(Right::Read), "&= narrows");
 
     char t[16];
-    CHECK(rights_text(Rights::all(), t, sizeof(t)) == 9 && same(t, "rwaecunfd"), "text of all");
-    CHECK(rights_text(Rights::none(), t, sizeof(t)) == 9 && same(t, "---------"), "text of none");
+    CHECK(rights_text(Rights::all(), t, sizeof(t)) == 10 && same(t, "rwaecunfdx"), "text of all");
+    CHECK(rights_text(Rights::none(), t, sizeof(t)) == 10 && same(t, "----------"), "text of none");
     rights_text(Right::Read | Right::Enumerate, t, sizeof(t));
-    CHECK(same(t, "r--e-----"), "text of read+enumerate");
+    CHECK(same(t, "r--e------"), "text of read+enumerate");
     char small[4];
-    CHECK(rights_text(Rights::all(), small, sizeof(small)) == 9 && same(small, "rwa"), "text truncates and terminates");
+    CHECK(rights_text(Rights::all(), small, sizeof(small)) == 10 && same(small, "rwa"), "text truncates and terminates");
     CHECK(RIGHTS_READ_ONLY.subset_of(RIGHTS_READ_WRITE), "read-only bundle inside read-write bundle");
-    CHECK(!RIGHTS_READ_WRITE.has(Right::Delegate) && !RIGHTS_READ_WRITE.has(Right::Freeze), "bundles never carry delegate or freeze");
+    CHECK(!RIGHTS_READ_WRITE.has(Right::Delegate) && !RIGHTS_READ_WRITE.has(Right::Freeze) && !RIGHTS_READ_WRITE.has(Right::Execute), "bundles never carry delegate, freeze or execute");
 }
 
 static Result<int> half(int v) {

@@ -13,9 +13,10 @@ enum class Right : u16 {
     Rename    = 1u << 6,
     Freeze    = 1u << 7,
     Delegate  = 1u << 8,
+    Execute   = 1u << 9,
 };
 
-constexpr u32 RIGHT_COUNT = 9;
+constexpr u32 RIGHT_COUNT = 10;
 constexpr u16 RIGHTS_ALL_BITS = (1u << RIGHT_COUNT) - 1;
 
 struct Rights {
@@ -52,7 +53,7 @@ constexpr Rights RIGHTS_READ_WRITE = Right::Read | Right::Write | Right::Append 
                                      | Right::Unlink | Right::Rename;
 
 inline u32 rights_text(Rights r, char* out, u32 cap) {
-    static constexpr char LETTERS[RIGHT_COUNT] = {'r', 'w', 'a', 'e', 'c', 'u', 'n', 'f', 'd'};
+    static constexpr char LETTERS[RIGHT_COUNT] = {'r', 'w', 'a', 'e', 'c', 'u', 'n', 'f', 'd', 'x'};
     u32 n = 0;
     for (u32 i = 0; i < RIGHT_COUNT; ++i) {
         if (n + 1 < cap) out[n] = (r.bits & (1u << i)) ? LETTERS[i] : '-';

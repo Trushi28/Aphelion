@@ -32,6 +32,7 @@ constexpr u64 FOUR_GB = 1ull << 32;
 constexpr u64 LOW_WINDOW = 0x100000;
 constexpr u32 MAX_ENTRIES = 512;
 constexpr u32 MAX_RANGES = 128;
+constexpr u32 RECLAIM_CHUNK_SLOTS = 16;
 constexpr u64 HHDM_FLAGS = WRITABLE | NO_EXECUTE;
 constexpr u64 PERM_BITS = WRITABLE | NO_EXECUTE;
 constexpr u64 CACHE_BITS = WRITE_THROUGH | NO_CACHE;
@@ -184,6 +185,48 @@ static bool map_4k_in(Space& s, u64 virt, u64 phys, u64 flags) {
     return true;
 }
 
+static bool table_empty(const u64* t) {
+    for (u32 i = 0; i < MAX_ENTRIES; ++i)
+        if (t[i]) return false;
+    return true;
+}
+
+static void reclaim_tables(Space& s, u64 virt, u64 bytes) {
+    if (!is_user(s) || !bytes) return;
+    u64 end = virt + bytes;
+    if (end < virt) return;
+    u64 freed[RECLAIM_CHUNK_SLOTS * 3];
+    for (u64 base = virt & ~(TWO_MB - 1); base < end;) {
+        u32 n = 0;
+        u64 chunk_end = base + RECLAIM_CHUNK_SLOTS * TWO_MB;
+        u64 a = base;
+        for (; a < end && a < chunk_end; a += TWO_MB) {
+            u64* pml4e = &s.root[(a >> 39) & 0x1FF];
+            if (!(*pml4e & PRESENT)) continue;
+            u64* pdpt = virt_of(*pml4e & PHYS_MASK);
+            u64* pdpte = &pdpt[(a >> 30) & 0x1FF];
+            if (!(*pdpte & PRESENT) || (*pdpte & HUGE_PAGE)) continue;
+            u64* pd = virt_of(*pdpte & PHYS_MASK);
+            u64* pde = &pd[(a >> 21) & 0x1FF];
+            if ((*pde & PRESENT) && !(*pde & HUGE_PAGE) && table_empty(virt_of(*pde & PHYS_MASK))) {
+                freed[n++] = *pde & PHYS_MASK;
+                *pde = 0;
+            }
+            if (!table_empty(pd)) continue;
+            freed[n++] = *pdpte & PHYS_MASK;
+            *pdpte = 0;
+            if (!table_empty(pdpt)) continue;
+            freed[n++] = *pml4e & PHYS_MASK;
+            *pml4e = 0;
+        }
+        if (n) {
+            shoot(s, base, a - base);
+            for (u32 i = 0; i < n; ++i) universe::free(freed[i], 0);
+        }
+        base = a;
+    }
+}
+
 static bool unmap_in(Space& s, u64 virt, u64 bytes) {
     if (!bytes || ((virt | bytes) & (FOUR_KB - 1))) return false;
     u64 end = virt + bytes;
@@ -204,6 +247,7 @@ static bool unmap_in(Space& s, u64 virt, u64 bytes) {
         a += FOUR_KB;
     }
     shoot(s, virt, bytes);
+    reclaim_tables(s, virt, bytes);
     return ok;
 }
 
@@ -485,6 +529,7 @@ bool space_map(Space* space, u64 virt_addr, u64 phys_addr, u64 bytes, u64 flags)
         Mapping m{};
         while (done < bytes && translate_in(*space, virt_addr + done, &m) && m.phys == phys_addr + done) done += FOUR_KB;
         if (done) unmap_in(*space, virt_addr, done);
+        if (done < bytes) reclaim_tables(*space, virt_addr + done, FOUR_KB);
         return false;
     }
     return true;

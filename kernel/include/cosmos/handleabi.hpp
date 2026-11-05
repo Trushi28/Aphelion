@@ -2,6 +2,7 @@
 #include <cosmos/types.hpp>
 #include <cosmos/lens_types.hpp>
 #include <cosmos/userabi.hpp>
+#include <cosmos/vmregion.hpp>
 
 namespace handleabi {
 
@@ -12,6 +13,26 @@ constexpr i64 ERR_BADHANDLE = -8;
 constexpr i64 ERR_TOOBIG = -9;
 constexpr i64 ERR_TIMEDOUT = -10;
 constexpr i64 ERR_CANCELLED = -11;
+constexpr i64 ERR_EXISTS = -12;
+constexpr i64 ERR_NOTMAPPED = -13;
+constexpr i64 ERR_BADIMAGE = -14;
+
+constexpr u64 SUBTYPE_NONE = 0;
+constexpr u64 SUBTYPE_CHANNEL = 1;
+constexpr u64 SUBTYPE_MEMOBJ = 2;
+constexpr u64 SUBTYPE_PROCESS = 3;
+
+constexpr i64 vm_error(vmregion::Status s) {
+    switch (s) {
+        case vmregion::Status::Ok: return 0;
+        case vmregion::Status::Invalid: return userabi::ERR_INVAL;
+        case vmregion::Status::Denied: return ERR_DENIED;
+        case vmregion::Status::Exists: return ERR_EXISTS;
+        case vmregion::Status::Limit: return userabi::ERR_LIMIT;
+        case vmregion::Status::NotMapped: return ERR_NOTMAPPED;
+    }
+    return userabi::ERR_INVAL;
+}
 
 constexpr u64 RECV_BLOCK = 1;
 constexpr u64 WAIT_FOREVER = ~0ull;
@@ -67,9 +88,12 @@ constexpr i64 error_of(lens::Status s) {
     return userabi::ERR_INVAL;
 }
 
-constexpr u64 info_pack(u16 rights_bits, u8 kind) { return (static_cast<u64>(kind) << 16) | rights_bits; }
+constexpr u64 info_pack(u16 rights_bits, u8 kind, u8 subtype = 0) {
+    return (static_cast<u64>(subtype) << 24) | (static_cast<u64>(kind) << 16) | rights_bits;
+}
 constexpr u16 info_rights(u64 info) { return static_cast<u16>(info & 0xFFFF); }
 constexpr u8 info_kind(u64 info) { return static_cast<u8>((info >> 16) & 0xFF); }
+constexpr u8 info_subtype(u64 info) { return static_cast<u8>((info >> 24) & 0xFF); }
 
 constexpr i64 recv_pack(u32 bytes, u32 handles) { return static_cast<i64>((static_cast<u64>(handles) << 32) | bytes); }
 constexpr u32 recv_bytes(i64 packed) { return static_cast<u32>(static_cast<u64>(packed) & 0xFFFFFFFFull); }

@@ -6,6 +6,13 @@
 #include <cosmos/fpu.hpp>
 #include <cosmos/clock.hpp>
 #include <cosmos/lens_channel.hpp>
+#include <cosmos/lens_text.hpp>
+#include <cosmos/apx.hpp>
+#include <cosmos/fileabi.hpp>
+#include <cosmos/handleabi.hpp>
+#include <cosmos/kheap.hpp>
+#include <cosmos/memobj.hpp>
+#include <cosmos/pmm.hpp>
 #include <cosmos/serial.hpp>
 
 extern "C" const u8 isr_common[];
@@ -48,6 +55,22 @@ BLOB_DECL(chanwait);
 BLOB_DECL(chanlimits);
 BLOB_DECL(peer_a);
 BLOB_DECL(peer_b);
+BLOB_DECL(vmbasic);
+BLOB_DECL(vmnx);
+BLOB_DECL(vmwro);
+BLOB_DECL(vmwrx);
+BLOB_DECL(vmgone);
+BLOB_DECL(vmlimits);
+BLOB_DECL(vmstack);
+BLOB_DECL(vmshoot);
+BLOB_DECL(vmrace);
+BLOB_DECL(vmshare);
+BLOB_DECL(vmspin);
+BLOB_DECL(fileio);
+BLOB_DECL(apxchild);
+BLOB_DECL(apxspin);
+BLOB_DECL(apxdata);
+BLOB_DECL(spawner);
 
 namespace userland {
 
@@ -90,6 +113,15 @@ const Case g_cases[] = {
     CASE(threadfault, 2, userabi::fault_status(6)),
     CASE(threadlimit, 2, 0),
     CASE(chanlimits, 2, 0),
+    CASE(vmbasic, 2, 0),
+    CASE(vmnx, 2, userabi::fault_status(14)),
+    CASE(vmwro, 2, userabi::fault_status(14)),
+    CASE(vmwrx, 2, userabi::fault_status(14)),
+    CASE(vmgone, 2, userabi::fault_status(14)),
+    CASE(vmlimits, 2, 0),
+    CASE(vmstack, 2, 0),
+    CASE(vmshoot, 2, userabi::fault_status(14)),
+    CASE(vmrace, 2, 0),
 };
 
 Image image_of(const u8* begin, const u8* end, u32 data_pages) {
@@ -441,6 +473,241 @@ bool run_nmi() {
     return ok;
 }
 
+bool run_vm() {
+    bool ok = true;
+    lens::Table& K = g_kernel_handles;
+    u64 base_pages = memobj::live_pages();
+    u64 base_objects = memobj::live_objects();
+
+    memobj::Object* obj = memobj::create(2);
+    bool share_ok = obj != nullptr;
+    lens::Lens keep, rw, ro, ca, cb;
+    if (share_ok) {
+        u64* page0 = static_cast<u64*>(universe::to_virt(memobj::frame(obj, 0)));
+        *page0 = 0xA9E110FA9E110FA1ull;
+        lens::Result<lens::Lens> made = lens::alloc_slot(K.domain, nullptr, nebula::Node{0, 0}, nebula::Node{0, 0}, memobj::HANDLE_RIGHTS,
+                                                         false, 0, "memobj", obj);
+        share_ok = made.ok();
+        if (made.ok()) {
+            lens::Result<lens::Lens> a = lens::narrow(K.domain, made.value(), memobj::HANDLE_RIGHTS);
+            lens::Result<lens::Lens> b = lens::narrow(K.domain, made.value(), lens::Right::Read | lens::Right::Delegate);
+            keep = made.value();
+            share_ok = a.ok() && b.ok();
+            if (a.ok()) rw = a.value();
+            if (b.ok()) ro = b.value();
+        } else {
+            memobj::discard(obj);
+        }
+    }
+    share_ok = share_ok && lens::channel::create(K, &ca, &cb).ok();
+    Process* sharer = share_ok ? launch_with("vmshare", image_of(ublob_vmshare, ublob_vmshare_end, 2), K, cb) : nullptr;
+    if (sharer) {
+        lens::Lens both[2] = { rw, ro };
+        share_ok = lens::channel::send(K, ca, lens::text_bytes("vmo"), both, 2).ok();
+        i32 status = -1;
+        bool finished = wait(sharer, &status, WAIT_MS);
+        u64 seen = 0;
+        if (finished) {
+            const u64* page1 = static_cast<const u64*>(universe::to_virt(memobj::frame(obj, 1)));
+            seen = page1[1];
+        }
+        share_ok = share_ok && finished && status == 0 && seen == 0x5EED5EED5EED5EEDull && live_handles(sharer) == 0;
+        share_ok = (finished && reap(sharer)) && share_ok;
+        serial::printf("[userland] shared memory object: kernel-made, handed to ring 3 as read-write and read-only handles: status %d, the process's write is visible to the kernel%s\n",
+                        status, share_ok ? "" : "  <-- wrong");
+    } else {
+        serial::writeln("[userland] shared memory case could not be launched");
+        share_ok = false;
+    }
+    lens::close_all(K.domain);
+    ok = share_ok && lens::live_count(K.domain) == 0 && ok;
+    bool freed = memobj::live_pages() == base_pages && memobj::live_objects() == base_objects;
+    serial::printf("[userland] memory object freed once the last handle and mapping are gone: %s\n", freed ? "yes" : "NO  <-- wrong");
+    ok = freed && ok;
+
+    Process* spin = launch("vmspin", image_of(ublob_vmspin, ublob_vmspin_end, 2));
+    bool spin_ok = spin != nullptr;
+    if (spin) {
+        orbital::sleep_ms(50);
+        u64 held = memobj::live_pages();
+        bool requested = kill(spin);
+        i32 status = 0;
+        bool finished = wait(spin, &status, WAIT_MS);
+        bool reaped = finished && reap(spin);
+        spin_ok = requested && finished && reaped && status == userabi::STATUS_KILLED && held == base_pages + 16 && memobj::live_pages() == base_pages &&
+                  memobj::live_objects() == base_objects;
+        serial::printf("[userland] kill of a process whose only reference to 16 pages is a mapping: status %d, %lu pages held, %lu left after teardown%s\n",
+                        status, held - base_pages, memobj::live_pages() - base_pages, spin_ok ? "" : "  <-- wrong");
+    } else {
+        serial::writeln("[userland] mapping-kill case could not be launched");
+    }
+    return spin_ok && ok;
+}
+
+bool put_apx(lens::Domain& d, lens::Lens dir, const char* name, const u8* begin, const u8* end, u32 data_pages, const u8* data, u32 data_bytes) {
+    u32 code = static_cast<u32>(end - begin);
+    usize cap = static_cast<usize>(apx::pack_size(code, data_bytes));
+    u8* buf = static_cast<u8*>(kheap::alloc(cap));
+    if (!buf) return false;
+    usize written = 0;
+    bool ok = apx::pack(begin, code, 0, data_pages, data, data_bytes, buf, cap, &written) &&
+              lens::put(d, dir, name, lens::ConstBytes(buf, written)).ok();
+    kheap::free(buf);
+    return ok;
+}
+
+bool file_equals(lens::Domain& d, lens::Lens dir, const char* path, const char* want) {
+    lens::Result<lens::Lens> f = lens::open_at(d, dir, path, lens::Right::Read);
+    if (!f.ok()) return false;
+    u8 got[32] = {};
+    usize n = 0;
+    while (want[n]) ++n;
+    lens::Result<usize> r = lens::read(d, f.value(), 0, lens::Bytes(got, sizeof(got)));
+    bool same = r.ok() && r.value() == n;
+    for (usize i = 0; same && i < n; ++i) same = got[i] == static_cast<u8>(want[i]);
+    (void)lens::close(d, f.value());
+    return same;
+}
+
+bool refused(lens::Table& K, lens::Lens file, i64 want, const char* what) {
+    u32 before = live_processes();
+    i64 error = 0;
+    Process* p = launch_file("refused", K, file, nullptr, lens::Lens(), &error);
+    bool ok = p == nullptr && error == want && live_processes() == before && frames_live() == 0;
+    if (p) {
+        kill(p);
+        i32 st;
+        (void)wait(p, &st, WAIT_MS);
+        (void)reap(p);
+    }
+    serial::printf("[userland] launching %s: error %ld, expected %ld%s\n", what, error, want, ok ? "" : "  <-- wrong");
+    return ok;
+}
+
+bool run_files() {
+    lens::Table& K = g_kernel_handles;
+    bool ok = true;
+    lens::Result<lens::Lens> rootr = lens::delegate(lens::boot_domain(), lens::boot_root("ram"), K.domain, lens::Rights::all());
+    if (!rootr.ok()) {
+        serial::writeln("[userland] file cases: could not obtain the RAM root");
+        return false;
+    }
+    lens::Lens root = rootr.value();
+    (void)lens::remove_tree(K.domain, root, "h3-selftest");
+    ok = lens::mkdir(K.domain, root, "h3-selftest").ok() && lens::mkdir(K.domain, root, "h3-selftest/apps").ok() &&
+         lens::mkdir(K.domain, root, "h3-selftest/work").ok();
+    lens::Result<lens::Lens> appsr = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Rights::all());
+    if (!ok || !appsr.ok()) {
+        serial::writeln("[userland] file cases: could not prepare the test directories");
+        lens::close_all(K.domain);
+        return false;
+    }
+    lens::Lens apps = appsr.value();
+
+    const u8 ab[2] = { 'A', 'B' };
+    const u8 apxd[4] = { 'A', 'P', 'X', 'D' };
+    bool put = put_apx(K.domain, apps, "exit42", ublob_exit42, ublob_exit42_end, 0, nullptr, 0) &&
+               put_apx(K.domain, apps, "datainit", ublob_apxdata, ublob_apxdata_end, 1, ab, 2) &&
+               put_apx(K.domain, apps, "child", ublob_apxchild, ublob_apxchild_end, 2, apxd, 4) &&
+               put_apx(K.domain, apps, "spin", ublob_apxspin, ublob_apxspin_end, 0, nullptr, 0) &&
+               put_apx(K.domain, apps, "bad", ublob_apxspin, ublob_apxspin_end, 0, nullptr, 0) &&
+               lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
+               lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
+    lens::Result<lens::Lens> badw = lens::open_at(K.domain, apps, "bad", lens::Right::Read | lens::Right::Write);
+    if (put && badw.ok()) {
+        u8 flip = 0;
+        lens::Result<usize> got = lens::read(K.domain, badw.value(), 70, lens::Bytes(&flip, 1));
+        flip ^= 0x40;
+        put = got.ok() && got.value() == 1 && lens::write(K.domain, badw.value(), 70, lens::ConstBytes(&flip, 1)).ok() &&
+              lens::sync(K.domain, badw.value()).ok();
+        (void)lens::close(K.domain, badw.value());
+    } else {
+        put = false;
+    }
+    if (!put) {
+        serial::writeln("[userland] file cases: could not write the test images");
+        lens::close_all(K.domain);
+        return false;
+    }
+
+    const lens::Rights run = lens::Right::Read | lens::Right::Execute;
+    {
+        lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "exit42", run);
+        i64 error = -1;
+        Process* p = f.ok() ? launch_file(nullptr, K, f.value(), nullptr, lens::Lens(), &error) : nullptr;
+        i32 status = -1;
+        bool good = p && wait(p, &status, WAIT_MS) && status == 42;
+        good = (p && reap(p)) && good;
+        serial::printf("[userland] process started from an APX file in the RAM realm: status %d%s\n", status, good ? "" : "  <-- wrong");
+        ok = good && ok;
+    }
+    {
+        lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "datainit", run);
+        i64 error = -1;
+        Process* p = f.ok() ? launch_file(nullptr, K, f.value(), nullptr, lens::Lens(), &error) : nullptr;
+        i32 status = -1;
+        bool good = p && wait(p, &status, WAIT_MS) && status == 0x42;
+        good = (p && reap(p)) && good;
+        serial::printf("[userland] initial data from the image is in place and the rest of the data page is zero: status %d%s\n", status,
+                        good ? "" : "  <-- wrong");
+        ok = good && ok;
+    }
+    {
+        lens::Result<lens::Lens> noexec = lens::open_at(K.domain, apps, "exit42", lens::Right::Read);
+        lens::Result<lens::Lens> bad = lens::open_at(K.domain, apps, "bad", run);
+        lens::Result<lens::Lens> shortf = lens::open_at(K.domain, apps, "short", run);
+        lens::Result<lens::Lens> empty = lens::open_at(K.domain, apps, "empty", run);
+        bool opened = noexec.ok() && bad.ok() && shortf.ok() && empty.ok();
+        bool r = opened;
+        if (opened) {
+            r = refused(K, noexec.value(), handleabi::ERR_DENIED, "a file without the execute right") && r;
+            r = refused(K, bad.value(), handleabi::ERR_BADIMAGE, "an image with one flipped byte") && r;
+            r = refused(K, shortf.value(), handleabi::ERR_BADIMAGE, "a file shorter than an APX header") && r;
+            r = refused(K, empty.value(), handleabi::ERR_BADIMAGE, "an empty file") && r;
+            r = refused(K, apps, fileabi::ERR_WRONGTYPE, "a directory") && r;
+            r = refused(K, lens::Lens(0x7777777700000099ull), handleabi::ERR_BADHANDLE, "a handle that does not exist") && r;
+        } else {
+            serial::writeln("[userland] file cases: could not open the refusal targets");
+        }
+        ok = r && ok;
+    }
+    {
+        lens::Result<lens::Lens> work = lens::open_at(K.domain, root, "h3-selftest/work", lens::Rights::all());
+        lens::Result<lens::Lens> given = work.ok() ? lens::narrow(K.domain, work.value(), lens::RIGHTS_READ_WRITE | lens::Right::Delegate) : work;
+        Process* p = given.ok() ? launch_with("fileio", image_of(ublob_fileio, ublob_fileio_end, 2), K, given.value()) : nullptr;
+        i32 status = -1;
+        bool good = p && wait(p, &status, WAIT_MS) && status == 0;
+        good = (p && reap(p)) && good;
+        bool hello = good && file_equals(K.domain, work.value(), "f.txt", "hello");
+        bool nested = good && lens::open_at(K.domain, work.value(), "sub/g.txt", lens::Right::Read).ok();
+        serial::printf("[userland] file and pipe syscalls from ring 3 on a directory handle: status %d, the file holds the data: %s, the nested file exists: %s%s\n",
+                        status, hello ? "yes" : "NO", nested ? "yes" : "NO", good && hello && nested ? "" : "  <-- wrong");
+        ok = good && hello && nested && ok;
+    }
+    {
+        u64 reaped_before = detached_reaped();
+        lens::Result<lens::Lens> given = lens::narrow(K.domain, apps, lens::Right::Read | lens::Right::Enumerate | lens::Right::Execute | lens::Right::Delegate);
+        Process* p = given.ok() ? launch_with("spawner", image_of(ublob_spawner, ublob_spawner_end, 2), K, given.value()) : nullptr;
+        i32 status = -1;
+        bool good = p && wait(p, &status, WAIT_MS) && status == 0;
+        good = (p && reap(p)) && good;
+        for (u32 i = 0; i < 300 && live_processes() != 0; ++i) {
+            (void)sweep_detached();
+            if (live_processes() != 0) orbital::sleep_ms(10);
+        }
+        u64 swept = detached_reaped() - reaped_before;
+        bool clean = live_processes() == 0 && frames_live() == 0;
+        serial::printf("[userland] a process that spawns children from files, waits on them, kills one, and leaves two running: status %d, %lu children were reaped by the sweeper, nothing left: %s%s\n",
+                        status, swept, clean ? "yes" : "NO", good && clean && swept == 4 ? "" : "  <-- wrong");
+        ok = good && clean && swept == 4 && ok;
+    }
+    (void)lens::remove_tree(K.domain, root, "h3-selftest");
+    lens::close_all(K.domain);
+    bool closed = lens::live_count(K.domain) == 0;
+    ok = closed && ok;
+    return ok;
+}
+
 void orchestrator(void*) {
     if (!supported()) {
         serial::writeln("[selftest] userland: skipped");
@@ -453,9 +720,13 @@ void orchestrator(void*) {
     ok = run_vector_state() && ok;
     ok = run_kill() && ok;
     ok = run_handles() && ok;
+    ok = run_vm() && ok;
+    ok = run_files() && ok;
     ok = run_nmi() && ok;
     ok = ok && frames_live() == 0 && live_processes() == 0;
     ok = ok && frames_quarantined() == 0;
+    ok = ok && memobj::live_pages() == 0 && memobj::live_objects() == 0 && memobj::quarantined_pages() == 0;
+    serial::printf("[userland] memory objects still alive: %lu, pages %lu\n", memobj::live_objects(), memobj::live_pages());
     serial::printf("[userland] frames still held: %lu, processes still live: %u\n", frames_live(), live_processes());
     serial::printf("[selftest] userland: %s\n", ok ? "ok" : "MISMATCH");
 }

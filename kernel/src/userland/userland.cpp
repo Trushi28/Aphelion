@@ -6,6 +6,11 @@
 #include <cosmos/procgroup.hpp>
 #include <cosmos/handleabi.hpp>
 #include <cosmos/lens_channel.hpp>
+#include <cosmos/memobj.hpp>
+#include <cosmos/apx.hpp>
+#include <cosmos/fileabi.hpp>
+#include <cosmos/kheap.hpp>
+#include <cosmos/vmregion.hpp>
 #include <cosmos/apic.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/gdt.hpp>
@@ -49,12 +54,18 @@ struct Process {
     volatile u32 created;
     u64 group;
     lens::Table handles;
+    orbital::Mutex vm;
+    vmregion::Map<> regions;
     orbital::WaitQueue events;
     orbital::WaitQueue done;
     volatile u32 exited;
+    volatile u32 detached;
+    volatile u32 reaping;
     i32 status;
     volatile u64 core_mask;
 };
+
+Process* launch_impl(const char* name, const Image& image, lens::Table* from, lens::Lens handle);
 
 namespace {
 
@@ -72,6 +83,7 @@ cpu::Spinlock g_table_lock;
 volatile u32 g_next_pid = 0;
 volatile u64 g_frames_live = 0;
 volatile u64 g_frames_quarantined = 0;
+volatile u64 g_detached_reaped = 0;
 volatile bool g_supported = false;
 volatile u32 g_nmi_expected = 0;
 volatile u64 g_nmi_from_user = 0;
@@ -124,6 +136,7 @@ NORETURN void leave_thread(Process* p, Thread* t, i32 own) {
         p->status = l.status;
         __atomic_store_n(&p->exited, 1u, __ATOMIC_RELEASE);
         p->done.wake_all();
+        lens::stream_event();
     }
     orbital::exit_with(own);
 }
@@ -147,7 +160,13 @@ Process* acquire_slot() {
     g_table_lock.lock();
     Process* found = nullptr;
     for (auto& p : g_procs) {
-        if (!p.in_use) { p.in_use = true; found = &p; break; }
+        if (!p.in_use) {
+            p.in_use = true;
+            __atomic_store_n(&p.detached, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&p.reaping, 0u, __ATOMIC_RELEASE);
+            found = &p;
+            break;
+        }
     }
     g_table_lock.unlock();
     cpu::irq_restore(f);
@@ -159,6 +178,8 @@ Process* acquire_slot() {
     found->poisoned_count = 0;
     for (auto& t : found->threads) t = Thread{};
     new (&found->handles) lens::Table();
+    new (&found->vm) orbital::Mutex();
+    new (&found->regions) vmregion::Map<>();
     found->created = 0;
     found->group = 0;
     found->exited = 0;
@@ -189,6 +210,76 @@ bool owns_frame(const Process* p, u64 frame) {
     return false;
 }
 
+struct VmGuard {
+    orbital::Mutex& m;
+    explicit VmGuard(orbital::Mutex& x) : m(x) { m.lock(); }
+    ~VmGuard() { m.unlock(); }
+    VmGuard(const VmGuard&) = delete;
+    VmGuard& operator=(const VmGuard&) = delete;
+};
+
+struct StreamOps {
+    void retain(void* o) { static_cast<lens::Stream*>(o)->retain(); }
+    void release(void* o) { static_cast<lens::Stream*>(o)->release(); }
+};
+
+struct DeferredOps {
+    static constexpr u32 CAPACITY = vmregion::MAX_REGIONS + 8;
+    void* pending[CAPACITY];
+    u32 count = 0;
+    void retain(void* o) { static_cast<lens::Stream*>(o)->retain(); }
+    void release(void* o) {
+        if (count < CAPACITY) pending[count++] = o;
+    }
+    void flush() {
+        for (u32 i = 0; i < count; ++i) static_cast<lens::Stream*>(pending[i])->release();
+        count = 0;
+    }
+};
+
+bool vm_owns_frame(Process* p, u64 frame, bool poison) {
+    bool hit = false;
+    for (u32 i = 0; i < p->regions.count(); ++i) {
+        memobj::Object* o = static_cast<memobj::Object*>(p->regions.at(i).object);
+        if (!memobj::owns(o, frame)) continue;
+        hit = true;
+        if (poison) memobj::poison(o, frame);
+        else break;
+    }
+    return hit;
+}
+
+constexpr u32 PROCESS_STREAM_TYPE = 0x434F5250;
+
+class ProcessObj final : public lens::Stream {
+public:
+    Process* proc;
+    u32 refs;
+
+    const char* name() const override { return "process"; }
+    lens::Result<usize> read(lens::Bytes) override { return lens::Result<usize>::fail(lens::Status::Unsupported); }
+    lens::Result<usize> write(lens::ConstBytes) override { return lens::Result<usize>::fail(lens::Status::Unsupported); }
+    lens::Readiness ready() override {
+        lens::Readiness r;
+        if (__atomic_load_n(&proc->exited, __ATOMIC_ACQUIRE)) r = lens::Ready::Readable | lens::Ready::Hangup;
+        return r;
+    }
+    void retain() override { __atomic_add_fetch(&refs, 1u, __ATOMIC_ACQ_REL); }
+    void release() override {
+        if (__atomic_sub_fetch(&refs, 1u, __ATOMIC_ACQ_REL) != 0) return;
+        Process* p = proc;
+        (void)kill(p);
+        __atomic_store_n(&p->detached, 1u, __ATOMIC_RELEASE);
+        kheap::free(this);
+    }
+    u32 type() const override { return PROCESS_STREAM_TYPE; }
+};
+
+ProcessObj* process_of(lens::Slot* s) {
+    if (s->kind != lens::NodeKind::Stream || !s->stream || s->stream->type() != PROCESS_STREAM_TYPE) return nullptr;
+    return static_cast<ProcessObj*>(s->stream);
+}
+
 bool take_frame(Process* p, u64* phys) {
     if (p->frame_count >= MAX_FRAMES) return false;
     u64 frame = universe::alloc_zeroed(0);
@@ -216,12 +307,13 @@ bool map_fresh(Process* p, u64 va, u32 pages, u64 flags, const u8* src, u64 src_
 bool build(Process* p, const Image& img) {
     if (!img.code || !img.code_bytes || img.code_bytes > userabi::MAX_CODE_PAGES * PAGE) return false;
     if (img.entry_offset >= img.code_bytes || img.data_pages > userabi::MAX_DATA_PAGES) return false;
+    if (img.data_bytes > static_cast<u64>(img.data_pages) * PAGE || (img.data_bytes && !img.data)) return false;
     p->space = constellation::create_space();
     if (!p->space) return false;
     u32 code_pages = static_cast<u32>((img.code_bytes + PAGE - 1) / PAGE);
     if (!map_fresh(p, userabi::CODE_BASE, code_pages, 0, img.code, img.code_bytes)) return false;
     if (img.data_pages &&
-        !map_fresh(p, userabi::DATA_BASE, img.data_pages, constellation::WRITABLE | constellation::NO_EXECUTE, nullptr, 0))
+        !map_fresh(p, userabi::DATA_BASE, img.data_pages, constellation::WRITABLE | constellation::NO_EXECUTE, img.data, img.data_bytes))
         return false;
     u64 stack_bottom = userabi::STACK_TOP - static_cast<u64>(userabi::STACK_PAGES) * PAGE;
     if (!map_fresh(p, stack_bottom, userabi::STACK_PAGES, constellation::WRITABLE | constellation::NO_EXECUTE, nullptr, 0))
@@ -229,6 +321,11 @@ bool build(Process* p, const Image& img) {
     p->threads[0] = Thread{ p, 0, 0, 0, userabi::CODE_BASE + img.entry_offset, userabi::STACK_TOP - 16, 0 };
     p->created = 1;
     return true;
+}
+
+void release_regions(Process* p) {
+    StreamOps ops;
+    p->regions.clear(ops);
 }
 
 bool teardown(Process* p) {
@@ -254,6 +351,7 @@ bool teardown(Process* p) {
         __atomic_sub_fetch(&g_frames_live, 1ull, __ATOMIC_RELAXED);
     }
     p->frame_count = 0;
+    release_regions(p);
     if (p->space) {
         constellation::destroy_space(p->space);
         p->space = nullptr;
@@ -339,7 +437,12 @@ i64 sys_debug_write(idt::Frame* f) {
     if (len > userabi::DEBUG_WRITE_MAX) return userabi::ERR_INVAL;
     char buf[userabi::DEBUG_WRITE_MAX + 1];
     SpaceReader reader{ p->space, false };
-    if (!usercopy::copy_in(reader, uva, buf, len)) return userabi::ERR_FAULT;
+    bool copied;
+    {
+        VmGuard vg(p->vm);
+        copied = usercopy::copy_in(reader, uva, buf, len);
+    }
+    if (!copied) return userabi::ERR_FAULT;
     for (u64 i = 0; i < len; ++i) {
         u8 c = static_cast<u8>(buf[i]);
         if ((c < 0x20 && c != '\n') || c >= 0x7F) buf[i] = '.';
@@ -367,11 +470,13 @@ i64 sys_set_fs_base(idt::Frame* f) {
 i64 sys_get_fs_base(idt::Frame*) { return static_cast<i64>(cpu::rdmsr(usergs::MSR_FS_BASE)); }
 
 bool user_read(Process* p, u64 uva, void* dst, u64 n) {
+    VmGuard vg(p->vm);
     SpaceReader reader{ p->space, false };
     return usercopy::copy_in(reader, uva, dst, n);
 }
 
 bool user_write(Process* p, u64 uva, const void* src, u64 n) {
+    VmGuard vg(p->vm);
     SpaceReader writer{ p->space, true };
     return usercopy::copy_out(writer, uva, src, n);
 }
@@ -400,7 +505,17 @@ i64 sys_handle_info(idt::Frame* f) {
     if (!r.ok()) return handleabi::error_of(r.status());
     lens::Result<lens::NodeKind> k = lens::kind_of(p->handles.domain, l);
     if (!k.ok()) return handleabi::error_of(k.status());
-    return static_cast<i64>(handleabi::info_pack(r.value().bits, static_cast<u8>(k.value())));
+    u64 subtype = handleabi::SUBTYPE_NONE;
+    if (k.value() == lens::NodeKind::Stream) {
+        lens::Result<lens::Slot*> sr = lens::slot_of(p->handles.domain, l);
+        if (sr.ok() && sr.value()->stream) {
+            u32 type = sr.value()->stream->type();
+            if (type == lens::channel::STREAM_TYPE) subtype = handleabi::SUBTYPE_CHANNEL;
+            else if (type == memobj::STREAM_TYPE) subtype = handleabi::SUBTYPE_MEMOBJ;
+            else if (type == PROCESS_STREAM_TYPE) subtype = handleabi::SUBTYPE_PROCESS;
+        }
+    }
+    return static_cast<i64>(handleabi::info_pack(r.value().bits, static_cast<u8>(k.value()), static_cast<u8>(subtype)));
 }
 
 i64 sys_handle_narrow(idt::Frame* f) {
@@ -496,6 +611,465 @@ i64 sys_handle_wait(idt::Frame* f) {
     return static_cast<i64>(r.value());
 }
 
+
+struct MemRef {
+    memobj::Object* object = nullptr;
+    u32 max = 0;
+    ~MemRef() { if (object) object->release(); }
+    MemRef() = default;
+    MemRef(const MemRef&) = delete;
+    MemRef& operator=(const MemRef&) = delete;
+};
+
+i64 resolve_memobj(Process* p, u64 raw, bool for_map, MemRef* out) {
+    TableGuard guard(p->handles.lock);
+    lens::Result<lens::Slot*> sr = lens::slot_of(p->handles.domain, lens::Lens(raw));
+    if (!sr.ok()) return handleabi::error_of(sr.status());
+    lens::Slot* s = sr.value();
+    memobj::Object* o = s->kind == lens::NodeKind::Stream ? memobj::from_stream(s->stream) : nullptr;
+    if (!o) return userabi::ERR_INVAL;
+    if (for_map) {
+        if (!s->rights.has(lens::Right::Read)) return handleabi::ERR_DENIED;
+        out->max = vmregion::PROT_READ | (s->rights.has(lens::Right::Write) ? vmregion::PROT_WRITE : 0u) |
+                   (s->rights.has(lens::Right::Execute) ? vmregion::PROT_EXEC : 0u);
+    }
+    o->retain();
+    out->object = o;
+    return 0;
+}
+
+bool vm_args_ok(u64 pages, u64 prot) { return pages != 0 && pages <= vmregion::MAX_MAPPED_PAGES && prot <= 0xFFFFFFFFull; }
+
+i64 sys_vmo_create(idt::Frame* f) {
+    Process* p = current_process();
+    if (f->rsi != 0 || f->rdi == 0) return userabi::ERR_INVAL;
+    if (f->rdi > memobj::MAX_PAGES) return handleabi::ERR_TOOBIG;
+    u64 raw = 0;
+    if (!user_write(p, f->rdx, &raw, sizeof(raw))) return userabi::ERR_FAULT;
+    memobj::Object* o = memobj::create(static_cast<u32>(f->rdi));
+    if (!o) return userabi::ERR_LIMIT;
+    {
+        TableGuard guard(p->handles.lock);
+        lens::Result<lens::Lens> r = lens::alloc_slot(p->handles.domain, nullptr, nebula::Node{0, 0}, nebula::Node{0, 0},
+                                                      memobj::HANDLE_RIGHTS, false, 0, "memobj", o);
+        if (!r.ok()) {
+            memobj::discard(o);
+            return handleabi::error_of(r.status());
+        }
+        raw = r.value().raw;
+        if (!user_write(p, f->rdx, &raw, sizeof(raw))) {
+            (void)lens::close(p->handles.domain, r.value());
+            return userabi::ERR_FAULT;
+        }
+    }
+    return 0;
+}
+
+i64 sys_vmo_size(idt::Frame* f) {
+    Process* p = current_process();
+    MemRef ref;
+    i64 e = resolve_memobj(p, f->rdi, false, &ref);
+    if (e) return e;
+    return static_cast<i64>(ref.object->pages);
+}
+
+i64 sys_vm_map(idt::Frame* f) {
+    Process* p = current_process();
+    u64 addr = f->rsi;
+    u64 offset = f->rdx;
+    u64 pages = f->r10;
+    u64 prot = f->r8;
+    if (!vm_args_ok(pages, prot) || offset > memobj::MAX_PAGES) return userabi::ERR_INVAL;
+    MemRef ref;
+    i64 e = resolve_memobj(p, f->rdi, true, &ref);
+    if (e) return e;
+    memobj::Object* o = ref.object;
+    if (pages > o->pages || offset > o->pages - pages) return userabi::ERR_INVAL;
+    vmregion::Status ps = vmregion::check_prot(static_cast<u32>(prot), ref.max);
+    if (ps != vmregion::Status::Ok) return handleabi::vm_error(ps);
+
+    VmGuard vg(p->vm);
+    for (u64 i = 0; i < pages; ++i)
+        if (memobj::poisoned(o, static_cast<u32>(offset + i))) return userabi::ERR_FAULT;
+    u64 base = addr;
+    vmregion::Status st = addr ? p->regions.check_free(addr, static_cast<u32>(pages)) : p->regions.find_gap(static_cast<u32>(pages), &base);
+    if (st != vmregion::Status::Ok) return handleabi::vm_error(st);
+    vmregion::Region r{ base, static_cast<u32>(pages), static_cast<u32>(offset), static_cast<u32>(prot), ref.max, o };
+    st = p->regions.insert(r);
+    if (st != vmregion::Status::Ok) return handleabi::vm_error(st);
+    o->retain();
+
+    u64 flags = vmregion::pte_flags(static_cast<u32>(prot));
+    u64 mapped = 0;
+    for (; mapped < pages; ++mapped) {
+        if (!constellation::space_map(p->space, base + mapped * PAGE, memobj::frame(o, static_cast<u32>(offset + mapped)), PAGE, flags)) break;
+    }
+    if (mapped != pages) {
+        if (mapped) constellation::space_unmap(p->space, base, mapped * PAGE);
+        StreamOps ops;
+        p->regions.unmap(base, static_cast<u32>(pages), ops);
+        return userabi::ERR_LIMIT;
+    }
+    return static_cast<i64>(base);
+}
+
+i64 sys_vm_unmap(idt::Frame* f) {
+    Process* p = current_process();
+    if (f->rsi == 0 || f->rsi > vmregion::MAX_MAPPED_PAGES) return userabi::ERR_INVAL;
+    u64 base = f->rdi;
+    u32 pages = static_cast<u32>(f->rsi);
+    DeferredOps ops;
+    VmGuard vg(p->vm);
+    vmregion::Status st = p->regions.unmap(base, pages, ops);
+    if (st != vmregion::Status::Ok) return handleabi::vm_error(st);
+    if (!constellation::space_unmap(p->space, base, static_cast<u64>(pages) * PAGE)) {
+        serial::printf("[userland] pid %u: page tables disagree with the region table, memory kept alive\n", p->pid);
+        return userabi::ERR_FAULT;
+    }
+    ops.flush();
+    return 0;
+}
+
+i64 sys_vm_protect(idt::Frame* f) {
+    Process* p = current_process();
+    if (!vm_args_ok(f->rsi, f->rdx)) return userabi::ERR_INVAL;
+    u64 base = f->rdi;
+    u32 pages = static_cast<u32>(f->rsi);
+    u32 prot = static_cast<u32>(f->rdx);
+    StreamOps ops;
+    VmGuard vg(p->vm);
+    vmregion::Status st = p->regions.protect(base, pages, prot, ops);
+    if (st != vmregion::Status::Ok) return handleabi::vm_error(st);
+    if (!constellation::space_protect(p->space, base, static_cast<u64>(pages) * PAGE, vmregion::pte_flags(prot))) {
+        serial::printf("[userland] pid %u: page tables disagree with the region table after protect\n", p->pid);
+        return userabi::ERR_FAULT;
+    }
+    return 0;
+}
+
+
+i64 fetch_path(Process* p, u64 uva, u64 len, char (&dst)[fileabi::MAX_PATH + 1]) {
+    if (!fileabi::path_len_ok(len)) return userabi::ERR_INVAL;
+    if (!user_read(p, uva, dst, len)) return userabi::ERR_FAULT;
+    dst[len] = 0;
+    if (!fileabi::path_text_ok(dst, len)) return userabi::ERR_INVAL;
+    return 0;
+}
+
+i64 sys_file_open(idt::Frame* f) {
+    Process* p = current_process();
+    if (!fileabi::rights_ok(f->r10)) return userabi::ERR_INVAL;
+    char path[fileabi::MAX_PATH + 1];
+    i64 e = fetch_path(p, f->rsi, f->rdx, path);
+    if (e) return e;
+    u64 raw = 0;
+    if (!user_write(p, f->r8, &raw, sizeof(raw))) return userabi::ERR_FAULT;
+    TableGuard guard(p->handles.lock);
+    lens::Result<lens::Lens> r = lens::open_at(p->handles.domain, lens::Lens(f->rdi), path, lens::Rights::from_bits(static_cast<u32>(f->r10)));
+    if (!r.ok()) return fileabi::error_of(r.status());
+    raw = r.value().raw;
+    if (!user_write(p, f->r8, &raw, sizeof(raw))) {
+        (void)lens::close(p->handles.domain, r.value());
+        return userabi::ERR_FAULT;
+    }
+    return 0;
+}
+
+i64 sys_file_read(idt::Frame* f) {
+    Process* p = current_process();
+    u64 n = fileabi::clamp_io(f->r10);
+    if (n == 0) return 0;
+    u8 bounce[fileabi::MAX_IO] = {};
+    if (!user_write(p, f->rdx, bounce, n)) return userabi::ERR_FAULT;
+    usize got = 0;
+    {
+        TableGuard guard(p->handles.lock);
+        lens::Result<usize> r = lens::read(p->handles.domain, lens::Lens(f->rdi), f->rsi, lens::Bytes(bounce, n));
+        if (!r.ok()) return fileabi::error_of(r.status());
+        got = r.value();
+    }
+    if (got > n) return userabi::ERR_INVAL;
+    if (got && !user_write(p, f->rdx, bounce, got)) return userabi::ERR_FAULT;
+    return static_cast<i64>(got);
+}
+
+i64 sys_file_write(idt::Frame* f) {
+    Process* p = current_process();
+    u64 n = fileabi::clamp_io(f->r10);
+    if (n == 0) return 0;
+    u8 bounce[fileabi::MAX_IO];
+    if (!user_read(p, f->rdx, bounce, n)) return userabi::ERR_FAULT;
+    TableGuard guard(p->handles.lock);
+    lens::Result<usize> r = lens::write(p->handles.domain, lens::Lens(f->rdi), f->rsi, lens::ConstBytes(bounce, n));
+    if (!r.ok()) return fileabi::error_of(r.status());
+    if (r.value() > n) return userabi::ERR_INVAL;
+    return static_cast<i64>(r.value());
+}
+
+i64 sys_file_stat(idt::Frame* f) {
+    Process* p = current_process();
+    fileabi::Stat st{};
+    if (!user_write(p, f->rsi, &st, sizeof(st))) return userabi::ERR_FAULT;
+    {
+        TableGuard guard(p->handles.lock);
+        lens::Lens l(f->rdi);
+        lens::Result<lens::NodeKind> k = lens::kind_of(p->handles.domain, l);
+        if (!k.ok()) return fileabi::error_of(k.status());
+        if (k.value() == lens::NodeKind::Stream) {
+            st.kind = fileabi::KIND_STREAM;
+        } else {
+            lens::Result<nebula::Info> info = lens::stat(p->handles.domain, l);
+            if (!info.ok()) return fileabi::error_of(info.status());
+            st.kind = info.value().kind == nebula::Kind::Dir ? fileabi::KIND_DIRECTORY : fileabi::KIND_FILE;
+            st.size = info.value().size;
+            st.mtime_ms = info.value().mtime_ms;
+            st.links = info.value().links;
+            st.flags = fileabi::stat_flags(info.value().read_only, info.value().dynamic);
+        }
+    }
+    if (!user_write(p, f->rsi, &st, sizeof(st))) return userabi::ERR_FAULT;
+    return 0;
+}
+
+i64 sys_file_create(idt::Frame* f) {
+    Process* p = current_process();
+    u64 flags = f->r8;
+    if ((flags & ~static_cast<u64>(fileabi::CREATE_FLAGS_MASK)) != 0 || !fileabi::rights_ok(f->r10)) return userabi::ERR_INVAL;
+    char path[fileabi::MAX_PATH + 1];
+    i64 e = fetch_path(p, f->rsi, f->rdx, path);
+    if (e) return e;
+    u64 raw = 0;
+    bool directory = (flags & fileabi::CREATE_DIRECTORY) != 0;
+    if (!directory && !user_write(p, f->r9, &raw, sizeof(raw))) return userabi::ERR_FAULT;
+    TableGuard guard(p->handles.lock);
+    if (directory) {
+        lens::Done d = lens::mkdir(p->handles.domain, lens::Lens(f->rdi), path, false);
+        return d.ok() ? 0 : fileabi::error_of(d.status());
+    }
+    lens::Result<lens::Lens> r = lens::create(p->handles.domain, lens::Lens(f->rdi), path, lens::Rights::from_bits(static_cast<u32>(f->r10)));
+    if (!r.ok()) return fileabi::error_of(r.status());
+    raw = r.value().raw;
+    if (!user_write(p, f->r9, &raw, sizeof(raw))) {
+        (void)lens::close(p->handles.domain, r.value());
+        return userabi::ERR_FAULT;
+    }
+    return 0;
+}
+
+struct DirPick {
+    u64 index;
+    u64 seen;
+    bool found;
+    fileabi::DirEntry entry;
+};
+
+bool dir_pick(void* ctx, const nebula::Entry& e) {
+    DirPick* d = static_cast<DirPick*>(ctx);
+    if (d->seen != d->index) {
+        ++d->seen;
+        return true;
+    }
+    d->found = true;
+    d->entry.size = e.size;
+    d->entry.mtime_ms = e.mtime_ms;
+    d->entry.kind = e.kind == nebula::Kind::Dir ? fileabi::KIND_DIRECTORY : fileabi::KIND_FILE;
+    u32 n = 0;
+    while (e.name[n] && n + 1 < fileabi::NAME_CAP) {
+        d->entry.name[n] = e.name[n];
+        ++n;
+    }
+    d->entry.name[n] = 0;
+    d->entry.name_len = n;
+    return false;
+}
+
+static_assert(nebula::NAME_BYTES + 1 <= fileabi::NAME_CAP, "a directory entry name must fit the user record");
+
+i64 sys_dir_entry(idt::Frame* f) {
+    Process* p = current_process();
+    DirPick pick{};
+    pick.index = f->rsi;
+    if (!user_write(p, f->rdx, &pick.entry, sizeof(pick.entry))) return userabi::ERR_FAULT;
+    {
+        TableGuard guard(p->handles.lock);
+        lens::Result<lens::EnumSummary> r = lens::enumerate(p->handles.domain, lens::Lens(f->rdi), &dir_pick, &pick, true);
+        if (!r.ok()) return fileabi::error_of(r.status());
+    }
+    if (!pick.found) return fileabi::DIR_END;
+    if (!user_write(p, f->rdx, &pick.entry, sizeof(pick.entry))) return userabi::ERR_FAULT;
+    return 0;
+}
+
+i64 sys_pipe_create(idt::Frame* f) {
+    Process* p = current_process();
+    if (f->rdi == 0 || f->rdi > fileabi::MAX_PIPE_BYTES) return userabi::ERR_INVAL;
+    u64 pair[2] = { 0, 0 };
+    if (!user_write(p, f->rsi, pair, sizeof(pair))) return userabi::ERR_FAULT;
+    TableGuard guard(p->handles.lock);
+    lens::Lens r, w;
+    lens::Done d = lens::make_pipe(p->handles.domain, static_cast<usize>(f->rdi), &r, &w);
+    if (!d.ok()) return fileabi::error_of(d.status());
+    pair[0] = r.raw;
+    pair[1] = w.raw;
+    if (!user_write(p, f->rsi, pair, sizeof(pair))) {
+        (void)lens::close(p->handles.domain, r);
+        (void)lens::close(p->handles.domain, w);
+        return userabi::ERR_FAULT;
+    }
+    return 0;
+}
+
+struct Loaded {
+    u8* buf = nullptr;
+    apx::Header header{};
+    char label[orbital::NAME_BYTES] = {};
+    Loaded() = default;
+    Loaded(const Loaded&) = delete;
+    Loaded& operator=(const Loaded&) = delete;
+    ~Loaded() { if (buf) kheap::free(buf); }
+};
+
+lens::Status read_exact(lens::Table& t, lens::Lens l, u8* dst, u64 n) {
+    u64 got = 0;
+    while (got < n) {
+        lens::Result<usize> r = lens::read(t.domain, l, got, lens::Bytes(dst + got, static_cast<usize>(n - got)));
+        if (!r.ok()) return r.status();
+        if (r.value() == 0) return lens::Status::Io;
+        got += r.value();
+    }
+    return lens::Status::Ok;
+}
+
+i64 load_apx(lens::Table& t, lens::Lens file, Loaded* out) {
+    TableGuard guard(t.lock);
+    lens::Result<lens::Slot*> sr = lens::slot_of(t.domain, file);
+    if (!sr.ok()) return fileabi::error_of(sr.status());
+    lens::Slot* s = sr.value();
+    if (s->kind != lens::NodeKind::Blob) return fileabi::ERR_WRONGTYPE;
+    if (!s->rights.has_all(fileabi::LAUNCH_RIGHTS)) return handleabi::ERR_DENIED;
+    lens::Result<u64> sz = lens::size(t.domain, file);
+    if (!sz.ok()) return fileabi::error_of(sz.status());
+    u64 size = sz.value();
+    if (size < apx::HEADER_BYTES || size > apx::MAX_FILE_BYTES) return handleabi::ERR_BADIMAGE;
+    u8 head[apx::HEADER_BYTES];
+    lens::Status st = read_exact(t, file, head, sizeof(head));
+    if (st != lens::Status::Ok) return fileabi::error_of(st);
+    if (apx::parse_header(head, sizeof(head), size).status != apx::Status::Ok) return handleabi::ERR_BADIMAGE;
+    out->buf = static_cast<u8*>(kheap::alloc(static_cast<usize>(size)));
+    if (!out->buf) return userabi::ERR_LIMIT;
+    st = read_exact(t, file, out->buf, size);
+    if (st != lens::Status::Ok) return fileabi::error_of(st);
+    apx::Parsed full = apx::parse(out->buf, static_cast<usize>(size));
+    if (full.status != apx::Status::Ok) return handleabi::ERR_BADIMAGE;
+    out->header = full.header;
+    lens::Result<u32> label = lens::label_of(t.domain, file, out->label, sizeof(out->label));
+    if (!label.ok() || out->label[0] == 0) {
+        const char fallback[] = "apx";
+        for (u32 i = 0; i < sizeof(fallback); ++i) out->label[i] = fallback[i];
+    }
+    return 0;
+}
+
+bool arg_handle_ok(lens::Table& t, lens::Lens arg, i64* error) {
+    TableGuard guard(t.lock);
+    lens::Result<lens::Rights> r = lens::rights_of(t.domain, arg);
+    if (!r.ok()) {
+        *error = handleabi::error_of(r.status());
+        return false;
+    }
+    if (!r.value().has(lens::Right::Delegate)) {
+        *error = handleabi::ERR_DENIED;
+        return false;
+    }
+    return true;
+}
+
+Process* spawn_file(lens::Table& files, lens::Lens file, const char* name, lens::Table* from, lens::Lens arg, i64* error) {
+    i64 scratch = 0;
+    if (!error) error = &scratch;
+    *error = 0;
+    if (!g_supported) {
+        *error = userabi::ERR_NOSYS;
+        return nullptr;
+    }
+    if (from && !arg.is_null() && !arg_handle_ok(*from, arg, error)) return nullptr;
+    Loaded loaded;
+    i64 e = load_apx(files, file, &loaded);
+    if (e) {
+        *error = e;
+        return nullptr;
+    }
+    const apx::Header& h = loaded.header;
+    Image img{ loaded.buf + h.code_offset, h.code_bytes, h.entry_offset, h.data_pages, h.data_bytes ? loaded.buf + h.data_offset : nullptr, h.data_bytes };
+    bool with_arg = from && !arg.is_null();
+    Process* p = launch_impl(name ? name : loaded.label, img, with_arg ? from : nullptr, arg);
+    if (!p) *error = userabi::ERR_LIMIT;
+    return p;
+}
+
+i64 sys_process_create(idt::Frame* f) {
+    Process* self = current_process();
+    if (f->r10 != 0) return userabi::ERR_INVAL;
+    u64 raw = 0;
+    if (!user_write(self, f->rdx, &raw, sizeof(raw))) return userabi::ERR_FAULT;
+    (void)sweep_detached();
+    ProcessObj* obj = static_cast<ProcessObj*>(kheap::alloc_zeroed(sizeof(ProcessObj)));
+    if (!obj) return userabi::ERR_LIMIT;
+    new (obj) ProcessObj();
+    i64 error = 0;
+    Process* child = spawn_file(self->handles, lens::Lens(f->rdi), nullptr, &self->handles, lens::Lens(f->rsi), &error);
+    if (!child) {
+        kheap::free(obj);
+        return error;
+    }
+    obj->proc = child;
+    obj->refs = 0;
+    TableGuard guard(self->handles.lock);
+    lens::Result<lens::Lens> made = lens::alloc_slot(self->handles.domain, nullptr, nebula::Node{0, 0}, nebula::Node{0, 0},
+                                                     fileabi::PROCESS_RIGHTS, false, 0, "process", obj);
+    if (!made.ok()) {
+        (void)kill(child);
+        __atomic_store_n(&child->detached, 1u, __ATOMIC_RELEASE);
+        kheap::free(obj);
+        return handleabi::error_of(made.status());
+    }
+    raw = made.value().raw;
+    if (!user_write(self, f->rdx, &raw, sizeof(raw))) {
+        (void)lens::close(self->handles.domain, made.value());
+        return userabi::ERR_FAULT;
+    }
+    return 0;
+}
+
+i64 sys_process_status(idt::Frame* f) {
+    Process* p = current_process();
+    i64 status = 0;
+    if (!user_write(p, f->rsi, &status, sizeof(status))) return userabi::ERR_FAULT;
+    {
+        TableGuard guard(p->handles.lock);
+        lens::Result<lens::Slot*> sr = lens::slot_of(p->handles.domain, lens::Lens(f->rdi));
+        if (!sr.ok()) return handleabi::error_of(sr.status());
+        ProcessObj* o = process_of(sr.value());
+        if (!o) return userabi::ERR_INVAL;
+        if (!sr.value()->rights.has(lens::Right::Read)) return handleabi::ERR_DENIED;
+        if (!__atomic_load_n(&o->proc->exited, __ATOMIC_ACQUIRE)) return handleabi::ERR_AGAIN;
+        status = o->proc->status;
+    }
+    if (!user_write(p, f->rsi, &status, sizeof(status))) return userabi::ERR_FAULT;
+    return 0;
+}
+
+i64 sys_process_kill(idt::Frame* f) {
+    Process* p = current_process();
+    TableGuard guard(p->handles.lock);
+    lens::Result<lens::Slot*> sr = lens::slot_of(p->handles.domain, lens::Lens(f->rdi));
+    if (!sr.ok()) return handleabi::error_of(sr.status());
+    ProcessObj* o = process_of(sr.value());
+    if (!o) return userabi::ERR_INVAL;
+    if (!sr.value()->rights.has(lens::Right::Write)) return handleabi::ERR_DENIED;
+    return kill(o->proc) ? 0 : handleabi::ERR_CLOSED;
+}
+
 using SysFn = i64 (*)(idt::Frame*);
 
 const SysFn g_table[userabi::SYS_COUNT] = {
@@ -517,7 +1091,25 @@ const SysFn g_table[userabi::SYS_COUNT] = {
     &sys_channel_send,
     &sys_channel_recv,
     &sys_handle_wait,
+    &sys_vmo_create,
+    &sys_vm_map,
+    &sys_vm_unmap,
+    &sys_vm_protect,
+    &sys_vmo_size,
+    &sys_file_open,
+    &sys_file_read,
+    &sys_file_write,
+    &sys_file_stat,
+    &sys_file_create,
+    &sys_dir_entry,
+    &sys_pipe_create,
+    &sys_process_create,
+    &sys_process_status,
+    &sys_process_kill,
 };
+
+static_assert(vmregion::PTE_WRITABLE == constellation::WRITABLE && vmregion::PTE_NO_EXECUTE == constellation::NO_EXECUTE,
+              "the region table's page flags must match the VMM");
 
 static_assert(userabi::USER_LIMIT == constellation::USER_LIMIT, "the native ABI and the VMM must agree on the user limit");
 
@@ -572,10 +1164,20 @@ bool user_machine_check(Process* p) {
         m.status[i] = cpu::rdmsr(base);
         if (m.status[i] & ringabort::STATUS_ADDRV) m.addr[i] = cpu::rdmsr(base + 1);
     }
-    ringabort::Verdict v = ringabort::judge_machine_check(true, m, [p](u64 frame) { return owns_frame(p, frame); });
-    if (v.action != ringabort::Action::Kill) return false;
+    bool vm_held = p->vm.try_lock();
+    ringabort::Verdict v = ringabort::judge_machine_check(true, m, [p, vm_held](u64 frame) {
+        return owns_frame(p, frame) || (vm_held && vm_owns_frame(p, frame, false));
+    });
+    if (v.action != ringabort::Action::Kill) {
+        if (vm_held) p->vm.unlock();
+        return false;
+    }
 
-    for (u32 i = 0; i < v.poisoned; ++i) p->poisoned[p->poisoned_count++] = v.frames[i];
+    for (u32 i = 0; i < v.poisoned; ++i) {
+        p->poisoned[p->poisoned_count++] = v.frames[i];
+        if (vm_held) vm_owns_frame(p, v.frames[i], true);
+    }
+    if (vm_held) p->vm.unlock();
     for (u32 i = 0; i < m.banks; ++i) {
         if (m.status[i] & ringabort::STATUS_VAL)
             cpu::wrmsr(ringabort::MSR_MC0_STATUS + i * ringabort::MSR_BANK_STRIDE, 0);
@@ -721,6 +1323,31 @@ Process* launch_with(const char* name, const Image& image, lens::Table& from, le
     return launch_impl(name, image, &from, handle);
 }
 
+Process* launch_file(const char* name, lens::Table& files, lens::Lens file, lens::Table* from, lens::Lens handle, i64* error) {
+    return spawn_file(files, file, name, from, handle, error);
+}
+
+u32 sweep_detached() {
+    u32 reaped = 0;
+    for (auto& p : g_procs) {
+        bool claimed = false;
+        u64 fl = cpu::irq_save();
+        g_table_lock.lock();
+        if (p.in_use && __atomic_load_n(&p.detached, __ATOMIC_ACQUIRE) && __atomic_load_n(&p.exited, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&p.reaping, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&p.reaping, 1u, __ATOMIC_RELEASE);
+            claimed = true;
+        }
+        g_table_lock.unlock();
+        cpu::irq_restore(fl);
+        if (claimed && reap(&p)) {
+            ++reaped;
+            __atomic_add_fetch(&g_detached_reaped, 1ull, __ATOMIC_RELAXED);
+        }
+    }
+    return reaped;
+}
+
 bool wait(Process* p, i32* status, u64 timeout_ms) {
     if (!p->done.wait_until_for(&exited_ready, p, timeout_ms)) return false;
     if (status) *status = p->status;
@@ -758,6 +1385,7 @@ u32 cores_used(const Process* p) {
 }
 
 u64 frames_live() { return __atomic_load_n(&g_frames_live, __ATOMIC_RELAXED); }
+u64 detached_reaped() { return __atomic_load_n(&g_detached_reaped, __ATOMIC_RELAXED); }
 u64 frames_quarantined() { return __atomic_load_n(&g_frames_quarantined, __ATOMIC_RELAXED); }
 
 void expect_nmis(u32 count) { __atomic_store_n(&g_nmi_expected, count, __ATOMIC_RELEASE); }
