@@ -822,6 +822,10 @@ i64 sys_file_stat(idt::Frame* f) {
             if (!info.ok()) return fileabi::error_of(info.status());
             st.kind = info.value().kind == nebula::Kind::Dir ? fileabi::KIND_DIRECTORY : fileabi::KIND_FILE;
             st.size = info.value().size;
+            if (info.value().kind == nebula::Kind::File) {
+                lens::Result<u64> live = lens::size(p->handles.domain, l);
+                if (live.ok()) st.size = live.value();
+            }
             st.mtime_ms = info.value().mtime_ms;
             st.links = info.value().links;
             st.flags = fileabi::stat_flags(info.value().read_only, info.value().dynamic);

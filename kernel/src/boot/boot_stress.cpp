@@ -258,7 +258,7 @@ constexpr u32 MM_PAGE_BLOCKS = 8;
 static volatile u32 g_mm_remaining = MM_WORKERS;
 static volatile u32 g_mm_errors = 0;
 static volatile u64 g_mm_operations = 0;
-static u64 g_mm_baseline_objects = 0;
+static u64 g_mm_heap_held = 0;
 
 struct MmLive { u8* p; u32 size; u8 tag; };
 struct MmPages { u64 phys; int order; u8 tag; };
@@ -344,11 +344,13 @@ static void demo_mm_stress(void* arg) {
                 if (reinterpret_cast<u64>(l.p) % kheap::GUARANTEED_ALIGNMENT) mm_fail("misaligned heap pointer", w, op);
                 mm_fill(l);
                 live[n++] = l;
+                __atomic_fetch_add(&g_mm_heap_held, 1ull, __ATOMIC_SEQ_CST);
             }
         } else {
             u32 j = static_cast<u32>(mm_next(rng) % n);
             if (!mm_intact(live[j])) mm_fail("a heap object was overwritten by another owner", w, op);
             kheap::free(live[j].p);
+            __atomic_fetch_sub(&g_mm_heap_held, 1ull, __ATOMIC_SEQ_CST);
             live[j] = live[--n];
         }
         if ((op & 63) == 0) orbital::yield();
@@ -356,6 +358,7 @@ static void demo_mm_stress(void* arg) {
     for (u32 i = 0; i < n; ++i) {
         if (!mm_intact(live[i])) mm_fail("a heap object was overwritten before release", w, MM_OPERATIONS);
         kheap::free(live[i].p);
+        __atomic_fetch_sub(&g_mm_heap_held, 1ull, __ATOMIC_SEQ_CST);
     }
     for (u32 i = 0; i < pn; ++i) {
         if (!mm_stamp_intact(blocks[i])) mm_fail("a physical block was overwritten before release", w, MM_OPERATIONS);
@@ -363,7 +366,7 @@ static void demo_mm_stress(void* arg) {
     }
     __atomic_fetch_add(&g_mm_operations, static_cast<u64>(MM_OPERATIONS), __ATOMIC_SEQ_CST);
     if (__atomic_sub_fetch(&g_mm_remaining, 1u, __ATOMIC_SEQ_CST) == 0) {
-        bool balanced = kheap::stats().live_objects == g_mm_baseline_objects && kheap::check();
+        bool balanced = __atomic_load_n(&g_mm_heap_held, __ATOMIC_SEQ_CST) == 0 && kheap::check();
         if (!balanced) __atomic_fetch_add(&g_mm_errors, 1u, __ATOMIC_SEQ_CST);
         u32 errors = g_mm_errors;
         serial::printf("[smp-mm] %lu workers ran %lu heap and page operations concurrently, heap %s: %u error(s)\n",
@@ -455,7 +458,7 @@ void spawn_test_tasks() {
 }
 
 void spawn_mm_stress() {
-    g_mm_baseline_objects = kheap::stats().live_objects;
+    __atomic_store_n(&g_mm_heap_held, 0ull, __ATOMIC_SEQ_CST);
     for (u64 i = 0; i < MM_WORKERS; ++i)
         orbital::spawn("mm-stress", &demo_mm_stress, reinterpret_cast<void*>(i));
 }

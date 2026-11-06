@@ -1,5 +1,6 @@
 #include <cosmos/lens_channel.hpp>
 #include <cosmos/kheap.hpp>
+#include <cosmos/orbital.hpp>
 
 namespace lens::channel {
 

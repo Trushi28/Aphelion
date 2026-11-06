@@ -1,6 +1,6 @@
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/kheap.hpp>
-#include <cosmos/orbital.hpp>
+#include <cosmos/mutex.hpp>
 #include <cosmos/clock.hpp>
 
 namespace nebula {

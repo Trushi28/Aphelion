@@ -193,6 +193,7 @@ void printf(const char* fmt, ...) {
             case 'p': write_raw("0x"); put_uint(__builtin_va_arg(ap, u64), 16, false); break;
             case 'l':
                 if (*(p + 1) == 'u') { ++p; put_uint(__builtin_va_arg(ap, u64), 10, false, width, zero); }
+                else if (*(p + 1) == 'd') { ++p; put_int(__builtin_va_arg(ap, i64), width, zero); }
                 else if (*(p + 1) == 'x') { ++p; put_uint(__builtin_va_arg(ap, u64), 16, false, width, zero); }
                 break;
             case '%': putc_raw('%'); break;

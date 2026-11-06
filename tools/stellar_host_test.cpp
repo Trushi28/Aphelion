@@ -3,7 +3,7 @@
 #include <cosmos/pmm.hpp>
 #include <cosmos/serial.hpp>
 #include <cosmos/stellar.hpp>
-#include <cosmos/orbital.hpp>
+#include <cosmos/mutex.hpp>
 #include <cosmos/civil.hpp>
 
 extern "C" {
