@@ -84,7 +84,7 @@ TEST_ISO := $(BUILD)/aphelion-test.iso
 
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
-.PHONY: test-iso run-test usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-userland test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+.PHONY: test-iso run-test usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-userland test-pe test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -235,7 +235,7 @@ run-uefi-usb:
 run-nodisk: iso
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio $(QEMU_EXIT)
 
-TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm acpi userland
+TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm acpi userland pe
 
 unit_inc_stellar  := -I$(KDIR)/include
 unit_src_stellar  := $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp
@@ -257,6 +257,8 @@ unit_inc_lens-types := -I$(KDIR)/include
 unit_src_lens-types := tools/lens_types_host_test.cpp
 unit_inc_userland := -I$(KDIR)/include
 unit_src_userland := tools/userland_host_test.cpp
+unit_inc_pe       := -I$(KDIR)/include -Itools
+unit_src_pe       := tools/pe_host_test.cpp
 
 FS_CORE_SRC := $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp
 LENS_SRC    := $(KDIR)/src/fs/lens.cpp $(KDIR)/src/fs/lens_ops.cpp
@@ -315,6 +317,11 @@ test-userland:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined $(unit_inc_userland) $(unit_src_userland) -o $(BUILD)/userland_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/userland_host_test
+
+test-pe:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pe) $(unit_src_pe) -o $(BUILD)/pe_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pe_host_test
 
 test-acpi:
 	@mkdir -p $(BUILD)

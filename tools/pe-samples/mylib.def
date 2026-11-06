@@ -1,0 +1,5 @@
+LIBRARY mylib.dll
+EXPORTS
+Alpha @1
+Beta @2
+Gamma @7 NONAME
