@@ -290,7 +290,7 @@ unit_src_userland := tools/userland_host_test.cpp
 unit_inc_pe       := -I$(KDIR)/include -Itools
 unit_src_pe       := tools/pe_host_test.cpp
 unit_inc_pehost   := -I$(KDIR)/include -Itools
-unit_src_pehost   := tools/pehost_host_test.cpp
+unit_src_pehost   := tools/pehost_host_test.cpp tools/pehost_lib_test.cpp
 unit_inc_apxpack  := -I$(KDIR)/include -Itools
 unit_src_apxpack  := tools/apxpack_host_test.cpp
 
@@ -359,8 +359,10 @@ test-pe:
 
 test-pehost:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) $(unit_src_pehost) -o $(BUILD)/pehost_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_host_test.cpp -o $(BUILD)/pehost_host_test
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_lib_test.cpp -o $(BUILD)/pehost_lib_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_lib_test
 
 test-apxpack: $(USER_DIR)/hello.elf
 	@mkdir -p $(BUILD)

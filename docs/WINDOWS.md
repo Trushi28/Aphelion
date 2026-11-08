@@ -69,16 +69,16 @@ Load sequence (`host.hpp`, header-only, no libc, identical in the kernel build a
 
 1. `pe::parse`, then refuse DLLs (`STATUS_INVALID_IMAGE_FORMAT`) and images that cannot move (`STATUS_CONFLICTING_ADDRESSES`).
 2. Map the image into a memory object at a 64 KiB aligned base, `pe::map`, `pe::relocate` to that base, `pe::bind_imports` against the host's table. Any missing import is logged by DLL and name (ordinals as `#n`) with a count, and the program does not start (`STATUS_ENTRYPOINT_NOT_FOUND`).
-3. Read the TLS directory, then allocate a support block: a TEB page, a PEB page, the TLS pointer array and one TLS block (template copied, zero fill left zero, the module's TLS index slot set to 0).
+3. Read the TLS directory, then allocate a support block: two TEB pages (the Windows TEB is larger than one page and `TlsSlots` sits at 0x1480), a PEB page, the TLS pointer array and one TLS block (template copied, zero fill left zero, the module's TLS index slot set to 0).
 4. Allocate a stack of the image's reserve size, clamped to 64 KiB to 1 MiB, and fill TEB stack base and limit.
 5. Set the page protections from `pe::plan`: headers and read-only data R, code R+X, data RW. Everything is mapped RW until the imports are bound and the relocations applied, so a section that is read-only at run time can still be patched.
 6. Point GS at the TEB, switch to the new stack, call each TLS callback with reason 1 (process attach), then call the entry point with the PEB address in `rcx`. A program that returns uses its return value as the exit status.
 
 Exit statuses use the NT codes a Windows loader would report: `0xC000007B` bad image, `0xC0000018` conflicting addresses, `0xC0000017` no memory, `0xC0000139` entry point not found.
 
-TEB fields set: `StackBase` 0x08, `StackLimit` 0x10, `Self` 0x30, client process (1) and thread ids 0x40 and 0x48, `ThreadLocalStoragePointer` 0x58, `ProcessEnvironmentBlock` 0x60, `LastErrorValue` 0x68. PEB fields set: `ImageBaseAddress` 0x10; the rest of the page is zero. The layouts come from Microsoft's published documentation of these structures; only the fields above are populated and a program that reads another field sees zero.
+TEB fields set: `StackBase` 0x08, `StackLimit` 0x10, `Self` 0x30, client process (1) and thread ids 0x40 and 0x48, `ThreadLocalStoragePointer` 0x58, `ProcessEnvironmentBlock` 0x60, `LastErrorValue` 0x68, `TlsSlots` 0x1480 (64 entries). PEB fields set: `ImageBaseAddress` 0x10 and `ProcessHeap` 0x30; the rest of the page is zero. The layouts come from Microsoft's published documentation of these structures; only the fields above are populated and a program that reads another field sees zero.
 
-`win32.hpp` provides the first `kernel32.dll` subset, each function with the Microsoft x64 calling convention (`ms_abi`): `ExitProcess`, `GetStdHandle`, `WriteFile` (standard output and error go to the serial console), `GetLastError`, `SetLastError`. Nothing else is provided yet; that is W3.
+Each host function has the Microsoft x64 calling convention (`ms_abi`). W2 provided `ExitProcess`, `GetStdHandle`, `WriteFile` (standard output and error go to the serial console), `GetLastError` and `SetLastError`; W3 added the rest, below.
 
 ### Tests
 
@@ -98,23 +98,71 @@ The kernel boot self-test runs the same four programs through `pehost.apx` from 
 ### Limits
 
 - The Windows program and the host share one address space and one privilege level. The host stubs are reachable by any pointer the program holds; there is no isolation inside the process, and none is intended for W2.
-- One thread. No `CreateThread`, no thread-start TLS callbacks, no dynamic `TlsAlloc`.
+- One thread. No `CreateThread` and no thread-start TLS callbacks. `TlsAlloc` exists (W3) but there is only ever one thread's slots.
 - No structured exception handling and no unwinding. A fault in the program is a fault in the process and kills it with the kernel's fault status.
-- No heap, no command line, no environment: `ProcessParameters` and `ProcessHeap` are null. A program that calls `GetCommandLineW` or `HeapAlloc` does not load, because those imports are missing.
+- `ProcessParameters` in the PEB is null: a program that reads it directly instead of calling `GetCommandLine` sees nothing. The environment is empty.
 - Input is not implemented: `GetStdHandle` returns a handle for standard input but `WriteFile` accepts only standard output and error.
 - Each protection run is a separate mapping, and a process has 64 mappings. An image whose sections need more than about 60 separate runs fails to load (`STATUS_NO_MEMORY`, with the reason logged).
 - The image is placed at a fixed address, `0x100100000000`. DLL loading (W5) will need an allocator.
 - The test machine must be Linux x86-64: the host test uses `fork`, `arch_prctl` and the Microsoft calling convention directly.
 
+## W3: kernel32 and msvcrt subsets, so a MinGW program runs
+
+The MinGW `hello world` (`x86_64-w64-mingw32-gcc new.c -o hello.exe`, 47 imports) now runs unmodified, in the host test and inside the kernel. The pieces, all header-only and free of libc so the host test and the ring-3 build compile the same text:
+
+| File | Contents |
+| --- | --- |
+| `heap.hpp` | `Heap`: boundary-tag allocator, 16-byte alignment, first fit, coalescing, in-place grow and shrink, `check()` for the invariants. Memory comes from the platform in chunks (256 KiB doubling to 2 MiB, at most 8 chunks, 8 MiB in all). Pointers it did not hand out, interior pointers and double frees are refused, not acted on. |
+| `codec.hpp` | UTF-8 to UTF-16 and back. Lenient mode replaces each maximal ill-formed subpart with U+FFFD; strict mode fails. |
+| `format.hpp` | The `printf` core: flags `-+ #0`, width and precision (also `*`), `hh h l ll z t j I I32 I64`, and the conversions `d i u o x X c s p %`. `%p` is 16 upper-case hex digits as msvcrt prints it. Floating point (`f e g a`) and `n` are not supported: the call returns -1 and sets `errno` to `EINVAL` instead of printing something wrong. |
+| `cmdline.hpp` | Splits a command line by the Microsoft rules (program name up to the first space or closing quote, then backslashes before quotes, doubled quotes inside quotes). |
+| `win32.hpp` | `kernel32.dll`: process (`ExitProcess`, `TerminateProcess` on the current process, `GetCurrentProcess`, `GetCurrentProcessId`, `GetCurrentThread`, `GetCurrentThreadId`), console (`GetStdHandle`, `WriteFile`), errors, heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`, `HeapReAlloc`, `HeapSize`), thread-local storage (`TlsAlloc`, `TlsFree`, `TlsGetValue`, `TlsSetValue`, 64 slots in the TEB), critical sections (five calls; there is one thread, so they count and never block), modules (`GetModuleHandleA/W`, `GetProcAddress`, `GetModuleFileNameA`, `GetCommandLineA/W`), memory protection (`VirtualQuery`, `VirtualProtect`, image pages only), `Sleep`, `SetUnhandledExceptionFilter`, and the code-page calls (`MultiByteToWideChar`, `WideCharToMultiByte`, `IsDBCSLeadByteEx`, `GetACP`). |
+| `msvcrt.hpp` | `msvcrt.dll`: the C start-up hooks (`__getmainargs`, `__set_app_type`, `__setusermatherr`, `_initterm`, `_initterm_e`, `_fmode`, `_commode`, `__initenv`, `_lock`, `_unlock`, `_amsg_exit`), `exit`, `_exit`, `_cexit`, `abort`, `atexit`, `_onexit`, `signal`, stdio on standard output and error (`__iob_func`, `fwrite`, `fputc`, `fputs`, `puts`, `putchar`, `fflush`, `printf`, `fprintf`, `vfprintf`, `vprintf`, `sprintf`, `vsprintf`, `_snprintf`, `_vsnprintf`), the allocator (`malloc`, `calloc`, `realloc`, `free`), string and memory functions, `getenv` (always unset), `strerror`, `localeconv`, `_errno`. |
+
+How the time and process facts are obtained: there is no clock syscall, so no time function is provided. `Sleep` waits on the read end of a pipe nobody writes, with a timeout, which is the one way ring 3 can sleep today. The command line is fixed at `pe.exe` by the Aphelion host, because a process receives one handle and nothing else; a launcher that passes arguments is future work, and the host test passes real command lines through `--run`.
+
+### Running a program on the test machine
+
+`build/pehost_host_test --run program.exe ["command line"]` runs any PE the host accepts, natively on Linux x86-64, and prints its output and exit status. For example `build/pehost_host_test --run hello.exe` runs the 249 KB MinGW program. The host logs what it refused and why. A Windows program that needs something missing is refused with the import named, before any of its code runs.
+
+### Running a program from the shell
+
+In shell mode the bundled programs are installed in `ram:/apps` at boot: `hello` (a native APX program), `pehost` (the PE host itself), and the Windows test programs `console.exe`, `k32.exe`, `teb.exe`, `tlscb.exe`, `stdio.exe` (`printf("Hello World\n")`) and `crt.exe`. `chart ram:/apps` lists them and `run stdio.exe` runs one: a file that starts with `MZ` is handed to `pehost`, anything else is launched as an APX image. The program's console output is printed in the shell (it also goes to the serial log with a `[user N]` prefix), Ctrl+C kills it, and the shell prints `exit status N`. Only plain names in `ram:/apps` are accepted. Programs cannot take arguments or read input yet, and the realm is in memory, so `ram:/apps` is rebuilt at every boot. To try your own program, copy it into the realm (for example with `twin disk:/prog.exe ram:/apps/prog.exe`) and `run prog.exe`.
+
+### Tests
+
+`make test-pehost` now builds two programs. `pehost_host_test` is the W2 one plus `stdio.exe` and the new `crt.exe`. `pehost_lib_test` (about 190 checks) covers the pieces:
+
+- The heap against a model: 400,000 random allocate, free and resize operations with contents verified and no two live blocks overlapping, an invariant check every 997 operations, exhaustion and recovery, a failing or misaligned platform, double and foreign frees, and deliberate corruption of every kind of metadata to show that `check()` notices.
+- UTF-8 against an independent encoder for all 1,112,064 scalar values, against an independent validity check on a million random byte strings, and (once, outside the test) against Python's decoder on 200,000 random inputs: identical output.
+- `printf` against glibc: 600,000 random format and value combinations print the same text with the same return value.
+- Command lines against the documented Microsoft examples, plus the storage and argument limits.
+- Every kernel32 and msvcrt stub, including process exit, `abort`, exit-handler order and `_amsg_exit` in forked children, `memmove` and `memcmp` and the string functions against libc, and the import tables (no duplicates; every entry found by `GetProcAddress`).
+
+`crt.exe` (MinGW, `__USE_MINGW_ANSI_STDIO=0` so `printf` comes from `msvcrt`) checks about forty behaviours from inside the program and returns 7 when all pass; `stdio.exe` is the plain `printf("Hello World\n")` program, built stripped (39 KB) and, in a manual check, unstripped (249 KB, the size of the user's `hello.exe`). The kernel self-test runs both on every disk configuration.
+
+MinGW builds are made reproducible with `-Wl,--no-insert-timestamp` (the PE header otherwise carries the build time), so regenerating the samples gives identical files.
+
+### Limits
+
+- Floating-point `printf` conversions are not provided in `msvcrt`. A MinGW program built with its default stdio uses MinGW's own formatter and prints doubles correctly (checked with `%f %e %g`); one built with `-D__USE_MINGW_ANSI_STDIO=0`, or an MSVC program linked against `msvcrt`, calls `msvcrt`'s `printf`, which returns -1 and prints nothing for a `double`.
+- Every code page is UTF-8. `WideCharToMultiByte` never substitutes a default character.
+- `HeapReAlloc` with `HEAP_ZERO_MEMORY` zeroes the bytes from the old block's usable size, not from the size originally requested, because the allocator does not record the requested size; the bytes in between keep whatever they held.
+- The heap never returns memory to the system, is capped at 8 MiB, and has no `HeapCreate`, `VirtualAlloc` or `LocalAlloc` (those imports are reported missing).
+- `VirtualProtect` and `VirtualQuery` only know the program's own image, and a writable-and-executable request is refused. A program that needs the MinGW runtime's pseudo-relocations (auto-imported data from a DLL) is not supported, and none was available to test it.
+- No standard input (`ReadFile`, `fgets`, `scanf`, `getchar` are missing imports), no files, no environment variables, no locale beyond `C`, no wide-character stdio, no `qsort` or `strtol` family, no time.
+- No exceptions: `__C_specific_handler` always answers "continue search", so structured exception handling never handles anything.
+
 ## Inspecting a program: `make peinfo`
 
 `build/peinfo [-v] [--supported list.txt] program.exe` runs the loader on a real file and prints the headers, sections, relocation count, TLS, and every import grouped by DLL. It exits 0 when the image can run, 1 when the loader refuses it or it is fixed at a base Aphelion cannot map. With `--supported`, a list of `dll!function` lines, it marks each import the executor does not provide; that list is what W4 will maintain. `tools/pe-samples/mingw.sh [outdir]` builds a few MinGW test programs and runs `peinfo` on each.
 
-What a MinGW `hello world` needs: `x86_64-w64-mingw32-gcc new.c -o hello.exe` produces a 249 KB image that the loader accepts, with 47 imports. 13 come from `kernel32.dll` (critical sections, `Sleep`, `TlsGetValue`, `VirtualProtect`, `VirtualQuery`, `GetLastError`, `SetUnhandledExceptionFilter`, code-page conversion) and 34 from `msvcrt.dll` (`__getmainargs`, `__set_app_type`, `_initterm`, `_onexit`, `__iob_func`, `fwrite`, `vfprintf`, `malloc`, `free`, `signal`, and so on). So the unmodified program needs a small `msvcrt` as well as `kernel32`; the first program the executor runs is the freestanding `kernel32`-only one.
+What a MinGW `hello world` needs (before W3): `x86_64-w64-mingw32-gcc new.c -o hello.exe` produces a 249 KB image that the loader accepts, with 47 imports. 13 come from `kernel32.dll` (critical sections, `Sleep`, `TlsGetValue`, `VirtualProtect`, `VirtualQuery`, `GetLastError`, `SetUnhandledExceptionFilter`, code-page conversion) and 34 from `msvcrt.dll` (`__getmainargs`, `__set_app_type`, `_initterm`, `_onexit`, `__iob_func`, `fwrite`, `vfprintf`, `malloc`, `free`, `signal`, and so on). So the unmodified program needs a small `msvcrt` as well as `kernel32`, which W3 now provides.
 
 ## Next
 
-- W2: done, see above. The host runs freestanding `kernel32`-only programs.
-- W3: an `ntdll` and `kernel32` subset, console only: heap, command line, critical sections, TLS API, `GetModuleHandle`, then a small `msvcrt` so the MinGW `printf` program runs.
-- W4: tracking of which imports programs ask for and Aphelion lacks.
-- W5: DLL loading and the API-set map.
+- Goal after the whole Windows section: a small game on Aphelion (snake, then pacman). It needs keyboard input and a clock and a drawing surface for ring 3, none of which exist yet; see the roadmap.
+
+- W2 and W3: done, see above. The host runs freestanding `kernel32` programs and MinGW C programs that use the subset in W3.
+- W4: tracking of which imports programs ask for and Aphelion lacks (the loader already names every missing import; W4 makes it a counted, persisted list).
+- W5: DLL loading and the API-set map, then `ucrtbase` so programs built with current MSVC or UCRT-linked MinGW run.

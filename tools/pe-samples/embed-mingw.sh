@@ -8,7 +8,7 @@ import sys, base64
 w = sys.argv[1]
 print("#pragma once")
 print()
-items = (("mingw_k32", "k32.exe"), ("mingw_stdio", "stdio-stripped.exe"))
+items = (("mingw_k32", "k32.exe"), ("mingw_stdio", "stdio-stripped.exe"), ("mingw_crt", "crt.exe"))
 for i, (name, file) in enumerate(items):
     text = base64.b64encode(open(w + "/" + file, "rb").read()).decode()
     print("static const char pe_sample_%s[] =" % name)
@@ -18,4 +18,8 @@ for i, (name, file) in enumerate(items):
     if i + 1 < len(items):
         print()
 PY
+mkdir -p bin
+cp "$W/k32.exe" bin/k32.exe
+cp "$W/stdio-stripped.exe" bin/stdio.exe
+cp "$W/crt.exe" bin/crt.exe
 rm -rf "$W"

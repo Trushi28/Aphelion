@@ -15,6 +15,7 @@
 #include <cosmos/power.hpp>
 #include <cosmos/pmm.hpp>
 #include <cosmos/kheap.hpp>
+#include <cosmos/userland_apps.hpp>
 
 namespace helm {
 
@@ -668,6 +669,64 @@ int cmd_sunset(Shell&, Io& io, u32, char**) {
     return 0;
 }
 
+struct RunOut {
+    Shell* sh;
+    Io* io;
+};
+
+void run_emit(void* ctx, const char* text, u32 length) {
+    RunOut* r = static_cast<RunOut*>(ctx);
+    r->io->out.bytes(text, length);
+    r->io->out.flush();
+}
+
+bool run_interrupted(void* ctx) {
+    RunOut* r = static_cast<RunOut*>(ctx);
+    Shell& sh = *r->sh;
+    if (sh.aborted) return true;
+    if (sh.interrupt_poll && sh.interrupt_poll(sh.interrupt_ctx)) {
+        sh.aborted = true;
+        return true;
+    }
+    return false;
+}
+
+int cmd_run(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc != 2) return usage(io, "usage: run name   (a program in ram:/apps; chart ram:/apps lists them; Ctrl+C stops it)");
+    RunOut ctx{ &sh, &io };
+    userland::apps::Report r = userland::apps::run(argv[1], &run_emit, &run_interrupted, &ctx);
+    using userland::apps::Outcome;
+    switch (r.outcome) {
+        case Outcome::Unavailable: print_error(io, "user programs are not supported on this machine"); return 1;
+        case Outcome::BadName: print_error(io, "give the name of a program in ram:/apps, without a path"); return 2;
+        case Outcome::NotFound: print_error(io, "no such program in ram:/apps"); return 1;
+        case Outcome::LaunchFailed:
+            io.err.rgb(palette::SAND);
+            io.err.str("  could not start it (error ");
+            if (r.error < 0) io.err.put('-');
+            io.err.num(static_cast<u64>(r.error < 0 ? -r.error : r.error));
+            io.err.str(")\n");
+            io.err.reset();
+            return 1;
+        case Outcome::Interrupted: print_error(io, "stopped"); return 130;
+        case Outcome::Finished: break;
+    }
+    io.out.rgb(palette::MIST);
+    io.out.str("  exit status ");
+    if (r.status < 0) {
+        io.out.put('-');
+        io.out.num(static_cast<u64>(-static_cast<i64>(r.status)));
+        io.out.str(" (0x");
+        io.out.hex(static_cast<u32>(r.status), 8);
+        io.out.put(')');
+    } else {
+        io.out.num(static_cast<u64>(r.status));
+    }
+    io.out.put('\n');
+    io.out.reset();
+    return r.status == 0 ? 0 : 1;
+}
+
 constexpr Command COMMANDS[] = {
     {"about", "about", "the info panel again", &cmd_about},
     {"wipe", "wipe", "clear the screen (also Ctrl+L)", &cmd_wipe},
@@ -685,6 +744,7 @@ constexpr Command COMMANDS[] = {
     {"usb", "usb", "xHCI controllers, devices and drives", &cmd_usb},
     {"storage", "storage [init erase <MiB>]", "the storage device and volume; in usb mode, format the window", &cmd_storage},
     {"restart", "restart", "flush the disk and restart", &cmd_restart},
+    {"run", "run name", "run a program from ram:/apps, a native Aphelion program or a Windows .exe through the PE host", &cmd_run},
     {"sunset", "sunset", "flush the disk and power off where the platform allows it", &cmd_sunset},
 };
 

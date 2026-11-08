@@ -80,6 +80,9 @@ constexpr u64 STAR_VALUE = (0x10ull << 48) | (0x08ull << 32);
 
 Process g_procs[MAX_PROCESSES];
 cpu::Spinlock g_table_lock;
+cpu::Spinlock g_console_lock;
+ConsoleFn g_console = nullptr;
+void* g_console_ctx = nullptr;
 volatile u32 g_next_pid = 0;
 volatile u64 g_frames_live = 0;
 volatile u64 g_frames_quarantined = 0;
@@ -452,6 +455,13 @@ i64 sys_debug_write(idt::Frame* f) {
         if ((c < 0x20 && c != '\n') || c >= 0x7F) buf[i] = '.';
     }
     buf[len] = 0;
+    {
+        u64 fl = cpu::irq_save();
+        g_console_lock.lock();
+        if (g_console) g_console(g_console_ctx, buf, static_cast<u32>(len));
+        g_console_lock.unlock();
+        cpu::irq_restore(fl);
+    }
     serial::printf("[user %u] %s", p->pid, buf);
     if (len == 0 || buf[len - 1] != '\n') serial::putc('\n');
     return static_cast<i64>(len);
@@ -1333,6 +1343,15 @@ Process* launch_with(const char* name, const Image& image, lens::Table& from, le
 
 Process* launch_file(const char* name, lens::Table& files, lens::Lens file, lens::Table* from, lens::Lens handle, i64* error) {
     return spawn_file(files, file, name, from, handle, error);
+}
+
+void set_console(ConsoleFn fn, void* ctx) {
+    u64 fl = cpu::irq_save();
+    g_console_lock.lock();
+    g_console = fn;
+    g_console_ctx = ctx;
+    g_console_lock.unlock();
+    cpu::irq_restore(fl);
 }
 
 u32 sweep_detached() {

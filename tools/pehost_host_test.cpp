@@ -1,7 +1,7 @@
 #include <cosmos/pe.hpp>
 #include "../userland/pehost/call.hpp"
 #include "../userland/pehost/host.hpp"
-#include "../userland/pehost/win32.hpp"
+#include "../userland/pehost/msvcrt.hpp"
 #include "pe_samples.hpp"
 #include "pe_samples_mingw.hpp"
 #include "pe_samples_run.hpp"
@@ -217,18 +217,25 @@ i64 child_write(u32 stream, const void* data, u32 length) {
     return lx(SYS_WRITE, static_cast<u64>(g_out_fd), reinterpret_cast<u64>(data), length);
 }
 
-pehost::Runtime g_runtime = { &child_exit, &child_write };
+u8* child_reserve(u64 bytes) { return g_platform.reserve(bytes, false); }
 
-pehost::ImportTable imports() {
-    u32 count = 0;
-    const pehost::Import* items = pehost::kernel32_imports(&count);
-    return pehost::ImportTable{ items, count };
+bool child_protect(u8* at, u64 bytes, u32 prot) { return g_platform.protect(at, bytes, prot); }
+
+void child_sleep(u32 milliseconds) {
+    u64 spec[2] = { milliseconds / 1000, static_cast<u64>(milliseconds % 1000) * 1000000 };
+    lx(35, reinterpret_cast<u64>(spec), 0);
 }
+
+pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep };
+
+const char* g_command_line = "pe.exe";
+
+pehost::ImportTable imports() { return *pehost::all_imports(); }
 
 struct Result {
     bool have_status;
     i64 status;
-    char out[1024];
+    char out[8192];
     u32 out_length;
     char log[4096];
     u32 log_length;
@@ -263,7 +270,10 @@ void run_child(const u8* file, usize size, Result* r) {
         pehost::g_runtime = &g_runtime;
         pehost::ImportTable table = imports();
         i64 st = pehost::load(g_platform, file, size, table, &g_prepared);
-        if (st == 0) st = pehost::start(g_platform, g_prepared);
+        if (st == 0) {
+            pehost::attach(g_prepared, pehost::all_imports(), pehost::Config{ g_command_line, "pe.exe" });
+            st = pehost::start(g_platform, g_prepared);
+        }
         lx(SYS_WRITE, static_cast<u64>(g_status_fd), reinterpret_cast<u64>(&st), 8);
         lx(SYS_EXIT_GROUP, 0);
     }
@@ -345,7 +355,7 @@ bool prepared_ok(const Linux& plat, const pehost::Prepared& p) {
         for (u32 i = 0; i < p.tls.template_bytes; ++i)
             if (block[i] != p.base[p.tls.template_rva + i]) return false;
         if (r32(p.base + p.tls.index_rva) != 0) return false;
-    } else if (teb->tls_pointer != reinterpret_cast<u64>(p.support + 2 * 4096)) {
+    } else if (teb->tls_pointer != reinterpret_cast<u64>(p.support + 3 * 4096)) {
         return false;
     }
     return true;
@@ -584,9 +594,7 @@ void run_tests() {
     expect(r.have_status && r.status == pehost::STATUS_ENTRYPOINT_NOT_FOUND && contains(r.log, "mylib.dll!Alpha") && contains(r.log, "mylib.dll!Beta") &&
                contains(r.log, "mylib.dll!#7") && contains(r.log, "3 of 4 imports are not provided") && r.out_length == 0,
            "missing imports by name and by ordinal are each named, counted, and nothing runs");
-    run_child(g_stdio.bytes, g_stdio.size, &r);
-    expect(r.have_status && r.status == pehost::STATUS_ENTRYPOINT_NOT_FOUND && contains(r.log, "msvcrt.dll!__getmainargs") && contains(r.log, "of 47 imports"),
-           "the MinGW printf program is refused with its msvcrt imports named");
+    expect(runs_with(g_stdio, 0, "Hello World\n", &r), "stdio.exe (GNU ld, msvcrt printf): C runtime start-up, printf and exit run to completion");
 
     run_child(g_console.bytes, 100, &r);
     expect(r.have_status && r.status == pehost::STATUS_INVALID_IMAGE_FORMAT && contains(r.log, "image refused"), "a truncated file is refused");
@@ -701,7 +709,38 @@ void run_tests() {
     printf("    (%u runs, %u loaded)\n", e.runs, e.loaded);
 }
 
+int run_file(const char* path, const char* command_line) {
+    i64 fd = lx(2, reinterpret_cast<u64>(path), 0);
+    if (fd < 0) {
+        printf("cannot open %s\n", path);
+        return 2;
+    }
+    constexpr u64 LIMIT = 16u << 20;
+    i64 map = lx(SYS_MMAP, 0, LIMIT, 3, 0x22, static_cast<u64>(-1), 0);
+    if (!mapped(map)) return 2;
+    u8* bytes = reinterpret_cast<u8*>(map);
+    u64 have = 0;
+    for (;;) {
+        i64 n = lx(SYS_READ, static_cast<u64>(fd), reinterpret_cast<u64>(bytes + have), LIMIT - have);
+        if (n <= 0) break;
+        have += static_cast<u64>(n);
+    }
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    static Result r;
+    g_command_line = command_line;
+    run_child(bytes, have, &r);
+    printf("%s", r.out);
+    if (r.log_length) printf("[host log]\n%s", r.log);
+    if (r.signal) {
+        printf("[host] the program died with signal %d\n", r.signal);
+        return 1;
+    }
+    printf("[host] exit status %lld (0x%llx)\n", static_cast<long long>(r.status), static_cast<unsigned long long>(r.status) & 0xFFFFFFFFull);
+    return r.have_status ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 2 && equals(argv[1], "--run")) return run_file(argv[2], argc > 3 ? argv[3] : "pe.exe");
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
     load_all();
     run_tests();

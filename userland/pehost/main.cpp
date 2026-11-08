@@ -2,7 +2,7 @@
 #include <cosmos/fileabi.hpp>
 #include "call.hpp"
 #include "host.hpp"
-#include "win32.hpp"
+#include "msvcrt.hpp"
 
 namespace {
 
@@ -33,9 +33,38 @@ struct Platform {
 
 void exit_process(u32 code) { sys::exit(static_cast<i32>(code)); }
 
+u8* reserve_memory(u64 bytes) {
+    u64 pages = (bytes + PAGE - 1) / PAGE;
+    u64 vmo = 0;
+    if (sys::vmo_create(pages, &vmo) != 0) return nullptr;
+    i64 at = sys::vm_map(vmo, 0, 0, pages, RW);
+    sys::handle_close(vmo);
+    return at > 0 ? reinterpret_cast<u8*>(at) : nullptr;
+}
+
+bool protect_memory(u8* at, u64 bytes, u32 prot) { return sys::vm_protect(reinterpret_cast<u64>(at), bytes / PAGE, prot) == 0; }
+
+void sleep_ms(u32 milliseconds) {
+    static u64 pair[2];
+    if (milliseconds == 0) {
+        sys::yield();
+        return;
+    }
+    if (pair[0] == 0 && sys::pipe_create(16, pair) != 0) {
+        pair[0] = 0;
+        return;
+    }
+    struct {
+        u64 handle;
+        u32 want;
+        u32 got;
+    } entry = { pair[0], 1, 0 };
+    sys::handle_wait(&entry, 1, milliseconds == 0xFFFFFFFFu ? ~0ull : milliseconds);
+}
+
 i64 write_console(u32, const void* data, u32 length) { return sys::debug_write(static_cast<const char*>(data), length); }
 
-pehost::Runtime g_runtime = { &exit_process, &write_console };
+pehost::Runtime g_runtime = { &exit_process, &write_console, &reserve_memory, &protect_memory, &sleep_ms };
 pehost::Prepared g_prepared;
 
 }
@@ -68,12 +97,11 @@ extern "C" i64 aphelion_main(u64 file) {
     }
 
     pehost::g_runtime = &g_runtime;
-    u32 count = 0;
-    const pehost::Import* items = pehost::kernel32_imports(&count);
-    pehost::ImportTable imports{ items, count };
-    i64 status = pehost::load(platform, buffer, st.size, imports, &g_prepared);
+    const pehost::ImportTable* imports = pehost::all_imports();
+    i64 status = pehost::load(platform, buffer, st.size, *imports, &g_prepared);
     platform.release(buffer, st.size);
     sys::handle_close(file);
     if (status != 0) return status;
+    pehost::attach(g_prepared, imports, pehost::Config{ "pe.exe", "pe.exe" });
     return pehost::start(platform, g_prepared);
 }

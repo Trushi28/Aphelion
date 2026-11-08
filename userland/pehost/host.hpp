@@ -13,7 +13,8 @@ constexpr u64 MIN_STACK = 0x10000;
 constexpr u64 MAX_STACK = 0x100000;
 constexpr u64 MAX_TLS_BYTES = 0x100000;
 constexpr u64 MAX_TLS_ALIGN = 4096;
-constexpr u64 SUPPORT_HEAD = 0x3000;
+constexpr u64 SUPPORT_HEAD = 0x4000;
+constexpr u32 TLS_SLOTS = 64;
 constexpr u32 REASON_PROCESS_ATTACH = 1;
 
 struct Teb {
@@ -32,6 +33,8 @@ struct Teb {
     u64 peb;
     u32 last_error;
     u32 reserved;
+    u8 gap[0x1480 - 0x70];
+    u64 tls_slots[TLS_SLOTS];
 };
 
 struct Peb {
@@ -54,7 +57,8 @@ static_assert(__builtin_offsetof(Teb, tls_pointer) == 0x58 && __builtin_offsetof
 static_assert(__builtin_offsetof(Teb, last_error) == 0x68);
 static_assert(__builtin_offsetof(Peb, being_debugged) == 0x02 && __builtin_offsetof(Peb, image_base_address) == 0x10);
 static_assert(__builtin_offsetof(Peb, process_parameters) == 0x20 && __builtin_offsetof(Peb, process_heap) == 0x30);
-static_assert(sizeof(Teb) < PAGE && sizeof(Peb) < PAGE);
+static_assert(__builtin_offsetof(Teb, tls_slots) == 0x1480);
+static_assert(sizeof(Teb) <= 2 * PAGE && sizeof(Peb) < PAGE);
 
 struct Import {
     const char* dll;
@@ -65,6 +69,7 @@ struct Import {
 struct ImportTable {
     const Import* items;
     u32 count;
+    const ImportTable* next = nullptr;
 };
 
 struct Prepared {
@@ -126,12 +131,13 @@ inline bool same_name(const char* a, const char* b) {
 
 inline bool resolve(void* ctx, const char* dll, const char* name, u16, u64* address) {
     if (name == nullptr) return false;
-    const ImportTable* table = static_cast<const ImportTable*>(ctx);
-    for (u32 i = 0; i < table->count; ++i) {
-        const Import& e = table->items[i];
-        if (same_dll(e.dll, dll) && same_name(e.name, name)) {
-            *address = reinterpret_cast<u64>(e.address);
-            return true;
+    for (const ImportTable* table = static_cast<const ImportTable*>(ctx); table; table = table->next) {
+        for (u32 i = 0; i < table->count; ++i) {
+            const Import& e = table->items[i];
+            if (same_dll(e.dll, dll) && same_name(e.name, name)) {
+                *address = reinterpret_cast<u64>(e.address);
+                return true;
+            }
         }
     }
     return false;
@@ -211,8 +217,8 @@ i64 load(P& p, const u8* file, usize size, const ImportTable& imports, Prepared*
     out->stack_bytes = stack_bytes;
 
     Teb* teb = reinterpret_cast<Teb*>(support);
-    Peb* peb = reinterpret_cast<Peb*>(support + PAGE);
-    u64* tls_array = reinterpret_cast<u64*>(support + 2 * PAGE);
+    Peb* peb = reinterpret_cast<Peb*>(support + 2 * PAGE);
+    u64* tls_array = reinterpret_cast<u64*>(support + 3 * PAGE);
     u8* tls_block = support + SUPPORT_HEAD;
     if (out->tls.present) {
         const u8* src = base + out->tls.template_rva;

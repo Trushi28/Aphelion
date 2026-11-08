@@ -35,6 +35,8 @@ inline i64 vm_protect(u64 address, u64 pages, u64 protection) { return call(user
 inline i64 file_open(u64 dir, const char* path, u64 length, u64 rights, u64* out) {
     return call(userabi::SYS_FILE_OPEN, dir, reinterpret_cast<u64>(path), length, rights, reinterpret_cast<u64>(out));
 }
+inline i64 pipe_create(u64 bytes, u64* pair) { return call(userabi::SYS_PIPE_CREATE, bytes, reinterpret_cast<u64>(pair)); }
+inline i64 handle_wait(void* entries, u64 count, u64 timeout_ms) { return call(userabi::SYS_HANDLE_WAIT, reinterpret_cast<u64>(entries), count, timeout_ms); }
 inline i64 file_stat(u64 file, void* out) { return call(userabi::SYS_FILE_STAT, file, reinterpret_cast<u64>(out)); }
 inline i64 file_read(u64 file, u64 offset, void* buffer, u64 length) { return call(userabi::SYS_FILE_READ, file, offset, reinterpret_cast<u64>(buffer), length); }
 inline i64 file_write(u64 file, u64 offset, const void* buffer, u64 length) {

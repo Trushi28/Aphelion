@@ -37,6 +37,7 @@
 #include <cosmos/civil.hpp>
 #include <cosmos/boot_tests.hpp>
 #include <cosmos/userland.hpp>
+#include <cosmos/userland_apps.hpp>
 
 extern "C" char __kernel_start[];
 extern "C" char __kernel_end[];
@@ -625,6 +626,7 @@ static void boot_start_shell(const BootState& s) {
     facts.disk_note = g_disk_note;
     helm::set_facts(facts);
     nebula::sys_set_facts(facts.storage, facts.suns);
+    (void)userland::apps::install();
     if (!helm::spawn()) serial::writeln("[boot] FATAL: could not start the Helm shell");
 }
 

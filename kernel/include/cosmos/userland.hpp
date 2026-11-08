@@ -15,6 +15,9 @@ struct Image {
     u64 data_bytes = 0;
 };
 
+using ConsoleFn = void (*)(void* ctx, const char* text, u32 length);
+void set_console(ConsoleFn fn, void* ctx);
+
 bool supported();
 void init_core(u32 core_index);
 
