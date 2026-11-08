@@ -69,7 +69,7 @@ endif
 
 FLAGS_STAMP := $(BUILD)/.cxxflags
 
-ASMFLAGS := -f elf64 -I $(KDIR)/data/
+ASMFLAGS := -f elf64 -I $(KDIR)/data/ -I $(BUILD)/ -I tools/pe-samples/bin/
 
 LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 \
            -T $(KDIR)/linker.ld
@@ -84,7 +84,37 @@ TEST_ISO := $(BUILD)/aphelion-test.iso
 
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
-.PHONY: test-iso run-test usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-userland test-pe test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs clean distclean
+USER_DIR := $(BUILD)/userland
+USER_PROGRAMS := hello pehost
+USER_CXX ?= g++
+USER_FLAGS := -std=c++20 -O2 -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie \
+              -fno-threadsafe-statics -nostdlib -static -no-pie -Wl,-z,max-page-size=0x1000 -Wl,-z,norelro -Wl,--build-id=none \
+              -I$(KDIR)/include -Iuserland/include
+USER_LD := userland/apx.ld
+USER_CRT := userland/crt/start.cpp
+APXPACK := $(BUILD)/tools/apxpack
+
+$(APXPACK): tools/apxpack.cpp tools/apxpack.hpp $(KDIR)/include/cosmos/apx.hpp $(KDIR)/include/cosmos/userabi.hpp
+	@mkdir -p $(dir $@)
+	g++ -std=c++20 -O1 -w -I$(KDIR)/include $< -o $@
+
+define USER_PROGRAM
+$(USER_DIR)/$(1).elf: $(USER_CRT) $(wildcard userland/$(1)/*.cpp) $(wildcard userland/$(1)/*.hpp) $(wildcard userland/include/*.hpp) $(wildcard $(KDIR)/include/cosmos/*.hpp) $(USER_LD) $(KDIR)/include/cosmos/userabi.hpp
+	@mkdir -p $$(dir $$@)
+	$(USER_CXX) $(USER_FLAGS) -T $(USER_LD) -o $$@ $(USER_CRT) $(wildcard userland/$(1)/*.cpp)
+endef
+$(foreach p,$(USER_PROGRAMS),$(eval $(call USER_PROGRAM,$(p))))
+
+$(USER_DIR)/%.apx: $(USER_DIR)/%.elf $(APXPACK)
+	$(APXPACK) $< $@
+
+USER_APX := $(USER_PROGRAMS:%=$(USER_DIR)/%.apx)
+$(BUILD)/$(KDIR)/src/userland/apps.o: $(USER_APX) $(wildcard tools/pe-samples/bin/*.exe)
+
+.PHONY: userland
+userland: $(USER_APX)
+
+.PHONY: test-iso run-test usb-image run-usb run-uefi-usb test-acpi test-mm test-sched test-console test-input test-lens-types test-userland test-pe test-pehost test-apxpack test-lens test-nebula test-helm test-usb test-usbstor all iso run run-smp run-headless run-uefi run-uefi-smp run-uefi-headless run-ahci run-uefi-ahci run-nvme run-uefi-nvme run-nodisk test-stellar bench-stellar crash-fuzz stellarfs peinfo clean distclean
 
 all: $(KERNEL_ELF)
 
@@ -235,7 +265,7 @@ run-uefi-usb:
 run-nodisk: iso
 	qemu-system-x86_64 -M q35 -cpu max -m 256M -cdrom $(ISO) -serial stdio $(QEMU_EXIT)
 
-TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm acpi userland pe
+TEST_UNITS := stellar mm sched console input usb usbstor lens-types lens nebula helm acpi userland pe pehost apxpack
 
 unit_inc_stellar  := -I$(KDIR)/include
 unit_src_stellar  := $(KDIR)/src/fs/stellar.cpp tools/stellar_host_test.cpp
@@ -259,6 +289,10 @@ unit_inc_userland := -I$(KDIR)/include
 unit_src_userland := tools/userland_host_test.cpp
 unit_inc_pe       := -I$(KDIR)/include -Itools
 unit_src_pe       := tools/pe_host_test.cpp
+unit_inc_pehost   := -I$(KDIR)/include -Itools
+unit_src_pehost   := tools/pehost_host_test.cpp
+unit_inc_apxpack  := -I$(KDIR)/include -Itools
+unit_src_apxpack  := tools/apxpack_host_test.cpp
 
 FS_CORE_SRC := $(KDIR)/src/fs/stellar.cpp $(KDIR)/src/fs/nebula.cpp $(KDIR)/src/fs/realm_ram.cpp $(KDIR)/src/fs/realm_stellar.cpp
 LENS_SRC    := $(KDIR)/src/fs/lens.cpp $(KDIR)/src/fs/lens_ops.cpp
@@ -323,6 +357,16 @@ test-pe:
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pe) $(unit_src_pe) -o $(BUILD)/pe_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pe_host_test
 
+test-pehost:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) $(unit_src_pehost) -o $(BUILD)/pehost_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_host_test
+
+test-apxpack: $(USER_DIR)/hello.elf
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_apxpack) $(unit_src_apxpack) -o $(BUILD)/apxpack_host_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/apxpack_host_test $(USER_DIR)/hello.elf
+
 test-acpi:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined $(unit_inc_acpi) $(unit_src_acpi) -o $(BUILD)/acpi_host_test
@@ -365,6 +409,10 @@ bench-stellar:
 	@mkdir -p $(BUILD)
 	g++ -std=c++20 -O2 -w -I$(KDIR)/include $(KDIR)/src/fs/stellar.cpp tools/stellar_bench.cpp -o $(BUILD)/stellar_bench
 	$(BUILD)/stellar_bench
+
+peinfo:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O2 -w -I$(KDIR)/include tools/peinfo.cpp -o $(BUILD)/peinfo
 
 stellarfs:
 	@mkdir -p $(BUILD)

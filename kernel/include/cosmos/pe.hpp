@@ -171,6 +171,7 @@ struct Image {
     u32 directory_count;
     bool is_dll;
     bool has_relocations;
+    bool relocatable;
     Section sections[MAX_SECTIONS];
     Directory directories[DIR_COUNT];
 };
@@ -382,6 +383,7 @@ inline Status parse(const u8* file, usize size, Image* out) {
         return Status::BadDirectory;
     img.has_relocations = !(chars & FILE_RELOCS_STRIPPED) && ndirs > DIR_BASERELOC && img.directories[DIR_BASERELOC].rva != 0 &&
                           img.directories[DIR_BASERELOC].size != 0;
+    img.relocatable = !(chars & FILE_RELOCS_STRIPPED) && (img.has_relocations || (img.dll_characteristics & DLLCHAR_DYNAMIC_BASE) != 0);
 
     if (img.entry_rva != 0 || !img.is_dll) {
         const Section* holder = detail::section_holding(img, img.entry_rva, 1);
@@ -441,7 +443,8 @@ inline Status relocate(const Image& img, u8* image, u64 actual_base, u32* applie
     if (applied) *applied = 0;
     if (actual_base % BASE_ALIGN != 0 || actual_base >= USER_LIMIT || img.size_of_image > USER_LIMIT - actual_base) return Status::BadBase;
     if (actual_base == img.image_base) return Status::Ok;
-    if (!img.has_relocations) return Status::NeedsFixedBase;
+    if (!img.relocatable) return Status::NeedsFixedBase;
+    if (!img.has_relocations) return Status::Ok;
     u64 delta = actual_base - img.image_base;
     const Directory& d = img.directories[DIR_BASERELOC];
     if (detail::section_holding(img, d.rva, d.size) == nullptr) return Status::BadReloc;

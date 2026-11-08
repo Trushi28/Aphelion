@@ -406,6 +406,8 @@ bool join_ready(void* arg) {
     return __atomic_load_n(&w->t->done, __ATOMIC_ACQUIRE) != 0 || procgroup::dying(procgroup::load(&w->p->group));
 }
 
+constexpr u64 JOIN_SETTLE_MS = 5000;
+
 i64 sys_thread_join(idt::Frame* f) {
     Process* p = current_process();
     Thread* self = current_thread();
@@ -420,6 +422,8 @@ i64 sys_thread_join(idt::Frame* f) {
     JoinWait w{ p, target };
     p->events.wait_until(&join_ready, &w);
     if (!__atomic_load_n(&target->done, __ATOMIC_ACQUIRE)) return userabi::ERR_INVAL;
+    i32 settled = 0;
+    (void)orbital::join(tid, &settled, JOIN_SETTLE_MS);
     return static_cast<i64>(target->status);
 }
 

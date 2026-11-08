@@ -18,6 +18,8 @@ jobs:
     outputs:
       units: ${{ steps.plan.outputs.units }}
       boot: ${{ steps.plan.outputs.boot }}
+      boot_matrix: ${{ steps.plan.outputs.boot_matrix }}
+      fuzz_matrix: ${{ steps.plan.outputs.fuzz_matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -87,16 +89,12 @@ jobs:
           if-no-files-found: error
 
   boot:
-    needs: iso
+    needs: [plan, iso]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { disk: nvme, cores: 1 }
-          - { disk: nvme, cores: 4 }
-          - { disk: ahci, cores: 1 }
-          - { disk: virtio, cores: 1 }
+        include: ${{ fromJSON(needs.plan.outputs.boot_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -169,15 +167,12 @@ jobs:
           if-no-files-found: ignore
 
   crash-fuzz:
-    needs: iso
+    needs: [plan, iso]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { disk: nvme, rounds: 16 }
-          - { disk: ahci, rounds: 10 }
-          - { disk: virtio, rounds: 10 }
+        include: ${{ fromJSON(needs.plan.outputs.fuzz_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

@@ -544,6 +544,19 @@ bool run_vm() {
     return spin_ok && ok;
 }
 
+extern "C" const u8 apx_hello_start[];
+extern "C" const u8 apx_hello_end[];
+extern "C" const u8 apx_pehost_start[];
+extern "C" const u8 apx_pehost_end[];
+extern "C" const u8 pe_console_start[];
+extern "C" const u8 pe_console_end[];
+extern "C" const u8 pe_k32_start[];
+extern "C" const u8 pe_k32_end[];
+extern "C" const u8 pe_teb_start[];
+extern "C" const u8 pe_teb_end[];
+extern "C" const u8 pe_tlscb_start[];
+extern "C" const u8 pe_tlscb_end[];
+
 bool put_apx(lens::Domain& d, lens::Lens dir, const char* name, const u8* begin, const u8* end, u32 data_pages, const u8* data, u32 data_bytes) {
     u32 code = static_cast<u32>(end - begin);
     usize cap = static_cast<usize>(apx::pack_size(code, data_bytes));
@@ -584,6 +597,22 @@ bool refused(lens::Table& K, lens::Lens file, i64 want, const char* what) {
     return ok;
 }
 
+bool put_blob(lens::Domain& d, lens::Lens dir, const char* name, const u8* begin, const u8* end) {
+    return lens::put(d, dir, name, lens::ConstBytes(begin, static_cast<usize>(end - begin))).ok();
+}
+
+bool run_pe(lens::Table& K, lens::Lens apps, const char* name, i32 want) {
+    lens::Result<lens::Lens> host = lens::open_at(K.domain, apps, "pehost", lens::Right::Read | lens::Right::Execute);
+    lens::Result<lens::Lens> prog = lens::open_at(K.domain, apps, name, lens::Right::Read | lens::Right::Delegate);
+    i64 error = -1;
+    Process* p = host.ok() && prog.ok() ? launch_file("pehost", K, host.value(), &K, prog.value(), &error) : nullptr;
+    i32 status = -1;
+    bool good = p && wait(p, &status, WAIT_MS) && status == want;
+    good = (p && reap(p)) && good;
+    serial::printf("[userland] %s through the PE host: status %d, expected %d%s\n", name, status, want, good ? "" : "  <-- wrong");
+    return good;
+}
+
 bool run_files() {
     lens::Table& K = g_kernel_handles;
     bool ok = true;
@@ -611,6 +640,12 @@ bool run_files() {
                put_apx(K.domain, apps, "child", ublob_apxchild, ublob_apxchild_end, 2, apxd, 4) &&
                put_apx(K.domain, apps, "spin", ublob_apxspin, ublob_apxspin_end, 0, nullptr, 0) &&
                put_apx(K.domain, apps, "bad", ublob_apxspin, ublob_apxspin_end, 0, nullptr, 0) &&
+               lens::put(K.domain, apps, "hello", lens::ConstBytes(apx_hello_start, static_cast<usize>(apx_hello_end - apx_hello_start))).ok() &&
+               put_blob(K.domain, apps, "pehost", apx_pehost_start, apx_pehost_end) &&
+               put_blob(K.domain, apps, "console.exe", pe_console_start, pe_console_end) &&
+               put_blob(K.domain, apps, "k32.exe", pe_k32_start, pe_k32_end) &&
+               put_blob(K.domain, apps, "teb.exe", pe_teb_start, pe_teb_end) &&
+               put_blob(K.domain, apps, "tlscb.exe", pe_tlscb_start, pe_tlscb_end) &&
                lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
                lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
     lens::Result<lens::Lens> badw = lens::open_at(K.domain, apps, "bad", lens::Right::Read | lens::Right::Write);
@@ -640,6 +675,26 @@ bool run_files() {
         good = (p && reap(p)) && good;
         serial::printf("[userland] process started from an APX file in the RAM realm: status %d%s\n", status, good ? "" : "  <-- wrong");
         ok = good && ok;
+    }
+    {
+        lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "hello", run);
+        i64 error = -1;
+        Process* p = f.ok() ? launch_file(nullptr, K, f.value(), nullptr, lens::Lens(), &error) : nullptr;
+        i32 status = -1;
+        bool good = p && wait(p, &status, WAIT_MS) && status == 42;
+        good = (p && reap(p)) && good;
+        serial::printf("[userland] a C++ program built by the userland toolchain, with initialised data, zeroed data, floating point and a syscall: status %d%s\n",
+                        status, good ? "" : "  <-- wrong");
+        ok = good && ok;
+    }
+    {
+        bool pe = run_pe(K, apps, "console.exe", 9);
+        pe = run_pe(K, apps, "k32.exe", 0) && pe;
+        pe = run_pe(K, apps, "teb.exe", 0) && pe;
+        pe = run_pe(K, apps, "tlscb.exe", 0) && pe;
+        pe = run_pe(K, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
+        pe = run_pe(K, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;
+        ok = pe && ok;
     }
     {
         lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "datainit", run);

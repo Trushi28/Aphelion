@@ -190,6 +190,7 @@ boot foreign
 grep -q 'Aphelion is up' "$LOG.clean" || fail "kernel did not finish booting on a foreign disk"
 grep -q 'UNHANDLED INTERRUPT' "$LOG.clean" && fail "unhandled interrupt on a foreign disk"
 grep -q 'FATAL' "$LOG.clean" && fail "fatal error on a foreign disk"
+grep -q '<-- wrong' "$LOG.clean" && fail "a self-test case reported a wrong result on a foreign disk"
 grep -q 'refusing to format' "$LOG.clean" || fail "kernel did not refuse to format a foreign disk"
 grep -q '\[stellar\] formatted:' "$LOG.clean" && fail "kernel formatted a foreign disk"
 grep -q 'block-device stress skipped' "$LOG.clean" || fail "disk-tail stress ran without a mounted volume"

@@ -98,7 +98,7 @@ Limits: 8 threads alive at once and 16 created over the life of a process (a fin
 - `exit` ends the whole process. Every other thread is stopped.
 - `thread_exit` ends the calling thread. When the last thread leaves, the process status is the status the last leaver passed, unless an `exit`, a fault or a kill came first, in which case that status wins.
 - A fault in any thread (page fault, #GP, #UD, double fault, machine check) ends the whole process with the fault status.
-- `thread_join` blocks until the named thread has finished and returns its status. Joining a finished thread again returns the same status. A join that is waiting when the process is being killed is woken and the thread dies.
+- `thread_join` blocks until the named thread has finished and returns its status. When it returns, the joined thread has also left the group, so a thread that joins another and then calls `thread_exit` is always the later leaver and its status is the one the process keeps if it is the last. The kernel waits for the joined thread's task to exit, bounded at 5 seconds, after it sees the thread's done flag. Joining a finished thread again returns the same status. A join that is waiting when the process is being killed is woken and the thread dies.
 - `userland::kill(process)` is the external kill. It returns false if the process has already finished or is already being killed. The process status is `-512` (`STATUS_KILLED`).
 
 How a kill reaches a thread. The group word (`procgroup.hpp`, one atomic 64-bit value holding the live count, a dying bit and the status) is checked in three places: before a new thread first enters ring 3, on the way out of every syscall, and after every interrupt that arrived from ring 3 (the interrupt-exit hook in `isr_dispatch`). A thread in a ring-3 loop with no syscalls therefore dies at its next timer tick, which is a few milliseconds. A thread that is queued dies when it is next scheduled. There is no inter-processor interrupt, so a kill can take as long as the longest time a thread waits for a core. A thread that is blocked in the kernel is only woken if it is in `thread_join`, the only blocking call a process has.
@@ -178,6 +178,20 @@ Limits and things that are deliberately not done:
 - A process can create children until the 16 process slots are gone, and there is no per-process quota. Child threads and memory are limited per process as before.
 - The child gets no environment, arguments or working directory beyond the one handle.
 - Nothing from R2.3 through H3 has been booted by me. The syscall handlers, `process_create` on real cores, kill-on-close from a dying parent and the lazy sweeper have been compiled and linked, and the ring-3 programs have run under an emulator against a model of the syscalls, but only your boots count.
+
+## Building ring-3 programs (W2a)
+
+`make userland` builds every program in `USER_PROGRAMS` (currently `hello`) into `build/userland/<name>.apx`. The pipeline is plain host g++ and needs no cross compiler:
+
+1. `userland/crt/start.cpp` plus `userland/<name>/*.cpp` are compiled freestanding (`-ffreestanding -nostdlib -static -no-pie -fno-exceptions -fno-rtti`) and linked with `userland/apx.ld` into an ELF. The linker script puts code and read-only data at `0x400000` (R+X) and data and bss at `0x800000` (R+W), which is exactly what an APX image describes.
+2. `tools/apxpack` (`tools/apxpack.hpp` is the converter, tested on the host) reads that ELF and writes the APX image: it checks the program headers against the same constants the kernel uses and refuses anything the kernel loader would refuse, with a status that names the problem.
+3. `kernel/src/userland/apps.asm` embeds `hello.apx` with `incbin`. The boot self-test writes it into the RAM realm and launches it as a process; it must exit with status 42.
+
+`userland/include/aphelion.hpp` has the syscall wrappers. The argument order follows the kernel: `vm_map(vmo, address, offset_pages, pages, protection)` returns the mapped base (address 0 lets the kernel choose), and `vmo_create(pages, &handle)` takes no flags.
+
+Limits, on purpose: no libc, no exceptions, no RTTI, and no global constructors (the linker script asserts that `.init_array` is empty, because nothing would run it). User code may use SSE and x87; the kernel saves that state. A program larger than 64 code pages or 64 data pages is refused by `apxpack`.
+
+`make test-apxpack` builds the converter test with ASan and UBSan (`-fno-sanitize-recover=undefined`) and checks malformed ELFs, every limit at its exact boundary, every truncation, every single-byte change to the headers, 200,000 random multi-byte header rewrites, and the real `hello.elf`. Mutation check: 79 single-token mutants of `apxpack.hpp` were run against it and all 79 are killed. The first round left 12 survivors; most were exact-limit gaps (a 64-byte file, 64 program headers, code of exactly 64 pages, an output buffer of exactly the needed size, each magic byte on its own) and one was a check that could never be reached, which is now removed.
 
 ## Verifying on your machine
 

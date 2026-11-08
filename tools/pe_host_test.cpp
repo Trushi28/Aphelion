@@ -1,7 +1,10 @@
 #include <cosmos/pe.hpp>
 #include "pe_samples.hpp"
+#include "pe_samples_mingw.hpp"
 #include <stdio.h>
 #include <stdlib.h>
+
+using S = pe::Status;
 
 static int g_failures = 0;
 
@@ -1291,7 +1294,6 @@ static __attribute__((noinline)) void taint_stack() {
 }
 
 static void edge_tests() {
-    using S = pe::Status;
     static Built b;
     Spec sp;
     default_imports(sp);
@@ -1571,7 +1573,6 @@ static void edge_tests() {
 
 
 static void edge_tests2() {
-    using S = pe::Status;
     static Built b;
     Spec sp;
     default_imports(sp);
@@ -1714,6 +1715,118 @@ static void edge_tests2() {
     }
 }
 
+static bool reject_msvcrt(void*, const char* dll, const char*, u16, u64* address) {
+    if (text_eq(dll, "msvcrt.dll")) return false;
+    *address = 0x7FFB00001000ull;
+    return true;
+}
+
+static void movable_tests() {
+    const u32 OPT = 0x80 + 4 + 20;
+    static Built b;
+    static pe::Image img;
+    u32 applied = 99;
+
+    Spec sp;
+    default_imports(sp);
+    sp.with_relocs = false;
+    build(sp, &b);
+    u8* im = load(b, &img);
+    expect(!img.has_relocations && img.relocatable, "movable: dynamic base with no relocation table is relocatable");
+    expect(pe::relocate(img, im, 0x150000000ull, &applied) == S::Ok && applied == 0, "movable: it moves to another base with nothing to patch");
+    expect(pe::relocate(img, im, 0x140000000ull, &applied) == S::Ok && applied == 0, "movable: and loads at its own base");
+    expect(pe::relocate(img, im, 0x150000001ull) == S::BadBase && pe::relocate(img, im, pe::USER_LIMIT) == S::BadBase, "movable: the base checks still come first");
+    free(im);
+
+    copy(&b, &b, sizeof(b));
+    w16(b.file + OPT + 70, pe::DLLCHAR_NX_COMPAT);
+    im = load(b, &img);
+    expect(!img.has_relocations && !img.relocatable, "movable: no table and no dynamic base is fixed");
+    expect(pe::relocate(img, im, 0x150000000ull) == S::NeedsFixedBase && pe::relocate(img, im, 0x140000000ull) == S::Ok, "movable: it loads only at its own base");
+    free(im);
+
+    sp.stripped = true;
+    build(sp, &b);
+    im = load(b, &img);
+    expect(!img.relocatable && pe::relocate(img, im, 0x150000000ull) == S::NeedsFixedBase, "movable: the stripped flag beats the dynamic base flag");
+    free(im);
+
+    sp.with_relocs = true;
+    sp.stripped = false;
+    build(sp, &b);
+    w16(b.file + OPT + 70, pe::DLLCHAR_NX_COMPAT);
+    im = load(b, &img);
+    expect(img.has_relocations && img.relocatable, "movable: a relocation table makes an image movable without the dynamic base flag");
+    expect(pe::relocate(img, im, 0x150000000ull, &applied) == S::Ok && applied == b.reloc_count, "movable: and every entry is applied");
+    free(im);
+
+    sp.stripped = true;
+    build(sp, &b);
+    im = load(b, &img);
+    expect(img.dll_characteristics == pe::DLLCHAR_DYNAMIC_BASE + pe::DLLCHAR_NX_COMPAT && !img.relocatable, "movable: a stripped image with a table is fixed");
+    free(im);
+}
+
+static void mingw_tests() {
+    static u8 k[0x4000], t[0x10000];
+    usize kn = 0, tn = 0;
+    decode_b64(pe_sample_mingw_k32, k, &kn);
+    decode_b64(pe_sample_mingw_stdio, t, &tn);
+    static pe::Image img;
+    u32 applied = 99;
+
+    expect(kn > 0 && pe::parse(k, kn, &img) == S::Ok, "gnu ld: the freestanding kernel32 program parses");
+    expect(!img.has_relocations && img.relocatable && !img.is_dll && img.subsystem == 3 && img.section_count == 5, "gnu ld: it has no relocation table, is movable, and has five sections");
+    expect(invariants(img, kn) && plan_ok(img), "gnu ld: the invariants hold and the plan is valid");
+    u8* im = new_image(img);
+    pe::map(img, k, kn, im, img.size_of_image);
+    expect(pe::relocate(img, im, 0x200000000ull, &applied) == S::Ok && applied == 0, "gnu ld: it moves to a user base with nothing to patch");
+    u32 count = 0;
+    pe::ImportReport rep{};
+    expect(pe::bind_imports(img, im, resolve_logging, &count, &rep) == S::Ok && rep.libraries == 1 && rep.imports == 3 && rep.resolved == 3, "gnu ld: its three kernel32 imports bind");
+    pe::Tls tls{};
+    expect(pe::tls_info(img, im, 0x200000000ull, &tls) == S::Ok && !tls.present, "gnu ld: it has no TLS");
+    free(im);
+
+    expect(tn > 0 && pe::parse(t, tn, &img) == S::Ok, "gnu ld: the stripped C program parses");
+    expect(img.has_relocations && img.relocatable && img.subsystem == 3 && img.stack_reserve == 0x200000, "gnu ld: it has a relocation table, is movable and asks for a 2 MiB stack");
+    expect(invariants(img, tn) && plan_ok(img), "gnu ld: the C program satisfies the invariants");
+    bool wx = false, has_crt = false;
+    for (u32 i = 0; i < img.section_count; ++i) {
+        if ((img.sections[i].prot & pe::PROT_WRITE) && (img.sections[i].prot & pe::PROT_EXEC)) wx = true;
+        if (text_eq(img.sections[i].name, ".CRT")) has_crt = true;
+    }
+    expect(!wx && has_crt, "gnu ld: no writable executable section, and the .CRT section is present");
+    im = new_image(img);
+    pe::map(img, t, tn, im, img.size_of_image);
+    expect(pe::relocate(img, im, 0x200000000ull, &applied) == S::Ok && applied == 47, "gnu ld: all 47 relocations apply");
+    count = 0;
+    expect(pe::bind_imports(img, im, resolve_logging, &count, &rep) == S::Ok && rep.libraries == 2 && rep.imports == 47 && rep.resolved == 47, "gnu ld: 47 imports from two libraries bind");
+    expect(pe::tls_info(img, im, 0x200000000ull, &tls) == S::Ok && tls.present && tls.callback_count == 2 && tls.template_bytes == 8, "gnu ld: the TLS directory has an 8 byte template and two callbacks");
+    bool callbacks_ok = true;
+    for (u32 i = 0; i < tls.callback_count; ++i) {
+        u64 rva = tls.callbacks[i] - 0x200000000ull;
+        callbacks_ok = callbacks_ok && rva >= img.sections[0].rva && rva < img.sections[0].rva + img.sections[0].virtual_size;
+    }
+    expect(callbacks_ok, "gnu ld: both TLS callbacks point into the code section after relocation");
+    pe::map(img, t, tn, im, img.size_of_image);
+    pe::relocate(img, im, 0x200000000ull);
+    expect(pe::bind_imports(img, im, reject_msvcrt, nullptr, &rep) == S::UnresolvedImport && rep.missing == 34 && rep.resolved == 13, "gnu ld: refusing msvcrt.dll reports its 34 imports and binds none");
+    bool named = rep.first[0].dll[0] == 'm' && rep.first[0].name[0] != 0;
+    expect(named, "gnu ld: the first missing import names its DLL and function");
+    free(im);
+
+    Sweep ks{};
+    sweep(k, kn, 0, kn, false, &ks);
+    expect(ks.violations == 0, "gnu ld: every mutation of the small program fails or satisfies the invariants");
+    printf("    (%u runs, %u accepted)\n", ks.runs, ks.accepted);
+    u32 prefixes = 0;
+    for (usize len = 0; len < tn; len += 97) {
+        if (pe::parse(t, len, &img) == S::Ok) ++prefixes;
+    }
+    expect(prefixes == 0, "gnu ld: no truncated prefix of the C program parses");
+}
+
 int main() {
     valid_tests();
     relocation_tests();
@@ -1725,6 +1838,8 @@ int main() {
     truncation_tests();
     layout_tests();
     real_tests();
+    movable_tests();
+    mingw_tests();
     resource_tests();
     sweep_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
