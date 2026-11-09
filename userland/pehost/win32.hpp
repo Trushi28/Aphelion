@@ -6,16 +6,6 @@
 
 namespace pehost {
 
-struct Runtime {
-    void (*exit_process)(u32 code) = nullptr;
-    i64 (*write_console)(u32 stream, const void* data, u32 length) = nullptr;
-    u8* (*reserve)(u64 bytes) = nullptr;
-    bool (*protect)(u8* at, u64 bytes, u32 prot) = nullptr;
-    void (*sleep_ms)(u32 milliseconds) = nullptr;
-};
-
-inline Runtime* g_runtime = nullptr;
-
 constexpr u32 ERROR_NOT_SUPPORTED = 50;
 constexpr u32 ERROR_INVALID_HANDLE = 6;
 constexpr u32 ERROR_NOT_ENOUGH_MEMORY = 8;
@@ -197,6 +187,7 @@ inline void attach(Prepared& run, const ImportTable* imports, const Config& conf
     World& w = g_world;
     w.heap.init(&detail::heap_map);
     w.imports = imports;
+    modules::g_state.builtins = imports;
     w.image = run.base;
     u64 pages = run.image.size_of_image / PAGE;
     w.image_pages = pages > MAX_IMAGE_PAGES ? MAX_IMAGE_PAGES : static_cast<u32>(pages);
@@ -221,12 +212,16 @@ inline void attach(Prepared& run, const ImportTable* imports, const Config& conf
 
 }
 
-#define PEHOST_WINAPI __attribute__((ms_abi))
-
 namespace pehost::win32 {
 
-PEHOST_WINAPI inline void ExitProcess(u32 code) {
+inline void end_process(u32 code) {
+    modules::DirectCall call;
+    modules::process_detach(call);
     g_runtime->exit_process(code);
+}
+
+PEHOST_WINAPI inline void ExitProcess(u32 code) {
+    end_process(code);
     for (;;) asm volatile("ud2");
 }
 
@@ -235,8 +230,8 @@ PEHOST_WINAPI inline i32 TerminateProcess(u64 process, u32 code) {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
     }
-    ExitProcess(code);
-    return 0;
+    g_runtime->exit_process(code);
+    for (;;) asm volatile("ud2");
 }
 
 PEHOST_WINAPI inline u64 GetStdHandle(u32 which) {
@@ -416,26 +411,14 @@ PEHOST_WINAPI inline const u16* GetCommandLineW() { return g_world.command_line_
 PEHOST_WINAPI inline u64 GetModuleHandleA(const char* name) {
     if (name == nullptr) return reinterpret_cast<u64>(g_world.image);
     u64 token = detail::module_token(name);
+    if (token == 0) {
+        char key[modules::NAME_BYTES];
+        char spelled[modules::NAME_BYTES];
+        i32 found = modules::normalise(name, key, spelled) ? modules::find(key) : -1;
+        if (found >= 0 && !modules::g_state.items[found].binding) token = reinterpret_cast<u64>(modules::g_state.items[found].base);
+    }
     if (token == 0) set_last_error(ERROR_MOD_NOT_FOUND);
     return token;
-}
-
-PEHOST_WINAPI inline u64 GetModuleHandleW(const u16* name) {
-    if (name == nullptr) return reinterpret_cast<u64>(g_world.image);
-    u32 n = 0;
-    while (name[n] && n < 63) ++n;
-    if (name[n]) {
-        set_last_error(ERROR_MOD_NOT_FOUND);
-        return 0;
-    }
-    char narrow[64];
-    i64 w = codec::utf16_to_utf8(name, n, reinterpret_cast<u8*>(narrow), sizeof(narrow) - 1, false);
-    if (w < 0) {
-        set_last_error(ERROR_MOD_NOT_FOUND);
-        return 0;
-    }
-    narrow[w] = 0;
-    return GetModuleHandleA(narrow);
 }
 
 PEHOST_WINAPI inline u64 LoadLibraryA(const char* name) {
@@ -444,8 +427,12 @@ PEHOST_WINAPI inline u64 LoadLibraryA(const char* name) {
         return 0;
     }
     u64 token = detail::module_token(name);
-    if (token == 0) set_last_error(ERROR_MOD_NOT_FOUND);
-    return token;
+    if (token != 0) return token;
+    modules::DirectCall call;
+    u32 error = 0;
+    u64 handle = modules::load_library(name, call, &error);
+    if (handle == 0) set_last_error(error);
+    return handle;
 }
 
 PEHOST_WINAPI inline u64 LoadLibraryW(const u16* name) {
@@ -470,45 +457,82 @@ PEHOST_WINAPI inline u64 LoadLibraryW(const u16* name) {
 }
 
 PEHOST_WINAPI inline i32 FreeLibrary(u64 module) {
-    if (detail::module_name(module) == nullptr) {
+    if (detail::module_name(module) != nullptr) return 1;
+    i32 found = modules::find_base(module);
+    if (found < 0 || modules::g_state.items[found].refs == 0) {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
     }
+    modules::DirectCall call;
+    modules::release(found, call);
     return 1;
 }
 
+PEHOST_WINAPI inline u64 GetModuleHandleW(const u16* name) {
+    if (name == nullptr) return reinterpret_cast<u64>(g_world.image);
+    u32 n = 0;
+    while (name[n] && n < 63) ++n;
+    if (name[n]) {
+        set_last_error(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    char narrow[64];
+    i64 w = codec::utf16_to_utf8(name, n, reinterpret_cast<u8*>(narrow), sizeof(narrow) - 1, false);
+    if (w < 0) {
+        set_last_error(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    narrow[w] = 0;
+    return GetModuleHandleA(narrow);
+}
+
 PEHOST_WINAPI inline void* GetProcAddress(u64 module, const char* name) {
+    bool by_ordinal = reinterpret_cast<u64>(name) < 0x10000;
     const char* dll = detail::module_name(module);
-    if (dll == nullptr || reinterpret_cast<u64>(name) < 0x10000) {
+    if (dll != nullptr) {
+        if (by_ordinal) {
+            set_last_error(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
+        for (const ImportTable* t = g_world.imports; t; t = t->next) {
+            for (u32 i = 0; i < t->count; ++i) {
+                if (detail::same_dll(t->items[i].dll, dll) && detail::same_name(t->items[i].name, name)) return t->items[i].address;
+            }
+        }
         set_last_error(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    for (const ImportTable* t = g_world.imports; t; t = t->next) {
-        for (u32 i = 0; i < t->count; ++i) {
-            if (detail::same_dll(t->items[i].dll, dll) && detail::same_name(t->items[i].name, name)) return t->items[i].address;
-        }
+    i32 found = modules::find_base(module);
+    u64 address = 0;
+    if (found < 0 || !modules::export_address(g_world.imports, found, by_ordinal ? nullptr : name, static_cast<u32>(reinterpret_cast<u64>(name)), 0, &address)) {
+        set_last_error(ERROR_PROC_NOT_FOUND);
+        return nullptr;
     }
-    set_last_error(ERROR_PROC_NOT_FOUND);
-    return nullptr;
+    return reinterpret_cast<void*>(address);
 }
 
 PEHOST_WINAPI inline u32 GetModuleFileNameA(u64 module, char* buffer, u32 size) {
+    const char* path = g_world.module_path;
     if (module != 0 && module != reinterpret_cast<u64>(g_world.image)) {
-        set_last_error(ERROR_MOD_NOT_FOUND);
-        return 0;
+        i32 found = modules::find_base(module);
+        if (found < 0) {
+            set_last_error(ERROR_MOD_NOT_FOUND);
+            return 0;
+        }
+        path = modules::g_state.items[found].key;
     }
     if (size == 0) {
         set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return 0;
     }
-    u32 length = detail::text_length(g_world.module_path);
+    u32 length = detail::text_length(path);
     if (length >= size) {
-        for (u32 i = 0; i + 1 < size; ++i) buffer[i] = g_world.module_path[i];
+        for (u32 i = 0; i + 1 < size; ++i) buffer[i] = path[i];
         buffer[size - 1] = 0;
         set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return size;
     }
-    for (u32 i = 0; i <= length; ++i) buffer[i] = g_world.module_path[i];
+    for (u32 i = 0; i <= length; ++i) buffer[i] = path[i];
     return length;
 }
 

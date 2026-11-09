@@ -21,7 +21,7 @@
 #include <cosmos/vmm.hpp>
 
 extern "C" void syscall_entry();
-extern "C" NORETURN void user_enter(u64 rip, u64 rsp, u64 arg);
+extern "C" NORETURN void user_enter(u64 rip, u64 rsp, u64 arg, u64 arg2);
 
 namespace userland {
 
@@ -39,6 +39,7 @@ struct Thread {
     u64 rip;
     u64 rsp;
     u64 arg;
+    u64 arg2;
 };
 
 struct Process {
@@ -65,7 +66,7 @@ struct Process {
     volatile u64 core_mask;
 };
 
-Process* launch_impl(const char* name, const Image& image, lens::Table* from, lens::Lens handle);
+Process* launch_impl(const char* name, const Image& image, lens::Table* from, lens::Lens handle, lens::Lens handle2);
 
 namespace {
 
@@ -321,7 +322,7 @@ bool build(Process* p, const Image& img) {
     u64 stack_bottom = userabi::STACK_TOP - static_cast<u64>(userabi::STACK_PAGES) * PAGE;
     if (!map_fresh(p, stack_bottom, userabi::STACK_PAGES, constellation::WRITABLE | constellation::NO_EXECUTE, nullptr, 0))
         return false;
-    p->threads[0] = Thread{ p, 0, 0, 0, userabi::CODE_BASE + img.entry_offset, userabi::STACK_TOP - 16, 0 };
+    p->threads[0] = Thread{ p, 0, 0, 0, userabi::CODE_BASE + img.entry_offset, userabi::STACK_TOP - 16, 0, 0 };
     p->created = 1;
     return true;
 }
@@ -367,7 +368,7 @@ void thread_main(void* arg) {
     Process* p = t->proc;
     orbital::current()->owner = p;
     die_if_killed();
-    user_enter(t->rip, t->rsp, t->arg);
+    user_enter(t->rip, t->rsp, t->arg, t->arg2);
 }
 
 bool exited_ready(void* arg) { return __atomic_load_n(&static_cast<Process*>(arg)->exited, __ATOMIC_ACQUIRE) != 0; }
@@ -389,7 +390,7 @@ i64 sys_thread_create(idt::Frame* f) {
         if (__atomic_compare_exchange_n(&p->created, &index, index + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
     }
     Thread& t = p->threads[index];
-    t = Thread{ p, 0, 0, 0, f->rdi, f->rsi, f->rdx };
+    t = Thread{ p, 0, 0, 0, f->rdi, f->rsi, f->rdx, 0 };
     if (!orbital::spawn_in(p->name, &thread_main, &t, p->space, &t.task_id)) {
         t.task_id = 0;
         __atomic_store_n(&t.done, 1u, __ATOMIC_RELEASE);
@@ -1002,7 +1003,7 @@ bool arg_handle_ok(lens::Table& t, lens::Lens arg, i64* error) {
     return true;
 }
 
-Process* spawn_file(lens::Table& files, lens::Lens file, const char* name, lens::Table* from, lens::Lens arg, i64* error) {
+Process* spawn_file(lens::Table& files, lens::Lens file, const char* name, lens::Table* from, lens::Lens arg, lens::Lens arg2, i64* error) {
     i64 scratch = 0;
     if (!error) error = &scratch;
     *error = 0;
@@ -1011,6 +1012,10 @@ Process* spawn_file(lens::Table& files, lens::Lens file, const char* name, lens:
         return nullptr;
     }
     if (from && !arg.is_null() && !arg_handle_ok(*from, arg, error)) return nullptr;
+    if (from && !arg2.is_null() && (arg.is_null() || !arg_handle_ok(*from, arg2, error))) {
+        if (*error == 0) *error = userabi::ERR_INVAL;
+        return nullptr;
+    }
     Loaded loaded;
     i64 e = load_apx(files, file, &loaded);
     if (e) {
@@ -1020,7 +1025,7 @@ Process* spawn_file(lens::Table& files, lens::Lens file, const char* name, lens:
     const apx::Header& h = loaded.header;
     Image img{ loaded.buf + h.code_offset, h.code_bytes, h.entry_offset, h.data_pages, h.data_bytes ? loaded.buf + h.data_offset : nullptr, h.data_bytes };
     bool with_arg = from && !arg.is_null();
-    Process* p = launch_impl(name ? name : loaded.label, img, with_arg ? from : nullptr, arg);
+    Process* p = launch_impl(name ? name : loaded.label, img, with_arg ? from : nullptr, arg, arg2);
     if (!p) *error = userabi::ERR_LIMIT;
     return p;
 }
@@ -1035,7 +1040,7 @@ i64 sys_process_create(idt::Frame* f) {
     if (!obj) return userabi::ERR_LIMIT;
     new (obj) ProcessObj();
     i64 error = 0;
-    Process* child = spawn_file(self->handles, lens::Lens(f->rdi), nullptr, &self->handles, lens::Lens(f->rsi), &error);
+    Process* child = spawn_file(self->handles, lens::Lens(f->rdi), nullptr, &self->handles, lens::Lens(f->rsi), lens::Lens(), &error);
     if (!child) {
         kheap::free(obj);
         return error;
@@ -1291,7 +1296,30 @@ void init_core(u32 core) {
     cpu::wrmsr(MSR_GS_BASE, reinterpret_cast<u64>(local));
 }
 
-Process* launch_impl(const char* name, const Image& image, lens::Table* from, lens::Lens handle) {
+bool move_handle(Process* p, lens::Table* from, lens::Lens handle, u64* out) {
+    lens::Parcel parcel;
+    lens::Done moved = lens::Done::success();
+    {
+        TableGuard guard(from->lock);
+        lens::Result<lens::Rights> rights = lens::rights_of(from->domain, handle);
+        if (rights.ok()) moved = lens::detach(from->domain, handle, rights.value(), &parcel);
+        else moved = lens::Done::fail(rights.status());
+    }
+    if (!moved.ok()) return false;
+    lens::Result<lens::Lens> attached = lens::Result<lens::Lens>::fail(lens::Status::Io);
+    {
+        TableGuard guard(p->handles.lock);
+        attached = lens::attach(p->handles.domain, parcel);
+    }
+    if (!attached.ok()) {
+        lens::discard(parcel);
+        return false;
+    }
+    *out = attached.value().raw;
+    return true;
+}
+
+Process* launch_impl(const char* name, const Image& image, lens::Table* from, lens::Lens handle, lens::Lens handle2) {
     if (!g_supported) return nullptr;
     Process* p = acquire_slot();
     if (!p) return nullptr;
@@ -1303,29 +1331,16 @@ Process* launch_impl(const char* name, const Image& image, lens::Table* from, le
         return nullptr;
     }
     if (from) {
-        lens::Parcel parcel;
-        lens::Done moved = lens::Done::success();
-        {
-            TableGuard guard(from->lock);
-            lens::Result<lens::Rights> rights = lens::rights_of(from->domain, handle);
-            if (rights.ok()) moved = lens::detach(from->domain, handle, rights.value(), &parcel);
-            else moved = lens::Done::fail(rights.status());
-        }
-        if (!moved.ok()) {
+        u64 first = 0;
+        u64 second = 0;
+        bool ok = move_handle(p, from, handle, &first);
+        if (ok && !handle2.is_null()) ok = move_handle(p, from, handle2, &second);
+        if (!ok) {
             if (teardown(p)) release_slot(p);
             return nullptr;
         }
-        lens::Result<lens::Lens> attached = lens::Result<lens::Lens>::fail(lens::Status::Io);
-        {
-            TableGuard guard(p->handles.lock);
-            attached = lens::attach(p->handles.domain, parcel);
-        }
-        if (!attached.ok()) {
-            lens::discard(parcel);
-            if (teardown(p)) release_slot(p);
-            return nullptr;
-        }
-        p->threads[0].arg = attached.value().raw;
+        p->threads[0].arg = first;
+        p->threads[0].arg2 = second;
     }
     procgroup::start(&p->group);
     if (!orbital::spawn_in(p->name, &thread_main, &p->threads[0], p->space, &p->threads[0].task_id)) {
@@ -1335,14 +1350,14 @@ Process* launch_impl(const char* name, const Image& image, lens::Table* from, le
     return p;
 }
 
-Process* launch(const char* name, const Image& image) { return launch_impl(name, image, nullptr, lens::Lens()); }
+Process* launch(const char* name, const Image& image) { return launch_impl(name, image, nullptr, lens::Lens(), lens::Lens()); }
 
 Process* launch_with(const char* name, const Image& image, lens::Table& from, lens::Lens handle) {
-    return launch_impl(name, image, &from, handle);
+    return launch_impl(name, image, &from, handle, lens::Lens());
 }
 
-Process* launch_file(const char* name, lens::Table& files, lens::Lens file, lens::Table* from, lens::Lens handle, i64* error) {
-    return spawn_file(files, file, name, from, handle, error);
+Process* launch_file(const char* name, lens::Table& files, lens::Lens file, lens::Table* from, lens::Lens handle, i64* error, lens::Lens handle2) {
+    return spawn_file(files, file, name, from, handle, handle2, error);
 }
 
 void set_console(ConsoleFn fn, void* ctx) {

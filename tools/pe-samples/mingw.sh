@@ -227,6 +227,146 @@ int main(int argc, char **argv) {
 }
 C
 
+cat > "$OUT/dllmath.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+
+static int calls;
+
+__declspec(dllexport) int add(int a, int b) {
+    calls++;
+    return a + b;
+}
+
+__declspec(dllexport) int call_count(void) { return calls; }
+
+__declspec(dllexport) int exported_value = 41;
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    (void)h;
+    printf("dllmath reason=%lu reserved=%d\n", (unsigned long)reason, reserved != NULL);
+    return TRUE;
+}
+C
+
+cat > "$OUT/dllchain.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+
+__declspec(dllimport) int add(int a, int b);
+
+int add3(int a, int b, int c) { return add(add(a, b), c); }
+
+int plus_one(int a) { return a + 1; }
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    (void)h;
+    printf("dllchain reason=%lu reserved=%d\n", (unsigned long)reason, reserved != NULL);
+    return TRUE;
+}
+C
+
+cat > "$OUT/dllplug.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+
+__declspec(dllexport) int plug_value(void) { return 99; }
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    (void)h;
+    printf("dllplug reason=%lu reserved=%d\n", (unsigned long)reason, reserved != NULL);
+    return TRUE;
+}
+C
+
+cat > "$OUT/dllfail.c" <<'C'
+#include <windows.h>
+
+__declspec(dllexport) int never(void) { return 0; }
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    (void)h;
+    (void)reserved;
+    return reason == DLL_PROCESS_ATTACH ? FALSE : TRUE;
+}
+C
+
+cat > "$OUT/dyn.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+
+__declspec(dllimport) int add3(int a, int b, int c);
+
+typedef int(__cdecl *add_fn)(int, int);
+typedef int(__cdecl *value_fn)(void);
+typedef int(__cdecl *step_fn)(int);
+
+static int failures;
+
+static void check(int ok, const char *what) {
+    if (!ok) {
+        failures++;
+        printf("FAIL %s\n", what);
+    }
+}
+
+int main(void) {
+    HMODULE chain = GetModuleHandleA("dllchain.dll");
+    HMODULE math = GetModuleHandleA("DLLMATH");
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    HMODULE plug;
+    add_fn add;
+    step_fn step;
+    value_fn plug_value;
+    int *data;
+    char name[64];
+
+    printf("start\n");
+    check(chain != NULL && math != NULL && chain != math, "both static dependencies are loaded");
+    check(add3(1, 2, 3) == 6, "a call through two DLLs");
+    add = (add_fn)GetProcAddress(math, "add");
+    check(add != NULL && add(40, 2) == 42, "GetProcAddress by name");
+    check(GetProcAddress(math, MAKEINTRESOURCEA(1)) == (FARPROC)add, "the same function by ordinal");
+    check(GetProcAddress(chain, "fwd_add") == (FARPROC)add, "a forwarder into another DLL resolves to the real function");
+    check(GetProcAddress(chain, "fwd_sleep") == GetProcAddress(k32, "Sleep"), "a forwarder into kernel32 resolves to the stub");
+    step = (step_fn)GetProcAddress(chain, MAKEINTRESOURCEA(9));
+    check(step != NULL && step(4) == 5, "an export that was given an explicit ordinal");
+    data = (int *)GetProcAddress(math, "exported_value");
+    check(data != NULL && *data == 41, "exported data");
+    SetLastError(0);
+    check(GetProcAddress(math, "nothere") == NULL && GetLastError() == ERROR_PROC_NOT_FOUND, "an unknown export");
+    check(GetProcAddress(math, MAKEINTRESOURCEA(99)) == NULL, "an ordinal past the table");
+    check(GetModuleFileNameA(math, name, sizeof name) > 0 && name[0] == 'd', "the name of a loaded module");
+    check(LoadLibraryA("C:\\somewhere\\DllMath.dll") == math, "a loaded DLL is found again by any spelling of its name");
+    check(FreeLibrary(math) != 0 && GetModuleHandleA("dllmath.dll") == math, "FreeLibrary balances it and the static import keeps it loaded");
+
+    plug = LoadLibraryA("dllplug.dll");
+    check(plug != NULL, "a DLL loaded at run time");
+    plug_value = (value_fn)GetProcAddress(plug, "plug_value");
+    check(plug_value != NULL && plug_value() == 99, "a call into it");
+    check(FreeLibrary(plug) != 0 && GetModuleHandleA("dllplug.dll") == NULL, "it is unloaded with its last reference");
+    plug = LoadLibraryA("dllplug.dll");
+    check(plug != NULL, "and can be loaded again");
+
+    SetLastError(0);
+    check(LoadLibraryA("nosuch.dll") == NULL && GetLastError() == ERROR_MOD_NOT_FOUND, "an unknown DLL is ERROR_MOD_NOT_FOUND");
+    check(LoadLibraryA("dllfail.dll") == NULL && GetLastError() == ERROR_DLL_INIT_FAILED, "a DLL whose DllMain fails is ERROR_DLL_INIT_FAILED");
+    check(GetModuleHandleA("dllfail.dll") == NULL, "and is not left loaded");
+
+    printf("done failures=%d\n", failures);
+    return failures ? 100 + failures : 7;
+}
+C
+
+cat > "$OUT/dllchain.def" <<'D'
+LIBRARY dllchain.dll
+EXPORTS
+    add3
+    plus_one @9
+    fwd_add = dllmath.add
+    fwd_sleep = KERNEL32.Sleep
+D
+
 cat > "$OUT/k32.c" <<'C'
 typedef void* HANDLE;
 typedef unsigned long DWORD;
@@ -263,12 +403,17 @@ $CC -O2 "$OUT/stdio.c" -o "$OUT/stdio.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/gaps.c" -o "$OUT/gaps.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/crt.c" -o "$OUT/crt.exe"
 "${MINGW_CC:-x86_64-w64-mingw32-gcc}" -Wl,--no-insert-timestamp -D_UCRT -O1 -s "$OUT/ucrt.c" -o "$OUT/ucrt.exe" -lucrt
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllmath.c" -o "$OUT/dllmath.dll"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllchain.c" "$OUT/dllchain.def" "$OUT/dllmath.dll" -o "$OUT/dllchain.dll"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllplug.c" -o "$OUT/dllplug.dll"
+$CC -O1 -s -shared -nostdlib -Wl,-e,DllMain "$OUT/dllfail.c" -o "$OUT/dllfail.dll"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/dyn.c" "$OUT/dllchain.dll" -o "$OUT/dyn.exe"
 $CC -O2 -Wl,--no-dynamicbase -Wl,--disable-reloc-section "$OUT/stdio.c" -o "$OUT/stdio-fixed.exe"
 $CC -O2 -s "$OUT/stdio.c" -o "$OUT/stdio-stripped.exe"
 $CC -O2 -ffreestanding -fno-stack-protector -nostdlib -Wl,-e,entry -Wl,--subsystem,console "$OUT/k32.c" -o "$OUT/k32.exe" -lkernel32
 
 if [ -x "$PEINFO" ]; then
-    for f in stdio stdio-fixed stdio-stripped crt ucrt k32; do
+    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn; do
         echo "================ $f.exe"
         "$PEINFO" "$OUT/$f.exe" || true
     done

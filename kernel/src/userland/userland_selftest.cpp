@@ -35,6 +35,16 @@ extern "C" const u8 pe_crt_start[];
 extern "C" const u8 pe_crt_end[];
 extern "C" const u8 pe_ucrt_start[];
 extern "C" const u8 pe_ucrt_end[];
+extern "C" const u8 pe_dllmath_start[];
+extern "C" const u8 pe_dllmath_end[];
+extern "C" const u8 pe_dllchain_start[];
+extern "C" const u8 pe_dllchain_end[];
+extern "C" const u8 pe_dllplug_start[];
+extern "C" const u8 pe_dllplug_end[];
+extern "C" const u8 pe_dllfail_start[];
+extern "C" const u8 pe_dllfail_end[];
+extern "C" const u8 pe_dyn_start[];
+extern "C" const u8 pe_dyn_end[];
 
 #define BLOB_DECL(name) extern "C" const u8 ublob_##name[]; extern "C" const u8 ublob_##name##_end[]
 
@@ -606,11 +616,12 @@ bool put_blob(lens::Domain& d, lens::Lens dir, const char* name, const u8* begin
     return lens::put(d, dir, name, lens::ConstBytes(begin, static_cast<usize>(end - begin))).ok();
 }
 
-bool run_pe(lens::Table& K, lens::Lens apps, const char* name, i32 want) {
+bool run_pe(lens::Table& K, lens::Lens root, lens::Lens apps, const char* name, i32 want) {
     lens::Result<lens::Lens> host = lens::open_at(K.domain, apps, "pehost", lens::Right::Read | lens::Right::Execute);
     lens::Result<lens::Lens> prog = lens::open_at(K.domain, apps, name, lens::Right::Read | lens::Right::Delegate);
+    lens::Result<lens::Lens> library = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Right::Read | lens::Right::Delegate);
     i64 error = -1;
-    Process* p = host.ok() && prog.ok() ? launch_file("pehost", K, host.value(), &K, prog.value(), &error) : nullptr;
+    Process* p = host.ok() && prog.ok() && library.ok() ? launch_file("pehost", K, host.value(), &K, prog.value(), &error, library.value()) : nullptr;
     i32 status = -1;
     bool good = p && wait(p, &status, WAIT_MS) && status == want;
     good = (p && reap(p)) && good;
@@ -654,6 +665,11 @@ bool run_files() {
                put_blob(K.domain, apps, "stdio.exe", pe_stdio_start, pe_stdio_end) &&
                put_blob(K.domain, apps, "crt.exe", pe_crt_start, pe_crt_end) &&
                put_blob(K.domain, apps, "ucrt.exe", pe_ucrt_start, pe_ucrt_end) &&
+               put_blob(K.domain, apps, "dllmath.dll", pe_dllmath_start, pe_dllmath_end) &&
+               put_blob(K.domain, apps, "dllchain.dll", pe_dllchain_start, pe_dllchain_end) &&
+               put_blob(K.domain, apps, "dllplug.dll", pe_dllplug_start, pe_dllplug_end) &&
+               put_blob(K.domain, apps, "dllfail.dll", pe_dllfail_start, pe_dllfail_end) &&
+               put_blob(K.domain, apps, "dyn.exe", pe_dyn_start, pe_dyn_end) &&
                lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
                lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
     lens::Result<lens::Lens> badw = lens::open_at(K.domain, apps, "bad", lens::Right::Read | lens::Right::Write);
@@ -696,15 +712,17 @@ bool run_files() {
         ok = good && ok;
     }
     {
-        bool pe = run_pe(K, apps, "console.exe", 9);
-        pe = run_pe(K, apps, "k32.exe", 0) && pe;
-        pe = run_pe(K, apps, "teb.exe", 0) && pe;
-        pe = run_pe(K, apps, "tlscb.exe", 0) && pe;
-        pe = run_pe(K, apps, "stdio.exe", 0) && pe;
-        pe = run_pe(K, apps, "crt.exe", 7) && pe;
-        pe = run_pe(K, apps, "ucrt.exe", 7) && pe;
-        pe = run_pe(K, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
-        pe = run_pe(K, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;
+        bool pe = run_pe(K, root, apps, "console.exe", 9);
+        pe = run_pe(K, root, apps, "k32.exe", 0) && pe;
+        pe = run_pe(K, root, apps, "teb.exe", 0) && pe;
+        pe = run_pe(K, root, apps, "tlscb.exe", 0) && pe;
+        pe = run_pe(K, root, apps, "stdio.exe", 0) && pe;
+        pe = run_pe(K, root, apps, "crt.exe", 7) && pe;
+        pe = run_pe(K, root, apps, "ucrt.exe", 7) && pe;
+        pe = run_pe(K, root, apps, "dyn.exe", 7) && pe;
+        pe = run_pe(K, root, apps, "dllmath.dll", static_cast<i32>(0xC000007Bu)) && pe;
+        pe = run_pe(K, root, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
+        pe = run_pe(K, root, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;
         ok = pe && ok;
     }
     {

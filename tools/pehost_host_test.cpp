@@ -100,6 +100,16 @@ struct Sample {
 
 void load_sample(Sample* s, const char* b64) { decode_b64(b64, s->bytes, &s->size); }
 
+bool load_file_sample(Sample* s, const char* path) {
+    i64 fd = lx(2, reinterpret_cast<u64>(path), 0);
+    if (fd < 0) return false;
+    i64 got = lx(SYS_READ, static_cast<u64>(fd), reinterpret_cast<u64>(s->bytes), sizeof(s->bytes));
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    if (got <= 0) return false;
+    s->size = static_cast<usize>(got);
+    return true;
+}
+
 struct Region {
     u8* at;
     u64 bytes;
@@ -122,7 +132,7 @@ struct Linux {
     int log_fd = -1;
     char logbuf[4096];
     u32 loglen = 0;
-    Region regions[16];
+    Region regions[64];
     u32 region_count = 0;
     Protect protects[256];
     u32 protect_count = 0;
@@ -150,7 +160,7 @@ struct Linux {
     u8* reserve(u64 bytes, bool image) {
         ++reserves;
         if (fail_reserve_at != 0 && reserves == fail_reserve_at) return nullptr;
-        if (region_count == 16) return nullptr;
+        if (region_count == 64) return nullptr;
         u64 span = bytes + 0x10000;
         i64 r = lx(SYS_MMAP, 0, span, 3, 0x22, static_cast<u64>(-1), 0);
         if (!mapped(r)) return nullptr;
@@ -226,7 +236,49 @@ void child_sleep(u32 milliseconds) {
     lx(35, reinterpret_cast<u64>(spec), 0);
 }
 
-pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep };
+const char* g_dll_dir = nullptr;
+const char* g_hide_file = nullptr;
+
+u8* child_read_file(const char* name, u64* size) {
+    if (g_dll_dir == nullptr) return nullptr;
+    if (g_hide_file) {
+        const char* a = g_hide_file;
+        const char* b = name;
+        while (*a && *a == *b) {
+            ++a;
+            ++b;
+        }
+        if (*a == 0 && *b == 0) return nullptr;
+    }
+    char path[512];
+    u32 n = 0;
+    for (const char* p = g_dll_dir; *p && n + 2 < sizeof(path); ++p) path[n++] = *p;
+    path[n++] = '/';
+    for (const char* p = name; *p && n + 1 < sizeof(path); ++p) path[n++] = *p;
+    path[n] = 0;
+    i64 fd = lx(2, reinterpret_cast<u64>(path), 0);
+    if (fd < 0) return nullptr;
+    i64 end = lx(8, static_cast<u64>(fd), 0, 2);
+    u8* out = nullptr;
+    if (end > 0 && end <= (16 << 20)) {
+        i64 map = lx(SYS_MMAP, 0, static_cast<u64>(end), 3, 0x22, static_cast<u64>(-1), 0);
+        if (mapped(map)) {
+            i64 got = lx(17, static_cast<u64>(fd), static_cast<u64>(map), static_cast<u64>(end), 0);
+            if (got == end) {
+                out = reinterpret_cast<u8*>(map);
+                *size = static_cast<u64>(end);
+            } else {
+                lx(SYS_MUNMAP, static_cast<u64>(map), static_cast<u64>(end));
+            }
+        }
+    }
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    return out;
+}
+
+void child_unmap(u8* at, u64 bytes) { lx(SYS_MUNMAP, reinterpret_cast<u64>(at), bytes); }
+
+pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap };
 
 const char* g_command_line = "pe.exe";
 
@@ -605,6 +657,25 @@ void run_tests() {
     expect(runs_with(g_ucrt, 7, "argc=4\nargv[0]=<pe.exe>\nargv[1]=<two words>\nargv[2]=<caf\xC3\xA9>\nargv[3]=<last>\ndirect 5 ucrt    ab|\na line\nno newline;\ndone failures=0\nexit handler 2\nexit handler 1\n", &r),
            "ucrt.exe sees its quoted and UTF-8 command line arguments through _configure_narrow_argv");
     g_command_line = "pe.exe";
+    {
+        static Sample dyn;
+        expect(load_file_sample(&dyn, "tools/pe-samples/bin/dyn.exe"), "dyn.exe is readable from tools/pe-samples/bin (run the tests from the repository root)");
+        g_dll_dir = "tools/pe-samples/bin";
+        expect(runs_with(dyn, 7,
+                         "dllmath reason=1 reserved=1\ndllchain reason=1 reserved=1\nstart\ndllplug reason=1 reserved=0\ndllplug reason=0 reserved=0\ndllplug reason=1 reserved=0\n"
+                         "done failures=0\ndllplug reason=0 reserved=1\ndllchain reason=0 reserved=1\ndllmath reason=0 reserved=1\n",
+                         &r),
+               "dyn.exe: two DLLs loaded in dependency order before the program starts, forwarders, ordinals, exported data, LoadLibrary and FreeLibrary at run time, a DLL whose DllMain fails refused, and every DLL detached in reverse order at exit");
+        g_hide_file = "dllmath.dll";
+        run_child(dyn.bytes, dyn.size, &r);
+        expect(r.have_status && r.status == pehost::STATUS_ENTRYPOINT_NOT_FOUND && contains(r.log, "missing import dllchain.dll!add3") && r.out_length == 0,
+               "a program whose DLL cannot be loaded because that DLL's own dependency is missing is refused, naming the import, and nothing runs");
+        g_hide_file = nullptr;
+        g_dll_dir = nullptr;
+        run_child(dyn.bytes, dyn.size, &r);
+        expect(r.have_status && r.status == pehost::STATUS_ENTRYPOINT_NOT_FOUND && contains(r.log, "missing import dllchain.dll!add3") && r.out_length == 0,
+               "without a place to look for DLLs the same program is refused too");
+    }
 
     run_child(g_console.bytes, 100, &r);
     expect(r.have_status && r.status == pehost::STATUS_INVALID_IMAGE_FORMAT && contains(r.log, "image refused"), "a truncated file is refused");
@@ -758,7 +829,14 @@ int list_supported() {
 
 int main(int argc, char** argv) {
     if (argc > 1 && equals(argv[1], "--list-supported")) return list_supported();
-    if (argc > 2 && equals(argv[1], "--run")) return run_file(argv[2], argc > 3 ? argv[3] : "pe.exe");
+    if (argc > 2 && equals(argv[1], "--run")) {
+        const char* line = "pe.exe";
+        for (int i = 3; i < argc; ++i) {
+            if (equals(argv[i], "--dlls") && i + 1 < argc) g_dll_dir = argv[++i];
+            else line = argv[i];
+        }
+        return run_file(argv[2], line);
+    }
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
     load_all();
     run_tests();

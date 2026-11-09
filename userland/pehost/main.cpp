@@ -9,6 +9,7 @@ namespace {
 constexpr u64 IMAGE_AT = 0x100100000000ull;
 constexpr u64 MAX_FILE = 16ull << 20;
 constexpr u64 RW = 3;
+constexpr u64 RIGHT_READ = 1;
 constexpr u64 PAGE = pehost::PAGE;
 
 struct Platform {
@@ -64,13 +65,47 @@ void sleep_ms(u32 milliseconds) {
 
 i64 write_console(u32, const void* data, u32 length) { return sys::debug_write(static_cast<const char*>(data), length); }
 
-pehost::Runtime g_runtime = { &exit_process, &write_console, &reserve_memory, &protect_memory, &sleep_ms };
+u64 g_directory = 0;
+
+u8* read_file(const char* name, u64* size) {
+    if (g_directory == 0) return nullptr;
+    u64 length = length_of(name);
+    if (length == 0 || length > fileabi::MAX_PATH) return nullptr;
+    u64 handle = 0;
+    if (sys::file_open(g_directory, name, length, RIGHT_READ, &handle) != 0) return nullptr;
+    fileabi::Stat st{};
+    u8* buffer = nullptr;
+    if (sys::file_stat(handle, &st) == 0 && st.kind == fileabi::KIND_FILE && st.size != 0 && st.size <= MAX_FILE) {
+        buffer = reserve_memory(st.size);
+        if (buffer) {
+            u64 have = 0;
+            while (have < st.size) {
+                i64 n = sys::file_read(handle, have, buffer + have, st.size - have);
+                if (n <= 0) break;
+                have += static_cast<u64>(n);
+            }
+            if (have == st.size) {
+                *size = st.size;
+            } else {
+                sys::vm_unmap(reinterpret_cast<u64>(buffer), (st.size + PAGE - 1) / PAGE);
+                buffer = nullptr;
+            }
+        }
+    }
+    sys::handle_close(handle);
+    return buffer;
+}
+
+void unmap_memory(u8* at, u64 bytes) { sys::vm_unmap(reinterpret_cast<u64>(at), (bytes + PAGE - 1) / PAGE); }
+
+pehost::Runtime g_runtime = { &exit_process, &write_console, &reserve_memory, &protect_memory, &sleep_ms, &read_file, &unmap_memory };
 pehost::Prepared g_prepared;
 
 }
 
-extern "C" i64 aphelion_main(u64 file) {
+extern "C" i64 aphelion_main(u64 file, u64 directory) {
     Platform platform;
+    g_directory = directory;
     fileabi::Stat st{};
     if (sys::file_stat(file, &st) != 0 || st.kind != fileabi::KIND_FILE) {
         log("[pehost] the argument is not a file handle\n");

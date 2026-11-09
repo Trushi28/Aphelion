@@ -1,6 +1,7 @@
 #pragma once
 #include <cosmos/pe.hpp>
 #include <cosmos/pe_modules.hpp>
+#include "modules.hpp"
 
 namespace pehost {
 
@@ -8,6 +9,7 @@ constexpr i64 STATUS_INVALID_IMAGE_FORMAT = static_cast<i32>(0xC000007Bu);
 constexpr i64 STATUS_CONFLICTING_ADDRESSES = static_cast<i32>(0xC0000018u);
 constexpr i64 STATUS_NO_MEMORY = static_cast<i32>(0xC0000017u);
 constexpr i64 STATUS_ENTRYPOINT_NOT_FOUND = static_cast<i32>(0xC0000139u);
+constexpr i64 STATUS_DLL_INIT_FAILED = static_cast<i32>(0xC0000142u);
 
 constexpr u64 PAGE = 4096;
 constexpr u64 MIN_STACK = 0x10000;
@@ -61,18 +63,6 @@ static_assert(__builtin_offsetof(Peb, process_parameters) == 0x20 && __builtin_o
 static_assert(__builtin_offsetof(Teb, tls_slots) == 0x1480);
 static_assert(sizeof(Teb) <= 2 * PAGE && sizeof(Peb) < PAGE);
 
-struct Import {
-    const char* dll;
-    const char* name;
-    void* address;
-};
-
-struct ImportTable {
-    const Import* items;
-    u32 count;
-    const ImportTable* next = nullptr;
-};
-
 struct Prepared {
     pe::Image image;
     pe::Tls tls;
@@ -112,37 +102,8 @@ struct Line {
     }
 };
 
-inline char fold(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; }
-
-inline bool same_dll(const char* a, const char* b) {
-    while (*a && fold(*a) == fold(*b)) {
-        ++a;
-        ++b;
-    }
-    return *a == 0 && *b == 0;
-}
-
-inline bool same_name(const char* a, const char* b) {
-    while (*a && *a == *b) {
-        ++a;
-        ++b;
-    }
-    return *a == 0 && *b == 0;
-}
-
-inline bool resolve(void* ctx, const char* dll, const char* name, u16, u64* address) {
-    if (name == nullptr) return false;
-    const char* home = pe::modules::canonical(dll);
-    for (const ImportTable* table = static_cast<const ImportTable*>(ctx); table; table = table->next) {
-        for (u32 i = 0; i < table->count; ++i) {
-            const Import& e = table->items[i];
-            if (same_dll(e.dll, home) && same_name(e.name, name)) {
-                *address = reinterpret_cast<u64>(e.address);
-                return true;
-            }
-        }
-    }
-    return false;
+inline bool resolve(void* ctx, const char* dll, const char* name, u16 ordinal, u64* address) {
+    return modules::resolve_import(static_cast<const ImportTable*>(ctx), -1, 0, dll, name, ordinal, address);
 }
 
 constexpr u64 up(u64 v, u64 a) { return (v + a - 1) / a * a; }
@@ -162,6 +123,7 @@ template <class P>
 i64 load(P& p, const u8* file, usize size, const ImportTable& imports, Prepared* out) {
     u8* raw = reinterpret_cast<u8*>(out);
     for (usize i = 0; i < sizeof(*out); ++i) raw[i] = 0;
+    modules::reset(&imports);
     pe::Status st = pe::parse(file, size, &out->image);
     if (st != pe::Status::Ok) return refuse(p, STATUS_INVALID_IMAGE_FORMAT, "image refused", pe::status_name(st));
     const pe::Image& img = out->image;
@@ -222,6 +184,7 @@ i64 load(P& p, const u8* file, usize size, const ImportTable& imports, Prepared*
     Peb* peb = reinterpret_cast<Peb*>(support + 2 * PAGE);
     u64* tls_array = reinterpret_cast<u64*>(support + 3 * PAGE);
     u8* tls_block = support + SUPPORT_HEAD;
+    modules::install_tls(tls_array);
     if (out->tls.present) {
         const u8* src = base + out->tls.template_rva;
         for (u32 i = 0; i < out->tls.template_bytes; ++i) tls_block[i] = src[i];
@@ -253,10 +216,13 @@ template <class P>
 i64 start(P& p, const Prepared& run) {
     if (!p.set_teb(run.teb)) return refuse(p, STATUS_NO_MEMORY, "the thread block could not be installed");
     void* top = run.stack_base + run.stack_bytes;
+    modules::PlatformCall<P> call{ p, top };
+    if (!modules::attach_static(call)) return STATUS_DLL_INIT_FAILED;
     u64 module = reinterpret_cast<u64>(run.base);
     for (u32 i = 0; i < run.tls.callback_count; ++i)
         p.call(reinterpret_cast<void*>(run.tls.callbacks[i]), module, REASON_PROCESS_ATTACH, 0, top);
     u64 result = p.call(run.base + run.image.entry_rva, reinterpret_cast<u64>(run.peb), 0, 0, top);
+    modules::process_detach(call);
     return static_cast<i32>(static_cast<u32>(result));
 }
 

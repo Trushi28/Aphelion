@@ -2001,6 +2001,265 @@ void ucrt_tests() {
     u::_c_exit();
 }
 
+
+char g_keybuf[64];
+char g_spellbuf[64];
+
+u32 chain_img_rva_add3(const u8* file, u64 size) {
+    static pe::Image img;
+    pe::parse(file, size, &img);
+    u8* flat = map_pages(img.size_of_image);
+    pe::map(img, file, size, flat, img.size_of_image);
+    pe::ExportRef r;
+    pe::find_export(flat, img.size_of_image, img.directories[pe::DIR_EXPORT], "add3", 0, &r);
+    return r.rva;
+}
+
+u8* read_sample(const char* name, u64* size) {
+    char path[160];
+    const char* dir = "tools/pe-samples/bin/";
+    u32 n = 0;
+    for (const char* p = dir; *p; ++p) path[n++] = *p;
+    for (const char* p = name; *p && n + 1 < sizeof(path); ++p) path[n++] = *p;
+    path[n] = 0;
+    i64 fd = lx(2, reinterpret_cast<u64>(path), 0);
+    if (fd < 0) return nullptr;
+    i64 end = lx(8, static_cast<u64>(fd), 0, 2);
+    u8* out = end > 0 ? map_pages(static_cast<u64>(end) + 1) : nullptr;
+    bool ok = out && lx(17, static_cast<u64>(fd), reinterpret_cast<u64>(out), static_cast<u64>(end), 0) == end;
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    if (!ok) return nullptr;
+    *size = static_cast<u64>(end);
+    return out;
+}
+
+struct Tracked {
+    u8* at;
+    u64 bytes;
+};
+Tracked g_tracked[64];
+u32 g_stray = 0;
+void track(u8* at, u64 bytes) {
+    if (!at) return;
+    for (Tracked& t : g_tracked) {
+        if (!t.at) {
+            t.at = at;
+            t.bytes = (bytes + 4095) / 4096 * 4096;
+            return;
+        }
+    }
+}
+u32 g_unmapped = 0;
+u64 g_truncate_to = 0;
+u8* mod_read(const char* name, u64* size) {
+    const char* real = name;
+    if (name[0] == 'p' && name[1] >= '0' && name[1] <= '9') real = "dllplug.dll";
+    u8* bytes = read_sample(real, size);
+    if (bytes) track(bytes, *size + 1);
+    if (bytes && g_truncate_to && g_truncate_to < *size) *size = g_truncate_to;
+    return bytes;
+}
+void mod_unmap(u8* at, u64 bytes) {
+    ++g_unmapped;
+    bool known = false;
+    for (Tracked& t : g_tracked) {
+        if (t.at == at && t.at && bytes <= t.bytes) {
+            t.at = nullptr;
+            known = true;
+        }
+    }
+    if (!known) {
+        ++g_stray;
+        return;
+    }
+    lx(SYS_MUNMAP, reinterpret_cast<u64>(at), bytes);
+}
+u8* mod_reserve(u64 bytes) {
+    u8* at = map_pages(bytes);
+    track(at, bytes);
+    return at;
+}
+bool mod_protect(u8*, u64, u32) { return true; }
+pehost::Runtime g_modrt = { &rec_exit, &rec_write, &mod_reserve, &mod_protect, &rec_sleep, &mod_read, &mod_unmap };
+bool real_protect(u8* at, u64 bytes, u32 prot) { return lx(10, reinterpret_cast<u64>(at), bytes, prot) == 0; }
+pehost::Runtime g_childmod = { &child_exit_process, &child_console, &mod_reserve, &real_protect, &rec_sleep, &mod_read, &mod_unmap };
+
+void child_load_plug() {
+    namespace m = pehost::modules;
+    pehost::g_runtime = &g_childmod;
+    static u64 tls[64];
+    m::reset(pehost::all_imports());
+    m::install_tls(tls);
+    m::DirectCall call;
+    u32 e = 0;
+    m::load_library("dllplug.dll", call, &e);
+}
+
+void module_tests() {
+    namespace m = pehost::modules;
+    pehost::g_runtime = &g_modrt;
+    static u64 tls_array[64];
+    m::reset(pehost::all_imports());
+    m::install_tls(tls_array);
+    m::NoCall none;
+    u32 err = 0;
+
+    u64 file_size = 0;
+    u8* chain_file = read_sample("dllchain.dll", &file_size);
+    static pe::Image chain_img;
+    pe::parse(chain_file, file_size, &chain_img);
+    u8* flat = map_pages(chain_img.size_of_image);
+    pe::map(chain_img, chain_file, file_size, flat, chain_img.size_of_image);
+    pe::ExportRef ref;
+    pe::Directory dir = chain_img.directories[pe::DIR_EXPORT];
+    using R = pe::ExportResult;
+    expect(pe::find_export(flat, chain_img.size_of_image, dir, "add3", 0, &ref) == R::Found && !ref.forwarded && ref.rva != 0 && ref.rva < chain_img.size_of_image, "an export is found by name");
+    expect(pe::find_export(flat, chain_img.size_of_image, dir, nullptr, 9, &ref) == R::Found && !ref.forwarded && ref.rva != 0, "an export is found by its ordinal, which starts at the directory's base, not at 1");
+    expect(pe::find_export(flat, chain_img.size_of_image, dir, "fwd_add", 0, &ref) == R::Found && ref.forwarded && same(ref.forward, "dllmath.add") &&
+           pe::find_export(flat, chain_img.size_of_image, dir, nullptr, 8, &ref) == R::Found && ref.forwarded && same(ref.forward, "KERNEL32.Sleep"),
+           "a forwarder yields its target text, by name or by ordinal");
+    expect(pe::find_export(flat, chain_img.size_of_image, dir, "ADD3", 0, &ref) == R::Missing && pe::find_export(flat, chain_img.size_of_image, dir, "add", 0, &ref) == R::Missing &&
+           pe::find_export(flat, chain_img.size_of_image, dir, "add33", 0, &ref) == R::Missing, "names are case sensitive and must match whole");
+    expect(pe::find_export(flat, chain_img.size_of_image, dir, nullptr, 5, &ref) == R::Missing && pe::find_export(flat, chain_img.size_of_image, dir, nullptr, 10, &ref) == R::Missing &&
+           pe::find_export(flat, chain_img.size_of_image, dir, nullptr, 0, &ref) == R::Missing && pe::find_export(flat, chain_img.size_of_image, dir, nullptr, 0xFFFF, &ref) == R::Missing,
+           "ordinals below the base, past the table and zero are missing");
+    expect(pe::find_export(flat, chain_img.size_of_image, pe::Directory{ 0, 0 }, "add3", 0, &ref) == R::Missing && pe::find_export(flat, chain_img.size_of_image, pe::Directory{ dir.rva, 39 }, "add3", 0, &ref) == R::Bad &&
+           pe::find_export(flat, chain_img.size_of_image, pe::Directory{ chain_img.size_of_image - 8, 40 }, "add3", 0, &ref) == R::Bad,
+           "no export directory is missing and a truncated or out of range one is bad");
+
+    u32 bad = 0, found_wild = 0;
+    u8* work = map_pages(chain_img.size_of_image);
+    for (u32 round = 0; round < (g_quick ? 3000u : 40000u); ++round) {
+        for (u32 i = 0; i < chain_img.size_of_image; ++i) work[i] = flat[i];
+        u32 edits = 1 + static_cast<u32>(below(6));
+        for (u32 e = 0; e < edits; ++e) {
+            u32 at = dir.rva + static_cast<u32>(below(dir.size + 64));
+            if (at < chain_img.size_of_image) work[at] = static_cast<u8>(below(256));
+        }
+        pe::Directory d = dir;
+        if (below(4) == 0) d.rva += static_cast<u32>(below(48)) - 24;
+        if (below(4) == 0) d.size = static_cast<u32>(below(dir.size * 2));
+        const char* name = below(3) == 0 ? nullptr : (below(2) ? "add3" : "fwd_sleep");
+        pe::ExportResult r = pe::find_export(work, chain_img.size_of_image, d, name, static_cast<u32>(below(14)), &ref);
+        if (r == R::Found) {
+            ++found_wild;
+            if (!ref.forwarded && ref.rva >= chain_img.size_of_image) ++bad;
+            if (ref.forwarded && ref.forward[0] == 0) ++bad;
+        }
+    }
+    expect(bad == 0 && found_wild > 100, "40,000 random corruptions of the export directory never give an address outside the image or an empty forwarder (and many still resolve)");
+
+    expect(m::normalise("C:\\Win\\System32\\MyLib.DLL", g_keybuf, g_spellbuf) && same(g_keybuf, "mylib.dll") && same(g_spellbuf, "MyLib.DLL") && m::normalise("a/b/plug", g_keybuf, g_spellbuf) && same(g_keybuf, "plug.dll") && same(g_spellbuf, "plug.dll"),
+           "module names reduce to the file name, a missing extension becomes .dll, and the spelling is kept for the file lookup");
+    expect(!m::normalise("", g_keybuf, g_spellbuf) && !m::normalise("dir\\", g_keybuf, g_spellbuf) && !m::normalise("0123456789012345678901234567890123456789012345678901234567890123.dll", g_keybuf, g_spellbuf) && m::normalise("v.x", g_keybuf, g_spellbuf) && same(g_keybuf, "v.x"),
+           "an empty name, a directory and a name that is too long are refused, and a name with its own extension keeps it");
+
+    err = 0;
+    u64 chain = m::load_library("dllchain.dll", none, &err);
+    i32 ci = m::find("dllchain.dll");
+    i32 mi = m::find("dllmath.dll");
+    expect(chain != 0 && ci >= 0 && mi >= 0 && m::g_state.items[ci].refs == 1 && m::g_state.items[mi].refs == 1 && m::g_state.items[ci].attached && m::g_state.items[mi].attached,
+           "loading a DLL loads what it imports, holds one reference on each and marks both initialised");
+    expect(m::g_state.order_count == 2 && m::g_state.order[0] == mi && m::g_state.order[1] == ci, "a dependency is initialised before the DLL that imports it");
+    expect(chain % 0x10000 == 0 && m::find_base(chain) == ci && reinterpret_cast<u64>(m::g_state.items[mi].base) % 0x10000 == 0, "the image bases are 64 KiB aligned");
+    expect(m::g_state.items[ci].tls_index >= 1 && m::g_state.items[mi].tls_index >= 1 && m::g_state.items[ci].tls_index != m::g_state.items[mi].tls_index &&
+           tls_array[m::g_state.items[ci].tls_index] == reinterpret_cast<u64>(m::g_state.items[ci].tls_block) && tls_array[m::g_state.items[mi].tls_index] != 0 &&
+           tls_array[0] == 0,
+           "each DLL with thread-local storage gets its own index above 0 and its block in the thread's table");
+    u32 idx_value = 0;
+    for (u32 k = 0; k < 4; ++k) idx_value |= static_cast<u32>(m::g_state.items[ci].base[m::g_state.items[ci].tls.index_rva + k]) << (8 * k);
+    expect(idx_value == m::g_state.items[ci].tls_index, "the DLL's own TLS index variable holds the assigned index");
+
+    u64 address = 0;
+    const pehost::ImportTable* builtins = pehost::all_imports();
+    expect(m::export_address(builtins, ci, "add3", 0, 0, &address) && address == chain + chain_img_rva_add3(chain_file, file_size),
+           "a plain export is the image base plus its relative address");
+    u64 math_add = 0;
+    expect(m::export_address(builtins, mi, "add", 0, 0, &math_add) && m::export_address(builtins, ci, "fwd_add", 0, 0, &address) && address == math_add && m::export_address(builtins, ci, nullptr, 7, 0, &address) && address == math_add,
+           "a forwarder to another loaded DLL is that DLL's own address, by name or by ordinal");
+    expect(m::export_address(builtins, ci, "fwd_sleep", 0, 0, &address) && address == reinterpret_cast<u64>(&pehost::win32::Sleep), "a forwarder into kernel32 is the built-in stub");
+    expect(!m::export_address(builtins, ci, "nothere", 0, 0, &address) && !m::export_address(builtins, ci, "fwd_add", 0, m::MAX_HOPS, &address), "an unknown name fails and a forwarder is not followed past the hop limit");
+
+    u8* base = m::g_state.items[ci].base;
+    pe::ExportRef fwd;
+    pe::find_export(base, chain_img.size_of_image, chain_img.directories[pe::DIR_EXPORT], "fwd_add", 0, &fwd);
+    char* text = reinterpret_cast<char*>(base + 0);
+    (void)text;
+    u8* image = const_cast<u8*>(base);
+    pe::Directory live = m::g_state.items[ci].exports;
+    auto forward_rva = [&]() {
+        u32 first = *reinterpret_cast<u32*>(image + live.rva + 28);
+        return *reinterpret_cast<u32*>(image + first + 4);
+    };
+    u32 where = forward_rva();
+    auto patch = [&](const char* to) {
+        u32 i = 0;
+        for (; to[i]; ++i) image[where + i] = static_cast<u8>(to[i]);
+        image[where + i] = 0;
+    };
+    patch("dllmath.#2");
+    u64 count_fn = 0;
+    expect(m::export_address(builtins, mi, "call_count", 0, 0, &count_fn) && m::export_address(builtins, ci, "fwd_add", 0, 0, &address) && address == count_fn, "a forwarder by ordinal (name.#N) reaches the export with that ordinal");
+    patch("dllmath.#");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder with an empty ordinal fails");
+    patch("dllmath.#70000");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder ordinal above 65535 fails");
+    patch("dllmath.#2x");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder ordinal with a letter fails");
+    patch("nodot");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder with no dot fails");
+    patch(".add");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder with no module name fails");
+    patch("dllmath.");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder with no function name fails");
+    patch("dllchain.fwd_add");
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder that points at itself ends at the hop limit instead of looping");
+    patch("nosuch.add");
+    u32 modules_before = 0;
+    for (u32 i = 0; i < m::MAX_MODULES; ++i) modules_before += m::g_state.items[i].used;
+    expect(!m::export_address(builtins, ci, "fwd_add", 0, 0, &address), "a forwarder into a DLL that does not exist fails");
+    patch("dllmath.add");
+
+    u32 before = g_unmapped;
+    u64 again = m::load_library("DLLCHAIN", none, &err);
+    expect(again == chain && m::g_state.items[ci].refs == 2 && m::g_state.items[mi].refs == 1 && g_unmapped == before, "loading it again by another spelling adds a reference to it only");
+    m::release(ci, none);
+    expect(m::g_state.items[ci].used && m::g_state.items[ci].refs == 1, "releasing once leaves it loaded");
+    m::release(ci, none);
+    expect(!m::g_state.items[ci].used && !m::g_state.items[mi].used && m::find("dllchain.dll") < 0 && g_unmapped > before && tls_array[1] == 0 && tls_array[2] == 0,
+           "releasing the last reference unloads it and, through it, its dependency, with their memory and TLS entries");
+    expect(g_stray == 0, "everything a module manager unmaps is exactly something it was given and never any other memory");
+    u32 mapped_ok = 0;
+    for (u32 i = 0; i < m::MAX_MODULES; ++i) mapped_ok += m::g_state.items[i].used;
+    expect(mapped_ok == 0 && m::g_state.order_count == 0, "nothing is left loaded or initialised");
+
+    err = 0;
+    expect(m::load_library("nosuch.dll", none, &err) == 0 && err == m::ERROR_NOT_FOUND, "an unknown DLL is ERROR_MOD_NOT_FOUND");
+    err = 0;
+    expect(m::load_library("dyn.exe", none, &err) == 0 && err == m::ERROR_BAD_IMAGE, "a program is not loadable as a library: ERROR_BAD_EXE_FORMAT");
+    g_truncate_to = 600;
+    err = 0;
+    expect(m::load_library("dllplug.dll", none, &err) == 0 && err == m::ERROR_BAD_IMAGE, "a truncated DLL file is ERROR_BAD_EXE_FORMAT");
+    g_truncate_to = 0;
+    u32 live_slots = 0;
+    for (u32 i = 0; i < m::MAX_MODULES; ++i) live_slots += m::g_state.items[i].used;
+    expect(live_slots == 0, "failed loads leave nothing behind");
+
+    pehost::g_runtime = &g_recording;
+    m::reset(pehost::all_imports());
+    ChildResult killed = in_child([] {
+        child_load_plug();
+        pehost::win32::TerminateProcess(~0ull, 9);
+    });
+    ChildResult ended = in_child([] {
+        child_load_plug();
+        pehost::win32::ExitProcess(9);
+    });
+    expect(killed.exited && killed.code == 9 && contains(killed.out, "dllplug reason=1") && !contains(killed.out, "reason=0") &&
+           ended.exited && ended.code == 9 && contains(ended.out, "dllplug reason=1") && contains(ended.out, "dllplug reason=0 reserved=1"),
+           "ExitProcess detaches the loaded DLLs with a non-null reserved argument and TerminateProcess on the current process does not, as on Windows");
+}
+
 int main(int argc, char** argv) {
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
     heap_tests();
@@ -2014,6 +2273,7 @@ int main(int argc, char** argv) {
     msvcrt_tests();
     msvcrt_edge_tests();
     ucrt_tests();
+    module_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

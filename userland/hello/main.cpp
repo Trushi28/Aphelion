@@ -29,7 +29,7 @@ bool bss_is_zero() {
 
 }
 
-extern "C" i64 aphelion_main(u64 argument) {
+extern "C" i64 aphelion_main(u64 argument, u64) {
     if (argument != 0) return 1;
     log(g_text);
     if (sum_table() != 31) return 2;

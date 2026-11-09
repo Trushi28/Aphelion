@@ -627,4 +627,60 @@ inline Status tls_info(const Image& img, const u8* image, u64 loaded_base, Tls* 
     return Status::Ok;
 }
 
+constexpr u32 MAX_EXPORTS = 65536;
+constexpr u32 EXPORT_DIRECTORY_BYTES = 40;
+
+enum class ExportResult : u8 { Found, Missing, Bad };
+
+struct ExportRef {
+    bool forwarded;
+    u32 rva;
+    char forward[MAX_NAME + 1];
+};
+
+inline ExportResult find_export(const u8* image, u64 bytes, Directory dir, const char* name, u32 ordinal, ExportRef* out) {
+    *out = ExportRef{};
+    if (dir.rva == 0 || dir.size == 0) return ExportResult::Missing;
+    detail::View v{ image, bytes };
+    if (dir.size < EXPORT_DIRECTORY_BYTES || !v.has(dir.rva, EXPORT_DIRECTORY_BYTES)) return ExportResult::Bad;
+    u32 first = v.r32(dir.rva + 16);
+    u32 functions = v.r32(dir.rva + 20);
+    u32 names = v.r32(dir.rva + 24);
+    u32 functions_at = v.r32(dir.rva + 28);
+    u32 names_at = v.r32(dir.rva + 32);
+    u32 ordinals_at = v.r32(dir.rva + 36);
+    if (functions > MAX_EXPORTS || names > MAX_EXPORTS) return ExportResult::Bad;
+    if (!v.has(functions_at, 4ull * functions) || !v.has(names_at, 4ull * names) || !v.has(ordinals_at, 2ull * names)) return ExportResult::Bad;
+    u64 index = 0;
+    if (name != nullptr) {
+        bool hit = false;
+        for (u32 i = 0; i < names && !hit; ++i) {
+            char text[MAX_NAME + 1];
+            if (!detail::read_text(image, bytes, v.r32(names_at + 4ull * i), MAX_NAME, text)) return ExportResult::Bad;
+            u32 k = 0;
+            while (text[k] && text[k] == name[k]) ++k;
+            if (text[k] == 0 && name[k] == 0) {
+                hit = true;
+                index = v.r16(ordinals_at + 2ull * i);
+            }
+        }
+        if (!hit) return ExportResult::Missing;
+        if (index >= functions) return ExportResult::Bad;
+    } else {
+        if (ordinal < first) return ExportResult::Missing;
+        index = ordinal - first;
+        if (index >= functions) return ExportResult::Missing;
+    }
+    u32 rva = v.r32(functions_at + 4 * index);
+    if (rva == 0) return ExportResult::Missing;
+    if (rva >= dir.rva && rva - dir.rva < dir.size) {
+        if (!detail::read_text(image, bytes, rva, MAX_NAME, out->forward)) return ExportResult::Bad;
+        out->forwarded = true;
+        return ExportResult::Found;
+    }
+    if (rva >= bytes) return ExportResult::Bad;
+    out->rva = rva;
+    return ExportResult::Found;
+}
+
 }

@@ -92,11 +92,11 @@ user_enter:
     push qword USER_CODE_SEL
     push rdi
     mov rdi, rdx
+    mov rsi, rcx
     xor eax, eax
     xor ebx, ebx
     xor ecx, ecx
     xor edx, edx
-    xor esi, esi
     xor ebp, ebp
     xor r8d, r8d
     xor r9d, r9d

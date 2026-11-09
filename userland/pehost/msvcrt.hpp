@@ -424,12 +424,12 @@ PEHOST_WINAPI inline void _cexit() { detail::run_exit_handlers(); }
 
 PEHOST_WINAPI inline void exit(i32 code) {
     detail::run_exit_handlers();
-    g_runtime->exit_process(static_cast<u32>(code));
+    win32::end_process(static_cast<u32>(code));
     for (;;) asm volatile("ud2");
 }
 
 PEHOST_WINAPI inline void _exit(i32 code) {
-    g_runtime->exit_process(static_cast<u32>(code));
+    win32::end_process(static_cast<u32>(code));
     for (;;) asm volatile("ud2");
 }
 

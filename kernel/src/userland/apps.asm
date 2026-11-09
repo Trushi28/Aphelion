@@ -20,5 +20,10 @@ embed pe_tlscb, "tlscb.exe"
 embed pe_stdio, "stdio.exe"
 embed pe_crt, "crt.exe"
 embed pe_ucrt, "ucrt.exe"
+embed pe_dllmath, "dllmath.dll"
+embed pe_dllchain, "dllchain.dll"
+embed pe_dllplug, "dllplug.dll"
+embed pe_dllfail, "dllfail.dll"
+embed pe_dyn, "dyn.exe"
 
 section .note.GNU-stack noalloc noexec nowrite

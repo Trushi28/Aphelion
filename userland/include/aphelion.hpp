@@ -53,4 +53,4 @@ constexpr u64 length_of(const char* text) {
 
 inline void log(const char* text) { sys::debug_write(text, length_of(text)); }
 
-extern "C" i64 aphelion_main(u64 argument);
+extern "C" i64 aphelion_main(u64 argument, u64 second);

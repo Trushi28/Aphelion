@@ -34,6 +34,8 @@ inline bool is(const char* s, const char* whole) {
     return *s == 0;
 }
 
+inline bool provided(const char* home) { return is(home, "kernel32.dll") || is(home, "msvcrt.dll") || is(home, "ucrtbase.dll"); }
+
 inline const char* canonical(const char* dll) {
     if (is(dll, "kernel32.dll") || is(dll, "kernelbase.dll")) return "kernel32.dll";
     if (is(dll, "msvcrt.dll")) return "msvcrt.dll";

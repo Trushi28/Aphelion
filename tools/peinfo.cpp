@@ -66,13 +66,106 @@ void label(const Entry& e, char* out) {
     out[n] = 0;
 }
 
+u8* slurp(const char* path, usize* size) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return nullptr;
+    usize cap = 1 << 16, len = 0;
+    u8* buf = static_cast<u8*>(malloc(cap));
+    for (;;) {
+        if (len == cap) {
+            u8* bigger = static_cast<u8*>(malloc(cap * 2));
+            for (usize i = 0; i < len; ++i) bigger[i] = buf[i];
+            free(buf);
+            buf = bigger;
+            cap *= 2;
+        }
+        usize n = fread(buf + len, 1, cap - len, f);
+        if (n == 0) break;
+        len += n;
+    }
+    fclose(f);
+    *size = len;
+    return buf;
+}
+
+char g_dir[512];
+constexpr u32 MAX_DEPTH = 4;
+
+bool provided_by_file(const Entry& e, u32 depth);
+
+struct Sibling {
+    u32 depth;
+    bool ok;
+};
+
+bool sibling_import(void* ctx, const char* dll, const char* name, u16 ordinal, u64* address) {
+    Sibling* s = static_cast<Sibling*>(ctx);
+    *address = 0x1000;
+    Entry e{};
+    u32 n = 0;
+    for (const char* p = dll; *p; ++p) put(e.dll, n, fold(*p));
+    e.dll[n] = 0;
+    e.by_ordinal = name == nullptr;
+    e.ordinal = ordinal;
+    n = 0;
+    if (name) {
+        for (const char* p = name; *p; ++p) put(e.name, n, *p);
+    }
+    e.name[n] = 0;
+    char l[TEXT];
+    label(e, l);
+    bool listed = false;
+    for (u32 i = 0; i < g_supported_count && !listed; ++i) listed = equal(g_supported[i], l);
+    if (!listed && !provided_by_file(e, s->depth + 1)) s->ok = false;
+    return true;
+}
+
+bool provided_by_file(const Entry& e, u32 depth) {
+    if (depth > MAX_DEPTH || g_dir[0] == 0 || pe::modules::provided(pe::modules::canonical(e.dll))) return false;
+    char path[TEXT + 520];
+    u32 n = 0;
+    for (const char* p = g_dir; *p && n + 1 < sizeof(path); ++p) path[n++] = *p;
+    bool dotted = false;
+    for (const char* p = e.dll; *p; ++p) {
+        if (*p == '/' || *p == '\\') return false;
+        if (*p == '.') dotted = true;
+    }
+    for (const char* p = e.dll; *p && n + 1 < sizeof(path); ++p) path[n++] = *p;
+    if (!dotted) {
+        for (const char* p = ".dll"; *p && n + 1 < sizeof(path); ++p) path[n++] = *p;
+    }
+    path[n] = 0;
+    usize size = 0;
+    u8* file = slurp(path, &size);
+    if (!file) return false;
+    pe::Image* img = static_cast<pe::Image*>(malloc(sizeof(pe::Image)));
+    bool found = false;
+    if (pe::parse(file, size, img) == pe::Status::Ok && img->is_dll && img->directory_count > pe::DIR_EXPORT) {
+        u8* mapped = static_cast<u8*>(malloc(img->size_of_image));
+        if (pe::map(*img, file, size, mapped, img->size_of_image) == pe::Status::Ok) {
+            pe::ExportRef ref;
+            pe::ExportResult r = pe::find_export(mapped, img->size_of_image, img->directories[pe::DIR_EXPORT], e.by_ordinal ? nullptr : e.name, e.ordinal, &ref);
+            found = r == pe::ExportResult::Found;
+            if (found && pe::relocate(*img, mapped, 0x200000000ull, nullptr) == pe::Status::Ok) {
+                Sibling sib{ depth, true };
+                pe::ImportReport report{};
+                found = pe::bind_imports(*img, mapped, sibling_import, &sib, &report) == pe::Status::Ok && sib.ok;
+            }
+        }
+        free(mapped);
+    }
+    free(img);
+    free(file);
+    return found;
+}
+
 bool is_supported(const Entry& e) {
     char l[TEXT];
     label(e, l);
     for (u32 i = 0; i < g_supported_count; ++i) {
         if (equal(g_supported[i], l)) return true;
     }
-    return false;
+    return provided_by_file(e, 0);
 }
 
 bool collect(void*, const char* dll, const char* name, u16 ordinal, u64* address) {
@@ -95,28 +188,6 @@ bool collect(void*, const char* dll, const char* name, u16 ordinal, u64* address
     ++g_entry_total;
     if (g_entry_count < MAX_ENTRIES) g_entries[g_entry_count++] = e;
     return true;
-}
-
-u8* slurp(const char* path, usize* size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return nullptr;
-    usize cap = 1 << 16, len = 0;
-    u8* buf = static_cast<u8*>(malloc(cap));
-    for (;;) {
-        if (len == cap) {
-            u8* bigger = static_cast<u8*>(malloc(cap * 2));
-            for (usize i = 0; i < len; ++i) bigger[i] = buf[i];
-            free(buf);
-            buf = bigger;
-            cap *= 2;
-        }
-        usize n = fread(buf + len, 1, cap - len, f);
-        if (n == 0) break;
-        len += n;
-    }
-    fclose(f);
-    *size = len;
-    return buf;
 }
 
 const char* prot_text(u32 p) {
@@ -176,7 +247,24 @@ struct Gap {
 Gap g_gaps[MAX_ENTRIES];
 u32 g_gap_count = 0;
 
+void set_directory(const char* path) {
+    u32 last = 0;
+    bool any = false;
+    for (u32 i = 0; path[i]; ++i) {
+        if (path[i] == '/') {
+            last = i + 1;
+            any = true;
+        }
+    }
+    u32 n = 0;
+    if (any) {
+        for (; n < last && n + 1 < sizeof(g_dir); ++n) g_dir[n] = path[n];
+    }
+    g_dir[n] = 0;
+}
+
 const char* collect_file(const char* path, bool* movable) {
+    set_directory(path);
     g_entry_count = 0;
     g_entry_total = 0;
     *movable = false;
@@ -310,6 +398,7 @@ int main(int argc, char** argv) {
         dprintf(2, "usage: peinfo [-v] [--supported list.txt] program.exe\n       peinfo --coverage --supported list.txt program.exe...\n");
         return 2;
     }
+    set_directory(path);
     usize size = 0;
     u8* file = slurp(path, &size);
     if (!file) {

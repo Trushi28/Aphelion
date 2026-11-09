@@ -127,7 +127,7 @@ How the time and process facts are obtained: there is no clock syscall, so no ti
 
 ### Running a program from the shell
 
-In shell mode the bundled programs are installed in `ram:/apps` at boot: `hello` (a native APX program), `pehost` (the PE host itself), and the Windows test programs `console.exe`, `k32.exe`, `teb.exe`, `tlscb.exe`, `stdio.exe` (`printf("Hello World\n")`), `crt.exe` and `ucrt.exe`. `chart ram:/apps` lists them and `run stdio.exe` runs one: a file that starts with `MZ` is handed to `pehost`, anything else is launched as an APX image. The program's console output is printed in the shell (it also goes to the serial log with a `[user N]` prefix), Ctrl+C kills it, and the shell prints `exit status N`. Only plain names in `ram:/apps` are accepted. Programs cannot take arguments or read input yet, and the realm is in memory, so `ram:/apps` is rebuilt at every boot. To try your own program, copy it into the realm (for example with `twin disk:/prog.exe ram:/apps/prog.exe`) and `run prog.exe`.
+In shell mode the bundled programs are installed in `ram:/apps` at boot: `hello` (a native APX program), `pehost` (the PE host itself), and the Windows test programs `console.exe`, `k32.exe`, `teb.exe`, `tlscb.exe`, `stdio.exe` (`printf("Hello World\n")`), `crt.exe`, `ucrt.exe` and `dyn.exe`, with the DLLs `dllmath.dll`, `dllchain.dll`, `dllplug.dll` and `dllfail.dll` that `dyn.exe` loads. `chart ram:/apps` lists them and `run stdio.exe` runs one: a file that starts with `MZ` is handed to `pehost`, anything else is launched as an APX image. The program's console output is printed in the shell (it also goes to the serial log with a `[user N]` prefix), Ctrl+C kills it, and the shell prints `exit status N`. Only plain names in `ram:/apps` are accepted. Programs cannot take arguments or read input yet, and the realm is in memory, so `ram:/apps` is rebuilt at every boot. To try your own program, copy it into the realm (for example with `twin disk:/prog.exe ram:/apps/prog.exe`) and `run prog.exe`.
 
 ### Tests
 
@@ -180,12 +180,45 @@ A program built against the universal C runtime (MSVC, or MinGW with `-D_UCRT -l
 
 ### Limits
 
-- This is not the loading of DLL *files*. A program that ships its own `.dll`, or calls `LoadLibrary("something.dll")` for a library that is not one of the three built-in modules, still fails with `ERROR_MOD_NOT_FOUND` (126). That is W5b; it needs the launcher to pass the host more than one handle and a place to look for the file.
+- This step does not load DLL *files*; W5b below does.
 - Every `api-ms-win-*` and `ext-ms-win-*` set other than the C runtime is served from the `kernel32` table. On Windows each set maps to a specific DLL (`kernelbase`, `ntdll`, `advapi32` and others); a function that is in the table but whose real set is different resolves here and would not there. For a program that works on Windows this cannot matter; for coverage reports it can make a program look runnable when it asks for something from `advapi32`, but only if that function is also in the table, and none are.
 - The UCRT output options are the ones the MinGW headers pass: bit 1 (`0x1`) ignored, bit 2 (`0x2`) standard `snprintf` behaviour (the full length is returned, the buffer is always terminated), neither set the legacy `_snprintf` behaviour (`-1` on truncation, no terminator when the output fills the buffer exactly). `ucrt.exe` shows MinGW's `snprintf` and `_snprintf` land on the intended branches. The values come from the UCRT headers as I recall them and were not checked against a real `ucrtbase.dll`, which was not available. What bit `0x1` changes in Microsoft's implementation, if anything beyond what is described, is not known here and is not implemented.
 - `__stdio_common_vsnprintf_s`, `__stdio_common_vsprintf_s`, the `scanf` family, wide printf and every wide function are not provided; programs that need them are reported by name. `printf` still has no floating point, so `%f` fails with `EINVAL` exactly as in W3.
 - Command-line wildcard expansion (`_crt_argv_expanded_arguments`) is accepted and behaves as mode 1. The environment is empty. The time zone is `UTC` and `_tzset` does nothing. `__daylight`, `__timezone` and `__tzname` are provided as functions, which is how the UCRT headers declare them; the sample imports them but never calls them, so the call itself is checked only by the unit tests.
 - The programs that run are MinGW programs. A program built by MSVC also needs `vcruntime140.dll` (`memset` intrinsics, `__CxxFrameHandler`, `_seh_filter_exe`) and no such program was available, so none has been run.
+
+## W5b: loading DLL files
+
+A program that imports a `.dll` of its own, or calls `LoadLibrary("name.dll")` for one, now gets it. The DLL is looked up in the directory the program was started from (`ram:/apps` from the shell), by file name only: `LoadLibraryA("C:\x\DllMath.dll")` finds `dllmath.dll` there, and a name without an extension gets `.dll`.
+
+How it works, in `userland/pehost/modules.hpp` (header-only like the rest, so the host test runs the same text):
+
+- **Handles.** A process still receives handles only through its start-up arguments, so the kernel now passes two: the program and, new, a directory handle with read and delegate rights. `launch_file(..., handle, &error, handle2)` moves both from the launcher's table into the child; `user_enter` puts the second in `rsi`, and `aphelion_main(u64 file, u64 directory)` is the new entry signature for every ring-3 program (`hello` ignores the second). The host reads a DLL with `file_open` relative to that handle, so it can open nothing outside that directory, and names that are only dots are refused before the call.
+- **Mapping.** Each DLL is reserved with 64 KiB more than its image and aligned to 64 KiB, because the loader's relocator requires an aligned base. It is mapped, relocated, imports bound (recursively, to a depth of 4), TLS prepared and page protections applied, exactly as the program is.
+- **Dependencies.** Each module keeps a reference count and a list of the modules it imports. Loading a DLL loads the DLLs it imports; releasing its last reference unloads it and then releases what it imported. At most 16 modules at once and 16 dependencies per module.
+- **`DllMain` and TLS callbacks.** DLLs imported statically are attached in dependency order before the program's TLS callbacks and entry point, with `DLL_PROCESS_ATTACH` and a non-null `lpvReserved`. A DLL loaded by `LoadLibrary` is attached when loaded, with a null reserved argument. A `DllMain` that returns `FALSE` makes `LoadLibrary` fail with `ERROR_DLL_INIT_FAILED` (1114) and the DLL is unloaded again; for a static import the process is refused with status `0xC0000142`. `ExitProcess`, `exit` and returning from `main` detach every loaded DLL in reverse order with `DLL_PROCESS_DETACH` and a non-null reserved argument; `FreeLibrary` of the last reference detaches with a null one. `TerminateProcess` on the current process and `abort` end the process without detaching, as on Windows.
+- **Exports.** `pe::find_export` (in `pe.hpp`) finds an export by name or ordinal, checking every table against the image. A forwarder (`dllmath.add`, `KERNEL32.Sleep`, or `DLL.#N`) is followed through other DLLs and the built-in modules up to 8 hops. `GetProcAddress` accepts names and ordinals; ordinals start at the directory's base, not at 1.
+- **TLS.** A DLL with a TLS directory gets its own block and index (1 to 63) in the thread's slot array, which the compiler's `__declspec(thread)` accesses read through the TEB.
+- **Process exit and other threads.** There is one thread, so no `DLL_THREAD_ATTACH` or `DLL_THREAD_DETACH` is ever delivered.
+
+### Tests
+
+`dllmath.dll` (exports a function, a variable and a forwarder), `dllchain.dll` (imports `dllmath.dll`, forwards into it and into `kernel32`, uses an explicit ordinal base), `dllplug.dll` (loaded at run time), `dllfail.dll` (`DllMain` returns `FALSE`) and `dyn.exe`, which imports `dllchain.dll` and exercises all of it, are MinGW builds in `tools/pe-samples/bin`. `dyn.exe` returns 7 when every check passes. They run in the host test, in the kernel self-test (also `dllmath.dll` started as a program is refused with `0xC000007B`) and from the shell with `run dyn.exe`.
+
+- `pehost_lib_test` (375 checks) covers the manager with the real DLL files: loading, unloading, reference counts, forwarder chains including a loop and a missing target, ordinals, TLS indices, truncated and corrupted files, memory unmapped on unload, and that everything it unmaps is something it was given (a mutation that made `FreeLibrary` unmap the module table itself was found by this check and by nothing else).
+- `pe::find_export` is run against 40,000 random corruptions of a real export directory without a crash or an out-of-range read.
+- `peinfo` treats a DLL beside the program as providing what it exports, checking the DLL's own imports too; the coverage test shows `dyn.exe` runnable with its DLLs and blocked, with `dllchain.dll!add3` named, without them.
+
+### Limits
+
+- A DLL is found only in the program's own directory, by file name. There is no `PATH`, no system directory and no side-by-side manifest. `LoadLibraryExA/W` and `AddDllDirectory` are not provided and are reported as missing imports.
+- A DLL must be relocatable (a `.reloc` table or position-independent), like programs. A DLL linked with `--disable-dynamicbase` and stripped of relocations is refused.
+- Every protection run of an image is a separate mapping and a process may hold 64, so a program and its DLLs together are limited by that, not by memory. `dyn.exe` with four DLLs is well within it; a large program with many sections per DLL might not be.
+- No data fix-ups beyond the import tables: the MinGW auto-import mechanism (pseudo-relocations) for data exported from a DLL is still not supported.
+- DLL files are read whole, up to 16 MiB each; the copy is released as soon as the image is mapped.
+- Not implemented: delay-load imports (the loader never reads that directory), `GetModuleHandleEx`, `DisableThreadLibraryCalls`, `GetModuleFileNameA` for a DLL returns its lower-case file name without a directory, and `DLL_THREAD_*` notifications.
+- The test DLLs are MinGW. No DLL from MSVC was available, so none has been run; an MSVC DLL also needs `vcruntime140.dll` (see W5a's last limit).
+- Verified in the sandbox: the host test under ASan and UBSan, the QEMU boots (NVMe with one and four cores, AHCI, VirtIO) and the shell session test. Not run on real hardware, and not run on Windows, so behaviours such as the exact order of `DllMain` calls follow the documented rules and the MinGW programs' own checks, not a comparison with a real loader.
 
 ## Next
 
@@ -193,4 +226,4 @@ A program built against the universal C runtime (MSVC, or MinGW with `-D_UCRT -l
 
 - W2 and W3: done, see above. The host runs freestanding `kernel32` programs and MinGW C programs that use the subset in W3.
 - W4: done, see above (a generated supported list and a ranked coverage report). Not done: recording missing imports on the machine itself; the host still logs them to the console at refusal.
-- W5a: done, see above (API-set names, `ucrtbase.dll`, built-in `LoadLibrary`). W5b: loading DLL files, `DllMain`, and the `vcruntime140` pieces an MSVC program needs.
+- W5a: done, see above (API-set names, `ucrtbase.dll`, built-in `LoadLibrary`). W5b: done, see above (DLL files, `DllMain`, forwarders, per-DLL TLS, a directory handle for the host). Next, W5c: the `vcruntime140` pieces an MSVC program needs (no such program is available to test against yet), then W6, the graphics and keyboard path.

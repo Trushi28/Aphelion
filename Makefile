@@ -109,7 +109,7 @@ $(USER_DIR)/%.apx: $(USER_DIR)/%.elf $(APXPACK)
 	$(APXPACK) $< $@
 
 USER_APX := $(USER_PROGRAMS:%=$(USER_DIR)/%.apx)
-$(BUILD)/$(KDIR)/src/userland/apps.o: $(USER_APX) $(wildcard tools/pe-samples/bin/*.exe)
+$(BUILD)/$(KDIR)/src/userland/apps.o: $(USER_APX) $(wildcard tools/pe-samples/bin/*.exe) $(wildcard tools/pe-samples/bin/*.dll)
 
 .PHONY: userland
 userland: $(USER_APX)
@@ -373,6 +373,9 @@ test-pehost:
 	grep '^ *[0-9][0-9]*  ' $(BUILD)/pe-gaps.txt | sed 's/^ *[0-9]*  //' | LC_ALL=C sort > $(BUILD)/pe-gaps-peinfo.txt && \
 	$(BUILD)/pehost_host_test --run tools/pe-samples/bin/gaps.exe 2>&1 | sed -n 's/^\[pehost\] missing import //p' | LC_ALL=C sort > $(BUILD)/pe-gaps-host.txt && \
 	cmp $(BUILD)/pe-gaps-peinfo.txt $(BUILD)/pe-gaps-host.txt && echo "coverage report: a program needing fopen, qsort, strtol and time is reported with exactly those gaps" || { echo "the coverage report for gaps.exe is wrong"; cat $(BUILD)/pe-gaps.txt; exit 1; }
+	@mkdir -p $(BUILD)/pe-alone && cp tools/pe-samples/bin/dyn.exe $(BUILD)/pe-alone/ && rm -f $(BUILD)/pe-alone/*.dll; \
+	$(BUILD)/peinfo --coverage --supported docs/pe-supported.txt $(BUILD)/pe-alone/dyn.exe > $(BUILD)/pe-alone.txt; test $$? -eq 1 && grep -q 'dllchain.dll!add3' $(BUILD)/pe-alone.txt && \
+	echo "coverage report: a program whose DLL is not beside it is reported as missing that DLL's imports" || { echo "the coverage report for a program without its DLL is wrong"; cat $(BUILD)/pe-alone.txt; exit 1; }
 
 .PHONY: pe-supported
 pe-supported:

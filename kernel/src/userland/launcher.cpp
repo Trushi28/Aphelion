@@ -24,6 +24,16 @@ extern "C" const u8 pe_crt_start[];
 extern "C" const u8 pe_crt_end[];
 extern "C" const u8 pe_ucrt_start[];
 extern "C" const u8 pe_ucrt_end[];
+extern "C" const u8 pe_dllmath_start[];
+extern "C" const u8 pe_dllmath_end[];
+extern "C" const u8 pe_dllchain_start[];
+extern "C" const u8 pe_dllchain_end[];
+extern "C" const u8 pe_dllplug_start[];
+extern "C" const u8 pe_dllplug_end[];
+extern "C" const u8 pe_dllfail_start[];
+extern "C" const u8 pe_dllfail_end[];
+extern "C" const u8 pe_dyn_start[];
+extern "C" const u8 pe_dyn_end[];
 
 namespace userland::apps {
 
@@ -45,6 +55,11 @@ const Entry ENTRIES[] = {
     { "stdio.exe", pe_stdio_start, pe_stdio_end },
     { "crt.exe", pe_crt_start, pe_crt_end },
     { "ucrt.exe", pe_ucrt_start, pe_ucrt_end },
+    { "dllmath.dll", pe_dllmath_start, pe_dllmath_end },
+    { "dllchain.dll", pe_dllchain_start, pe_dllchain_end },
+    { "dllplug.dll", pe_dllplug_start, pe_dllplug_end },
+    { "dllfail.dll", pe_dllfail_start, pe_dllfail_end },
+    { "dyn.exe", pe_dyn_start, pe_dyn_end },
 };
 
 constexpr const char* DIRECTORY = "apps";
@@ -181,10 +196,11 @@ Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx) {
     if (is_pe) {
         lens::Result<lens::Lens> host = lens::open_at(g_table.domain, dir, "pehost", lens::Right::Read | lens::Right::Execute);
         lens::Result<lens::Lens> prog = lens::open_at(g_table.domain, dir, name, lens::Right::Read | lens::Right::Delegate);
-        if (host.ok() && prog.ok()) {
+        lens::Result<lens::Lens> library = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read | lens::Right::Delegate);
+        if (host.ok() && prog.ok() && library.ok()) {
             g_capture.head = g_capture.tail = g_capture.dropped = 0;
             set_console(&capture_put, nullptr);
-            p = launch_file("pehost", g_table, host.value(), &g_table, prog.value(), &error);
+            p = launch_file("pehost", g_table, host.value(), &g_table, prog.value(), &error, library.value());
         }
     } else {
         lens::Result<lens::Lens> file = lens::open_at(g_table.domain, dir, name, lens::Right::Read | lens::Right::Execute);
