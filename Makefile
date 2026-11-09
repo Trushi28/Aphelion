@@ -363,6 +363,22 @@ test-pehost:
 	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_lib_test.cpp -o $(BUILD)/pehost_lib_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_lib_test
+	g++ -std=c++20 -O2 -w -I$(KDIR)/include tools/peinfo.cpp -o $(BUILD)/peinfo
+	$(BUILD)/pehost_host_test --list-supported | LC_ALL=C sort > $(BUILD)/pe-supported.txt
+	cmp $(BUILD)/pe-supported.txt docs/pe-supported.txt || { echo "docs/pe-supported.txt is stale: run make pe-supported"; exit 1; }
+	$(BUILD)/peinfo --coverage --supported docs/pe-supported.txt $(filter-out %/gaps.exe,$(wildcard tools/pe-samples/bin/*.exe))
+	@$(BUILD)/peinfo --coverage --supported docs/pe-supported.txt tools/pe-samples/bin/gaps.exe tools/pe-samples/bin/stdio.exe > $(BUILD)/pe-gaps.txt; test $$? -eq 1 && \
+	grep -q '^ *1  msvcrt.dll!fopen$$' $(BUILD)/pe-gaps.txt && grep -q '^ *1  msvcrt.dll!qsort$$' $(BUILD)/pe-gaps.txt && grep -q '^ *1  msvcrt.dll!strtol$$' $(BUILD)/pe-gaps.txt && \
+	grep -q '1 can run, 1 blocked' $(BUILD)/pe-gaps.txt && \
+	grep '^ *[0-9][0-9]*  ' $(BUILD)/pe-gaps.txt | sed 's/^ *[0-9]*  //' | LC_ALL=C sort > $(BUILD)/pe-gaps-peinfo.txt && \
+	$(BUILD)/pehost_host_test --run tools/pe-samples/bin/gaps.exe 2>&1 | sed -n 's/^\[pehost\] missing import //p' | LC_ALL=C sort > $(BUILD)/pe-gaps-host.txt && \
+	cmp $(BUILD)/pe-gaps-peinfo.txt $(BUILD)/pe-gaps-host.txt && echo "coverage report: a program needing fopen, qsort, strtol and time is reported with exactly those gaps" || { echo "the coverage report for gaps.exe is wrong"; cat $(BUILD)/pe-gaps.txt; exit 1; }
+
+.PHONY: pe-supported
+pe-supported:
+	@mkdir -p $(BUILD)
+	g++ -std=c++20 -O1 -w $(unit_inc_pehost) tools/pehost_host_test.cpp -o $(BUILD)/pehost_list
+	$(BUILD)/pehost_list --list-supported | LC_ALL=C sort > docs/pe-supported.txt
 
 test-apxpack: $(USER_DIR)/hello.elf
 	@mkdir -p $(BUILD)

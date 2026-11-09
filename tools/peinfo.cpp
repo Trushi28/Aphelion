@@ -1,4 +1,5 @@
 #include <cosmos/pe.hpp>
+#include <cosmos/pe_modules.hpp>
 
 extern "C" {
 struct _IO_FILE;
@@ -47,7 +48,7 @@ void put(char* dst, u32& n, char c) {
 
 void label(const Entry& e, char* out) {
     u32 n = 0;
-    for (const char* p = e.dll; *p; ++p) put(out, n, fold(*p));
+    for (const char* p = pe::modules::canonical(e.dll); *p; ++p) put(out, n, fold(*p));
     put(out, n, '!');
     if (e.by_ordinal) {
         put(out, n, '#');
@@ -147,7 +148,11 @@ bool load_supported(const char* path) {
             line[n] = 0;
             if (n > 0 && line[0] != '#' && g_supported_count < MAX_SUPPORTED) {
                 u32 k = 0;
-                for (u32 j = 0; line[j]; ++j) g_supported[g_supported_count][k++] = fold(line[j]);
+                bool in_dll = true;
+                for (u32 j = 0; line[j]; ++j) {
+                    g_supported[g_supported_count][k++] = in_dll ? fold(line[j]) : line[j];
+                    if (line[j] == '!') in_dll = false;
+                }
                 g_supported[g_supported_count][k] = 0;
                 ++g_supported_count;
             }
@@ -163,6 +168,119 @@ bool load_supported(const char* path) {
 pe::Image g_image;
 pe::Run g_runs[pe::MAX_RUNS];
 
+struct Gap {
+    char text[TEXT];
+    u32 programs;
+};
+
+Gap g_gaps[MAX_ENTRIES];
+u32 g_gap_count = 0;
+
+const char* collect_file(const char* path, bool* movable) {
+    g_entry_count = 0;
+    g_entry_total = 0;
+    *movable = false;
+    usize size = 0;
+    u8* file = slurp(path, &size);
+    if (!file) return "cannot be read";
+    pe::Status st = pe::parse(file, size, &g_image);
+    if (st != pe::Status::Ok) {
+        free(file);
+        return pe::status_name(st);
+    }
+    u8* image = static_cast<u8*>(malloc(g_image.size_of_image));
+    pe::Status ms = pe::map(g_image, file, size, image, g_image.size_of_image);
+    const char* why = nullptr;
+    if (ms != pe::Status::Ok) {
+        why = pe::status_name(ms);
+    } else {
+        u32 applied = 0;
+        *movable = pe::relocate(g_image, image, 0x200000000ull, &applied) == pe::Status::Ok;
+        pe::ImportReport report{};
+        pe::Status bs = pe::bind_imports(g_image, image, collect, nullptr, &report);
+        if (bs != pe::Status::Ok) why = pe::status_name(bs);
+    }
+    free(image);
+    free(file);
+    return why;
+}
+
+void note_gap(const char* text) {
+    for (u32 i = 0; i < g_gap_count; ++i) {
+        if (equal(g_gaps[i].text, text)) {
+            ++g_gaps[i].programs;
+            return;
+        }
+    }
+    if (g_gap_count == MAX_ENTRIES) return;
+    u32 n = 0;
+    while (text[n] && n + 1 < TEXT) {
+        g_gaps[g_gap_count].text[n] = text[n];
+        ++n;
+    }
+    g_gaps[g_gap_count].text[n] = 0;
+    g_gaps[g_gap_count].programs = 1;
+    ++g_gap_count;
+}
+
+bool gap_before(const Gap& a, const Gap& b) {
+    if (a.programs != b.programs) return a.programs > b.programs;
+    for (u32 i = 0;; ++i) {
+        if (a.text[i] != b.text[i]) return a.text[i] < b.text[i];
+        if (!a.text[i]) return false;
+    }
+}
+
+int coverage(int count, char** files, const char* supported_path) {
+    if (!supported_path || !load_supported(supported_path)) {
+        dprintf(2, "peinfo: --coverage needs --supported list.txt that can be read\n");
+        return 2;
+    }
+    u32 runnable = 0, blocked = 0, refused = 0;
+    for (int i = 0; i < count; ++i) {
+        bool movable = false;
+        const char* why = collect_file(files[i], &movable);
+        if (why) {
+            ++refused;
+            printf("%-40s REFUSED: %s\n", files[i], why);
+            continue;
+        }
+        u32 lacking = 0;
+        for (u32 j = 0; j < g_entry_count; ++j) {
+            if (is_supported(g_entries[j])) continue;
+            ++lacking;
+            char l[TEXT];
+            label(g_entries[j], l);
+            note_gap(l);
+        }
+        if (!movable) {
+            ++blocked;
+            printf("%-40s %u imports, cannot run: fixed at a preferred base outside the user window\n", files[i], g_entry_total);
+        } else if (lacking) {
+            ++blocked;
+            printf("%-40s %u imports, %u not provided\n", files[i], g_entry_total, lacking);
+        } else {
+            ++runnable;
+            printf("%-40s %u imports, all provided\n", files[i], g_entry_total);
+        }
+    }
+    for (u32 i = 1; i < g_gap_count; ++i) {
+        Gap key = g_gaps[i];
+        u32 j = i;
+        while (j > 0 && gap_before(key, g_gaps[j - 1])) {
+            g_gaps[j] = g_gaps[j - 1];
+            --j;
+        }
+        g_gaps[j] = key;
+    }
+    printf("\n%d program(s): %u can run, %u blocked by missing imports or base address, %u refused by the loader\n", count, runnable, blocked, refused);
+    if (g_gap_count) {
+        printf("\nmissing imports, by number of programs that need them\n");
+        for (u32 i = 0; i < g_gap_count; ++i) printf("  %4u  %s\n", g_gaps[i].programs, g_gaps[i].text);
+    }
+    return blocked == 0 && refused == 0 ? 0 : 1;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -170,14 +288,26 @@ int main(int argc, char** argv) {
     const char* supported_path = nullptr;
     bool verbose = false;
     bool bad = false;
+    bool coverage_mode = false;
+    char* many[256];
+    int many_count = 0;
     for (int i = 1; i < argc; ++i) {
         if (equal(argv[i], "-v")) verbose = true;
         else if (equal(argv[i], "--supported") && i + 1 < argc) supported_path = argv[++i];
+        else if (equal(argv[i], "--coverage")) coverage_mode = true;
         else if (!path) path = argv[i];
         else bad = true;
+        if (argv[i][0] != '-' && argv[i] != supported_path && many_count < 256) many[many_count++] = argv[i];
+    }
+    if (coverage_mode) {
+        if (many_count == 0) {
+            dprintf(2, "usage: peinfo --coverage --supported list.txt program.exe...\n");
+            return 2;
+        }
+        return coverage(many_count, many, supported_path);
     }
     if (!path || bad) {
-        dprintf(2, "usage: peinfo [-v] [--supported list.txt] program.exe\n");
+        dprintf(2, "usage: peinfo [-v] [--supported list.txt] program.exe\n       peinfo --coverage --supported list.txt program.exe...\n");
         return 2;
     }
     usize size = 0;

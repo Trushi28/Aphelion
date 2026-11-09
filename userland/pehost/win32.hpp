@@ -142,7 +142,7 @@ inline Teb* current_teb() {
 
 inline u64 current_thread_id() { return current_teb()->client_thread; }
 
-inline const char* const MODULE_NAMES[] = { "kernel32.dll", "msvcrt.dll" };
+inline const char* const MODULE_NAMES[] = { "kernel32.dll", "msvcrt.dll", "ucrtbase.dll" };
 inline u8 MODULE_TOKENS[sizeof(MODULE_NAMES) / sizeof(MODULE_NAMES[0])][16];
 
 inline const char* module_name(u64 token) {
@@ -153,13 +153,17 @@ inline const char* module_name(u64 token) {
 }
 
 inline u64 module_token(const char* name) {
-    char wanted[40];
+    const char* base = name;
+    for (const char* p = name; *p; ++p) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+    char wanted[48];
     u32 n = 0;
-    while (name[n] && n + 5 < sizeof(wanted)) {
-        wanted[n] = fold(name[n]);
+    while (base[n] && n + 5 < sizeof(wanted)) {
+        wanted[n] = fold(base[n]);
         ++n;
     }
-    if (name[n]) return 0;
+    if (base[n] || n == 0) return 0;
     wanted[n] = 0;
     bool dotted = false;
     for (u32 i = 0; i < n; ++i) {
@@ -172,8 +176,9 @@ inline u64 module_token(const char* name) {
         wanted[n++] = 'l';
         wanted[n] = 0;
     }
+    const char* home = pe::modules::canonical(wanted);
     for (u32 i = 0; i < sizeof(MODULE_NAMES) / sizeof(MODULE_NAMES[0]); ++i) {
-        if (same_name(MODULE_NAMES[i], wanted)) return reinterpret_cast<u64>(&MODULE_TOKENS[i][0]);
+        if (same_name(MODULE_NAMES[i], home)) return reinterpret_cast<u64>(&MODULE_TOKENS[i][0]);
     }
     return 0;
 }
@@ -433,6 +438,45 @@ PEHOST_WINAPI inline u64 GetModuleHandleW(const u16* name) {
     return GetModuleHandleA(narrow);
 }
 
+PEHOST_WINAPI inline u64 LoadLibraryA(const char* name) {
+    if (name == nullptr) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    u64 token = detail::module_token(name);
+    if (token == 0) set_last_error(ERROR_MOD_NOT_FOUND);
+    return token;
+}
+
+PEHOST_WINAPI inline u64 LoadLibraryW(const u16* name) {
+    if (name == nullptr) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    u32 n = 0;
+    while (name[n] && n < 127) ++n;
+    if (name[n]) {
+        set_last_error(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    char narrow[128 * 3];
+    i64 w = codec::utf16_to_utf8(name, n, reinterpret_cast<u8*>(narrow), sizeof(narrow) - 1, false);
+    if (w < 0) {
+        set_last_error(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    narrow[w] = 0;
+    return LoadLibraryA(narrow);
+}
+
+PEHOST_WINAPI inline i32 FreeLibrary(u64 module) {
+    if (detail::module_name(module) == nullptr) {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    return 1;
+}
+
 PEHOST_WINAPI inline void* GetProcAddress(u64 module, const char* name) {
     const char* dll = detail::module_name(module);
     if (dll == nullptr || reinterpret_cast<u64>(name) < 0x10000) {
@@ -636,6 +680,9 @@ inline const ImportTable* kernel32_table() {
         { "kernel32.dll", "GetModuleHandleA", reinterpret_cast<void*>(&win32::GetModuleHandleA) },
         { "kernel32.dll", "GetModuleHandleW", reinterpret_cast<void*>(&win32::GetModuleHandleW) },
         { "kernel32.dll", "GetProcAddress", reinterpret_cast<void*>(&win32::GetProcAddress) },
+        { "kernel32.dll", "LoadLibraryA", reinterpret_cast<void*>(&win32::LoadLibraryA) },
+        { "kernel32.dll", "LoadLibraryW", reinterpret_cast<void*>(&win32::LoadLibraryW) },
+        { "kernel32.dll", "FreeLibrary", reinterpret_cast<void*>(&win32::FreeLibrary) },
         { "kernel32.dll", "GetModuleFileNameA", reinterpret_cast<void*>(&win32::GetModuleFileNameA) },
         { "kernel32.dll", "GetCurrentProcess", reinterpret_cast<void*>(&win32::GetCurrentProcess) },
         { "kernel32.dll", "GetCurrentThread", reinterpret_cast<void*>(&win32::GetCurrentThread) },

@@ -1,7 +1,7 @@
 #include <cosmos/pe.hpp>
 #include "../userland/pehost/call.hpp"
 #include "../userland/pehost/host.hpp"
-#include "../userland/pehost/msvcrt.hpp"
+#include "../userland/pehost/ucrt.hpp"
 #include "pe_samples.hpp"
 #include "pe_samples_mingw.hpp"
 #include "pe_samples_run.hpp"
@@ -425,7 +425,7 @@ void rewrite_sweep(const Sample& good, u32 rounds, u32 span, Sweep* acc) {
     free(buf);
 }
 
-Sample g_console, g_k32, g_teb, g_tlscb, g_fixed, g_ordinals, g_library, g_stdio;
+Sample g_console, g_k32, g_teb, g_tlscb, g_fixed, g_ordinals, g_library, g_stdio, g_crt, g_ucrt;
 
 void load_all() {
     load_sample(&g_console, pe_sample_console);
@@ -436,6 +436,8 @@ void load_all() {
     load_sample(&g_ordinals, pe_sample_ordinals);
     load_sample(&g_library, pe_sample_library);
     load_sample(&g_stdio, pe_sample_mingw_stdio);
+    load_sample(&g_crt, pe_sample_mingw_crt);
+    load_sample(&g_ucrt, pe_sample_mingw_ucrt);
 }
 
 
@@ -595,6 +597,14 @@ void run_tests() {
                contains(r.log, "mylib.dll!#7") && contains(r.log, "3 of 4 imports are not provided") && r.out_length == 0,
            "missing imports by name and by ordinal are each named, counted, and nothing runs");
     expect(runs_with(g_stdio, 0, "Hello World\n", &r), "stdio.exe (GNU ld, msvcrt printf): C runtime start-up, printf and exit run to completion");
+    expect(runs_with(g_crt, 7, "argc=1\nargv[0]=<pe.exe>\ndirect 5 msvcrt    ab|\ndone failures=0\nexit handler 2\nexit handler 1\n", &r),
+           "crt.exe (msvcrt): arguments, allocator, formatting, strings, signal, heap, TLS, critical sections, modules and code pages all pass, exit handlers run in reverse, exit status 7");
+    expect(runs_with(g_ucrt, 7, "argc=1\nargv[0]=<pe.exe>\ndirect 5 ucrt    ab|\na line\nno newline;\ndone failures=0\nexit handler 2\nexit handler 1\n", &r),
+           "ucrt.exe (api-ms-win-crt sets, ucrtbase.dll): UCRT start-up, __stdio_common_* printf, snprintf, allocator, strings, LoadLibrary and GetProcAddress all pass, exit status 7");
+    g_command_line = "pe.exe \"two words\" caf\xC3\xA9 last";
+    expect(runs_with(g_ucrt, 7, "argc=4\nargv[0]=<pe.exe>\nargv[1]=<two words>\nargv[2]=<caf\xC3\xA9>\nargv[3]=<last>\ndirect 5 ucrt    ab|\na line\nno newline;\ndone failures=0\nexit handler 2\nexit handler 1\n", &r),
+           "ucrt.exe sees its quoted and UTF-8 command line arguments through _configure_narrow_argv");
+    g_command_line = "pe.exe";
 
     run_child(g_console.bytes, 100, &r);
     expect(r.have_status && r.status == pehost::STATUS_INVALID_IMAGE_FORMAT && contains(r.log, "image refused"), "a truncated file is refused");
@@ -739,7 +749,15 @@ int run_file(const char* path, const char* command_line) {
     return r.have_status ? 0 : 1;
 }
 
+int list_supported() {
+    for (const pehost::ImportTable* t = pehost::all_imports(); t; t = t->next) {
+        for (u32 i = 0; i < t->count; ++i) printf("%s!%s\n", t->items[i].dll, t->items[i].name);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && equals(argv[1], "--list-supported")) return list_supported();
     if (argc > 2 && equals(argv[1], "--run")) return run_file(argv[2], argc > 3 ? argv[3] : "pe.exe");
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
     load_all();

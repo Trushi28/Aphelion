@@ -516,7 +516,7 @@ PEHOST_WINAPI inline i32 __C_specific_handler(void*, void*, void*, void*) { retu
 
 namespace pehost {
 
-inline const ImportTable* all_imports() {
+inline const ImportTable* msvcrt_table() {
 #define PEHOST_FN(name) { "msvcrt.dll", #name, reinterpret_cast<void*>(&msvcrt::name) }
 #define PEHOST_DATA(name, object) { "msvcrt.dll", #name, reinterpret_cast<void*>(&msvcrt::object) }
     static const Import items[] = {

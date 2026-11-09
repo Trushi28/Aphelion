@@ -132,6 +132,101 @@ int main(int argc, char **argv) {
 }
 C
 
+cat > "$OUT/ucrt.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+#include <windows.h>
+
+static int failures;
+
+static void check(int ok, const char *what) {
+    if (!ok) {
+        failures++;
+        printf("FAIL %s\n", what);
+    }
+}
+
+static void first_handler(void) { printf("exit handler 1\n"); }
+static void second_handler(void) { printf("exit handler 2\n"); }
+
+typedef size_t (__cdecl *strlen_fn)(const char *);
+
+int main(int argc, char **argv) {
+    char text[96];
+    char small[8];
+    int i, n;
+
+    printf("argc=%d\n", argc);
+    for (i = 0; i < argc; i++) printf("argv[%d]=<%s>\n", i, argv[i]);
+
+    atexit(first_handler);
+    atexit(second_handler);
+
+    {
+        char *a = malloc(100);
+        char *z;
+        memset(a, 'x', 100);
+        a = realloc(a, 5000);
+        check(a != NULL && a[0] == 'x' && a[99] == 'x', "realloc keeps the old bytes");
+        z = calloc(10, 8);
+        for (i = 0, n = 0; i < 80; i++) n |= z[i];
+        check(z != NULL && n == 0, "calloc returns zeroed memory");
+        free(a);
+        free(z);
+        check(malloc(64u << 20) == NULL, "an allocation past the heap cap fails");
+    }
+
+    n = sprintf(text, "%5d|%-5d|%05d|%x|%X|%#x|%s|%c|%%|%ld|%lld", 42, 42, 42, 255, 255, 255, "str", 'c', -7L, 123456789012LL);
+    check(strcmp(text, "   42|42   |00042|ff|FF|0xff|str|c|%|-7|123456789012") == 0, "sprintf formats integers, strings and characters");
+    check(n == (int)strlen(text), "sprintf returns the length");
+
+    n = snprintf(small, sizeof small, "%s", "0123456789");
+    check(n == 10 && strcmp(small, "0123456") == 0, "snprintf returns the full length and always terminates");
+    n = snprintf(small, sizeof small, "%s", "01234567");
+    check(n == 8 && strcmp(small, "0123456") == 0, "snprintf with an exact fit loses the last character to the terminator");
+    n = snprintf(NULL, 0, "%d-%d", 12, 345);
+    check(n == 6, "snprintf with no buffer measures");
+    n = _snprintf(small, sizeof small, "%s", "0123456789");
+    check(n == -1, "_snprintf reports truncation");
+
+    printf("direct %d %s %5.2s|\n", 5, "ucrt", "abcdef");
+    fprintf(stderr, "to stderr %u\n", 3u);
+    puts("a line");
+    fputs("no newline;", stdout);
+    putchar('\n');
+    fflush(stdout);
+
+    check(strlen("hello") == 5 && strcmp("a", "b") < 0 && strncmp("abcd", "abxx", 2) == 0, "string compare and length");
+    check(strchr("hello", 'l') != NULL && strrchr("hello", 'l') - "hello" == 3 && strstr("hello", "llo") != NULL, "string search");
+    strcpy(text, "ab");
+    strcat(text, "cd");
+    check(strcmp(text, "abcd") == 0 && memcmp("abc", "abd", 3) < 0, "string copy and concatenation");
+
+    check(signal(SIGINT, SIG_IGN) == SIG_DFL && signal(SIGINT, SIG_DFL) == SIG_IGN, "signal returns the previous handler");
+    errno = 0;
+    check(strlen(strerror(EINVAL)) > 0 && getenv("NO_SUCH_VARIABLE") == NULL, "strerror and getenv");
+
+    {
+        HMODULE ucrt = GetModuleHandleA("ucrtbase.dll");
+        HMODULE viaset = GetModuleHandleA("api-ms-win-crt-string-l1-1-0.dll");
+        HMODULE loaded = LoadLibraryA("C:\\Windows\\System32\\ucrtbase.dll");
+        strlen_fn fn;
+        check(ucrt != NULL && ucrt == viaset && ucrt == loaded, "ucrtbase is one module under its real name, an api set name and a path");
+        fn = (strlen_fn)GetProcAddress(ucrt, "strlen");
+        check(fn != NULL && fn("four") == 4, "GetProcAddress on ucrtbase returns a callable function");
+        check(GetProcAddress(ucrt, "NoSuchFunction") == NULL, "an unknown export is not found");
+        check(LoadLibraryA("nosuchlib.dll") == NULL && GetLastError() == ERROR_MOD_NOT_FOUND, "LoadLibrary of an unknown library fails with ERROR_MOD_NOT_FOUND");
+        check(FreeLibrary(loaded) != 0, "FreeLibrary");
+    }
+
+    printf("done failures=%d\n", failures);
+    return failures ? 100 + failures : 7;
+}
+C
+
 cat > "$OUT/k32.c" <<'C'
 typedef void* HANDLE;
 typedef unsigned long DWORD;
@@ -148,14 +243,32 @@ void entry(void) {
 }
 C
 
+cat > "$OUT/gaps.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+static int order(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+
+int main(void) {
+    int v[3] = { 3, 1, 2 };
+    qsort(v, 3, sizeof(int), order);
+    FILE *f = fopen("x.txt", "r");
+    printf("%d %ld %p\n", v[0], strtol("12", NULL, 10), (void *)f);
+    return (int)time(NULL) & 1;
+}
+C
+
 $CC -O2 "$OUT/stdio.c" -o "$OUT/stdio.exe"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/gaps.c" -o "$OUT/gaps.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/crt.c" -o "$OUT/crt.exe"
+"${MINGW_CC:-x86_64-w64-mingw32-gcc}" -Wl,--no-insert-timestamp -D_UCRT -O1 -s "$OUT/ucrt.c" -o "$OUT/ucrt.exe" -lucrt
 $CC -O2 -Wl,--no-dynamicbase -Wl,--disable-reloc-section "$OUT/stdio.c" -o "$OUT/stdio-fixed.exe"
 $CC -O2 -s "$OUT/stdio.c" -o "$OUT/stdio-stripped.exe"
 $CC -O2 -ffreestanding -fno-stack-protector -nostdlib -Wl,-e,entry -Wl,--subsystem,console "$OUT/k32.c" -o "$OUT/k32.exe" -lkernel32
 
 if [ -x "$PEINFO" ]; then
-    for f in stdio stdio-fixed stdio-stripped crt k32; do
+    for f in stdio stdio-fixed stdio-stripped crt ucrt k32; do
         echo "================ $f.exe"
         "$PEINFO" "$OUT/$f.exe" || true
     done

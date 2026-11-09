@@ -1,4 +1,4 @@
-#include "../userland/pehost/msvcrt.hpp"
+#include "../userland/pehost/ucrt.hpp"
 #include "pe_samples_mingw.hpp"
 
 extern "C" {
@@ -984,11 +984,11 @@ void kernel32_tests() {
     bool every = true;
     for (const pehost::ImportTable* t = pehost::all_imports(); t; t = t->next) {
         for (u32 i = 0; i < t->count; ++i) {
-            u64 m = pehost::detail::same_dll(t->items[i].dll, "kernel32.dll") ? k32 : crt;
+            u64 m = GetModuleHandleA(t->items[i].dll);
             every = every && t->items[i].address != nullptr && GetProcAddress(m, t->items[i].name) == t->items[i].address;
         }
     }
-    expect(every, "every import in both tables is found by GetProcAddress at its own address");
+    expect(every, "every import in every table is found by GetProcAddress at its own address");
     u32 total = 0;
     u32 dups = 0;
     for (const pehost::ImportTable* t = pehost::all_imports(); t; t = t->next) {
@@ -1753,6 +1753,254 @@ void msvcrt_tests() {
 
 }
 
+
+PEHOST_WINAPI i32 snp(u64 options, char* buffer, u64 count, const char* f, ...) {
+    pehost::fmt::VaList ap;
+    __builtin_ms_va_start(ap, f);
+    i32 r = pehost::ucrt::__stdio_common_vsprintf(options, buffer, count, f, nullptr, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+
+PEHOST_WINAPI i32 fpr(u64 options, pehost::msvcrt::File* fp, const char* f, ...) {
+    pehost::fmt::VaList ap;
+    __builtin_ms_va_start(ap, f);
+    i32 r = pehost::ucrt::__stdio_common_vfprintf(options, fp, f, nullptr, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+
+u32 g_order[64];
+u32 g_two_count = 0;
+u32 g_order_count = 0;
+u32 g_order_next = 0;
+PEHOST_WINAPI void order_fn() { g_order[g_order_count++] = g_order_next++; }
+PEHOST_WINAPI void order_two() { ++g_two_count; }
+
+bool wide_is(const u16* w, const char* a) {
+    for (u32 i = 0;; ++i) {
+        if (w[i] != static_cast<u8>(a[i])) return false;
+        if (a[i] == 0) return true;
+    }
+}
+
+void ucrt_tests() {
+    namespace u = pehost::ucrt;
+    namespace crt = pehost::msvcrt;
+    using namespace pehost::win32;
+    using pe::modules::canonical;
+    using pehost::set_last_error;
+    using pehost::last_error;
+    pehost::g_runtime = &g_recording;
+    g_rec = Recorder{};
+    pehost::World& w = pehost::g_world;
+    w.heap.init(&test_map);
+    w.imports = pehost::all_imports();
+
+    expect(same(canonical("KERNEL32.DLL"), "kernel32.dll") && same(canonical("KernelBase.dll"), "kernel32.dll") && same(canonical("msvcrt.dll"), "msvcrt.dll") && same(canonical("UCRTBASE.dll"), "ucrtbase.dll"),
+           "the real names of the three provided modules are canonical, case folded, with kernelbase folded into kernel32");
+    expect(same(canonical("api-ms-win-crt-stdio-l1-1-0.dll"), "ucrtbase.dll") && same(canonical("API-MS-WIN-CRT-HEAP-L1-1-0.DLL"), "ucrtbase.dll") && same(canonical("api-ms-win-crt-.dll"), "ucrtbase.dll"),
+           "every api-ms-win-crt set is the universal C runtime, in any case");
+    expect(same(canonical("api-ms-win-core-synch-l1-2-0.dll"), "kernel32.dll") && same(canonical("API-MS-WIN-CORE-HANDLE-L1-1-0.DLL"), "kernel32.dll") && same(canonical("ext-ms-win-foo-l1-1-0.dll"), "kernel32.dll"),
+           "the other api-ms-win and ext-ms-win sets are served by the kernel32 table");
+    const char* plain[] = { "user32.dll", "", "dll", ".dll", "api-ms-win-crt-stdio", "api-ms-win-core.dl", "xapi-ms-win-core-l1.dll", "ucrtbase", "msvcrt.dll.x", "api-ms-crt-x.dll", "ext-ms-win" };
+    bool same_ptr = true;
+    for (const char* name : plain) same_ptr = same_ptr && canonical(name) == name;
+    expect(same_ptr, "names that are not a known module or an api set come back unchanged as the same string");
+
+    u64 address = 0;
+    const pehost::ImportTable* all = pehost::all_imports();
+    auto found = [&](const char* dll, const char* name) { return pehost::detail::resolve(const_cast<pehost::ImportTable*>(all), dll, name, 0, &address); };
+    expect(found("api-ms-win-crt-heap-l1-1-0.dll", "malloc") && address == reinterpret_cast<u64>(&crt::malloc), "malloc is resolved through an api set to the same stub msvcrt uses");
+    expect(found("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfprintf") && address == reinterpret_cast<u64>(&u::__stdio_common_vfprintf), "a UCRT-only function is resolved through its api set");
+    expect(found("ucrtbase.dll", "__stdio_common_vsprintf") && found("UCRTBASE.DLL", "_configure_narrow_argv"), "the real ucrtbase name resolves in any case");
+    expect(!found("msvcrt.dll", "__stdio_common_vfprintf") && !found("ucrtbase.dll", "__getmainargs") && !found("ucrtbase.dll", "printf") && !found("api-ms-win-crt-stdio-l1-1-0.dll", "__iob_func"),
+           "each module only provides its own exports: msvcrt has no UCRT stdio and ucrtbase has no msvcrt start-up hooks");
+    expect(found("api-ms-win-core-synch-l1-1-0.dll", "Sleep") && address == reinterpret_cast<u64>(&Sleep) && found("KERNELBASE.dll", "GetLastError") && address == reinterpret_cast<u64>(&GetLastError),
+           "kernel32 functions are resolved through api-ms-win-core and kernelbase");
+    expect(!found("api-ms-win-core-foo-l1-1-0.dll", "malloc") && !found("api-ms-win-crt-heap-l1-1-0.dll", "MALLOC") && !found("api-ms-win-crt-heap-l1-1-0.dll", "Sleep") && !found("user32.dll", "malloc"),
+           "api sets keep the case sensitive function lookup and the module separation");
+
+    u64 k32 = GetModuleHandleA("kernel32.dll");
+    u64 ucrt = GetModuleHandleA("ucrtbase.dll");
+    expect(ucrt != 0 && ucrt != k32 && ucrt != GetModuleHandleA("msvcrt.dll") && GetModuleHandleA("ucrtbase") == ucrt && GetModuleHandleA("api-ms-win-crt-stdio-l1-1-0.dll") == ucrt && GetModuleHandleA("KERNELBASE") == k32,
+           "ucrtbase is a module with its own handle, reachable by its api set names, and kernelbase is kernel32");
+    expect(LoadLibraryA("C:\\Windows\\System32\\UCRTBASE.DLL") == ucrt && LoadLibraryA("c:/windows/system32/kernel32") == k32 && LoadLibraryA("msvcrt.dll") == GetModuleHandleA("msvcrt.dll"),
+           "LoadLibrary finds a built-in module by bare name, by name without extension and by a full path with either separator");
+    set_last_error(0);
+    expect(LoadLibraryA("nothere.dll") == 0 && last_error() == pehost::ERROR_MOD_NOT_FOUND && LoadLibraryA("") == 0 && LoadLibraryA("C:\\dir\\") == 0 && LoadLibraryA("a:b\\") == 0,
+           "an unknown module, an empty name and a path ending in a separator are ERROR_MOD_NOT_FOUND");
+    set_last_error(0);
+    expect(LoadLibraryA(nullptr) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && LoadLibraryW(nullptr) == 0, "a null name is ERROR_INVALID_PARAMETER");
+    static const u16 wname[] = { 'U', 'C', 'R', 'T', 'B', 'A', 'S', 'E', 0 };
+    static const u16 wmiss[] = { 'x', 'y', 0 };
+    static u16 wlong[200];
+    for (u32 i = 0; i < 199; ++i) wlong[i] = 'a';
+    set_last_error(0);
+    expect(LoadLibraryW(wname) == ucrt && LoadLibraryW(wmiss) == 0 && last_error() == pehost::ERROR_MOD_NOT_FOUND && LoadLibraryW(wlong) == 0, "LoadLibraryW matches like LoadLibraryA and refuses over-long names");
+    set_last_error(0);
+    expect(FreeLibrary(ucrt) == 1 && FreeLibrary(ucrt) == 1 && FreeLibrary(k32) == 1 && last_error() == 0, "FreeLibrary on a built-in module succeeds, repeatedly");
+    expect(FreeLibrary(0) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && FreeLibrary(ucrt + 1) == 0, "FreeLibrary on a non-module is ERROR_INVALID_HANDLE");
+    set_last_error(0);
+    expect(GetProcAddress(ucrt, "malloc") == reinterpret_cast<void*>(&crt::malloc) && GetProcAddress(ucrt, "__stdio_common_vfprintf") == reinterpret_cast<void*>(&u::__stdio_common_vfprintf) &&
+           GetProcAddress(GetModuleHandleA("msvcrt.dll"), "__stdio_common_vfprintf") == nullptr && GetProcAddress(ucrt, "__getmainargs") == nullptr && last_error() == pehost::ERROR_PROC_NOT_FOUND,
+           "GetProcAddress on ucrtbase finds its own exports and not msvcrt's");
+
+    u32 ucrt_count = 0, shared = 0, unique = 0;
+    for (const pehost::ImportTable* t = all; t; t = t->next) {
+        for (u32 i = 0; i < t->count; ++i) {
+            if (!pehost::detail::same_dll(t->items[i].dll, "ucrtbase.dll")) continue;
+            ++ucrt_count;
+            bool also = false;
+            for (const pehost::ImportTable* v = all; v; v = v->next) {
+                for (u32 j = 0; j < v->count; ++j) {
+                    if (pehost::detail::same_dll(v->items[j].dll, "msvcrt.dll") && pehost::detail::same_name(v->items[j].name, t->items[i].name)) also = also || v->items[j].address == t->items[i].address;
+                }
+            }
+            if (also) ++shared;
+            else ++unique;
+        }
+    }
+    expect(ucrt_count == shared + unique && shared > 30 && unique > 30, "ucrtbase shares its C library stubs with msvcrt at the same addresses and adds its own");
+
+    const char* line = "prog.exe \"two words\" caf\xC3\xA9";
+    pehost::g_world.command_line[0] = 0;
+    {
+        u32 n = 0;
+        while (line[n]) {
+            w.command_line[n] = line[n];
+            ++n;
+        }
+        w.command_line[n] = 0;
+    }
+    u::reset();
+    expect(*u::__p___argc() == 3 && (*u::__p___argv())[1][0] == 't' && same((*u::__p___argv())[1], "two words") && same((*u::__p___argv())[2], "caf\xC3\xA9") && (*u::__p___argv())[3] == nullptr,
+           "__p___argc and __p___argv parse the command line on first use");
+    u::reset();
+    expect(u::_configure_narrow_argv(1) == 0 && *u::__p___argc() == 3 && u::_configure_narrow_argv(2) == 0 && *u::__p___argc() == 3, "_configure_narrow_argv in either mode fills argc and argv, and repeating it is harmless");
+    u::reset();
+    expect(u::_configure_wide_argv(1) == 0 && wide_is((*u::__p___wargv())[0], "prog.exe") && wide_is((*u::__p___wargv())[1], "two words") && (*u::__p___wargv())[2][2] == 'f' && (*u::__p___wargv())[2][3] == 0xE9 && (*u::__p___wargv())[2][4] == 0 &&
+           (*u::__p___wargv())[3] == nullptr && *u::__p___argc() == 3,
+           "the wide argument vector is the same arguments in UTF-16 and ends with a null");
+    u::reset();
+    u16** wv = *u::__p___wargv();
+    expect(wv != nullptr && wide_is(wv[1], "two words") && *u::__p___argc() == 3, "__p___wargv parses on first use");
+    expect(u::_configure_narrow_argv(3) == crt::ERR_INVAL && u::_configure_narrow_argv(-1) == crt::ERR_INVAL && u::_configure_wide_argv(3) == crt::ERR_INVAL && u::_configure_wide_argv(-1) == crt::ERR_INVAL, "a mode outside 0 to 2 is EINVAL");
+    u::reset();
+    expect(u::_configure_narrow_argv(0) == 0 && *u::__p___argc() == 0 && (*u::__p___argv())[0] == nullptr, "mode 0 means no arguments");
+    u::reset();
+    expect(u::_configure_wide_argv(0) == 0 && *u::__p___argc() == 0 && (*u::__p___wargv())[0] == nullptr, "mode 0 for the wide vector means no arguments either");
+    for (u32 i = 0; i < 70; ++i) {
+        w.command_line[i * 2] = 'a';
+        w.command_line[i * 2 + 1] = ' ';
+    }
+    w.command_line[140] = 0;
+    u::reset();
+    expect(u::_configure_narrow_argv(1) == crt::ERR_NOMEM && u::_configure_wide_argv(1) == crt::ERR_NOMEM, "a command line with too many arguments is ENOMEM");
+    w.command_line[0] = 0;
+    u::reset();
+    expect(u::_configure_narrow_argv(1) == 0 && *u::__p___argc() == 0 && (*u::__p___argv())[0] == nullptr && u::_configure_wide_argv(1) == 0 && (*u::__p___wargv())[0] == nullptr, "an empty command line has no arguments");
+
+    expect(*u::__p__environ() == crt::g_environment && **u::__p__environ() == nullptr && u::_get_initial_narrow_environment() == crt::g_environment && *u::__p__wenviron() != nullptr && **u::__p__wenviron() == nullptr &&
+           u::_get_initial_wide_environment() == *u::__p__wenviron() && u::_initialize_narrow_environment() == 0 && u::_initialize_wide_environment() == 0,
+           "the environment is empty in both widths");
+
+    u::reset();
+    expect(u::__p__fmode() == &crt::g_fmode && u::__p__commode() == &crt::g_commode && u::_set_fmode(0x4000) == 0 && *u::__p__fmode() == 0x4000, "the mode variables are the msvcrt ones");
+    i32 got = 0;
+    expect(u::_get_fmode(&got) == 0 && got == 0x4000 && u::_set_fmode(0x8000) == 0 && u::_get_fmode(&got) == 0 && got == 0x8000 && u::_set_fmode(0) == 0, "_set_fmode and _get_fmode round trip text, binary and default");
+    expect(u::_set_fmode(5) == crt::ERR_INVAL && *u::__p__fmode() == 0 && u::_get_fmode(nullptr) == crt::ERR_INVAL, "an invalid mode or a null destination is EINVAL");
+    u::_set_app_type(2);
+    expect(crt::g_app_type == 2 && u::_set_new_mode(1) == 0 && u::_set_new_mode(0) == 1 && u::_set_new_mode(2) == -1 && u::_set_new_mode(-1) == -1 && u::_set_new_mode(0) == 0, "_set_app_type and _set_new_mode keep their values");
+    expect(u::_set_invalid_parameter_handler(reinterpret_cast<void*>(0x1234)) == nullptr && u::_set_invalid_parameter_handler(nullptr) == reinterpret_cast<void*>(0x1234) && u::_configthreadlocale(1) == 0,
+           "the invalid parameter handler is stored and the old one returned");
+    expect(u::__acrt_iob_func(0) == &crt::g_iob[0] && u::__acrt_iob_func(1) == &crt::g_iob[1] && u::__acrt_iob_func(2) == &crt::g_iob[2] && u::__acrt_iob_func(3) == nullptr && u::__acrt_iob_func(~0u) == nullptr,
+           "__acrt_iob_func hands out the three standard streams");
+
+    g_rec = Recorder{};
+    expect(fpr(0, &crt::g_iob[1], "n=%d %s", 12, "ok") == 7 && g_rec.last_stream == 1 && same(g_rec.last_text, "n=12 ok") && fpr(4, &crt::g_iob[2], "e") == 1 && g_rec.last_stream == 2, "__stdio_common_vfprintf prints to the standard streams whatever the options");
+    *crt::_errno() = 0;
+    expect(fpr(0, &crt::g_iob[0], "x") == -1 && *crt::_errno() == crt::ERR_BADF && fpr(0, &crt::g_iob[1], "%f", 1) == -1 && *crt::_errno() == crt::ERR_INVAL, "an unusable stream or an unsupported conversion fails");
+    expect(u::__stdio_common_vfwprintf(0, &crt::g_iob[1], nullptr, nullptr, pehost::fmt::VaList{}) == -1, "wide printf reports failure");
+
+    char buf[16];
+    auto fill = [&]() {
+        for (u32 i = 0; i < 16; ++i) buf[i] = 'Z';
+    };
+    fill();
+    expect(snp(2, buf, 4, "%s", "hello") == 5 && same(buf, "hel") && buf[4] == 'Z', "standard snprintf truncates, terminates and returns the full length");
+    fill();
+    expect(snp(2, buf, 6, "%s", "hello") == 5 && same(buf, "hello") && buf[6] == 'Z', "standard snprintf that fits is terminated");
+    fill();
+    expect(snp(2, buf, 5, "%s", "hello") == 5 && same(buf, "hell") && buf[5] == 'Z', "standard snprintf of exactly the buffer size loses the last character to the terminator");
+    fill();
+    expect(snp(2, buf, 0, "%s", "hello") == 5 && buf[0] == 'Z', "standard snprintf with size 0 only counts");
+    fill();
+    expect(snp(3, buf, 1, "ab") == 2 && buf[0] == 0 && buf[1] == 'Z', "other option bits do not change the standard result");
+    fill();
+    expect(snp(0, buf, 4, "%s", "hello") == -1 && buf[0] == 'h' && buf[3] == 'l' && buf[4] == 'Z', "legacy truncation returns -1 and writes exactly count characters");
+    fill();
+    expect(snp(1, buf, 5, "%s", "hello") == 5 && buf[4] == 'o' && buf[5] == 'Z', "legacy output that exactly fills the buffer has no terminator");
+    fill();
+    expect(snp(0, buf, 6, "%s", "hello") == 5 && same(buf, "hello"), "legacy output that fits is terminated");
+    fill();
+    expect(snp(0, buf, ~0ull, "%d", 42) == 2 && same(buf, "42"), "an unbounded count behaves like sprintf");
+    *crt::_errno() = 0;
+    fill();
+    expect(snp(2, buf, 8, "%f", 1) == -1 && buf[0] == 0 && *crt::_errno() == crt::ERR_INVAL, "a failing conversion returns -1 with an empty string");
+    fill();
+    expect(snp(0, buf, 0, "%f", 1) == -1 && buf[0] == 'Z', "a failing conversion with no buffer writes nothing");
+
+    crt::reset();
+    g_rec = Recorder{};
+    expect(u::_crt_atexit(reinterpret_cast<void*>(&ms_say_one)) == 0, "_crt_atexit registers");
+    crt::_cexit();
+    expect(same(g_rec.last_text, "one;"), "an exit handler registered with _crt_atexit runs at _cexit");
+    bool full = true;
+    for (u32 i = 0; i < 32; ++i) full = full && u::_crt_atexit(reinterpret_cast<void*>(&ms_say_one)) == 0;
+    expect(full && u::_crt_atexit(reinterpret_cast<void*>(&ms_say_one)) == -1, "_crt_atexit shares the 32 slots of atexit");
+    crt::reset();
+    full = true;
+    for (u32 i = 0; i < 32; ++i) full = full && u::_crt_at_quick_exit(reinterpret_cast<void*>(&ms_say_one)) == 0;
+    expect(full && u::_crt_at_quick_exit(reinterpret_cast<void*>(&ms_say_one)) == -1, "_crt_at_quick_exit has 32 slots");
+    u::reset();
+    expect(u::_crt_at_quick_exit(nullptr) == 0, "reset empties the quick exit list");
+
+    u::OnexitTable table{ reinterpret_cast<void**>(1), reinterpret_cast<void**>(2), reinterpret_cast<void**>(3) };
+    expect(u::_initialize_onexit_table(&table) == 0 && table.first == nullptr && table.last == nullptr && table.end == nullptr && u::_initialize_onexit_table(nullptr) == -1 &&
+           u::_register_onexit_function(nullptr, nullptr) == -1 && u::_execute_onexit_table(nullptr) == -1,
+           "an onexit table starts empty and a null table is refused");
+    g_order_count = g_order_next = 0;
+    for (u32 i = 0; i < 20; ++i) {
+        void* fn = i == 3 ? nullptr : reinterpret_cast<void*>(&order_fn);
+        if (u::_register_onexit_function(&table, fn) != 0) g_failures++;
+    }
+    expect(table.last - table.first == 20 && table.end - table.first == 32 && w.heap.owns(table.first), "the table grows from 8 slots by doubling");
+    expect(u::_execute_onexit_table(&table) == 0 && g_order_count == 19 && g_order[0] == 0 && g_order[18] == 18 && table.first == nullptr && table.last == nullptr && table.end == nullptr, "the table runs its non-null entries, last registered first, and empties itself");
+    u32 before = g_order_count;
+    expect(u::_execute_onexit_table(&table) == 0 && g_order_count == before && u::_register_onexit_function(&table, reinterpret_cast<void*>(&order_two)) == 0 && (g_two_count = 0, u::_execute_onexit_table(&table) == 0) && g_two_count == 1, "an emptied table can be used again");
+
+    g_two_count = 0;
+    u32 registered = 0;
+    while (registered < 4000000 && u::_register_onexit_function(&table, reinterpret_cast<void*>(&order_two)) == 0) ++registered;
+    expect(registered < 4000000 && registered >= 8 && table.last - table.first == registered && table.last <= table.end, "registration fails cleanly when the heap cannot grow the table");
+    void** keep = table.first;
+    expect(u::_register_onexit_function(&table, reinterpret_cast<void*>(&order_two)) == -1 && table.first == keep && table.last - table.first == registered, "a failed registration leaves the table as it was");
+    expect(u::_execute_onexit_table(&table) == 0 && g_two_count == registered, "and every registered entry still runs");
+
+    u16 cw = 0;
+    u16 odd = 0x27F;
+    asm volatile("fldcw %0" : : "m"(odd));
+    u::_fpreset();
+    asm volatile("fnstcw %0" : "=m"(cw));
+    expect(cw == 0x37F, "_fpreset restores the default x87 control word");
+
+    expect(*u::__daylight() == 0 && *u::__timezone() == 0 && same(u::__tzname()[0], "UTC") && same(u::__tzname()[1], "UTC"), "time zone data is UTC");
+    u::_tzset();
+    expect(*u::__daylight() == 0 && *u::__timezone() == 0, "_tzset changes nothing");
+    u::_c_exit();
+}
+
 int main(int argc, char** argv) {
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
     heap_tests();
@@ -1765,6 +2013,7 @@ int main(int argc, char** argv) {
     kernel32_edge_tests();
     msvcrt_tests();
     msvcrt_edge_tests();
+    ucrt_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

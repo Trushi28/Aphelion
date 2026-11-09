@@ -33,6 +33,8 @@ extern "C" const u8 pe_stdio_start[];
 extern "C" const u8 pe_stdio_end[];
 extern "C" const u8 pe_crt_start[];
 extern "C" const u8 pe_crt_end[];
+extern "C" const u8 pe_ucrt_start[];
+extern "C" const u8 pe_ucrt_end[];
 
 #define BLOB_DECL(name) extern "C" const u8 ublob_##name[]; extern "C" const u8 ublob_##name##_end[]
 
@@ -651,6 +653,7 @@ bool run_files() {
                put_blob(K.domain, apps, "tlscb.exe", pe_tlscb_start, pe_tlscb_end) &&
                put_blob(K.domain, apps, "stdio.exe", pe_stdio_start, pe_stdio_end) &&
                put_blob(K.domain, apps, "crt.exe", pe_crt_start, pe_crt_end) &&
+               put_blob(K.domain, apps, "ucrt.exe", pe_ucrt_start, pe_ucrt_end) &&
                lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
                lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
     lens::Result<lens::Lens> badw = lens::open_at(K.domain, apps, "bad", lens::Right::Read | lens::Right::Write);
@@ -699,6 +702,7 @@ bool run_files() {
         pe = run_pe(K, apps, "tlscb.exe", 0) && pe;
         pe = run_pe(K, apps, "stdio.exe", 0) && pe;
         pe = run_pe(K, apps, "crt.exe", 7) && pe;
+        pe = run_pe(K, apps, "ucrt.exe", 7) && pe;
         pe = run_pe(K, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
         pe = run_pe(K, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;
         ok = pe && ok;

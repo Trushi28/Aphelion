@@ -22,6 +22,8 @@ extern "C" const u8 pe_stdio_start[];
 extern "C" const u8 pe_stdio_end[];
 extern "C" const u8 pe_crt_start[];
 extern "C" const u8 pe_crt_end[];
+extern "C" const u8 pe_ucrt_start[];
+extern "C" const u8 pe_ucrt_end[];
 
 namespace userland::apps {
 
@@ -42,6 +44,7 @@ const Entry ENTRIES[] = {
     { "tlscb.exe", pe_tlscb_start, pe_tlscb_end },
     { "stdio.exe", pe_stdio_start, pe_stdio_end },
     { "crt.exe", pe_crt_start, pe_crt_end },
+    { "ucrt.exe", pe_ucrt_start, pe_ucrt_end },
 };
 
 constexpr const char* DIRECTORY = "apps";

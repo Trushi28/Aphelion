@@ -1,5 +1,6 @@
 #pragma once
 #include <cosmos/pe.hpp>
+#include <cosmos/pe_modules.hpp>
 
 namespace pehost {
 
@@ -131,10 +132,11 @@ inline bool same_name(const char* a, const char* b) {
 
 inline bool resolve(void* ctx, const char* dll, const char* name, u16, u64* address) {
     if (name == nullptr) return false;
+    const char* home = pe::modules::canonical(dll);
     for (const ImportTable* table = static_cast<const ImportTable*>(ctx); table; table = table->next) {
         for (u32 i = 0; i < table->count; ++i) {
             const Import& e = table->items[i];
-            if (same_dll(e.dll, dll) && same_name(e.name, name)) {
+            if (same_dll(e.dll, home) && same_name(e.name, name)) {
                 *address = reinterpret_cast<u64>(e.address);
                 return true;
             }

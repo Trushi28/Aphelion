@@ -19,5 +19,6 @@ embed pe_teb, "teb.exe"
 embed pe_tlscb, "tlscb.exe"
 embed pe_stdio, "stdio.exe"
 embed pe_crt, "crt.exe"
+embed pe_ucrt, "ucrt.exe"
 
 section .note.GNU-stack noalloc noexec nowrite
