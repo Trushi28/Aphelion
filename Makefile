@@ -85,7 +85,7 @@ TEST_ISO := $(BUILD)/aphelion-test.iso
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
 USER_DIR := $(BUILD)/userland
-USER_PROGRAMS := hello pehost
+USER_PROGRAMS := hello echo pehost
 USER_CXX ?= g++
 USER_FLAGS := -std=c++20 -O2 -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie \
               -fno-threadsafe-statics -nostdlib -static -no-pie -Wl,-z,max-page-size=0x1000 -Wl,-z,norelro -Wl,--build-id=none \
@@ -375,6 +375,9 @@ test-pehost:
 	cmp $(BUILD)/pe-gaps-peinfo.txt $(BUILD)/pe-gaps-host.txt && echo "coverage report: a program needing fopen, qsort, strtol and time is reported with exactly those gaps" || { echo "the coverage report for gaps.exe is wrong"; cat $(BUILD)/pe-gaps.txt; exit 1; }
 	@$(BUILD)/pehost_host_test --run tools/pe-samples/bin/sysio.exe --dlls tools/pe-samples/bin > $(BUILD)/pe-sysio.txt 2>&1; grep -q 'sysio done failures=0' $(BUILD)/pe-sysio.txt && grep -q 'exit status 6' $(BUILD)/pe-sysio.txt && \
 	echo "sysio.exe: a program using the clock, file and search calls runs under the host harness and passes its own checks" || { echo "sysio.exe failed under the host harness"; cat $(BUILD)/pe-sysio.txt; exit 1; }
+	@$(BUILD)/pehost_host_test --run tools/pe-samples/bin/argv.exe --dlls tools/pe-samples/bin 'argv.exe x "a \"q\" b" "" back\' --env 'GREETING=hi there' --env SHELL=helm --stdin 'ab' > $(BUILD)/pe-argv.txt 2>&1; \
+	printf 'argc=5\nargv[0]=<argv.exe>\nargv[1]=<x>\nargv[2]=<a "q" b>\nargv[3]=<>\nargv[4]=<back\\>\ncmdline=<argv.exe x "a \\"q\\" b" "" back\\>\nmodule=<pe.exe>\nGREETING=<hi there>\nSHELL=<helm>\nstdin 2 bytes\nab[host] exit status 5 (0x5)\n' | cmp - $(BUILD)/pe-argv.txt && \
+	echo "argv.exe: arguments, environment and standard input reach a program under the host harness exactly as given" || { echo "argv.exe failed under the host harness"; cat $(BUILD)/pe-argv.txt; exit 1; }
 	@mkdir -p $(BUILD)/pe-alone && cp tools/pe-samples/bin/dyn.exe $(BUILD)/pe-alone/ && rm -f $(BUILD)/pe-alone/*.dll; \
 	$(BUILD)/peinfo --coverage --supported docs/pe-supported.txt $(BUILD)/pe-alone/dyn.exe > $(BUILD)/pe-alone.txt; test $$? -eq 1 && grep -q 'dllchain.dll!add3' $(BUILD)/pe-alone.txt && \
 	echo "coverage report: a program whose DLL is not beside it is reported as missing that DLL's imports" || { echo "the coverage report for a program without its DLL is wrong"; cat $(BUILD)/pe-alone.txt; exit 1; }

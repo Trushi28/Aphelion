@@ -186,6 +186,8 @@ struct Table {
 constexpr u32 MAX_TABLES = 8;
 bool register_table(const Table* table);
 const Command* find_command(const char* name);
+using ProgramResolver = const Command* (*)(const char* name);
+void set_program_resolver(ProgramResolver resolver);
 u32 table_count();
 const Table* table_at(u32 index);
 

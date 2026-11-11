@@ -26,6 +26,7 @@ struct Runtime {
     i64 (*file_read)(i64 handle, u64 offset, void* buffer, u64 length) = nullptr;
     void (*file_close)(i64 handle) = nullptr;
     i32 (*dir_entry)(u64 index, char* name, u32 capacity, u64* size, u64* mtime_ms, bool* directory) = nullptr;
+    i64 (*read_stdin)(void* buffer, u32 length) = nullptr;
 };
 
 inline Runtime* g_runtime = nullptr;

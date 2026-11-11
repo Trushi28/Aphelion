@@ -12,6 +12,7 @@ global %1_end
 %endmacro
 
 embed apx_hello, "userland/hello.apx"
+embed apx_echo, "userland/echo.apx"
 embed apx_pehost, "userland/pehost.apx"
 embed pe_console, "console.exe"
 embed pe_k32, "k32.exe"
@@ -26,5 +27,6 @@ embed pe_dllplug, "dllplug.dll"
 embed pe_dllfail, "dllfail.dll"
 embed pe_dyn, "dyn.exe"
 embed pe_sysio, "sysio.exe"
+embed pe_argv, "argv.exe"
 
 section .note.GNU-stack noalloc noexec nowrite

@@ -691,15 +691,33 @@ bool run_interrupted(void* ctx) {
     return false;
 }
 
-int cmd_run(Shell& sh, Io& io, u32 argc, char** argv) {
-    if (argc != 2) return usage(io, "usage: run name   (a program in ram:/apps; chart ram:/apps lists them; Ctrl+C stops it)");
+enum class Report { Exit, Quiet };
+
+int run_program(Shell& sh, Io& io, const char* name, u32 argc, char** argv, Report how) {
     RunOut ctx{ &sh, &io };
-    userland::apps::Report r = userland::apps::run(argv[1], &run_emit, &run_interrupted, &ctx);
+    const char* env[] = { "SHELL=helm" };
+    static const char empty[] = "";
+    userland::apps::Request request;
+    request.name = name;
+    request.args = argv;
+    request.arg_count = argc;
+    request.env = env;
+    request.env_count = 1;
+    if (io.has_in) {
+        request.input = io.in_size ? reinterpret_cast<const char*>(io.in) : empty;
+        request.input_length = static_cast<u32>(io.in_size > ~0u ? ~0u : io.in_size);
+    }
+    request.emit = &run_emit;
+    request.interrupted = &run_interrupted;
+    request.ctx = &ctx;
+    userland::apps::Report r = userland::apps::run(request);
     using userland::apps::Outcome;
     switch (r.outcome) {
         case Outcome::Unavailable: print_error(io, "user programs are not supported on this machine"); return 1;
         case Outcome::BadName: print_error(io, "give the name of a program in ram:/apps, without a path"); return 2;
         case Outcome::NotFound: print_error(io, "no such program in ram:/apps"); return 1;
+        case Outcome::BadArguments: print_error(io, "too many arguments, or too much text, for a program (at most 15 arguments and about 220 bytes in all)"); return 2;
+        case Outcome::InputTooLarge: print_error(io, "a program can be given at most 64 KiB of input"); return 1;
         case Outcome::LaunchFailed:
             io.err.rgb(palette::SAND);
             io.err.str("  could not start it (error ");
@@ -711,21 +729,34 @@ int cmd_run(Shell& sh, Io& io, u32 argc, char** argv) {
         case Outcome::Interrupted: print_error(io, "stopped"); return 130;
         case Outcome::Finished: break;
     }
-    io.out.rgb(palette::MIST);
-    io.out.str("  exit status ");
+    if (how == Report::Quiet && r.status == 0) return 0;
+    Writer& w = how == Report::Exit ? io.out : io.err;
+    w.rgb(palette::MIST);
+    w.str("  exit status ");
     if (r.status < 0) {
-        io.out.put('-');
-        io.out.num(static_cast<u64>(-static_cast<i64>(r.status)));
-        io.out.str(" (0x");
-        io.out.hex(static_cast<u32>(r.status), 8);
-        io.out.put(')');
+        w.put('-');
+        w.num(static_cast<u64>(-static_cast<i64>(r.status)));
+        w.str(" (0x");
+        w.hex(static_cast<u32>(r.status), 8);
+        w.put(')');
     } else {
-        io.out.num(static_cast<u64>(r.status));
+        w.num(static_cast<u64>(r.status));
     }
-    io.out.put('\n');
-    io.out.reset();
+    w.put('\n');
+    w.reset();
     return r.status == 0 ? 0 : 1;
 }
+
+int cmd_run(Shell& sh, Io& io, u32 argc, char** argv) {
+    if (argc < 2) return usage(io, "usage: run name [arguments...]   (a program in ram:/apps; chart ram:/apps lists them; Ctrl+C stops it)");
+    return run_program(sh, io, argv[1], argc - 2, argv + 2, Report::Exit);
+}
+
+int cmd_program(Shell& sh, Io& io, u32 argc, char** argv) { return run_program(sh, io, argv[0], argc - 1, argv + 1, Report::Quiet); }
+
+const Command PROGRAM_COMMAND = { "program", "name [arguments...]", "run a program from ram:/apps by typing its name", &cmd_program };
+
+const Command* resolve_program(const char* name) { return userland::apps::exists(name) ? &PROGRAM_COMMAND : nullptr; }
 
 constexpr Command COMMANDS[] = {
     {"about", "about", "the info panel again", &cmd_about},
@@ -744,7 +775,7 @@ constexpr Command COMMANDS[] = {
     {"usb", "usb", "xHCI controllers, devices and drives", &cmd_usb},
     {"storage", "storage [init erase <MiB>]", "the storage device and volume; in usb mode, format the window", &cmd_storage},
     {"restart", "restart", "flush the disk and restart", &cmd_restart},
-    {"run", "run name", "run a program from ram:/apps, a native Aphelion program or a Windows .exe through the PE host", &cmd_run},
+    {"run", "run name [arguments...]", "run a program from ram:/apps with arguments and, in a pipeline, its input; the exit status is shown (a program name on its own runs it too)", &cmd_run},
     {"sunset", "sunset", "flush the disk and power off where the platform allows it", &cmd_sunset},
 };
 
@@ -752,6 +783,9 @@ constexpr Table TABLE{"system", COMMANDS, sizeof(COMMANDS) / sizeof(COMMANDS[0])
 
 }
 
-void register_sys_commands() { register_table(&TABLE); }
+void register_sys_commands() {
+    register_table(&TABLE);
+    set_program_resolver(&resolve_program);
+}
 
 }

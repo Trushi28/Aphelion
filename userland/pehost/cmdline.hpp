@@ -81,4 +81,61 @@ inline bool parse(const char* line, char* storage, u32 capacity, char** argv, u3
     return true;
 }
 
+inline bool needs_quotes(const char* a) {
+    if (*a == 0) return true;
+    for (; *a; ++a) {
+        if (blank(*a) || *a == '"') return true;
+    }
+    return false;
+}
+
+inline bool join(const char* const* argv, u32 argc, char* out, u32 capacity) {
+    u32 used = 0;
+    auto put = [&](char c) {
+        if (used + 1 >= capacity) return false;
+        out[used++] = c;
+        return true;
+    };
+    for (u32 i = 0; i < argc; ++i) {
+        if (i > 0 && !put(' ')) return false;
+        const char* a = argv[i];
+        if (!needs_quotes(a)) {
+            for (; *a; ++a) {
+                if (!put(*a)) return false;
+            }
+            continue;
+        }
+        if (!put('"')) return false;
+        if (i == 0) {
+            for (; *a; ++a) {
+                if (!put(*a)) return false;
+            }
+        } else {
+            u32 slashes = 0;
+            for (; *a; ++a) {
+                if (*a == '\\') {
+                    ++slashes;
+                    if (!put('\\')) return false;
+                    continue;
+                }
+                if (*a == '"') {
+                    for (u32 k = 0; k < slashes; ++k) {
+                        if (!put('\\')) return false;
+                    }
+                    if (!put('\\') || !put('"')) return false;
+                } else if (!put(*a)) {
+                    return false;
+                }
+                slashes = 0;
+            }
+            for (u32 k = 0; k < slashes; ++k) {
+                if (!put('\\')) return false;
+            }
+        }
+        if (!put('"')) return false;
+    }
+    out[used] = 0;
+    return true;
+}
+
 }

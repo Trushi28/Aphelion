@@ -7,6 +7,7 @@ constexpr u32 ERROR_INVALID_FUNCTION = 1;
 constexpr u32 ERROR_FILE_NOT_FOUND = 2;
 constexpr u32 ERROR_PATH_NOT_FOUND = 3;
 constexpr u32 ERROR_ACCESS_DENIED = 5;
+constexpr u32 ERROR_BROKEN_PIPE = 109;
 constexpr u32 ERROR_NEGATIVE_SEEK = 131;
 constexpr u32 ERROR_ENVVAR_NOT_FOUND = 203;
 constexpr u32 ERROR_TIMEOUT = 1460;
@@ -585,7 +586,19 @@ PEHOST_WINAPI inline i32 ReadFile(u64 handle, void* buffer, u32 length, u32* rea
         set_last_error(ERROR_NOT_SUPPORTED);
         return 0;
     }
-    if (handle == HANDLE_STDIN) return 1;
+    if (handle == HANDLE_STDIN) {
+        if (!g_runtime->read_stdin || length == 0 || buffer == nullptr) return 1;
+        i64 n = g_runtime->read_stdin(buffer, length);
+        if (n > 0) {
+            if (read) *read = static_cast<u32>(n);
+            return 1;
+        }
+        if (n < 0) {
+            set_last_error(ERROR_BROKEN_PIPE);
+            return 0;
+        }
+        return 1;
+    }
     OpenFile* f = detail::file_of(handle);
     if (!f) {
         set_last_error(ERROR_INVALID_HANDLE);

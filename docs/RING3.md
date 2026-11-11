@@ -178,7 +178,7 @@ Limits and things that are deliberately not done:
 - A pipe read copies out of the pipe before it copies into the caller's buffer; the buffer is probed first, but if another thread unmaps it in between those bytes are lost.
 - Writing past the end of a file leaves the result to the realm.
 - A process can create children until the 16 process slots are gone, and there is no per-process quota. Child threads and memory are limited per process as before.
-- The child gets no environment, arguments or working directory beyond the one handle.
+- `process_create` itself still gives the child only the one handle. Arguments, environment and standard input travel on top of that handle, as the start-up contract below.
 - Nothing from R2.3 through H3 has been booted by me. The syscall handlers, `process_create` on real cores, kill-on-close from a dying parent and the lazy sweeper have been compiled and linked, and the ring-3 programs have run under an emulator against a model of the syscalls, but only your boots count.
 
 ## Building ring-3 programs (W2a)
@@ -229,6 +229,23 @@ Limits, on purpose: no libc, no exceptions, no RTTI, and no global constructors 
 - `took exception 13` in the `hello` case: a selector or `swapgs` imbalance.
 - Hang inside a syscall: `CoreLocal.kernel_rsp` not updated on that core.
 - `could not be torn down`: a core still has the address space loaded after the thread exited.
+
+## The start-up contract (W5d.1)
+
+A program started by the shell receives, in `rdi`, one end of a channel that already holds one message. The message is the same for every kind of program; an executor (the native loader, the PE host, a future ELF loader) reads it and sets up what its programs expect. The shell and the launcher know nothing about executors except which one a file needs, which they decide by looking at the first two bytes.
+
+The message (`kernel/include/cosmos/startup.hpp`, host-tested) is a 16-byte header followed by NUL-terminated strings: magic `APST`, version 1, argument count, environment count, a presence mask for the handles, the length of the text, and a reserved field that must be zero. The strings are the arguments (`argv[0]` is the program name) and then `NAME=value` environment entries. Handles ride in the message in slot order and only for slots that are present: program file (0), directory (1), standard input (2), standard output (3). A decoder refuses a wrong magic, a newer version, a count above 16 arguments or 8 variables, a text length that is not exactly the rest of the message, text that is not terminated or whose string count differs from the header, a handle count that differs from the mask, and a non-zero reserved field.
+
+| slot | meaning | given by the shell today |
+|---|---|---|
+| 0 program | the file itself, readable and delegable, for executors that load it themselves | for PE programs |
+| 1 directory | the program directory (read, enumerate, delegate), the base of what the program can name | always |
+| 2 stdin | the read end of a pipe, already filled and already closed at the write end, so reads end in end-of-file | when the shell has input for the program |
+| 3 stdout | reserved; not given yet (output still reaches the shell through the console sink) | never |
+
+`userland::launch_started` builds the channel, sends the message and starts the process; `userland::apps::run` takes a `Request` (name, arguments, environment, input, callbacks) and is what the shell calls. In ring 3, `userland/include/begin.hpp` receives and decodes the message. A bad message, too many arguments or too much text is refused before anything starts (`-9` for size, `-3` for a malformed list, `-7` for a handle without the delegate right) and leaves no handle or process behind.
+
+Limits: one message means at most 240 bytes of text and 15 arguments plus the name; the input is at most 64 KiB and is complete before the program starts; there is no standard output handle yet; the executor, not the contract, decides what to do with a slot it does not understand.
 
 ## Not covered yet
 

@@ -713,6 +713,52 @@ void cmdline_tests() {
     expect(!pehost::cmdline::parse("abcdefg", storage, 7, argv, 8, &n) && !pehost::cmdline::parse("a bcdef", storage, 7, argv, 8, &n) && !pehost::cmdline::parse("p \"\\\\\\\\\\\\\\\\\\\\\\\\\"", storage, 7, argv, 8, &n),
            "one byte more does not, in the program name, an argument, or the backslash run before a quote");
     expect(pehost::cmdline::parse("a", storage, 2, argv, 8, &n) && !pehost::cmdline::parse("a", storage, 1, argv, 8, &n) && !pehost::cmdline::parse("a", storage, 0, argv, 8, &n) && !pehost::cmdline::parse("a", storage, 8, argv, 1, &n), "no storage or no argument slots is a failure, not an overrun");
+
+    {
+        struct JoinCase {
+            const char* argv[6];
+            u32 argc;
+        };
+        const JoinCase joins[] = {
+            { { "prog", "a", "b c" }, 3 },
+            { { "p", "", "x" }, 3 },
+            { { "p", "a\"b" }, 2 },
+            { { "p", "back\\" }, 2 },
+            { { "p", "back slash\\" }, 2 },
+            { { "p", "a\\\\\"b" }, 2 },
+            { { "my prog", "x y" }, 2 },
+            { { "p", "\\\\server\\share dir\\", "z" }, 3 },
+            { { "p", "tab\there" }, 2 },
+            { { "p", "\"\"" }, 2 },
+            { { "p", "\\", "\\\\", "\\\"" }, 4 },
+            { { "only" }, 1 },
+        };
+        u32 round = 0;
+        for (const JoinCase& c : joins) {
+            char line[256];
+            char store[256];
+            char* parsed[16];
+            u32 count = 0;
+            bool ok = pehost::cmdline::join(c.argv, c.argc, line, sizeof(line)) && pehost::cmdline::parse(line, store, sizeof(store), parsed, 16, &count) && count == c.argc;
+            for (u32 i = 0; ok && i < c.argc; ++i) ok = same(parsed[i], c.argv[i]);
+            if (ok) ++round;
+            else printf("join round trip failed for [%s]\n", c.argv[0]);
+        }
+        expect(round == sizeof(joins) / sizeof(joins[0]), "joining arguments into a command line and parsing it again gives back the same arguments, including empty, quoted and backslash cases");
+        const char* two[] = { "p", "a b" };
+        const char* empty[] = { "p", "" };
+        const char* quote[] = { "p", "a\"b" };
+        char line[64];
+        expect(pehost::cmdline::join(two, 2, line, sizeof(line)) && same(line, "p \"a b\""), "an argument with a space is quoted");
+        expect(pehost::cmdline::join(empty, 2, line, sizeof(line)) && same(line, "p \"\""), "an empty argument is written as two quotes");
+        expect(pehost::cmdline::join(quote, 2, line, sizeof(line)) && same(line, "p \"a\\\"b\""), "a quote inside an argument is escaped");
+        const char* plain[] = { "a", "b" };
+        expect(pehost::cmdline::join(plain, 2, line, 4) && same(line, "a b") && !pehost::cmdline::join(plain, 2, line, 3), "a line that exactly fills the buffer with its terminator fits and one byte less does not");
+        char guard[8];
+        for (u32 i = 0; i < sizeof(guard); ++i) guard[i] = 'g';
+        expect(!pehost::cmdline::join(two, 2, guard, 4) && guard[4] == 'g' && guard[5] == 'g', "a refused join does not write past the capacity");
+        expect(pehost::cmdline::join(nullptr, 0, line, sizeof(line)) && line[0] == 0, "no arguments is an empty line");
+    }
 }
 
 struct Recorder {
@@ -2373,6 +2419,19 @@ struct FakeTypeInfo {
     char decorated[24];
 };
 
+const char* g_stdin_feed = nullptr;
+u32 g_stdin_taken = 0;
+
+i64 fake_stdin(void* buffer, u32 length) {
+    if (!g_stdin_feed) return -1;
+    u32 left = 0;
+    while (g_stdin_feed[g_stdin_taken + left]) ++left;
+    u32 n = length < left ? length : left;
+    for (u32 i = 0; i < n; ++i) static_cast<char*>(buffer)[i] = g_stdin_feed[g_stdin_taken + i];
+    g_stdin_taken += n;
+    return n;
+}
+
 void extended_tests() {
     using namespace pehost::win32;
     using namespace pehost;
@@ -2390,6 +2449,7 @@ void extended_tests() {
     ext.file_read = &fake_read;
     ext.file_close = &fake_close;
     ext.dir_entry = &fake_dir;
+    ext.read_stdin = &fake_stdin;
     pehost::g_runtime = &ext;
     g_rec = Recorder{};
     pehost::World& w = pehost::g_world;
@@ -2559,6 +2619,26 @@ void extended_tests() {
     expect(LoadLibraryExA("kernel32.dll", 0, 0x2) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && LoadLibraryExW(wide("kernel32.dll"), 0, 0x1) == 0 && LoadLibraryExA("kernel32.dll", 1, 0) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER,
            "data file and dependency flags are refused and a reserved handle is invalid");
 
+    {
+        char in[16] = {};
+        u32 got = 99;
+        g_stdin_feed = "hello";
+        g_stdin_taken = 0;
+        expect(ReadFile(HANDLE_STDIN, in, 3, &got, nullptr) == 1 && got == 3 && strncmp(in, "hel", 3) == 0, "standard input is read through the host");
+        expect(ReadFile(HANDLE_STDIN, in, 16, &got, nullptr) == 1 && got == 2 && strncmp(in, "lo", 2) == 0, "a second read returns what is left");
+        expect(ReadFile(HANDLE_STDIN, in, 16, &got, nullptr) == 1 && got == 0, "the end of standard input is success with zero bytes");
+        got = 99;
+        expect(ReadFile(HANDLE_STDIN, in, 0, &got, nullptr) == 1 && got == 0, "a zero-length read of standard input succeeds with nothing read");
+        g_stdin_feed = nullptr;
+        got = 99;
+        expect(ReadFile(HANDLE_STDIN, in, 4, &got, nullptr) == 0 && got == 0 && last_error() == pehost::ERROR_BROKEN_PIPE, "a host that reports an error on standard input fails the read as a broken pipe");
+        pehost::Runtime none = ext;
+        none.read_stdin = nullptr;
+        pehost::g_runtime = &none;
+        got = 99;
+        expect(ReadFile(HANDLE_STDIN, in, 4, &got, nullptr) == 1 && got == 0, "a host with no standard input reads as already at the end");
+        pehost::g_runtime = &ext;
+    }
     expect(GetFileType(HANDLE_STDOUT) == 3 && GetFileType(HANDLE_STDIN) == 3 && GetFileType(0x100) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE, "standard handles are character devices and unknown handles are not files");
     expect(GetConsoleMode(HANDLE_STDOUT, nullptr) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && SetConsoleMode(HANDLE_STDOUT, 0) == 0 && GetConsoleScreenBufferInfo(HANDLE_STDOUT, nullptr) == 0 && ReadConsoleW(HANDLE_STDIN, nullptr, 0, nullptr, nullptr) == 0,
            "console queries fail as they do for a redirected handle");
@@ -2598,6 +2678,8 @@ void extended_tests() {
     expect(SetFilePointerEx(fh, 500, &pos, 0) == 1 && ReadFile(fh, buf, 4, &got, nullptr) == 1 && got == 0 && SetFilePointerEx(fh, 0, &pos, 1) == 1 && pos == 500, "seeking past the end is allowed and reads nothing there");
     expect(ReadFile(fh, buf, 4, &got, &got) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && got == 0 && SetEndOfFile(fh) == 0 && last_error() == pehost::ERROR_ACCESS_DENIED && SetEndOfFile(0x104) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE,
            "overlapped reads and truncation are refused");
+    g_stdin_feed = "";
+    g_stdin_taken = 0;
     expect(ReadFile(HANDLE_STDIN, buf, 4, &got, nullptr) == 1 && got == 0 && ReadFile(0x104, buf, 4, &got, nullptr) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && GetFileSizeEx(0x104, &size) == 0 && SetFilePointerEx(0x104, 0, &pos, 0) == 0,
            "standard input reads end of file and unknown handles fail");
     expect(CloseHandle(fh) == 1 && g_fake_closed == 1 && CloseHandle(fh) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && ReadFile(fh, buf, 1, &got, nullptr) == 0, "closing releases the platform file and a second close fails");

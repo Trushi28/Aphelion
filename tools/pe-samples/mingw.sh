@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
         check(self != NULL && (char *)self == (char *)&__ImageBase, "GetModuleHandle(NULL) is the image base");
         check(k32 != NULL && GetProcAddress(k32, "GetLastError") != NULL && GetProcAddress(k32, "NoSuchFunction") == NULL, "GetProcAddress");
         check(GetModuleHandleA("nosuch.dll") == NULL, "an unknown module is not found");
-        check(strstr(GetCommandLineA(), "pe.exe") != NULL, "GetCommandLineA");
+        check(strstr(GetCommandLineA(), ".exe") != NULL, "GetCommandLineA");
         check(GetModuleFileNameA(NULL, text, sizeof text) > 0, "GetModuleFileNameA");
     }
 
@@ -509,6 +509,39 @@ int main(void) {
 }
 C
 
+cat > "$OUT/argv.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    char text[256];
+    char module[MAX_PATH];
+    printf("argc=%d\n", argc);
+    for (int i = 0; i < argc; i++) printf("argv[%d]=<%s>\n", i, argv[i]);
+    printf("cmdline=<%s>\n", GetCommandLineA());
+    DWORD n = GetModuleFileNameA(NULL, module, sizeof(module));
+    printf("module=<%s>\n", n ? module : "?");
+    n = GetEnvironmentVariableA("GREETING", text, sizeof(text));
+    printf("GREETING=<%s>\n", n ? text : "unset");
+    n = GetEnvironmentVariableA("SHELL", text, sizeof(text));
+    printf("SHELL=<%s>\n", n ? text : "unset");
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    unsigned total = 0;
+    char data[512];
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(in, data + total, (DWORD)(sizeof(data) - 1 - total), &got, NULL) || got == 0) break;
+        total += got;
+        if (total >= sizeof(data) - 1) break;
+    }
+    data[total] = 0;
+    printf("stdin %u bytes\n", total);
+    if (total) printf("%s", data);
+    return argc;
+}
+C
+
 $CC -O2 "$OUT/stdio.c" -o "$OUT/stdio.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/gaps.c" -o "$OUT/gaps.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/crt.c" -o "$OUT/crt.exe"
@@ -519,12 +552,13 @@ $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllplug.c" -o "$OUT/dllplug.
 $CC -O1 -s -shared -nostdlib -Wl,-e,DllMain "$OUT/dllfail.c" -o "$OUT/dllfail.dll"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/dyn.c" "$OUT/dllchain.dll" -o "$OUT/dyn.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/sysio.c" -o "$OUT/sysio.exe"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/argv.c" -o "$OUT/argv.exe"
 $CC -O2 -Wl,--no-dynamicbase -Wl,--disable-reloc-section "$OUT/stdio.c" -o "$OUT/stdio-fixed.exe"
 $CC -O2 -s "$OUT/stdio.c" -o "$OUT/stdio-stripped.exe"
 $CC -O2 -ffreestanding -fno-stack-protector -nostdlib -Wl,-e,entry -Wl,--subsystem,console "$OUT/k32.c" -o "$OUT/k32.exe" -lkernel32
 
 if [ -x "$PEINFO" ]; then
-    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn sysio; do
+    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn sysio argv; do
         echo "================ $f.exe"
         "$PEINFO" "$OUT/$f.exe" || true
     done

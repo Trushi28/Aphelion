@@ -1,8 +1,10 @@
 #include <aphelion.hpp>
+#include <begin.hpp>
 #include <cosmos/fileabi.hpp>
 #include "call.hpp"
 #include "host.hpp"
 #include "ucrt.hpp"
+#include "win32x.hpp"
 
 namespace {
 
@@ -168,18 +170,59 @@ i32 dir_entry_hook(u64 index, char* name, u32 capacity, u64* size, u64* mtime_ms
     return 1;
 }
 
+u64 g_stdin = 0;
+
+i64 read_stdin_hook(void* buffer, u32 length) {
+    if (g_stdin == 0) return -1;
+    u64 want = length < fileabi::MAX_IO ? length : fileabi::MAX_IO;
+    return sys::file_read(g_stdin, 0, buffer, want);
+}
+
 pehost::Runtime g_runtime = { &exit_process, &write_console, &reserve_memory, &protect_memory, &sleep_ms, &read_file, &unmap_memory,
-                              &read_clock, &file_open_hook, &file_read_hook, &file_close_hook, &dir_entry_hook };
+                              &read_clock, &file_open_hook, &file_read_hook, &file_close_hook, &dir_entry_hook, &read_stdin_hook };
 pehost::Prepared g_prepared;
+
+constexpr u32 COMMAND_LINE = 1024;
+char g_command_line[COMMAND_LINE];
+begin::Start g_start;
+
+void seed_environment(const startup::Parsed& parsed) {
+    for (u32 i = 0; i < parsed.envc; ++i) {
+        char name[64];
+        const char* entry = parsed.env[i];
+        u32 n = 0;
+        while (entry[n] && entry[n] != '=' && n + 1 < sizeof(name)) {
+            name[n] = entry[n];
+            ++n;
+        }
+        if (entry[n] != '=') continue;
+        name[n] = 0;
+        pehost::win32::SetEnvironmentVariableA(name, entry + n + 1);
+    }
+}
 
 }
 
-extern "C" i64 aphelion_main(u64 file, u64 directory) {
+extern "C" i64 aphelion_main(u64 channel, u64) {
     Platform platform;
-    g_directory = directory;
+    if (channel == 0 || !begin::receive(channel, &g_start)) {
+        log("[pehost] no start-up message\n");
+        return pehost::STATUS_INVALID_IMAGE_FORMAT;
+    }
+    u64 file = g_start.handle[startup::PROGRAM];
+    g_directory = g_start.handle[startup::DIRECTORY];
+    g_stdin = g_start.handle[startup::STDIN];
+    if (file == 0) {
+        log("[pehost] the start-up message names no program\n");
+        return pehost::STATUS_INVALID_IMAGE_FORMAT;
+    }
+    if (!pehost::cmdline::join(g_start.parsed.argv, g_start.parsed.argc, g_command_line, sizeof(g_command_line))) {
+        log("[pehost] the arguments do not fit in a command line\n");
+        return pehost::STATUS_INVALID_IMAGE_FORMAT;
+    }
     fileabi::Stat st{};
     if (sys::file_stat(file, &st) != 0 || st.kind != fileabi::KIND_FILE) {
-        log("[pehost] the argument is not a file handle\n");
+        log("[pehost] the program is not a file handle\n");
         return pehost::STATUS_INVALID_IMAGE_FORMAT;
     }
     if (st.size == 0 || st.size > MAX_FILE) {
@@ -208,6 +251,7 @@ extern "C" i64 aphelion_main(u64 file, u64 directory) {
     platform.release(buffer, st.size);
     sys::handle_close(file);
     if (status != 0) return status;
-    pehost::attach(g_prepared, imports, pehost::Config{ "pe.exe", "pe.exe" });
+    pehost::attach(g_prepared, imports, pehost::Config{ g_command_line, g_start.parsed.argc ? g_start.parsed.argv[0] : "pe.exe" });
+    seed_environment(g_start.parsed);
     return pehost::start(platform, g_prepared);
 }

@@ -40,6 +40,9 @@ inline i64 handle_wait(void* entries, u64 count, u64 timeout_ms) { return call(u
 inline i64 file_stat(u64 file, void* out) { return call(userabi::SYS_FILE_STAT, file, reinterpret_cast<u64>(out)); }
 inline i64 file_read(u64 file, u64 offset, void* buffer, u64 length) { return call(userabi::SYS_FILE_READ, file, offset, reinterpret_cast<u64>(buffer), length); }
 inline i64 dir_entry(u64 dir, u64 index, void* out) { return call(userabi::SYS_DIR_ENTRY, dir, index, reinterpret_cast<u64>(out)); }
+inline i64 channel_recv(u64 channel, void* bytes, u64 capacity, u64* handles, u64 handle_capacity, u64 flags) {
+    return call(userabi::SYS_CHANNEL_RECV, channel, reinterpret_cast<u64>(bytes), capacity, reinterpret_cast<u64>(handles), handle_capacity, flags);
+}
 inline i64 clock(void* out) { return call(userabi::SYS_CLOCK, reinterpret_cast<u64>(out)); }
 inline i64 file_write(u64 file, u64 offset, const void* buffer, u64 length) {
     return call(userabi::SYS_FILE_WRITE, file, offset, reinterpret_cast<u64>(buffer), length);

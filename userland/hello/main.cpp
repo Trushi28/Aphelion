@@ -1,6 +1,14 @@
-#include <aphelion.hpp>
+#include <begin.hpp>
 
 namespace {
+
+bool same(const char* a, const char* b) {
+    while (*a && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
 
 u32 g_table[8] = { 3, 1, 4, 1, 5, 9, 2, 6 };
 u64 g_zero[64];
@@ -30,7 +38,11 @@ bool bss_is_zero() {
 }
 
 extern "C" i64 aphelion_main(u64 argument, u64) {
-    if (argument != 0) return 1;
+    if (argument != 0) {
+        begin::Start start;
+        if (!begin::receive(argument, &start)) return 1;
+        if (start.parsed.argc != 1 || !same(start.parsed.argv[0], "hello")) return 1;
+    }
     log(g_text);
     if (sum_table() != 31) return 2;
     if (!bss_is_zero()) return 3;

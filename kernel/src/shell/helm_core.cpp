@@ -14,6 +14,7 @@ constexpr u32 CANDIDATE_BYTES = 60;
 
 const Table* g_tables[MAX_TABLES];
 u32 g_table_count;
+ProgramResolver g_program_resolver;
 
 bool same(const char* a, const char* b) {
     while (*a && *a == *b) { ++a; ++b; }
@@ -267,6 +268,7 @@ bool expand_stage(Shell& sh, const parse::Parsed& p, u32 stage, Expanded& ex, Wr
         return false;
     }
     const Command* cmd = find_command(buf);
+    if (!cmd && g_program_resolver) cmd = g_program_resolver(buf);
     if (!cmd) {
         err.rgb(palette::SAND);
         err.str("  unknown command: ");
@@ -509,6 +511,8 @@ int run_pipe(Shell& sh, Work& w, const parse::Pipe& pipe) {
 }
 
 }
+
+void set_program_resolver(ProgramResolver resolver) { g_program_resolver = resolver; }
 
 bool register_table(const Table* table) {
     for (u32 i = 0; i < g_table_count; ++i)

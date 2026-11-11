@@ -9,6 +9,7 @@
 #include <cosmos/vmregion.hpp>
 #include <cosmos/apx.hpp>
 #include <cosmos/fileabi.hpp>
+#include <cosmos/startup.hpp>
 #include <stdio.h>
 #include <pthread.h>
 
@@ -1404,6 +1405,111 @@ static void clock_abi_tests() {
     expect(!userabi::tsc_usable(0, false, true) && userabi::tsc_usable(1, false, true) && !userabi::tsc_usable(~0ull, true, true), "clock abi: a zero frequency or an assumed one is never usable");
 }
 
+static bool same_text(const char* a, const char* b) {
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+
+static void startup_tests() {
+    u8 buf[startup::MAX_MESSAGE];
+    u32 len = 0;
+    const char* argv[] = { "prog", "-n", "two words", "" };
+    const char* env[] = { "A=1", "PATH=ram:/apps" };
+    u32 present = (1u << startup::PROGRAM) | (1u << startup::STDIN) | (1u << startup::STDOUT);
+    expect(startup::encode(argv, 4, env, 2, present, buf, sizeof(buf), &len) == startup::OK, "startup: encode succeeds");
+    expect(len == sizeof(startup::Header) + 5 + 3 + 10 + 1 + 4 + 15, "startup: length is header plus every string with its terminator");
+    startup::Parsed p;
+    expect(startup::decode(buf, len, 3, &p) == startup::OK, "startup: decode of a fresh encoding succeeds");
+    expect(p.argc == 4 && p.envc == 2 && p.present == present, "startup: counts and presence survive");
+    expect(same_text(p.argv[0], "prog") && same_text(p.argv[1], "-n") && same_text(p.argv[2], "two words") && same_text(p.argv[3], ""), "startup: arguments survive in order, including an empty one");
+    expect(p.argv[4] == nullptr && p.env[2] == nullptr, "startup: both lists are null-terminated");
+    expect(same_text(p.env[0], "A=1") && same_text(p.env[1], "PATH=ram:/apps"), "startup: environment survives in order");
+    expect(startup::handle_index(present, startup::PROGRAM) == 0 && startup::handle_index(present, startup::DIRECTORY) == -1 &&
+           startup::handle_index(present, startup::STDIN) == 1 && startup::handle_index(present, startup::STDOUT) == 2,
+           "startup: handle indices pack the present slots in slot order");
+    expect(startup::handle_index(present, 4) == -1 && !startup::has(present, 9), "startup: slots past the table are absent");
+
+    expect(startup::encode(nullptr, 0, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::OK && len == sizeof(startup::Header), "startup: an empty start-up is just the header");
+    expect(startup::decode(buf, len, 0, &p) == startup::OK && p.argc == 0 && p.argv[0] == nullptr && p.env[0] == nullptr, "startup: an empty start-up decodes to empty lists");
+
+    const char* many[startup::MAX_ARGS + 1];
+    for (u32 i = 0; i <= startup::MAX_ARGS; ++i) many[i] = "x";
+    expect(startup::encode(many, startup::MAX_ARGS, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::OK, "startup: the maximum argument count is accepted");
+    expect(startup::encode(many, startup::MAX_ARGS + 1, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_TOO_MANY, "startup: one argument past the maximum is refused");
+    expect(startup::encode(argv, 1, many, startup::MAX_ENV + 1, 0, buf, sizeof(buf), &len) == startup::ERR_TOO_MANY, "startup: one variable past the maximum is refused");
+
+    char big[startup::MAX_TEXT];
+    for (u32 i = 0; i < sizeof(big); ++i) big[i] = 'a';
+    big[sizeof(big) - 1] = 0;
+    const char* fits[] = { big };
+    expect(startup::encode(fits, 1, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::OK && len == startup::MAX_MESSAGE, "startup: text that fills the message exactly is accepted");
+    char over[startup::MAX_TEXT + 1];
+    for (u32 i = 0; i < sizeof(over) - 1; ++i) over[i] = 'a';
+    over[sizeof(over) - 1] = 0;
+    const char* too[] = { over };
+    expect(startup::encode(too, 1, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_TOO_LARGE && len == 0, "startup: text one byte past the message is refused and reports no length");
+    const char* split[] = { "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "cccccccccccccccccccccccccc" };
+    expect(startup::encode(split, 3, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_TOO_LARGE, "startup: the limit applies to the sum of all strings");
+    expect(startup::encode(argv, 1, nullptr, 0, 0x10, buf, sizeof(buf), &len) == startup::ERR_MALFORMED, "startup: a presence bit past the table is refused");
+    expect(startup::encode(argv, 1, nullptr, 0, 0, buf, sizeof(startup::Header) - 1, &len) == startup::ERR_MALFORMED, "startup: a buffer smaller than the header is refused");
+    const char* holes[] = { "a", nullptr };
+    expect(startup::encode(holes, 2, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_MALFORMED, "startup: a null string is refused");
+    expect(startup::encode(nullptr, 1, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_MALFORMED, "startup: a count without a list is refused");
+    u8 small[sizeof(startup::Header) + 4];
+    expect(startup::encode(argv, 2, nullptr, 0, 0, small, sizeof(small), &len) == startup::ERR_TOO_LARGE, "startup: a caller buffer smaller than the text is refused, not overrun");
+
+    startup::encode(argv, 4, env, 2, present, buf, sizeof(buf), &len);
+    u8 bad[startup::MAX_MESSAGE];
+    auto fresh = [&]() { for (u32 i = 0; i < len; ++i) bad[i] = buf[i]; };
+    fresh();
+    expect(startup::decode(bad, len, 2, &p) == startup::ERR_MALFORMED, "startup: a handle count that disagrees with presence is refused");
+    expect(startup::decode(bad, len, 4, &p) == startup::ERR_MALFORMED, "startup: more handles than presence bits is refused");
+    expect(startup::decode(bad, len - 1, 3, &p) == startup::ERR_MALFORMED, "startup: a truncated message is refused");
+    expect(startup::decode(bad, sizeof(startup::Header) - 1, 0, &p) == startup::ERR_MALFORMED, "startup: a message shorter than the header is refused");
+    expect(startup::decode(nullptr, 0, 0, &p) == startup::ERR_MALFORMED, "startup: a null message is refused");
+    expect(startup::decode(bad, startup::MAX_MESSAGE + 1, 3, &p) == startup::ERR_MALFORMED, "startup: a message longer than a channel can carry is refused");
+    bad[0] ^= 1;
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: a wrong magic is refused");
+    fresh();
+    bad[4] = 2;
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_VERSION, "startup: a newer version is reported as such");
+    fresh();
+    bad[6] = static_cast<u8>(startup::MAX_ARGS + 1);
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_TOO_MANY, "startup: an argument count past the maximum is refused");
+    fresh();
+    bad[6] = 3;
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: fewer arguments declared than strings present is refused");
+    fresh();
+    bad[6] = 5;
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: more strings declared than present is refused");
+    fresh();
+    bad[len - 1] = 'x';
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: text that is not terminated is refused");
+    fresh();
+    bad[14] = 1;
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: a nonzero reserved field is refused");
+    fresh();
+    bad[10] = 0x1F;
+    expect(startup::decode(bad, len, 5, &p) == startup::ERR_MALFORMED, "startup: a presence bit past the table is refused on decode");
+    fresh();
+    bad[12] = static_cast<u8>(bad[12] + 1);
+    expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: a text length that disagrees with the message is refused");
+    expect(p.argc == 0 && p.argv[0] == nullptr, "startup: a refused decode leaves empty lists behind");
+    u8 hdr_only[sizeof(startup::Header)];
+    startup::encode(nullptr, 0, nullptr, 0, 0, hdr_only, sizeof(hdr_only), &len);
+    hdr_only[6] = 1;
+    expect(startup::decode(hdr_only, len, 0, &p) == startup::ERR_MALFORMED, "startup: strings declared with no text is refused");
+    u8 flood[startup::MAX_MESSAGE] = {};
+    startup::encode(nullptr, 0, nullptr, 0, 0, flood, sizeof(flood), &len);
+    u16 flood_text = startup::MAX_TEXT;
+    flood[12] = static_cast<u8>(flood_text & 0xFF);
+    flood[13] = static_cast<u8>(flood_text >> 8);
+    flood[6] = 1;
+    expect(startup::decode(flood, startup::MAX_MESSAGE, 0, &p) == startup::ERR_MALFORMED && p.argc == 0, "startup: a message of empty strings cannot write past the parsed lists");
+}
+
 int main() {
     entry_fence_tests();
     range_tests();
@@ -1423,6 +1529,7 @@ int main() {
     apx_layout_tests();
     file_abi_tests();
     clock_abi_tests();
+    startup_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

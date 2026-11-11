@@ -358,7 +358,37 @@ i32 child_dir_entry(u64 index, char* name, u32 capacity, u64* size, u64* mtime_m
     return result;
 }
 
-pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap, &child_clock, &child_file_open, &child_file_read, &child_file_close, &child_dir_entry };
+const char* g_stdin_text = nullptr;
+u32 g_stdin_length = 0;
+u32 g_stdin_position = 0;
+const char* g_env_seed[8];
+u32 g_env_seed_count = 0;
+
+i64 child_read_stdin(void* buffer, u32 length) {
+    if (!g_stdin_text) return -1;
+    u32 left = g_stdin_length - g_stdin_position;
+    u32 n = length < left ? length : left;
+    for (u32 i = 0; i < n; ++i) static_cast<char*>(buffer)[i] = g_stdin_text[g_stdin_position + i];
+    g_stdin_position += n;
+    return n;
+}
+
+void seed_child_environment() {
+    for (u32 i = 0; i < g_env_seed_count; ++i) {
+        char name[64];
+        const char* entry = g_env_seed[i];
+        u32 n = 0;
+        while (entry[n] && entry[n] != '=' && n + 1 < sizeof(name)) {
+            name[n] = entry[n];
+            ++n;
+        }
+        if (entry[n] != '=') continue;
+        name[n] = 0;
+        pehost::win32::SetEnvironmentVariableA(name, entry + n + 1);
+    }
+}
+
+pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap, &child_clock, &child_file_open, &child_file_read, &child_file_close, &child_dir_entry, &child_read_stdin };
 
 const char* g_command_line = "pe.exe";
 
@@ -404,6 +434,7 @@ void run_child(const u8* file, usize size, Result* r) {
         i64 st = pehost::load(g_platform, file, size, table, &g_prepared);
         if (st == 0) {
             pehost::attach(g_prepared, pehost::all_imports(), pehost::Config{ g_command_line, "pe.exe" });
+            seed_child_environment();
             st = pehost::start(g_platform, g_prepared);
         }
         lx(SYS_WRITE, static_cast<u64>(g_status_fd), reinterpret_cast<u64>(&st), 8);
@@ -915,7 +946,12 @@ int main(int argc, char** argv) {
         const char* line = "pe.exe";
         for (int i = 3; i < argc; ++i) {
             if (equals(argv[i], "--dlls") && i + 1 < argc) g_dll_dir = argv[++i];
-            else line = argv[i];
+            else if (equals(argv[i], "--env") && i + 1 < argc && g_env_seed_count < 8) g_env_seed[g_env_seed_count++] = argv[++i];
+            else if (equals(argv[i], "--stdin") && i + 1 < argc) {
+                g_stdin_text = argv[++i];
+                g_stdin_length = 0;
+                while (g_stdin_text[g_stdin_length]) ++g_stdin_length;
+            } else line = argv[i];
         }
         return run_file(argv[2], line);
     }

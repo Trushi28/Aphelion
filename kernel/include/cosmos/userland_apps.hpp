@@ -10,6 +10,8 @@ enum class Outcome : u32 {
     NotFound,
     LaunchFailed,
     Interrupted,
+    BadArguments,
+    InputTooLarge,
 };
 
 struct Report {
@@ -21,7 +23,24 @@ struct Report {
 using Emit = void (*)(void* ctx, const char* text, u32 length);
 using Interrupted = bool (*)(void* ctx);
 
+constexpr u32 MAX_INPUT = 65536;
+
+struct Request {
+    const char* name = nullptr;
+    const char* const* args = nullptr;
+    u32 arg_count = 0;
+    const char* const* env = nullptr;
+    u32 env_count = 0;
+    const char* input = nullptr;
+    u32 input_length = 0;
+    Emit emit = nullptr;
+    Interrupted interrupted = nullptr;
+    void* ctx = nullptr;
+};
+
 bool install();
+bool exists(const char* name);
+Report run(const Request& request);
 Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx);
 
 }

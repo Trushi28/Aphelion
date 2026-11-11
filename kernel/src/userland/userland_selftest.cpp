@@ -14,11 +14,16 @@
 #include <cosmos/memobj.hpp>
 #include <cosmos/pmm.hpp>
 #include <cosmos/serial.hpp>
+#include <cosmos/startup.hpp>
 
 extern "C" const u8 isr_common[];
 extern "C" const u8 isr_paranoid[];
 extern "C" const u8 apx_hello_start[];
 extern "C" const u8 apx_hello_end[];
+extern "C" const u8 apx_echo_start[];
+extern "C" const u8 apx_echo_end[];
+extern "C" const u8 pe_argv_start[];
+extern "C" const u8 pe_argv_end[];
 extern "C" const u8 apx_pehost_start[];
 extern "C" const u8 apx_pehost_end[];
 extern "C" const u8 pe_console_start[];
@@ -620,16 +625,113 @@ bool put_blob(lens::Domain& d, lens::Lens dir, const char* name, const u8* begin
     return lens::put(d, dir, name, lens::ConstBytes(begin, static_cast<usize>(end - begin))).ok();
 }
 
+struct Captured {
+    char text[1024];
+    u32 length;
+};
+
+void capture_into(void* ctx, const char* text, u32 length) {
+    Captured* c = static_cast<Captured*>(ctx);
+    for (u32 i = 0; i < length && c->length + 1 < sizeof(c->text); ++i) c->text[c->length++] = text[i];
+    c->text[c->length] = 0;
+}
+
+bool same_text(const char* a, const char* b) {
+    while (*a && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+struct Started {
+    const char* name;
+    bool pe;
+    const char* const* args;
+    u32 argc;
+    const char* const* env;
+    u32 envc;
+    const char* input;
+    u32 input_length;
+};
+
+bool run_started(lens::Table& K, lens::Lens root, lens::Lens apps, const Started& s, i32 want_status, const char* want_text, const char* what) {
+    lens::Lens file;
+    Startup startup;
+    startup.argv = s.args;
+    startup.argc = s.argc;
+    startup.env = s.env;
+    startup.envc = s.envc;
+    lens::Result<lens::Lens> library = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
+    bool ready = library.ok();
+    if (ready) startup.directory = library.value();
+    const char* label = nullptr;
+    if (ready && s.pe) {
+        lens::Result<lens::Lens> host = lens::open_at(K.domain, apps, "pehost", lens::Right::Read | lens::Right::Execute);
+        lens::Result<lens::Lens> prog = lens::open_at(K.domain, apps, s.name, lens::Right::Read | lens::Right::Delegate);
+        ready = host.ok() && prog.ok();
+        if (ready) {
+            file = host.value();
+            startup.program = prog.value();
+            label = "pehost";
+        }
+    } else if (ready) {
+        lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, s.name, lens::Right::Read | lens::Right::Execute);
+        ready = f.ok();
+        if (ready) file = f.value();
+    }
+    if (ready && s.input) {
+        lens::Lens reader, writer;
+        ready = lens::make_pipe(K.domain, s.input_length ? s.input_length : 1, &reader, &writer).ok();
+        if (ready && s.input_length) {
+            lens::Result<usize> put = lens::write(K.domain, writer, 0, lens::ConstBytes(reinterpret_cast<const u8*>(s.input), s.input_length));
+            ready = put.ok() && put.value() == s.input_length;
+        }
+        if (ready) {
+            ready = lens::close(K.domain, writer).ok();
+            startup.input = reader;
+        }
+    }
+    Captured captured;
+    captured.length = 0;
+    captured.text[0] = 0;
+    i64 error = -1;
+    Process* p = nullptr;
+    if (ready) {
+        set_console(&capture_into, &captured);
+        p = launch_started(label, K, file, startup, &error);
+    }
+    i32 status = -1;
+    bool finished = p && wait(p, &status, WAIT_MS);
+    set_console(nullptr, nullptr);
+    bool good = finished && status == want_status && same_text(captured.text, want_text);
+    good = (p && reap(p)) && good;
+    serial::printf("[userland] %s: status %d, expected %d, output %s%s\n", what, status, want_status, same_text(captured.text, want_text) ? "as expected" : "DIFFERS", good ? "" : "  <-- wrong");
+    if (!good) serial::printf("[userland]   got [%s] error %ld\n", captured.text, error);
+    if (!file.is_null()) (void)lens::close(K.domain, file);
+    return good;
+}
+
 bool run_pe(lens::Table& K, lens::Lens root, lens::Lens apps, const char* name, i32 want) {
+    const char* argv[] = { name };
+    Startup startup;
+    startup.argv = argv;
+    startup.argc = 1;
     lens::Result<lens::Lens> host = lens::open_at(K.domain, apps, "pehost", lens::Right::Read | lens::Right::Execute);
     lens::Result<lens::Lens> prog = lens::open_at(K.domain, apps, name, lens::Right::Read | lens::Right::Delegate);
     lens::Result<lens::Lens> library = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
     i64 error = -1;
-    Process* p = host.ok() && prog.ok() && library.ok() ? launch_file("pehost", K, host.value(), &K, prog.value(), &error, library.value()) : nullptr;
+    Process* p = nullptr;
+    if (host.ok() && prog.ok() && library.ok()) {
+        startup.program = prog.value();
+        startup.directory = library.value();
+        p = launch_started("pehost", K, host.value(), startup, &error);
+    }
     i32 status = -1;
     bool good = p && wait(p, &status, WAIT_MS) && status == want;
     good = (p && reap(p)) && good;
     serial::printf("[userland] %s through the PE host: status %d, expected %d%s\n", name, status, want, good ? "" : "  <-- wrong");
+    if (host.ok()) (void)lens::close(K.domain, host.value());
     return good;
 }
 
@@ -675,6 +777,8 @@ bool run_files() {
                put_blob(K.domain, apps, "dllfail.dll", pe_dllfail_start, pe_dllfail_end) &&
                put_blob(K.domain, apps, "dyn.exe", pe_dyn_start, pe_dyn_end) &&
                put_blob(K.domain, apps, "sysio.exe", pe_sysio_start, pe_sysio_end) &&
+               put_blob(K.domain, apps, "argv.exe", pe_argv_start, pe_argv_end) &&
+               put_blob(K.domain, apps, "echo", apx_echo_start, apx_echo_end) &&
                lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
                lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
     lens::Result<lens::Lens> badw = lens::open_at(K.domain, apps, "bad", lens::Right::Read | lens::Right::Write);
@@ -730,6 +834,64 @@ bool run_files() {
         pe = run_pe(K, root, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
         pe = run_pe(K, root, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;
         ok = pe && ok;
+    }
+    {
+        const char* echo_args[] = { "echo", "one", "two words" };
+        const char* bare[] = { "echo" };
+        const char* hello_args[] = { "hello" };
+        const char* tricky[] = { "argv.exe", "x", "a \"q\" b", "", "back\\" };
+        const char* env[] = { "GREETING=hi there", "SHELL=helm" };
+        bool started = run_started(K, root, apps, Started{ "echo", false, echo_args, 3, nullptr, 0, "from stdin\n", 11 }, 0, "one two words\nfrom stdin\n",
+                                   "a native program given arguments and standard input");
+        started = run_started(K, root, apps, Started{ "echo", false, bare, 1, nullptr, 0, nullptr, 0 }, 0, "\n", "a native program given no input") && started;
+        started = run_started(K, root, apps, Started{ "echo", false, bare, 1, nullptr, 0, "", 0 }, 0, "\n", "a native program given empty input that is already closed") && started;
+        started = run_started(K, root, apps, Started{ "hello", false, hello_args, 1, nullptr, 0, nullptr, 0 }, 42, "hello from a C++ APX program\n",
+                              "a native program that checks its own start-up message") && started;
+        started = run_started(K, root, apps, Started{ "argv.exe", true, tricky, 5, env, 2, "ab\ncd\n", 6 }, 5,
+                              "argc=5\nargv[0]=<argv.exe>\nargv[1]=<x>\nargv[2]=<a \"q\" b>\nargv[3]=<>\nargv[4]=<back\\>\n"
+                              "cmdline=<argv.exe x \"a \\\"q\\\" b\" \"\" back\\>\nmodule=<argv.exe>\nGREETING=<hi there>\nSHELL=<helm>\nstdin 6 bytes\nab\ncd\n",
+                              "a Windows program given arguments, an environment and standard input") && started;
+        ok = started && ok;
+    }
+    {
+        lens::Result<lens::Lens> echo = lens::open_at(K.domain, apps, "echo", lens::Right::Read | lens::Right::Execute);
+        lens::Result<lens::Lens> plain = lens::open_at(K.domain, apps, "hello", lens::Right::Read);
+        bool refused_ok = echo.ok() && plain.ok();
+        if (refused_ok) {
+            const char* many[startup::MAX_ARGS + 1];
+            for (u32 i = 0; i <= startup::MAX_ARGS; ++i) many[i] = "x";
+            const char* holes[] = { "a", nullptr };
+            char big[startup::MAX_MESSAGE];
+            for (u32 i = 0; i + 1 < sizeof(big); ++i) big[i] = 'a';
+            big[sizeof(big) - 1] = 0;
+            const char* fat[] = { big };
+            u32 before = live_processes();
+            u32 handles_before = lens::live_count(K.domain);
+            i64 e1 = 0, e2 = 0, e3 = 0, e4 = 0;
+            Startup t1;
+            t1.argv = many;
+            t1.argc = startup::MAX_ARGS + 1;
+            Startup t2;
+            t2.argv = holes;
+            t2.argc = 2;
+            Startup t3;
+            t3.argv = fat;
+            t3.argc = 1;
+            Startup t4;
+            t4.directory = plain.value();
+            Process* p1 = launch_started("t", K, echo.value(), t1, &e1);
+            Process* p2 = launch_started("t", K, echo.value(), t2, &e2);
+            Process* p3 = launch_started("t", K, echo.value(), t3, &e3);
+            Process* p4 = launch_started("t", K, echo.value(), t4, &e4);
+            bool good = !p1 && !p2 && !p3 && !p4 && e1 == handleabi::ERR_TOOBIG && e2 == userabi::ERR_INVAL && e3 == handleabi::ERR_TOOBIG &&
+                        e4 == handleabi::ERR_DENIED && live_processes() == before && lens::live_count(K.domain) == handles_before && frames_live() == 0;
+            serial::printf("[userland] start-up refusals: too many arguments %ld, a null argument %ld, too much text %ld, a handle that cannot be delegated %ld, nothing leaked: %s%s\n",
+                            e1, e2, e3, e4, good ? "yes" : "NO", good ? "" : "  <-- wrong");
+            ok = good && ok;
+        } else {
+            serial::writeln("[userland] file cases: could not open the start-up refusal targets");
+            ok = false;
+        }
     }
     {
         lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "datainit", run);

@@ -1,6 +1,7 @@
 #include <cosmos/userland_apps.hpp>
 #include <cosmos/userland.hpp>
 #include <cosmos/lens_channel.hpp>
+#include <cosmos/startup.hpp>
 #include <cosmos/lens_text.hpp>
 #include <cosmos/mutex.hpp>
 #include <cosmos/cpu.hpp>
@@ -8,6 +9,8 @@
 
 extern "C" const u8 apx_hello_start[];
 extern "C" const u8 apx_hello_end[];
+extern "C" const u8 apx_echo_start[];
+extern "C" const u8 apx_echo_end[];
 extern "C" const u8 apx_pehost_start[];
 extern "C" const u8 apx_pehost_end[];
 extern "C" const u8 pe_console_start[];
@@ -36,6 +39,8 @@ extern "C" const u8 pe_dyn_start[];
 extern "C" const u8 pe_dyn_end[];
 extern "C" const u8 pe_sysio_start[];
 extern "C" const u8 pe_sysio_end[];
+extern "C" const u8 pe_argv_start[];
+extern "C" const u8 pe_argv_end[];
 
 namespace userland::apps {
 
@@ -49,6 +54,7 @@ struct Entry {
 
 const Entry ENTRIES[] = {
     { "hello", apx_hello_start, apx_hello_end },
+    { "echo", apx_echo_start, apx_echo_end },
     { "pehost", apx_pehost_start, apx_pehost_end },
     { "console.exe", pe_console_start, pe_console_end },
     { "k32.exe", pe_k32_start, pe_k32_end },
@@ -63,6 +69,7 @@ const Entry ENTRIES[] = {
     { "dllfail.dll", pe_dllfail_start, pe_dllfail_end },
     { "dyn.exe", pe_dyn_start, pe_dyn_end },
     { "sysio.exe", pe_sysio_start, pe_sysio_end },
+    { "argv.exe", pe_argv_start, pe_argv_end },
 };
 
 constexpr const char* DIRECTORY = "apps";
@@ -124,6 +131,50 @@ bool plain_name(const char* name) {
     return true;
 }
 
+constexpr u32 NAME_CAP = 56;
+
+bool has_dot(const char* name) {
+    for (u32 i = 0; name[i]; ++i) {
+        if (name[i] == '.') return true;
+    }
+    return false;
+}
+
+void with_suffix(const char* name, char* out) {
+    u32 n = 0;
+    while (name[n] && n + 1 < NAME_CAP) {
+        out[n] = name[n];
+        ++n;
+    }
+    out[n] = 0;
+    if (!has_dot(name)) {
+        const char suffix[] = ".exe";
+        for (u32 i = 0; i < sizeof(suffix) && n + i < NAME_CAP; ++i) out[n + i] = suffix[i];
+        out[NAME_CAP - 1] = 0;
+    }
+}
+
+bool probe_program(lens::Lens dir, const char* name, char* canon, bool* is_pe) {
+    char suffixed[NAME_CAP];
+    with_suffix(name, suffixed);
+    const char* tries[2] = { name, suffixed };
+    for (const char* candidate : tries) {
+        lens::Result<lens::Lens> probe = lens::open_at(g_table.domain, dir, candidate, lens::Right::Read);
+        if (!probe.ok()) continue;
+        u32 n = 0;
+        while (candidate[n] && n + 1 < NAME_CAP) {
+            canon[n] = candidate[n];
+            ++n;
+        }
+        canon[n] = 0;
+        u8 magic[2] = { 0, 0 };
+        lens::Result<usize> got = lens::read(g_table.domain, probe.value(), 0, lens::Bytes(magic, sizeof(magic)));
+        *is_pe = got.ok() && got.value() == 2 && magic[0] == 'M' && magic[1] == 'Z';
+        return true;
+    }
+    return false;
+}
+
 bool root_of(lens::Lens* out) {
     lens::Result<lens::Lens> r = lens::delegate(lens::boot_domain(), lens::boot_root("ram"), g_table.domain, lens::Rights::all());
     if (!r.ok()) return false;
@@ -131,6 +182,22 @@ bool root_of(lens::Lens* out) {
     return true;
 }
 
+}
+
+bool exists(const char* name) {
+    if (!supported() || !plain_name(name)) return false;
+    g_gate.lock();
+    bool found = false;
+    lens::Lens root;
+    if (root_of(&root)) {
+        lens::Result<lens::Lens> dir = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read);
+        char canon[NAME_CAP];
+        bool is_pe = false;
+        found = dir.ok() && probe_program(dir.value(), name, canon, &is_pe);
+    }
+    lens::close_all(g_table.domain);
+    g_gate.unlock();
+    return found;
 }
 
 bool install() {
@@ -156,6 +223,19 @@ bool install() {
 }
 
 Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx) {
+    Request request;
+    request.name = name;
+    request.emit = emit;
+    request.interrupted = interrupted;
+    request.ctx = ctx;
+    return run(request);
+}
+
+Report run(const Request& request) {
+    const char* name = request.name;
+    Emit emit = request.emit;
+    Interrupted interrupted = request.interrupted;
+    void* ctx = request.ctx;
     Report report{ Outcome::Finished, 0, 0 };
     if (!supported()) {
         report.outcome = Outcome::Unavailable;
@@ -164,6 +244,34 @@ Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx) {
     if (!plain_name(name)) {
         report.outcome = Outcome::BadName;
         return report;
+    }
+    if (request.input_length > MAX_INPUT || (request.input_length && !request.input)) {
+        report.outcome = Outcome::InputTooLarge;
+        return report;
+    }
+    const char* argv[startup::MAX_ARGS];
+    u32 argc = 0;
+    if (request.arg_count > startup::MAX_ARGS - 1 || (request.arg_count && !request.args)) {
+        report.outcome = Outcome::BadArguments;
+        return report;
+    }
+    char canon[NAME_CAP];
+    with_suffix(name, canon);
+    argv[argc++] = canon;
+    for (u32 i = 0; i < request.arg_count; ++i) {
+        if (!request.args[i]) {
+            report.outcome = Outcome::BadArguments;
+            return report;
+        }
+        argv[argc++] = request.args[i];
+    }
+    {
+        u8 probe_message[startup::MAX_MESSAGE];
+        u32 probe_length = 0;
+        if (startup::encode(argv, argc, request.env, request.env_count, 0, probe_message, sizeof(probe_message), &probe_length) != startup::OK) {
+            report.outcome = Outcome::BadArguments;
+            return report;
+        }
     }
     g_gate.lock();
     lens::Lens root;
@@ -178,15 +286,7 @@ Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx) {
     }
     bool is_pe = false;
     bool found = false;
-    if (have_dir) {
-        lens::Result<lens::Lens> probe = lens::open_at(g_table.domain, dir, name, lens::Right::Read);
-        if (probe.ok()) {
-            found = true;
-            u8 magic[2] = { 0, 0 };
-            lens::Result<usize> got = lens::read(g_table.domain, probe.value(), 0, lens::Bytes(magic, sizeof(magic)));
-            is_pe = got.ok() && got.value() == 2 && magic[0] == 'M' && magic[1] == 'Z';
-        }
-    }
+    if (have_dir) found = probe_program(dir, name, canon, &is_pe);
     if (!found) {
         lens::close_all(g_table.domain);
         g_gate.unlock();
@@ -194,24 +294,49 @@ Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx) {
         return report;
     }
 
+    Startup begin;
+    begin.argv = argv;
+    begin.argc = argc;
+    begin.env = request.env;
+    begin.envc = request.env_count;
+    bool prepared = true;
+    lens::Result<lens::Lens> cwd = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
+    prepared = cwd.ok();
+    if (prepared) begin.directory = cwd.value();
+    if (prepared && request.input) {
+        lens::Lens reader, writer;
+        usize size = request.input_length ? request.input_length : 1;
+        prepared = lens::make_pipe(g_table.domain, size, &reader, &writer).ok();
+        if (prepared && request.input_length) {
+            lens::Result<usize> put = lens::write(g_table.domain, writer, 0, lens::ConstBytes(reinterpret_cast<const u8*>(request.input), request.input_length));
+            prepared = put.ok() && put.value() == request.input_length;
+        }
+        if (prepared) {
+            prepared = lens::close(g_table.domain, writer).ok();
+            begin.input = reader;
+        }
+    }
+
     Process* p = nullptr;
     i64 error = -1;
-    if (is_pe) {
+    lens::Lens launched;
+    const char* label = nullptr;
+    if (prepared && is_pe) {
         lens::Result<lens::Lens> host = lens::open_at(g_table.domain, dir, "pehost", lens::Right::Read | lens::Right::Execute);
-        lens::Result<lens::Lens> prog = lens::open_at(g_table.domain, dir, name, lens::Right::Read | lens::Right::Delegate);
-        lens::Result<lens::Lens> library = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
-        if (host.ok() && prog.ok() && library.ok()) {
-            g_capture.head = g_capture.tail = g_capture.dropped = 0;
-            set_console(&capture_put, nullptr);
-            p = launch_file("pehost", g_table, host.value(), &g_table, prog.value(), &error, library.value());
+        lens::Result<lens::Lens> prog = lens::open_at(g_table.domain, dir, canon, lens::Right::Read | lens::Right::Delegate);
+        if (host.ok() && prog.ok()) {
+            begin.program = prog.value();
+            launched = host.value();
+            label = "pehost";
         }
-    } else {
-        lens::Result<lens::Lens> file = lens::open_at(g_table.domain, dir, name, lens::Right::Read | lens::Right::Execute);
-        if (file.ok()) {
-            g_capture.head = g_capture.tail = g_capture.dropped = 0;
-            set_console(&capture_put, nullptr);
-            p = launch_file(nullptr, g_table, file.value(), nullptr, lens::Lens(), &error);
-        }
+    } else if (prepared) {
+        lens::Result<lens::Lens> file = lens::open_at(g_table.domain, dir, canon, lens::Right::Read | lens::Right::Execute);
+        if (file.ok()) launched = file.value();
+    }
+    if (!launched.is_null()) {
+        g_capture.head = g_capture.tail = g_capture.dropped = 0;
+        set_console(&capture_put, nullptr);
+        p = launch_started(label, g_table, launched, begin, &error);
     }
     if (!p) {
         set_console(nullptr, nullptr);

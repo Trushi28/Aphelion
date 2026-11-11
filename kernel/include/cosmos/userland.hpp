@@ -24,6 +24,19 @@ void init_core(u32 core_index);
 Process* launch(const char* name, const Image& image);
 Process* launch_with(const char* name, const Image& image, lens::Table& from, lens::Lens handle);
 Process* launch_file(const char* name, lens::Table& files, lens::Lens file, lens::Table* from, lens::Lens handle, i64* error, lens::Lens handle2 = lens::Lens());
+
+struct Startup {
+    const char* const* argv = nullptr;
+    u32 argc = 0;
+    const char* const* env = nullptr;
+    u32 envc = 0;
+    lens::Lens program;
+    lens::Lens directory;
+    lens::Lens input;
+    lens::Lens output;
+};
+
+Process* launch_started(const char* name, lens::Table& table, lens::Lens file, const Startup& startup, i64* error);
 u32 sweep_detached();
 bool wait(Process* p, i32* status, u64 timeout_ms);
 bool reap(Process* p);

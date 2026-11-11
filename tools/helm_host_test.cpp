@@ -725,6 +725,54 @@ static void test_typed_rows() {
     sh("go ram:/; fade tree: yes rt");
 }
 
+static int fake_program(helm::Shell&, helm::Io& io, u32 argc, char** argv) {
+    io.out.str("prog:");
+    for (u32 i = 1; i < argc; ++i) {
+        io.out.put(' ');
+        io.out.str(argv[i]);
+    }
+    if (io.has_in) {
+        io.out.str(" in=[");
+        io.out.bytes(reinterpret_cast<const char*>(io.in), static_cast<u32>(io.in_size));
+        io.out.put(']');
+    }
+    io.out.put('\n');
+    for (u32 i = 1; i < argc; ++i)
+        if (same(argv[i], "fail")) return 3;
+    return 0;
+}
+
+static const helm::Command FAKE_PROGRAM = { "program", "name [arguments...]", "a stand-in program", &fake_program };
+
+static char g_last_resolved[64];
+static const helm::Command* fake_resolver(const char* name) {
+    u32 n = 0;
+    while (name[n] && n + 1 < sizeof(g_last_resolved)) {
+        g_last_resolved[n] = name[n];
+        ++n;
+    }
+    g_last_resolved[n] = 0;
+    return same(name, "tool") || same(name, "say") ? &FAKE_PROGRAM : nullptr;
+}
+
+static void test_programs() {
+    CHECK(out_is("tool one", "  unknown command: tool\n  try help\n") && g_status == 127, "a program name is unknown before any resolver is installed");
+    helm::set_program_resolver(&fake_resolver);
+    CHECK(out_is("tool", "prog:\n") && g_status == 0, "a program name on its own runs it with no arguments");
+    CHECK(out_is("tool a \"b c\" 'd'", "prog: a b c d\n"), "arguments reach the program, quoted words staying whole");
+    CHECK(out_is("bind who world; tool hello @who", "prog: hello world\n"), "bound names are expanded in program arguments");
+    CHECK(out_is("say plain", "plain\n"), "a built-in verb wins over a program of the same name");
+    CHECK(out_is("say hello | tool", "prog: in=[hello\n]\n"), "text from the previous stage reaches the program as input");
+    CHECK(out_is("tool x | tool y", "prog: y in=[prog: x\n]\n"), "one program's output is the next program's input");
+    CHECK(out_is("tool fail; say @status", "prog: fail\n3\n"), "a program's exit status becomes the shell status");
+    CHECK(out_is("nosuchprogram", "  unknown command: nosuchprogram\n  try help\n") && g_status == 127, "a name that is neither a verb nor a program is still unknown");
+    CHECK(same(g_last_resolved, "nosuchprogram"), "the resolver is asked with the name as typed");
+    CHECK(out_has("tool one two | tally", "1") && out_has("tool one two | tally", "3") && out_has("tool one two | tally", "14"), "a program's text output can feed a verb that counts lines, words and bytes");
+    CHECK(out_has("tool *.zzz", "no match") && g_status != 0, "a wildcard in program arguments that matches nothing is refused like for any other command");
+    helm::set_program_resolver(nullptr);
+    CHECK(out_is("tool one", "  unknown command: tool\n  try help\n") && g_status == 127, "removing the resolver makes program names unknown again");
+}
+
 int main() {
     g_sectors = 131072;
     g_disk = static_cast<u8*>(calloc(g_sectors, 512));
@@ -756,6 +804,7 @@ int main() {
     test_disk();
     test_console_lens();
     test_typed_rows();
+    test_programs();
     helm::shutdown(shell);
 
     printf("%d checks, %d failed\n", g_checks, g_fail);

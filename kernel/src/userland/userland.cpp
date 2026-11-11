@@ -9,6 +9,7 @@
 #include <cosmos/memobj.hpp>
 #include <cosmos/apx.hpp>
 #include <cosmos/fileabi.hpp>
+#include <cosmos/startup.hpp>
 #include <cosmos/kheap.hpp>
 #include <cosmos/vmregion.hpp>
 #include <cosmos/apic.hpp>
@@ -1388,6 +1389,47 @@ Process* launch_with(const char* name, const Image& image, lens::Table& from, le
 
 Process* launch_file(const char* name, lens::Table& files, lens::Lens file, lens::Table* from, lens::Lens handle, i64* error, lens::Lens handle2) {
     return spawn_file(files, file, name, from, handle, handle2, error);
+}
+
+Process* launch_started(const char* name, lens::Table& table, lens::Lens file, const Startup& startup, i64* error) {
+    i64 scratch = 0;
+    if (!error) error = &scratch;
+    *error = 0;
+    lens::Lens handles[startup::MAX_HANDLES];
+    u32 count = 0;
+    u32 present = 0;
+    const lens::Lens* wanted[startup::SLOT_COUNT] = { &startup.program, &startup.directory, &startup.input, &startup.output };
+    for (u32 slot = 0; slot < startup::SLOT_COUNT; ++slot) {
+        if (wanted[slot]->is_null()) continue;
+        present |= 1u << slot;
+        handles[count++] = *wanted[slot];
+    }
+    u8 message[startup::MAX_MESSAGE];
+    u32 length = 0;
+    i32 encoded = startup::encode(startup.argv, startup.argc, startup.env, startup.envc, present, message, sizeof(message), &length);
+    if (encoded != startup::OK) {
+        *error = (encoded == startup::ERR_TOO_MANY || encoded == startup::ERR_TOO_LARGE) ? handleabi::ERR_TOOBIG : userabi::ERR_INVAL;
+        return nullptr;
+    }
+    lens::Lens mine, theirs;
+    lens::Done made = lens::channel::create(table, &mine, &theirs);
+    if (!made.ok()) {
+        *error = handleabi::error_of(made.status());
+        return nullptr;
+    }
+    lens::Done sent = lens::channel::send(table, mine, lens::ConstBytes(message, length), handles, count);
+    if (!sent.ok()) {
+        *error = handleabi::error_of(sent.status());
+        TableGuard guard(table.lock);
+        (void)lens::close(table.domain, mine);
+        (void)lens::close(table.domain, theirs);
+        return nullptr;
+    }
+    Process* p = spawn_file(table, file, name, &table, theirs, lens::Lens(), error);
+    TableGuard guard(table.lock);
+    (void)lens::close(table.domain, mine);
+    if (!p) (void)lens::close(table.domain, theirs);
+    return p;
 }
 
 void set_console(ConsoleFn fn, void* ctx) {
