@@ -64,6 +64,38 @@ struct MemoryBasicInformation {
 
 static_assert(sizeof(MemoryBasicInformation) == 48);
 
+struct UnicodeString {
+    u16 length;
+    u16 maximum;
+    u32 padding;
+    u64 buffer;
+};
+
+struct ProcessParameters {
+    u32 maximum_length;
+    u32 length;
+    u32 flags;
+    u32 debug_flags;
+    u64 console_handle;
+    u32 console_flags;
+    u32 padding;
+    u64 standard_input;
+    u64 standard_output;
+    u64 standard_error;
+    UnicodeString current_directory;
+    u64 current_directory_handle;
+    UnicodeString dll_path;
+    UnicodeString image_path_name;
+    UnicodeString command_line;
+    u64 environment;
+};
+
+static_assert(sizeof(UnicodeString) == 16);
+static_assert(__builtin_offsetof(ProcessParameters, flags) == 0x08 && __builtin_offsetof(ProcessParameters, standard_input) == 0x20);
+static_assert(__builtin_offsetof(ProcessParameters, current_directory) == 0x38 && __builtin_offsetof(ProcessParameters, dll_path) == 0x50);
+static_assert(__builtin_offsetof(ProcessParameters, image_path_name) == 0x60 && __builtin_offsetof(ProcessParameters, command_line) == 0x70);
+static_assert(__builtin_offsetof(ProcessParameters, environment) == 0x80);
+
 struct World {
     Heap heap;
     const ImportTable* imports = nullptr;
@@ -75,6 +107,10 @@ struct World {
     char command_line[MAX_COMMAND_LINE] = {};
     u16 command_line_wide[MAX_COMMAND_LINE] = {};
     char module_path[MAX_MODULE_PATH] = {};
+    u16 module_path_wide[MAX_MODULE_PATH] = {};
+    u16 root_wide[2] = { '\\', 0 };
+    u16 empty_environment[2] = {};
+    ProcessParameters parameters = {};
 };
 
 inline World g_world;
@@ -132,7 +168,7 @@ inline Teb* current_teb() {
 
 inline u64 current_thread_id() { return current_teb()->client_thread; }
 
-inline const char* const MODULE_NAMES[] = { "kernel32.dll", "msvcrt.dll", "ucrtbase.dll" };
+inline const char* const MODULE_NAMES[] = { "kernel32.dll", "msvcrt.dll", "ucrtbase.dll", "vcruntime140.dll" };
 inline u8 MODULE_TOKENS[sizeof(MODULE_NAMES) / sizeof(MODULE_NAMES[0])][16];
 
 inline const char* module_name(u64 token) {
@@ -207,6 +243,25 @@ inline void attach(Prepared& run, const ImportTable* imports, const Config& conf
     i64 wide = codec::utf8_to_utf16(reinterpret_cast<const u8*>(w.command_line), detail::text_length(w.command_line), w.command_line_wide,
                                     MAX_COMMAND_LINE - 1, false);
     w.command_line_wide[wide > 0 ? wide : 0] = 0;
+    i64 module_wide = codec::utf8_to_utf16(reinterpret_cast<const u8*>(w.module_path), detail::text_length(w.module_path), w.module_path_wide,
+                                           MAX_MODULE_PATH - 1, false);
+    w.module_path_wide[module_wide > 0 ? module_wide : 0] = 0;
+    ProcessParameters& pp = w.parameters;
+    pp = ProcessParameters{};
+    pp.maximum_length = sizeof(pp);
+    pp.length = sizeof(pp);
+    pp.flags = 1;
+    pp.standard_input = HANDLE_STDIN;
+    pp.standard_output = HANDLE_STDOUT;
+    pp.standard_error = HANDLE_STDERR;
+    pp.current_directory = UnicodeString{ 2, 4, 0, reinterpret_cast<u64>(w.root_wide) };
+    pp.dll_path = UnicodeString{ 0, 2, 0, reinterpret_cast<u64>(w.empty_environment) };
+    u16 image_units = static_cast<u16>(module_wide > 0 ? module_wide : 0);
+    pp.image_path_name = UnicodeString{ static_cast<u16>(image_units * 2), static_cast<u16>(MAX_MODULE_PATH * 2), 0, reinterpret_cast<u64>(w.module_path_wide) };
+    u16 command_units = static_cast<u16>(wide > 0 ? wide : 0);
+    pp.command_line = UnicodeString{ static_cast<u16>(command_units * 2), static_cast<u16>(MAX_COMMAND_LINE * 2), 0, reinterpret_cast<u64>(w.command_line_wide) };
+    pp.environment = reinterpret_cast<u64>(w.empty_environment);
+    run.peb->process_parameters = reinterpret_cast<u64>(&pp);
     run.peb->process_heap = reinterpret_cast<u64>(&w.heap);
 }
 

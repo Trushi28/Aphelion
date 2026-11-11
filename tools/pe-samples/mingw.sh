@@ -367,6 +367,116 @@ EXPORTS
     fwd_sleep = KERNEL32.Sleep
 D
 
+cat > "$OUT/sysio.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+static int failures;
+static LARGE_INTEGER frequency;
+
+static void check(int ok, const char *what) {
+    if (!ok) {
+        failures++;
+        printf("FAIL %s\n", what);
+    }
+}
+
+static unsigned long long micros(void) {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    unsigned long long n = (unsigned long long)c.QuadPart;
+    unsigned long long f = (unsigned long long)frequency.QuadPart;
+    return n / f * 1000000ull + n % f * 1000000ull / f;
+}
+
+static unsigned long long as_u64(FILETIME t) {
+    return ((unsigned long long)t.dwHighDateTime << 32) | t.dwLowDateTime;
+}
+
+int main(void) {
+    check(QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0, "QueryPerformanceFrequency");
+    unsigned long long t0 = micros();
+    ULONGLONG k0 = GetTickCount64();
+    FILETIME w0, w1;
+    GetSystemTimeAsFileTime(&w0);
+    Sleep(120);
+    unsigned long long t1 = micros();
+    ULONGLONG k1 = GetTickCount64();
+    GetSystemTimeAsFileTime(&w1);
+    check(t1 > t0 && t1 - t0 >= 100000 && t1 - t0 < 5000000, "the performance counter measures a sleep");
+    check(k1 >= k0 + 100 && k1 - k0 < 5000, "the tick count measures a sleep");
+    check(as_u64(w1) >= as_u64(w0) + 1000000 && as_u64(w1) - as_u64(w0) < 50000000, "the system time advances by about the sleep");
+    printf("sysio clock: %lld Hz, slept %llu us, ticks %llu ms\n", (long long)frequency.QuadPart, t1 - t0, (unsigned long long)(k1 - k0));
+
+    HANDLE h = CreateFileA("sysio.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE, "open the program file");
+    LARGE_INTEGER size;
+    size.QuadPart = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+        unsigned char buf[600];
+        DWORD got = 0;
+        check(GetFileType(h) == FILE_TYPE_DISK && GetFileSizeEx(h, &size) && size.QuadPart > 1024, "file type and size");
+        check(ReadFile(h, buf, 2, &got, NULL) && got == 2 && buf[0] == 'M' && buf[1] == 'Z', "the file starts with MZ");
+        LARGE_INTEGER to;
+        to.QuadPart = 0x3C;
+        check(SetFilePointerEx(h, to, NULL, FILE_BEGIN) && ReadFile(h, buf, 4, &got, NULL) && got == 4, "read the PE header offset");
+        to.QuadPart = (LONGLONG)(buf[0] | (buf[1] << 8) | (buf[2] << 16) | ((unsigned)buf[3] << 24));
+        check(SetFilePointerEx(h, to, NULL, FILE_BEGIN) && ReadFile(h, buf, 4, &got, NULL) && got == 4 && memcmp(buf, "PE\0\0", 4) == 0, "the PE signature is where the header says");
+        to.QuadPart = 0;
+        SetFilePointerEx(h, to, NULL, FILE_BEGIN);
+        LONGLONG total = 0;
+        while (ReadFile(h, buf, sizeof(buf), &got, NULL) && got > 0) total += got;
+        check(total == size.QuadPart, "reading to the end returns exactly the file size");
+        to.QuadPart = -1;
+        SetLastError(0);
+        check(!SetFilePointerEx(h, to, NULL, FILE_BEGIN) && GetLastError() == ERROR_NEGATIVE_SEEK, "a negative seek fails");
+        check(CloseHandle(h), "close");
+        check(!CloseHandle(h) && GetLastError() == ERROR_INVALID_HANDLE, "closing twice fails");
+    }
+
+    WIN32_FIND_DATAA fd;
+    HANDLE s = FindFirstFileA("*.exe", &fd);
+    int found_self = 0;
+    int listed = 0;
+    DWORD self_size = 0;
+    if (s != INVALID_HANDLE_VALUE) {
+        do {
+            listed++;
+            if (strcmp(fd.cFileName, "sysio.exe") == 0) {
+                found_self = 1;
+                self_size = fd.nFileSizeLow;
+            }
+        } while (FindNextFileA(s, &fd));
+        check(GetLastError() == ERROR_NO_MORE_FILES, "the end of a search is ERROR_NO_MORE_FILES");
+        FindClose(s);
+    }
+    check(listed >= 1 && found_self && (LONGLONG)self_size == size.QuadPart, "a search lists the program with its size");
+    printf("sysio search: %d programs\n", listed);
+
+    SetLastError(0);
+    h = CreateFileA("nosuch.bin", GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND, "a missing file is ERROR_FILE_NOT_FOUND");
+    h = CreateFileA("sysio.exe", GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED, "writing is denied");
+    check(GetFileAttributesA("sysio.exe") != INVALID_FILE_ATTRIBUTES && GetFileAttributesA("nosuch.bin") == INVALID_FILE_ATTRIBUTES, "file attributes");
+
+    char env[16];
+    check(SetEnvironmentVariableA("Aphelion", "yes") && GetEnvironmentVariableA("APHELION", env, sizeof(env)) == 3 && strcmp(env, "yes") == 0, "environment variables ignore case");
+    DWORD slot = FlsAlloc(NULL);
+    check(slot != FLS_OUT_OF_INDEXES && FlsSetValue(slot, (PVOID)42) && FlsGetValue(slot) == (PVOID)42 && FlsFree(slot), "fiber local storage");
+    SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    check(!TryAcquireSRWLockExclusive(&lock), "an exclusive lock is exclusive");
+    ReleaseSRWLockExclusive(&lock);
+    check(TryAcquireSRWLockExclusive(&lock), "and can be taken again");
+    ReleaseSRWLockExclusive(&lock);
+
+    printf("sysio done failures=%d\n", failures);
+    return failures ? 1 : 6;
+}
+C
+
 cat > "$OUT/k32.c" <<'C'
 typedef void* HANDLE;
 typedef unsigned long DWORD;
@@ -408,12 +518,13 @@ $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllchain.c" "$OUT/dllchain.d
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllplug.c" -o "$OUT/dllplug.dll"
 $CC -O1 -s -shared -nostdlib -Wl,-e,DllMain "$OUT/dllfail.c" -o "$OUT/dllfail.dll"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/dyn.c" "$OUT/dllchain.dll" -o "$OUT/dyn.exe"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/sysio.c" -o "$OUT/sysio.exe"
 $CC -O2 -Wl,--no-dynamicbase -Wl,--disable-reloc-section "$OUT/stdio.c" -o "$OUT/stdio-fixed.exe"
 $CC -O2 -s "$OUT/stdio.c" -o "$OUT/stdio-stripped.exe"
 $CC -O2 -ffreestanding -fno-stack-protector -nostdlib -Wl,-e,entry -Wl,--subsystem,console "$OUT/k32.c" -o "$OUT/k32.exe" -lkernel32
 
 if [ -x "$PEINFO" ]; then
-    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn; do
+    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn sysio; do
         echo "================ $f.exe"
         "$PEINFO" "$OUT/$f.exe" || true
     done

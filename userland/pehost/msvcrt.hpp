@@ -1,6 +1,6 @@
 #pragma once
 #include "format.hpp"
-#include "win32.hpp"
+#include "win32x.hpp"
 
 namespace pehost::msvcrt {
 
@@ -534,7 +534,7 @@ inline const ImportTable* msvcrt_table() {
     };
 #undef PEHOST_FN
 #undef PEHOST_DATA
-    static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), kernel32_table() };
+    static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), kernel32x_table() };
     return &table;
 }
 

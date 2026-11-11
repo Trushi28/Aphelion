@@ -162,6 +162,7 @@ A file or directory handle is a Lens like any other, so a process can only reach
 | 30 | `process_create` | file, arg handle or 0, out, flags (0) | 0, process handle in `*out` |
 | 31 | `process_status` | process handle, out | 0 and the status as a 64-bit value, or -5 while it runs |
 | 32 | `process_kill` | process handle | 0, or -6 if it is already ending |
+| 33 | `clock` | out | 0 and a 32-byte record: uptime_ms, wall_ms (0 unless the wall clock is trusted), tsc_khz, flags (1 wall valid, 2 TSC usable) |
 
 New error codes: -14 for an image that fails validation, -15 not found, -16 wrong kind of object (a directory where a file is needed or the reverse). Everything else uses the codes from H1 and H2; -12 is "already exists" here too. A transfer moves at most 1024 bytes per call and returns the count, so callers loop. Pipes never block: an empty read or a full write returns -5, and `handle_wait` is how a process sleeps until a pipe is readable or writable. A pipe's read end carries Read and the write end carries Write, so the direction cannot be reversed by a process that holds only one end. A closed write end gives readers end-of-file once the buffer is drained; a closed read end makes writes return -6.
 
@@ -172,6 +173,7 @@ APX v1 is a 64-byte header followed by a code section and an optional initial-da
 Limits and things that are deliberately not done:
 - The checksum detects accidents, not tampering. There is no signature, so Execute on a file is the only gate on what can run.
 - File syscalls hold the caller's handle-table lock while the filesystem works, so a slow disk stalls the process's other handle operations (not other processes).
+- `clock` reports the TSC as usable only when the frequency was measured against a timer (not assumed) and CPUID reports an invariant TSC; it does not verify that the cores' counters agree. Uptime is the 10 ms tick count.
 - `dir_entry` lists the whole directory on every call and picks the entry at `index`, so a full walk is quadratic, the order is whatever the realm returns, and entries added or removed during a walk can be skipped or repeated.
 - A pipe read copies out of the pipe before it copies into the caller's buffer; the buffer is probed first, but if another thread unmaps it in between those bytes are lost.
 - Writing past the end of a file leaves the result to the realm.

@@ -34,6 +34,8 @@ extern "C" const u8 pe_dllfail_start[];
 extern "C" const u8 pe_dllfail_end[];
 extern "C" const u8 pe_dyn_start[];
 extern "C" const u8 pe_dyn_end[];
+extern "C" const u8 pe_sysio_start[];
+extern "C" const u8 pe_sysio_end[];
 
 namespace userland::apps {
 
@@ -60,6 +62,7 @@ const Entry ENTRIES[] = {
     { "dllplug.dll", pe_dllplug_start, pe_dllplug_end },
     { "dllfail.dll", pe_dllfail_start, pe_dllfail_end },
     { "dyn.exe", pe_dyn_start, pe_dyn_end },
+    { "sysio.exe", pe_sysio_start, pe_sysio_end },
 };
 
 constexpr const char* DIRECTORY = "apps";
@@ -196,7 +199,7 @@ Report run(const char* name, Emit emit, Interrupted interrupted, void* ctx) {
     if (is_pe) {
         lens::Result<lens::Lens> host = lens::open_at(g_table.domain, dir, "pehost", lens::Right::Read | lens::Right::Execute);
         lens::Result<lens::Lens> prog = lens::open_at(g_table.domain, dir, name, lens::Right::Read | lens::Right::Delegate);
-        lens::Result<lens::Lens> library = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read | lens::Right::Delegate);
+        lens::Result<lens::Lens> library = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
         if (host.ok() && prog.ok() && library.ok()) {
             g_capture.head = g_capture.tail = g_capture.dropped = 0;
             set_console(&capture_put, nullptr);

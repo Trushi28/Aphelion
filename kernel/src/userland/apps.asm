@@ -25,5 +25,6 @@ embed pe_dllchain, "dllchain.dll"
 embed pe_dllplug, "dllplug.dll"
 embed pe_dllfail, "dllfail.dll"
 embed pe_dyn, "dyn.exe"
+embed pe_sysio, "sysio.exe"
 
 section .note.GNU-stack noalloc noexec nowrite

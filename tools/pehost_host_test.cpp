@@ -222,8 +222,13 @@ void child_exit(u32 code) {
     for (;;) asm volatile("ud2");
 }
 
+bool g_show_stderr = false;
+
 i64 child_write(u32 stream, const void* data, u32 length) {
-    if (stream == 2) return length;
+    if (stream == 2) {
+        if (g_show_stderr) lx(SYS_WRITE, 2, reinterpret_cast<u64>(data), length);
+        return length;
+    }
     return lx(SYS_WRITE, static_cast<u64>(g_out_fd), reinterpret_cast<u64>(data), length);
 }
 
@@ -278,7 +283,82 @@ u8* child_read_file(const char* name, u64* size) {
 
 void child_unmap(u8* at, u64 bytes) { lx(SYS_MUNMAP, reinterpret_cast<u64>(at), bytes); }
 
-pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap };
+bool child_clock(pehost::Clock* out) {
+    u64 mono[2] = { 0, 0 };
+    u64 wall[2] = { 0, 0 };
+    if (lx(228, 1, reinterpret_cast<u64>(mono)) != 0 || lx(228, 0, reinterpret_cast<u64>(wall)) != 0) return false;
+    out->counter = mono[0] * 1000000000ull + mono[1];
+    out->frequency = 1000000000ull;
+    out->wall_ms = wall[0] * 1000ull + wall[1] / 1000000ull;
+    out->wall_valid = true;
+    return true;
+}
+
+i64 child_file_open(const char* name, u64* size) {
+    if (g_dll_dir == nullptr) return -1;
+    char path[512];
+    u32 n = 0;
+    for (const char* p = g_dll_dir; *p && n + 2 < sizeof(path); ++p) path[n++] = *p;
+    path[n++] = '/';
+    for (const char* p = name; *p && n + 1 < sizeof(path); ++p) path[n++] = *p;
+    path[n] = 0;
+    i64 fd = lx(2, reinterpret_cast<u64>(path), 0);
+    if (fd < 0) return -1;
+    i64 end = lx(8, static_cast<u64>(fd), 0, 2);
+    if (end < 0) {
+        lx(SYS_CLOSE, static_cast<u64>(fd));
+        return -1;
+    }
+    *size = static_cast<u64>(end);
+    return fd;
+}
+
+i64 child_file_read(i64 handle, u64 offset, void* buffer, u64 length) { return lx(17, static_cast<u64>(handle), reinterpret_cast<u64>(buffer), length, offset); }
+
+void child_file_close(i64 handle) { lx(SYS_CLOSE, static_cast<u64>(handle)); }
+
+i32 child_dir_entry(u64 index, char* name, u32 capacity, u64* size, u64* mtime_ms, bool* directory) {
+    if (g_dll_dir == nullptr) return -1;
+    i64 fd = lx(2, reinterpret_cast<u64>(g_dll_dir), 0x10000);
+    if (fd < 0) return -1;
+    static char buffer[32768];
+    u64 seen = 0;
+    i32 result = 0;
+    for (;;) {
+        i64 got = lx(217, static_cast<u64>(fd), reinterpret_cast<u64>(buffer), sizeof(buffer));
+        if (got <= 0) break;
+        for (i64 at = 0; at < got && result == 0;) {
+            u16 reclen = *reinterpret_cast<u16*>(buffer + at + 16);
+            const char* entry = buffer + at + 19;
+            at += reclen;
+            if (entry[0] == '.' && (entry[1] == 0 || (entry[1] == '.' && entry[2] == 0))) continue;
+            if (seen++ != index) continue;
+            u32 n = 0;
+            while (entry[n] && n + 1 < capacity) {
+                name[n] = entry[n];
+                ++n;
+            }
+            name[n] = 0;
+            u8 st[144];
+            i64 r = lx(262, static_cast<u64>(fd), reinterpret_cast<u64>(entry), reinterpret_cast<u64>(st), 0);
+            *size = 0;
+            *mtime_ms = 0;
+            *directory = false;
+            if (r == 0) {
+                u32 mode = *reinterpret_cast<u32*>(st + 24);
+                *directory = (mode & 0170000) == 0040000;
+                *size = *reinterpret_cast<u64*>(st + 48);
+                *mtime_ms = *reinterpret_cast<u64*>(st + 88) * 1000ull + *reinterpret_cast<u64*>(st + 96) / 1000000ull;
+            }
+            result = 1;
+        }
+        if (result) break;
+    }
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    return result;
+}
+
+pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap, &child_clock, &child_file_open, &child_file_read, &child_file_close, &child_dir_entry };
 
 const char* g_command_line = "pe.exe";
 
@@ -822,7 +902,8 @@ int run_file(const char* path, const char* command_line) {
 
 int list_supported() {
     for (const pehost::ImportTable* t = pehost::all_imports(); t; t = t->next) {
-        for (u32 i = 0; i < t->count; ++i) printf("%s!%s\n", t->items[i].dll, t->items[i].name);
+        bool stub = t == pehost::kernel32_stub_table();
+        for (u32 i = 0; i < t->count; ++i) printf("%s!%s%s\n", t->items[i].dll, t->items[i].name, stub ? " stub" : "");
     }
     return 0;
 }
@@ -830,6 +911,7 @@ int list_supported() {
 int main(int argc, char** argv) {
     if (argc > 1 && equals(argv[1], "--list-supported")) return list_supported();
     if (argc > 2 && equals(argv[1], "--run")) {
+        g_show_stderr = true;
         const char* line = "pe.exe";
         for (int i = 3; i < argc; ++i) {
             if (equals(argv[i], "--dlls") && i + 1 < argc) g_dll_dir = argv[++i];

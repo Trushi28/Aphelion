@@ -1,5 +1,5 @@
 #pragma once
-#include "msvcrt.hpp"
+#include "vcrt.hpp"
 
 namespace pehost::ucrt {
 
@@ -276,7 +276,7 @@ inline const ImportTable* all_imports() {
     };
 #undef PEHOST_SHARED
 #undef PEHOST_UCRT
-    static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), msvcrt_table() };
+    static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), vcrt_table() };
     return &table;
 }
 

@@ -36,7 +36,8 @@ constexpr u64 SYS_PIPE_CREATE = 29;
 constexpr u64 SYS_PROCESS_CREATE = 30;
 constexpr u64 SYS_PROCESS_STATUS = 31;
 constexpr u64 SYS_PROCESS_KILL = 32;
-constexpr u64 SYS_COUNT = 33;
+constexpr u64 SYS_CLOCK = 33;
+constexpr u64 SYS_COUNT = 34;
 
 constexpr i64 ERR_NOSYS = -1;
 constexpr i64 ERR_FAULT = -2;
@@ -44,6 +45,21 @@ constexpr i64 ERR_INVAL = -3;
 constexpr i64 ERR_LIMIT = -4;
 
 constexpr u64 DEBUG_WRITE_MAX = 512;
+
+constexpr u64 CLOCK_WALL_VALID = 1;
+constexpr u64 CLOCK_TSC_USABLE = 2;
+constexpr u64 CLOCK_FLAGS_ALL = CLOCK_WALL_VALID | CLOCK_TSC_USABLE;
+
+struct ClockRecord {
+    u64 uptime_ms;
+    u64 wall_ms;
+    u64 tsc_khz;
+    u64 flags;
+};
+
+static_assert(sizeof(ClockRecord) == 32, "the clock record is part of the user ABI");
+
+constexpr bool tsc_usable(u64 tsc_khz, bool assumed, bool invariant) { return tsc_khz != 0 && !assumed && invariant; }
 
 constexpr i32 FAULT_STATUS_BASE = -256;
 constexpr i32 FAULT_STATUS_FLOOR = FAULT_STATUS_BASE - 31;

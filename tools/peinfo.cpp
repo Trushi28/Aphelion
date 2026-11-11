@@ -30,6 +30,7 @@ Entry g_entries[MAX_ENTRIES];
 u32 g_entry_count = 0;
 u32 g_entry_total = 0;
 char g_supported[MAX_SUPPORTED][TEXT];
+bool g_supported_stub[MAX_SUPPORTED];
 u32 g_supported_count = 0;
 
 bool equal(const char* a, const char* b) {
@@ -168,6 +169,15 @@ bool is_supported(const Entry& e) {
     return provided_by_file(e, 0);
 }
 
+bool is_stub(const Entry& e) {
+    char l[TEXT];
+    label(e, l);
+    for (u32 i = 0; i < g_supported_count; ++i) {
+        if (equal(g_supported[i], l)) return g_supported_stub[i];
+    }
+    return false;
+}
+
 bool collect(void*, const char* dll, const char* name, u16 ordinal, u64* address) {
     *address = 0x1000;
     Entry e{};
@@ -224,7 +234,11 @@ bool load_supported(const char* path) {
                     g_supported[g_supported_count][k++] = in_dll ? fold(line[j]) : line[j];
                     if (line[j] == '!') in_dll = false;
                 }
+                bool stub = k > 5 && g_supported[g_supported_count][k - 5] == ' ' && g_supported[g_supported_count][k - 4] == 's' &&
+                            g_supported[g_supported_count][k - 3] == 't' && g_supported[g_supported_count][k - 2] == 'u' && g_supported[g_supported_count][k - 1] == 'b';
+                if (stub) k -= 5;
                 g_supported[g_supported_count][k] = 0;
+                g_supported_stub[g_supported_count] = stub;
                 ++g_supported_count;
             }
             n = 0;
@@ -334,8 +348,12 @@ int coverage(int count, char** files, const char* supported_path) {
             continue;
         }
         u32 lacking = 0;
+        u32 stubbed = 0;
         for (u32 j = 0; j < g_entry_count; ++j) {
-            if (is_supported(g_entries[j])) continue;
+            if (is_supported(g_entries[j])) {
+                if (is_stub(g_entries[j])) ++stubbed;
+                continue;
+            }
             ++lacking;
             char l[TEXT];
             label(g_entries[j], l);
@@ -349,7 +367,8 @@ int coverage(int count, char** files, const char* supported_path) {
             printf("%-40s %u imports, %u not provided\n", files[i], g_entry_total, lacking);
         } else {
             ++runnable;
-            printf("%-40s %u imports, all provided\n", files[i], g_entry_total);
+            if (stubbed) printf("%-40s %u imports, all provided (%u of them always fail)\n", files[i], g_entry_total, stubbed);
+            else printf("%-40s %u imports, all provided\n", files[i], g_entry_total);
         }
     }
     for (u32 i = 1; i < g_gap_count; ++i) {
@@ -487,9 +506,11 @@ int main(int argc, char** argv) {
         for (u32 j = i; j < g_entry_count; ++j) {
             if (!equal(g_entries[j].dll, g_entries[i].dll)) continue;
             bool lacks = supported_path && !is_supported(g_entries[j]);
-            if (!verbose && !lacks) continue;
-            if (g_entries[j].by_ordinal) printf("    %s#%u\n", lacks ? "MISSING " : "", g_entries[j].ordinal);
-            else printf("    %s%s\n", lacks ? "MISSING " : "", g_entries[j].name);
+            bool stub = supported_path && !lacks && is_stub(g_entries[j]);
+            if (!verbose && !lacks && !stub) continue;
+            const char* mark = lacks ? "MISSING " : (stub ? "ALWAYS FAILS " : "");
+            if (g_entries[j].by_ordinal) printf("    %s#%u\n", mark, g_entries[j].ordinal);
+            else printf("    %s%s\n", mark, g_entries[j].name);
         }
     }
     printf("\nverdict         ");

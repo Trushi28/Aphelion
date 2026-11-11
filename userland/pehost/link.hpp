@@ -6,6 +6,13 @@
 
 namespace pehost {
 
+struct Clock {
+    u64 counter;
+    u64 frequency;
+    u64 wall_ms;
+    bool wall_valid;
+};
+
 struct Runtime {
     void (*exit_process)(u32 code) = nullptr;
     i64 (*write_console)(u32 stream, const void* data, u32 length) = nullptr;
@@ -14,6 +21,11 @@ struct Runtime {
     void (*sleep_ms)(u32 milliseconds) = nullptr;
     u8* (*read_file)(const char* name, u64* size) = nullptr;
     void (*unmap)(u8* at, u64 bytes) = nullptr;
+    bool (*clock)(Clock* out) = nullptr;
+    i64 (*file_open)(const char* name, u64* size) = nullptr;
+    i64 (*file_read)(i64 handle, u64 offset, void* buffer, u64 length) = nullptr;
+    void (*file_close)(i64 handle) = nullptr;
+    i32 (*dir_entry)(u64 index, char* name, u32 capacity, u64* size, u64* mtime_ms, bool* directory) = nullptr;
 };
 
 inline Runtime* g_runtime = nullptr;

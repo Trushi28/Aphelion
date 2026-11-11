@@ -2260,6 +2260,686 @@ void module_tests() {
            "ExitProcess detaches the loaded DLLs with a non-null reserved argument and TerminateProcess on the current process does not, as on Windows");
 }
 
+struct FakeFile {
+    const char* name;
+    const u8* data;
+    u64 size;
+};
+
+u8 g_fake_pattern[300];
+const u8 g_fake_hello[] = { 'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' };
+FakeFile g_fake_files[] = {
+    { "a.txt", g_fake_hello, 11 },
+    { "b.dat", g_fake_pattern, 300 },
+};
+u32 g_fake_closed = 0;
+u32 g_fake_opened = 0;
+u64 g_fake_chunk = 0;
+u64 g_fake_fail_from = ~0ull;
+u64 g_fake_last_offset = 0;
+
+i64 fake_open(const char* name, u64* size) {
+    for (i64 i = 0; i < 2; ++i) {
+        if (same(g_fake_files[i].name, name)) {
+            ++g_fake_opened;
+            *size = g_fake_files[i].size;
+            return 500 + i;
+        }
+    }
+    return -1;
+}
+
+i64 fake_read(i64 handle, u64 offset, void* buffer, u64 length) {
+    const FakeFile& f = g_fake_files[handle - 500];
+    g_fake_last_offset = offset;
+    if (offset >= g_fake_fail_from) return -5;
+    if (offset >= f.size) return 0;
+    u64 n = f.size - offset;
+    if (n > length) n = length;
+    if (g_fake_chunk && n > g_fake_chunk) n = g_fake_chunk;
+    if (g_fake_fail_from != ~0ull && offset + n > g_fake_fail_from) n = g_fake_fail_from - offset;
+    u8* out = static_cast<u8*>(buffer);
+    for (u64 i = 0; i < n; ++i) out[i] = f.data[offset + i];
+    return static_cast<i64>(n);
+}
+
+void fake_close(i64) { ++g_fake_closed; }
+
+struct FakeEntry {
+    const char* name;
+    u64 size;
+    u64 mtime;
+    bool directory;
+};
+
+FakeEntry g_fake_entries[] = {
+    { "a.txt", 11, 1000, false },
+    { "b.dat", 300, 2000, false },
+    { "sub", 0, 3000, true },
+    { "C.TXT", 5, 4000, false },
+};
+
+i32 fake_dir(u64 index, char* name, u32 capacity, u64* size, u64* mtime, bool* directory) {
+    if (index >= 4) return 0;
+    const FakeEntry& e = g_fake_entries[index];
+    u32 n = 0;
+    while (e.name[n] && n + 1 < capacity) {
+        name[n] = e.name[n];
+        ++n;
+    }
+    name[n] = 0;
+    *size = e.size;
+    *mtime = e.mtime;
+    *directory = e.directory;
+    return 1;
+}
+
+pehost::Clock g_fake_clock{};
+bool g_fake_clock_ok = true;
+
+bool fake_clock(pehost::Clock* out) {
+    *out = g_fake_clock;
+    return g_fake_clock_ok;
+}
+
+int g_fls_hits = 0;
+u64 g_fls_last = 0;
+
+PEHOST_WINAPI void fls_callback(void* value) {
+    ++g_fls_hits;
+    g_fls_last = reinterpret_cast<u64>(value);
+}
+
+int g_locale_hits = 0;
+u16 g_locale_first[16];
+
+PEHOST_WINAPI i32 locale_callback(u16* name) {
+    ++g_locale_hits;
+    for (u32 i = 0; i < 15 && name[i]; ++i) g_locale_first[i] = name[i];
+    return 1;
+}
+
+u16 wstr_buf[4][300];
+const u16* wide(const char* text, u32 slot = 0) {
+    u32 i = 0;
+    for (; text[i]; ++i) wstr_buf[slot][i] = static_cast<u8>(text[i]);
+    wstr_buf[slot][i] = 0;
+    return wstr_buf[slot];
+}
+
+struct FakeTypeInfo {
+    void* vtable;
+    void* undecorated;
+    char decorated[24];
+};
+
+void extended_tests() {
+    using namespace pehost::win32;
+    using namespace pehost;
+    static pehost::Teb teb;
+    static pehost::Peb peb;
+    teb.self = reinterpret_cast<u64>(&teb);
+    teb.client_thread = 77;
+    teb.client_process = 5;
+    lx(SYS_ARCH_PRCTL, 0x1001, reinterpret_cast<u64>(&teb));
+    for (u32 i = 0; i < 300; ++i) g_fake_pattern[i] = static_cast<u8>(i * 7 + 3);
+
+    static pehost::Runtime ext = g_recording;
+    ext.clock = &fake_clock;
+    ext.file_open = &fake_open;
+    ext.file_read = &fake_read;
+    ext.file_close = &fake_close;
+    ext.dir_entry = &fake_dir;
+    pehost::g_runtime = &ext;
+    g_rec = Recorder{};
+    pehost::World& w = pehost::g_world;
+    w.heap.init(&test_map);
+    w.imports = pehost::all_imports();
+    g_extra = Extra{};
+    for (Search& s : g_searches) s = Search{};
+
+    g_fake_clock = pehost::Clock{ 12345, 10000000, 0, false };
+    i64 value = 0;
+    set_last_error(0);
+    expect(QueryPerformanceFrequency(&value) == 1 && value == 10000000 && QueryPerformanceCounter(&value) == 1 && value == 12345 && last_error() == 0, "the performance counter reports the platform frequency and count");
+    expect(QueryPerformanceFrequency(nullptr) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && QueryPerformanceCounter(nullptr) == 0, "a null output is ERROR_INVALID_PARAMETER");
+    g_fake_clock = pehost::Clock{ 5000000, 10000000, 0, false };
+    expect(GetTickCount64() == 500, "ticks are the counter scaled to milliseconds");
+    g_fake_clock = pehost::Clock{ 0x100000005ull, 1000, 0, false };
+    expect(GetTickCount64() == 0x100000005ull && GetTickCount() == 5, "GetTickCount is the low 32 bits of GetTickCount64");
+    g_fake_clock = pehost::Clock{ 0xFFFFFFFFFFFFFFull, 3000000000ull, 0, false };
+    expect(GetTickCount64() == 0xFFFFFFFFFFFFFFull / 3000000000ull * 1000 + 0xFFFFFFFFFFFFFFull % 3000000000ull * 1000 / 3000000000ull, "scaling does not overflow with a large counter");
+    u32 ft[2] = { 1, 1 };
+    g_fake_clock = pehost::Clock{ 20000000, 10000000, 0, true };
+    GetSystemTimeAsFileTime(ft);
+    expect(((static_cast<u64>(ft[1]) << 32) | ft[0]) == 116444736000000000ull, "a valid wall clock at the Unix epoch is the FILETIME of 1970");
+    g_fake_clock = pehost::Clock{ 20000000, 10000000, 86400000, true };
+    GetSystemTimeAsFileTime(ft);
+    expect(((static_cast<u64>(ft[1]) << 32) | ft[0]) == 116444736000000000ull + 864000000000ull, "one day later adds exactly 864e9 ticks");
+    g_fake_clock = pehost::Clock{ 20000000, 10000000, 99, false };
+    GetSystemTimeAsFileTime(ft);
+    expect(((static_cast<u64>(ft[1]) << 32) | ft[0]) == 2000ull * 10000, "without a wall clock the uptime is used as the time");
+    g_fake_clock_ok = false;
+    set_last_error(0);
+    expect(QueryPerformanceFrequency(&value) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && QueryPerformanceCounter(&value) == 0 && GetTickCount64() == 0, "a clock that fails is reported as unsupported");
+    g_fake_clock_ok = true;
+    g_fake_clock = pehost::Clock{ 1, 0, 0, false };
+    expect(QueryPerformanceFrequency(&value) == 0 && GetTickCount64() == 0, "a zero frequency is not accepted");
+    ext.clock = nullptr;
+    set_last_error(0);
+    expect(QueryPerformanceCounter(&value) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && GetTickCount() == 0, "without a clock hook the time functions fail cleanly");
+    ext.clock = &fake_clock;
+
+    expect(IsProcessorFeaturePresent(10) == 1 && IsProcessorFeaturePresent(25) == 0 && IsDebuggerPresent() == 0 && GetActiveProcessorCount(0xFFFF) == 1, "processor features, the debugger and the processor count");
+    u8 startup[120];
+    for (u8& b : startup) b = 0xAA;
+    GetStartupInfoA(startup);
+    bool tail_clear = true;
+    for (u32 i = 4; i < 104; ++i) tail_clear = tail_clear && startup[i] == 0;
+    expect(*reinterpret_cast<u32*>(startup) == 104 && tail_clear && startup[104] == 0xAA, "GetStartupInfo fills exactly 104 bytes with the size first");
+    expect(EncodePointer(0x1234) == 0x1234 && DecodePointer(0x1234) == 0x1234, "pointer encoding is the identity");
+
+    alignas(16) static u64 head[2];
+    alignas(16) static u64 entries[3][2];
+    InitializeSListHead(head);
+    expect(InterlockedPopEntrySList(head) == 0 && QueryDepthSList(head) == 0, "an empty list pops nothing");
+    u64 first = InterlockedPushEntrySList(head, entries[0]);
+    u64 second = InterlockedPushEntrySList(head, entries[1]);
+    InterlockedPushEntrySList(head, entries[2]);
+    expect(first == 0 && second == reinterpret_cast<u64>(entries[0]) && QueryDepthSList(head) == 3, "pushes return the previous top and the depth counts");
+    expect(InterlockedPopEntrySList(head) == reinterpret_cast<u64>(entries[2]) && QueryDepthSList(head) == 2, "pops come back last in first out");
+    u64 flushed = InterlockedFlushSList(head);
+    expect(flushed == reinterpret_cast<u64>(entries[1]) && QueryDepthSList(head) == 0 && InterlockedPopEntrySList(head) == 0, "flush returns the chain and empties the list");
+
+    set_last_error(0);
+    u32 f0 = FlsAlloc(&fls_callback);
+    u32 f1 = FlsAlloc(nullptr);
+    expect(f0 == 0 && f1 == 1 && FlsGetValue(f0) == nullptr && last_error() == 0, "FLS indexes are handed out in order and start empty");
+    expect(FlsSetValue(f0, reinterpret_cast<void*>(0x77)) == 1 && FlsGetValue(f0) == reinterpret_cast<void*>(0x77), "a stored value reads back");
+    g_fls_hits = 0;
+    expect(FlsFree(f1) == 1 && g_fls_hits == 0, "freeing a slot without a callback is silent");
+    expect(FlsFree(f0) == 1 && g_fls_hits == 1 && g_fls_last == 0x77, "freeing a slot runs its callback with the value");
+    f0 = FlsAlloc(&fls_callback);
+    FlsFree(f0);
+    expect(g_fls_hits == 1, "a callback is not run for an empty value");
+    expect(FlsFree(0) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && FlsGetValue(0) == nullptr && FlsSetValue(0, nullptr) == 0 && FlsFree(200) == 0 && FlsGetValue(200) == nullptr && FlsSetValue(200, nullptr) == 0,
+           "a freed or out of range index is invalid everywhere");
+    bool all = true;
+    for (u32 i = 0; i < MAX_FLS; ++i) all = all && FlsAlloc(nullptr) == i;
+    expect(all && FlsAlloc(nullptr) == FLS_OUT_OF_INDEXES && last_error() == pehost::ERROR_NOT_ENOUGH_MEMORY, "128 FLS slots exist and then allocation fails");
+    FlsFree(40);
+    expect(FlsAlloc(nullptr) == 40, "the lowest freed slot is reused");
+
+    u64 lock = 5;
+    InitializeSRWLock(&lock);
+    expect(lock == 0 && TryAcquireSRWLockExclusive(&lock) == 1 && TryAcquireSRWLockExclusive(&lock) == 0 && TryAcquireSRWLockShared(&lock) == 0, "an exclusive lock blocks everything else");
+    ReleaseSRWLockExclusive(&lock);
+    expect(TryAcquireSRWLockShared(&lock) == 1 && TryAcquireSRWLockShared(&lock) == 1 && TryAcquireSRWLockExclusive(&lock) == 0, "shared locks stack and block exclusive ones");
+    ReleaseSRWLockShared(&lock);
+    ReleaseSRWLockShared(&lock);
+    ReleaseSRWLockShared(&lock);
+    expect(lock == 0 && TryAcquireSRWLockExclusive(&lock) == 1, "releasing more than was taken does not corrupt the lock");
+    u64 cond = 9;
+    InitializeConditionVariable(&cond);
+    WakeConditionVariable(&cond);
+    WakeAllConditionVariable(&cond);
+    expect(cond == 0, "condition variable wake calls are harmless without waiters");
+
+    lock = 0;
+    AcquireSRWLockExclusive(&lock);
+    g_rec.sleeps = 0;
+    set_last_error(0);
+    expect(SleepConditionVariableSRW(&cond, &lock, 50, 0) == 0 && last_error() == pehost::ERROR_TIMEOUT && g_rec.sleeps == 1 && g_rec.slept == 50 && lock == 1, "a timed condition wait sleeps, times out and holds the lock again");
+    ReleaseSRWLockExclusive(&lock);
+    AcquireSRWLockShared(&lock);
+    expect(SleepConditionVariableSRW(&cond, &lock, 10, 1) == 0 && lock == 2, "a shared wait gives the shared lock back");
+    CriticalSection cs{};
+    InitializeCriticalSection(&cs);
+    EnterCriticalSection(&cs);
+    expect(SleepConditionVariableCS(&cond, &cs, 7) == 0 && last_error() == pehost::ERROR_TIMEOUT && g_rec.slept == 7 && TryEnterCriticalSection(&cs) == 1, "a critical section wait leaves the section owned");
+    expect(InitializeCriticalSectionEx(&cs, 0, 0) == 1 && InitializeCriticalSectionAndSpinCount(&cs, 4000) == 1 && SetCriticalSectionSpinCount(&cs, 1) == 0, "the extended critical section initialisers succeed");
+
+    pehost::g_runtime = &g_child_runtime;
+    ChildResult infinite = in_child([] {
+        u64 l = 0, c = 0;
+        AcquireSRWLockExclusive(&l);
+        SleepConditionVariableSRW(&c, &l, 0xFFFFFFFFu, 0);
+    });
+    ChildResult contended = in_child([] {
+        u64 l = 0;
+        AcquireSRWLockExclusive(&l);
+        AcquireSRWLockExclusive(&l);
+    });
+    ChildResult shared_blocked = in_child([] {
+        u64 l = 1;
+        AcquireSRWLockShared(&l);
+    });
+    ChildResult raised = in_child([] { RaiseException(0xE0001234u, 0, 0, nullptr); });
+    ChildResult unwound = in_child([] { RtlUnwind(nullptr, nullptr, nullptr, nullptr); });
+    ChildResult virtual_unwound = in_child([] { RtlVirtualUnwind(0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr); });
+    expect(infinite.exited && static_cast<u32>(infinite.code) == STATUS_POSSIBLE_DEADLOCK && contains(infinite.out, "no other thread can end"), "an infinite wait that nothing can end stops the process instead of hanging");
+    expect(contended.exited && static_cast<u32>(contended.code) == STATUS_POSSIBLE_DEADLOCK && shared_blocked.exited && static_cast<u32>(shared_blocked.code) == STATUS_POSSIBLE_DEADLOCK,
+           "taking a lock nobody can release stops the process");
+    expect(raised.exited && static_cast<u32>(raised.code) == 0xE0001234u && contains(raised.out, "status 0xE0001234") && unwound.exited && static_cast<u32>(unwound.code) == STATUS_NOT_SUPPORTED &&
+               virtual_unwound.exited && static_cast<u32>(virtual_unwound.code) == STATUS_NOT_SUPPORTED && contains(unwound.out, "unwinding is not supported"),
+           "an exception that nothing can handle or unwind ends the process with its code and says why");
+    pehost::g_runtime = &ext;
+
+    u8 context[1232];
+    for (u8& b : context) b = 0xCC;
+    RtlCaptureContext(context);
+    u64 base_out = 77;
+    expect(*reinterpret_cast<u32*>(context + 0x30) == 0x10000F && context[0] == 0 && context[1231] == 0 && RtlLookupFunctionEntry(0x1000, &base_out, nullptr) == nullptr && base_out == 0 && UnhandledExceptionFilter(nullptr) == 0,
+           "context capture fills a CONTEXT and function lookup finds no unwind data");
+    alignas(4096) static u8 fake_image[8192];
+    w.image = fake_image;
+    w.image_pages = 2;
+    u64 header = 5;
+    expect(RtlPcToFileHeader(reinterpret_cast<u64>(fake_image) + 100, &header) == reinterpret_cast<u64>(fake_image) && header == reinterpret_cast<u64>(fake_image) &&
+               RtlPcToFileHeader(reinterpret_cast<u64>(fake_image) + 8192, &header) == 0 && header == 0 && RtlPcToFileHeader(0, nullptr) == 0,
+           "an address inside the image maps to its base and one past the end does not");
+    u64 handle = 0;
+    expect(GetModuleHandleExW(4, fake_image + 10, &handle) == 1 && handle == reinterpret_cast<u64>(fake_image) && GetModuleHandleExW(4, fake_image + 9000, &handle) == 0 && last_error() == pehost::ERROR_MOD_NOT_FOUND && handle == 0,
+           "GetModuleHandleEx by address finds the image and fails outside it");
+    expect(GetModuleHandleExW(0, wide("kernel32.dll"), &handle) == 1 && handle == GetModuleHandleA("kernel32.dll") && GetModuleHandleExW(1, wide("nosuch.dll"), &handle) == 0 && handle == 0 &&
+               GetModuleHandleExW(3, wide("kernel32.dll"), &handle) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && GetModuleHandleExW(0, wide("kernel32.dll"), nullptr) == 0 && GetModuleHandleExW(8, wide("kernel32.dll"), &handle) == 0,
+           "GetModuleHandleEx by name works and rejects bad flags and a null output");
+
+    detail::copy_text(w.module_path, MAX_MODULE_PATH, "C:\\dir\\prog.exe");
+    u16 path[40];
+    for (u16& c : path) c = 0xEEEE;
+    expect(GetModuleFileNameW(0, path, 40) == 15 && wide_is(path, "C:\\dir\\prog.exe") && path[16] == 0xEEEE, "the wide module path is the narrow one converted");
+    for (u16& c : path) c = 0xEEEE;
+    set_last_error(0);
+    expect(GetModuleFileNameW(0, path, 5) == 5 && path[3] == 'd' && path[4] == 0 && path[5] == 0xEEEE && last_error() == pehost::ERROR_INSUFFICIENT_BUFFER, "a short wide buffer gets a terminated truncation");
+    expect(GetModuleFileNameW(0, path, 0) == 0 && last_error() == pehost::ERROR_INSUFFICIENT_BUFFER && GetModuleFileNameW(GetModuleHandleA("kernel32.dll"), path, 40) == 0, "a zero size and another module fail");
+    set_last_error(0);
+    u64 k32 = GetModuleHandleA("kernel32.dll");
+    expect(LoadLibraryExA("kernel32.dll", 0, 0) == k32 && LoadLibraryExA("kernel32.dll", 0, 0x800) == k32 && LoadLibraryExW(wide("kernel32.dll"), 0, 0) == k32, "LoadLibraryEx without special flags is LoadLibrary");
+    expect(LoadLibraryExA("kernel32.dll", 0, 0x2) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && LoadLibraryExW(wide("kernel32.dll"), 0, 0x1) == 0 && LoadLibraryExA("kernel32.dll", 1, 0) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER,
+           "data file and dependency flags are refused and a reserved handle is invalid");
+
+    expect(GetFileType(HANDLE_STDOUT) == 3 && GetFileType(HANDLE_STDIN) == 3 && GetFileType(0x100) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE, "standard handles are character devices and unknown handles are not files");
+    expect(GetConsoleMode(HANDLE_STDOUT, nullptr) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && SetConsoleMode(HANDLE_STDOUT, 0) == 0 && GetConsoleScreenBufferInfo(HANDLE_STDOUT, nullptr) == 0 && ReadConsoleW(HANDLE_STDIN, nullptr, 0, nullptr, nullptr) == 0,
+           "console queries fail as they do for a redirected handle");
+    expect(GetConsoleOutputCP() == 65001 && GetConsoleCP() == 65001 && GetOEMCP() == 65001 && SetConsoleCtrlHandler(nullptr, 1) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && SetStdHandle(0xFFFFFFF5u, 1) == 0, "code pages are UTF-8 and handler and handle changes are refused");
+
+    u32 written = 99;
+    g_rec = Recorder{};
+    expect(WriteConsoleW(HANDLE_STDOUT, wide("hi"), 2, &written, nullptr) == 1 && written == 2 && same(g_rec.last_text, "hi") && g_rec.last_stream == 1 && WriteConsoleW(HANDLE_STDERR, wide("e"), 1, &written, nullptr) == 1 && g_rec.last_stream == 2,
+           "WriteConsoleW writes UTF-8 to the right stream");
+    expect(WriteConsoleW(0x100, wide("x"), 1, &written, nullptr) == 0 && written == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && WriteConsoleW(HANDLE_STDOUT, wide("x"), 1, &written, &written) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER,
+           "a bad handle or a reserved argument fails");
+    u16 pair[129];
+    for (u32 i = 0; i < 127; ++i) pair[i] = 'a';
+    pair[127] = 0xD83D;
+    pair[128] = 0xDE00;
+    g_rec = Recorder{};
+    expect(WriteConsoleW(HANDLE_STDOUT, pair, 129, &written, nullptr) == 1 && written == 129 && g_rec.writes == 2 && g_rec.last_length == 4 && static_cast<u8>(g_rec.last_text[0]) == 0xF0 && static_cast<u8>(g_rec.last_text[3]) == 0x80,
+           "a surrogate pair is never split across the chunk boundary");
+
+    expect(FlushFileBuffers(HANDLE_STDOUT) == 1 && FlushFileBuffers(0x100) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && CloseHandle(HANDLE_STDOUT) == 1 && CloseHandle(0x100) == 0, "flushing and closing the standard handles works and unknown handles fail");
+    expect(CreateFileA("CONOUT$", 0xC0000000u, 0, nullptr, 3, 0, 0) == HANDLE_STDOUT && CreateFileA("CONIN$", 0x80000000u, 0, nullptr, 3, 0, 0) == HANDLE_STDIN, "the console device names open the standard handles");
+
+    g_fake_opened = g_fake_closed = 0;
+    u64 fh = CreateFileA("a.txt", 0x80000000u, 1, nullptr, 3, 0x80, 0);
+    expect(fh == 0x100 && GetFileType(fh) == 1 && FlushFileBuffers(fh) == 1 && g_fake_opened == 1, "a read only open of an existing file gives a file handle");
+    i64 size = 0;
+    char buf[64];
+    u32 got = 99;
+    expect(GetFileSizeEx(fh, &size) == 1 && size == 11 && ReadFile(fh, buf, 5, &got, nullptr) == 1 && got == 5 && strncmp(buf, "hello", 5) == 0, "size and the first read");
+    expect(ReadFile(fh, buf, 64, &got, nullptr) == 1 && got == 6 && strncmp(buf, " world", 6) == 0 && ReadFile(fh, buf, 64, &got, nullptr) == 1 && got == 0, "reading to the end returns the rest and then zero bytes with success");
+    i64 pos = -1;
+    expect(SetFilePointerEx(fh, 6, &pos, 0) == 1 && pos == 6 && ReadFile(fh, buf, 5, &got, nullptr) == 1 && strncmp(buf, "world", 5) == 0, "seeking from the start");
+    expect(SetFilePointerEx(fh, -3, &pos, 1) == 1 && pos == 8 && SetFilePointerEx(fh, -5, &pos, 2) == 1 && pos == 6 && SetFilePointerEx(fh, 0, nullptr, 2) == 1, "seeking from the current position and from the end");
+    set_last_error(0);
+    expect(SetFilePointerEx(fh, -100, &pos, 1) == 0 && last_error() == pehost::ERROR_NEGATIVE_SEEK && SetFilePointerEx(fh, 0, &pos, 3) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && SetFilePointerEx(fh, 0, &pos, 1) == 1 && pos == 11,
+           "a seek before the start or with a bad method fails and keeps the position");
+    expect(SetFilePointerEx(fh, 500, &pos, 0) == 1 && ReadFile(fh, buf, 4, &got, nullptr) == 1 && got == 0 && SetFilePointerEx(fh, 0, &pos, 1) == 1 && pos == 500, "seeking past the end is allowed and reads nothing there");
+    expect(ReadFile(fh, buf, 4, &got, &got) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && got == 0 && SetEndOfFile(fh) == 0 && last_error() == pehost::ERROR_ACCESS_DENIED && SetEndOfFile(0x104) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE,
+           "overlapped reads and truncation are refused");
+    expect(ReadFile(HANDLE_STDIN, buf, 4, &got, nullptr) == 1 && got == 0 && ReadFile(0x104, buf, 4, &got, nullptr) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && GetFileSizeEx(0x104, &size) == 0 && SetFilePointerEx(0x104, 0, &pos, 0) == 0,
+           "standard input reads end of file and unknown handles fail");
+    expect(CloseHandle(fh) == 1 && g_fake_closed == 1 && CloseHandle(fh) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && ReadFile(fh, buf, 1, &got, nullptr) == 0, "closing releases the platform file and a second close fails");
+    expect(CreateFileA("a.txt", 0x80000000u, 1, nullptr, 3, 0, 0) == 0x100 && CloseHandle(0x102) == 0, "the lowest handle is reused and a misaligned handle is invalid");
+    CloseHandle(0x100);
+
+    set_last_error(0);
+    expect(CreateFileA("missing.txt", 0x80000000u, 1, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_FILE_NOT_FOUND && CreateFileA("missing.txt", 0x80000000u, 1, nullptr, 4, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_ACCESS_DENIED,
+           "a missing file is ERROR_FILE_NOT_FOUND, and creating one is denied");
+    expect(CreateFileA("dir\\a.txt", 0x80000000u, 1, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_PATH_NOT_FOUND && CreateFileA("..", 0x80000000u, 1, nullptr, 3, 0, 0) == INVALID_HANDLE && CreateFileA(nullptr, 0, 0, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_INVALID_PARAMETER,
+           "a path with a separator is not found and a null name is invalid");
+    expect(CreateFileA("a.txt", 0x40000000u, 1, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_ACCESS_DENIED && CreateFileA("a.txt", 0x80000000u, 1, nullptr, 2, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_ACCESS_DENIED &&
+               CreateFileA("a.txt", 0x80000000u, 1, nullptr, 3, 0x40000000u, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_NOT_SUPPORTED && g_fake_opened == 2,
+           "write access, creating dispositions and overlapped files are refused before the file is touched");
+    u64 bh = CreateFileW(wide("b.dat"), 0x80000000u, 1, nullptr, 3, 0, 0);
+    expect(bh == 0x100 && CreateFileW(wide("nope"), 0x80000000u, 1, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_FILE_NOT_FOUND && CreateFileW(nullptr, 0, 0, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_INVALID_PARAMETER,
+           "the wide open is the narrow open");
+    g_fake_chunk = 7;
+    u8 big[300];
+    got = 0;
+    expect(ReadFile(bh, big, 300, &got, nullptr) == 1 && got == 300 && g_fake_last_offset == 294, "a platform that returns short reads is asked again until the request is filled");
+    bool intact = true;
+    for (u32 i = 0; i < 300; ++i) intact = intact && big[i] == g_fake_pattern[i];
+    expect(intact, "and the data arrives intact and in order");
+    g_fake_chunk = 0;
+    SetFilePointerEx(bh, 0, nullptr, 0);
+    g_fake_fail_from = 100;
+    set_last_error(0);
+    expect(ReadFile(bh, big, 300, &got, nullptr) == 0 && got == 100 && last_error() == pehost::ERROR_INVALID_FUNCTION && SetFilePointerEx(bh, 0, &pos, 1) == 1 && pos == 100, "a read error part way reports the bytes read and fails");
+    g_fake_fail_from = ~0ull;
+    CloseHandle(bh);
+
+    u64 many[MAX_OPEN_FILES];
+    bool filled = true;
+    for (u32 i = 0; i < MAX_OPEN_FILES; ++i) {
+        many[i] = CreateFileA("a.txt", 0x80000000u, 1, nullptr, 3, 0, 0);
+        filled = filled && many[i] == 0x100 + 4ull * i;
+    }
+    g_fake_closed = 0;
+    expect(filled && CreateFileA("a.txt", 0x80000000u, 1, nullptr, 3, 0, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_NOT_ENOUGH_MEMORY && g_fake_closed == 1, "32 files can be open and the next open fails after releasing its platform file");
+    CloseHandle(many[5]);
+    expect(CreateFileA("a.txt", 0x80000000u, 1, nullptr, 3, 0, 0) == many[5], "a closed slot is reused");
+    for (u32 i = 0; i < MAX_OPEN_FILES; ++i) CloseHandle(0x100 + 4ull * i);
+
+    g_fake_closed = 0;
+    set_last_error(0);
+    expect(GetFileAttributesA("a.txt") == 0x80 && g_fake_closed == 1 && GetFileAttributesA("nope") == INVALID_FILE_ATTRIBUTES && last_error() == pehost::ERROR_FILE_NOT_FOUND && GetFileAttributesA("x\\y") == INVALID_FILE_ATTRIBUTES && last_error() == pehost::ERROR_PATH_NOT_FOUND &&
+               GetFileAttributesA(nullptr) == INVALID_FILE_ATTRIBUTES && last_error() == pehost::ERROR_INVALID_PARAMETER && GetFileAttributesW(wide("a.txt")) == 0x80 && GetFileAttributesW(nullptr) == INVALID_FILE_ATTRIBUTES,
+           "file attributes open and release the file and report the right errors");
+    u8 attr[40];
+    for (u8& b : attr) b = 0xAA;
+    expect(GetFileAttributesExA("b.dat", 0, attr) == 1 && *reinterpret_cast<u32*>(attr) == 0x80 && *reinterpret_cast<u32*>(attr + 28) == 0 && *reinterpret_cast<u32*>(attr + 32) == 300 && attr[36] == 0xAA && attr[4] == 0,
+           "extended attributes carry the size in the right fields and clear the times");
+    expect(GetFileAttributesExW(wide("b.dat"), 0, attr) == 1 && GetFileAttributesExA("b.dat", 1, attr) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && GetFileAttributesExA("nope", 0, attr) == 0 && last_error() == pehost::ERROR_FILE_NOT_FOUND && GetFileAttributesExA("a.txt", 0, nullptr) == 0,
+           "the wide form works and a bad level, a missing file and a null buffer fail");
+    expect(DeleteFileA("a.txt") == 0 && last_error() == pehost::ERROR_ACCESS_DENIED && DeleteFileW(wide("a.txt")) == 0 && RemoveDirectoryA("x") == 0 && CreateDirectoryW(wide("x"), nullptr) == 0 && MoveFileExW(wide("a", 0), wide("b", 1), 0) == 0 && SetFileAttributesA("a.txt", 1) == 0,
+           "everything that would change the file system is denied");
+
+    char cwd[8];
+    u16 wcwd[8];
+    expect(GetCurrentDirectoryA(8, cwd) == 1 && same(cwd, "\\") && GetCurrentDirectoryA(1, cwd) == 2 && GetCurrentDirectoryW(8, wcwd) == 1 && wide_is(wcwd, "\\") && GetCurrentDirectoryW(0, wcwd) == 2, "the current directory is the root and a short buffer gets the required size");
+    expect(SetCurrentDirectoryW(wide("\\")) == 1 && SetCurrentDirectoryW(wide("C:\\x")) == 0 && last_error() == pehost::ERROR_FILE_NOT_FOUND && SetCurrentDirectoryW(nullptr) == 0, "only the root can be made current");
+    char full[40];
+    char* part = nullptr;
+    expect(GetFullPathNameA("foo.txt", 40, full, &part) == 8 && same(full, "\\foo.txt") && part == full + 1 && GetFullPathNameA("C:\\x\\y.z", 40, full, &part) == 8 && same(full, "C:\\x\\y.z") && part == full + 5 && GetFullPathNameA("/a/b", 40, full, nullptr) == 4,
+           "relative names are rooted, absolute names kept and the file part is located");
+    expect(GetFullPathNameA("foo.txt", 4, full, &part) == 9 && GetFullPathNameA("", 40, full, &part) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && GetFullPathNameA(nullptr, 40, full, &part) == 0, "a short buffer gets the required size and an empty name is invalid");
+    u16 wfull[40];
+    u16* wpart = nullptr;
+    expect(GetFullPathNameW(wide("dir\\foo.txt"), 40, wfull, &wpart) == 12 && wide_is(wfull, "\\dir\\foo.txt") && wide_is(wpart, "foo.txt") && GetFullPathNameW(wide("foo"), 3, wfull, &wpart) == 5 && GetFullPathNameW(nullptr, 40, wfull, &wpart) == 0, "the wide full path matches");
+    char temp[8];
+    expect(GetTempPathA(8, temp) == 1 && same(temp, "\\") && GetTempPathA(1, temp) == 2, "the temporary directory is the root");
+
+    void* block = HeapAlloc(GetProcessHeap(), 0, 32);
+    expect(LocalFree(0) == 0 && LocalFree(reinterpret_cast<u64>(block)) == 0 && LocalFree(0x1234) == 0x1234 && last_error() == pehost::ERROR_INVALID_HANDLE, "LocalFree releases heap memory and returns the argument for a foreign pointer");
+
+    char ebuf[300];
+    set_last_error(0);
+    expect(GetEnvironmentVariableA("ZED", ebuf, 300) == 0 && last_error() == pehost::ERROR_ENVVAR_NOT_FOUND && SetEnvironmentVariableA("Zed", "one") == 1 && GetEnvironmentVariableA("ZED", ebuf, 300) == 3 && same(ebuf, "one") && GetEnvironmentVariableA("zed", ebuf, 3) == 4,
+           "a variable is set, found regardless of case, and a short buffer gets the size with the terminator");
+    expect(SetEnvironmentVariableA("ZED", "two!") == 1 && GetEnvironmentVariableA("Zed", ebuf, 300) == 4 && same(ebuf, "two!") && GetEnvironmentVariableA("Zed", ebuf, 5) == 4, "setting again replaces the value and an exact fit succeeds");
+    expect(SetEnvironmentVariableW(wide("W", 0), wide("wide", 1)) == 1 && GetEnvironmentVariableA("w", ebuf, 300) == 4 && same(ebuf, "wide"), "wide variables are the same store");
+    u16 webuf[16];
+    expect(GetEnvironmentVariableW(wide("W"), webuf, 16) == 4 && wide_is(webuf, "wide") && GetEnvironmentVariableW(wide("W"), webuf, 4) == 5 && GetEnvironmentVariableW(wide("NOPE"), webuf, 16) == 0 && last_error() == pehost::ERROR_ENVVAR_NOT_FOUND,
+           "wide lookups, short buffers and misses");
+    u16* strings = GetEnvironmentStringsW();
+    u32 total = 0;
+    while (strings[total] || strings[total + 1]) ++total;
+    expect(strings != nullptr && wide_is(strings, "Zed=two!") && wide_is(strings + 9, "W=wide") && total == 9 + 6 && FreeEnvironmentStringsW(strings) == 1 && FreeEnvironmentStringsW(nullptr) == 0, "the environment block lists NAME=value entries and ends with an extra zero");
+    expect(SetEnvironmentVariableA("ZED", nullptr) == 1 && GetEnvironmentVariableA("Zed", ebuf, 300) == 0 && SetEnvironmentVariableA("ZED", nullptr) == 0 && last_error() == pehost::ERROR_ENVVAR_NOT_FOUND && SetEnvironmentVariableW(wide("W"), nullptr) == 1, "a null value removes the variable and removing it twice fails");
+    char longv[300];
+    for (u32 i = 0; i < 299; ++i) longv[i] = 'v';
+    longv[299] = 0;
+    longv[255] = 0;
+    expect(SetEnvironmentVariableA("A=B", "x") == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && SetEnvironmentVariableA("", "x") == 0 && SetEnvironmentVariableA(nullptr, "x") == 0 && SetEnvironmentVariableA("L", longv) == 1, "bad names are rejected and a 255 character value fits");
+    longv[255] = 'v';
+    longv[256] = 0;
+    expect(SetEnvironmentVariableA("L2", longv) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER, "a 256 character value does not fit");
+    g_extra = Extra{};
+    bool env_full = true;
+    char nm[8];
+    for (u32 i = 0; i < MAX_ENV; ++i) {
+        nm[0] = 'N';
+        nm[1] = static_cast<char>('a' + i / 10);
+        nm[2] = static_cast<char>('a' + i % 10);
+        nm[3] = 0;
+        env_full = env_full && SetEnvironmentVariableA(nm, "v") == 1;
+    }
+    expect(env_full && SetEnvironmentVariableA("OneTooMany", "v") == 0 && last_error() == pehost::ERROR_NOT_ENOUGH_MEMORY, "the table holds 32 variables and the next one fails");
+    g_extra = Extra{};
+
+    expect(GetUserDefaultLCID() == 0x409 && GetSystemDefaultLCID() == 0x409 && IsValidLocale(0x409, 1) == 1 && IsValidLocale(0x411, 1) == 0 && IsValidCodePage(65001) == 1 && IsValidCodePage(1252) == 0, "locale and code page validity");
+    u8 cpinfo[20];
+    for (u8& b : cpinfo) b = 0xAA;
+    expect(GetCPInfo(65001, cpinfo) == 1 && *reinterpret_cast<u32*>(cpinfo) == 4 && cpinfo[4] == '?' && cpinfo[5] == 0 && cpinfo[19] == 0 && GetCPInfo(1252, cpinfo) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && GetCPInfo(65001, nullptr) == 0, "GetCPInfo describes UTF-8");
+    g_locale_hits = 0;
+    expect(EnumSystemLocalesW(&locale_callback, 1) == 1 && g_locale_hits == 1 && wide_is(g_locale_first, "00000409") && EnumSystemLocalesW(nullptr, 1) == 0, "locale enumeration lists en-US once");
+    u16 li[16];
+    expect(GetLocaleInfoW(0x409, 0x0E, li, 16) == 2 && wide_is(li, ".") && GetLocaleInfoW(0x409, 0x0F, li, 16) == 2 && wide_is(li, ",") && GetLocaleInfoW(0x409, 0x5C, li, 16) == 6 && wide_is(li, "en-US") && GetLocaleInfoW(0x409, 0x0E, nullptr, 0) == 2,
+           "locale strings and the size query");
+    set_last_error(0);
+    expect(GetLocaleInfoW(0x409, 0x5C, li, 3) == 0 && last_error() == pehost::ERROR_INSUFFICIENT_BUFFER && GetLocaleInfoW(0x409, 0x7777, li, 16) == 0 && last_error() == pehost::ERROR_INVALID_FLAGS && GetLocaleInfoW(0x411, 0x0E, li, 16) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER,
+           "a short buffer, an unknown type and an unknown locale fail with the matching errors");
+    expect(GetLocaleInfoW(0x409, 0x20001004u, li, 2) == 2 && *reinterpret_cast<u32*>(li) == 65001 && GetLocaleInfoW(0x409, 0x20000001u, li, 2) == 2 && *reinterpret_cast<u32*>(li) == 0x409 && GetLocaleInfoW(0x409, 0x20007777u, li, 2) == 0 && GetLocaleInfoW(0x409, 0x20001004u, li, 1) == 0,
+           "number valued locale queries return a DWORD");
+    expect(GetUserDefaultLocaleName(li, 16) == 6 && wide_is(li, "en-US") && GetUserDefaultLocaleName(li, 3) == 0, "the default locale name is en-US");
+
+    expect(CompareStringW(0x409, 0, wide("abc", 0), -1, wide("abd", 1), -1) == 1 && CompareStringW(0x409, 0, wide("abc", 0), 3, wide("abc", 1), 3) == 2 && CompareStringW(0x409, 0, wide("abd", 0), -1, wide("abc", 1), -1) == 3, "string comparison is less, equal and greater");
+    expect(CompareStringW(0x409, 0, wide("ABC", 0), -1, wide("abc", 1), -1) != 2 && CompareStringW(0x409, 1, wide("ABC", 0), -1, wide("abc", 1), -1) == 2 && CompareStringW(0x409, 0, wide("ab", 0), -1, wide("abc", 1), -1) == 1 && CompareStringW(0x409, 0, wide("abc", 0), 2, wide("abc", 1), 3) == 1,
+           "comparison honours the ignore case flag and lengths");
+    set_last_error(0);
+    expect(CompareStringW(0x409, 0x8, wide("a", 0), 1, wide("a", 1), 1) == 0 && last_error() == pehost::ERROR_INVALID_FLAGS && CompareStringEx(nullptr, 0, nullptr, 1, wide("a"), 1, nullptr, nullptr, 0) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER &&
+               CompareStringEx(nullptr, 0x1, wide("Q", 0), 1, wide("q", 1), 1, nullptr, nullptr, 0) == 2, "unsupported flags and null strings fail and the Ex form compares");
+    u16 mapped[16];
+    expect(LCMapStringW(0x409, 0x200, wide("aBc"), -1, mapped, 16) == 4 && wide_is(mapped, "ABC") && LCMapStringEx(nullptr, 0x100, wide("aBc"), 3, mapped, 16, nullptr, nullptr, 0) == 3 && mapped[0] == 'a' && mapped[2] == 'c' && LCMapStringW(0x409, 0x200, wide("aBc"), 3, nullptr, 0) == 3,
+           "case mapping, the terminator with a length of -1 and the size query");
+    expect(LCMapStringW(0x409, 0x200, wide("abc"), 3, mapped, 2) == 0 && last_error() == pehost::ERROR_INSUFFICIENT_BUFFER && LCMapStringW(0x409, 0x400, wide("a"), 1, mapped, 16) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && LCMapStringW(0x409, 0, wide("a"), 1, mapped, 16) == 0 && last_error() == pehost::ERROR_INVALID_FLAGS && LCMapStringW(0x409, 0x200, wide("a"), 0, mapped, 16) == 0,
+           "a short buffer, an unsupported mapping and missing flags fail");
+    const u16 types_in[] = { 'A', 'f', '5', ' ', '\t', '!', 1, 0xE9 };
+    u16 types[8];
+    expect(GetStringTypeW(1, types_in, 8, types) == 1 && types[0] == 0x181 && types[1] == 0x182 && types[2] == 0x84 && types[3] == 0x48 && types[4] == 0x68 && types[5] == 0x10 && types[6] == 0x20 && types[7] == 0 && GetStringTypeW(2, types_in, 8, types) == 0 && GetStringTypeW(1, types_in, 0, types) == 0,
+           "character classification of letters, digits, blanks, punctuation and controls");
+
+    u8 fd[600];
+    set_last_error(0);
+    u64 s1 = FindFirstFileExA("*.txt", 0, fd, 0, nullptr, 0);
+    u64 stamp = (1000ull + 11644473600000ull) * 10000;
+    u64 write_time = static_cast<u64>(*reinterpret_cast<u32*>(fd + 24)) << 32 | *reinterpret_cast<u32*>(fd + 20);
+    expect(s1 == 0x1000 && *reinterpret_cast<u32*>(fd) == 0x80 && *reinterpret_cast<u32*>(fd + 28) == 0 && *reinterpret_cast<u32*>(fd + 32) == 11 && same(reinterpret_cast<char*>(fd + 44), "a.txt") && write_time == stamp,
+           "the first match of a pattern fills attributes, times, size and name");
+    expect(FindNextFileA(s1, fd) == 1 && same(reinterpret_cast<char*>(fd + 44), "C.TXT") && *reinterpret_cast<u32*>(fd + 32) == 5 && FindNextFileA(s1, fd) == 0 && last_error() == pehost::ERROR_NO_MORE_FILES,
+           "patterns match without regard to case and the end is ERROR_NO_MORE_FILES");
+    expect(FindClose(s1) == 1 && FindClose(s1) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE && FindNextFileA(s1, fd) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE, "a closed search is invalid");
+    u64 s2 = FindFirstFileExA("*", 1, fd, 0, nullptr, 0);
+    u32 listed = 1;
+    bool saw_dir = *reinterpret_cast<u32*>(fd) == 0x80 && same(reinterpret_cast<char*>(fd + 44), "a.txt");
+    while (FindNextFileA(s2, fd)) {
+        ++listed;
+        if (same(reinterpret_cast<char*>(fd + 44), "sub")) saw_dir = saw_dir && *reinterpret_cast<u32*>(fd) == 0x10;
+    }
+    FindClose(s2);
+    expect(s2 == 0x1000 && listed == 4 && saw_dir, "a bare star lists everything and directories carry the directory attribute");
+    u32 star_dot_star = 0, question = 0;
+    u64 s3 = FindFirstFileExA("*.*", 0, fd, 0, nullptr, 0);
+    do ++star_dot_star;
+    while (FindNextFileA(s3, fd));
+    FindClose(s3);
+    u64 s4 = FindFirstFileExA("?.txt", 0, fd, 0, nullptr, 0);
+    do ++question;
+    while (FindNextFileA(s4, fd));
+    FindClose(s4);
+    expect(star_dot_star == 4 && question == 2, "star dot star matches names without a dot and a question mark matches one character");
+    set_last_error(0);
+    expect(FindFirstFileExA("nomatch*", 0, fd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_FILE_NOT_FOUND && FindFirstFileExA("sub\\x", 0, fd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_PATH_NOT_FOUND &&
+               FindFirstFileExA("", 0, fd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_PATH_NOT_FOUND && FindFirstFileExA(nullptr, 0, fd, 0, nullptr, 0) == INVALID_HANDLE,
+           "no match is file not found, and a pattern that names a directory is path not found");
+    u64 s5 = FindFirstFileExA(".\\b*", 0, fd, 0, nullptr, 0);
+    u64 s6 = FindFirstFileExA("\\s*", 0, fd, 0, nullptr, 0);
+    expect(s5 == 0x1000 && s6 == 0x1004 && same(reinterpret_cast<char*>(fd + 44), "sub") && FindClose(s5) == 1 && FindClose(s6) == 1, "a leading dot slash or slash is accepted and handles are small distinct numbers");
+    expect(FindFirstFileExA("*", 2, fd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_INVALID_PARAMETER && FindFirstFileExA("*", 0, fd, 1, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_NOT_SUPPORTED &&
+               FindFirstFileExA("*", 0, fd, 3, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_INVALID_PARAMETER && FindFirstFileExA("*", 0, nullptr, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_INVALID_PARAMETER,
+           "an unknown level, directory only searches, an unknown operation and a null buffer are refused");
+    u64 plain = FindFirstFileA("b*", fd);
+    u8 wide_data[600];
+    u64 plain_wide = FindFirstFileW(wide("B*"), wide_data);
+    expect(plain != INVALID_HANDLE && same(reinterpret_cast<char*>(fd + 44), "b.dat") && FindNextFileA(plain, fd) == 0 && FindClose(plain) == 1 && plain_wide != INVALID_HANDLE && *reinterpret_cast<u16*>(wide_data + 44) == 'b' && FindNextFileW(plain_wide, wide_data) == 0 && FindClose(plain_wide) == 1 &&
+               FindFirstFileA("zzz", fd) == INVALID_HANDLE && last_error() == pehost::ERROR_FILE_NOT_FOUND && FindFirstFileW(wide("zzz"), wide_data) == INVALID_HANDLE,
+           "FindFirstFile is the level zero search in its narrow and wide forms");
+    u8 wfd[600];
+    u64 w1 = FindFirstFileExW(wide("*.TXT"), 1, wfd, 0, nullptr, 0);
+    expect(w1 != INVALID_HANDLE && *reinterpret_cast<u16*>(wfd + 44) == 'a' && *reinterpret_cast<u16*>(wfd + 48) == 't' && *reinterpret_cast<u16*>(wfd + 54) == 0 && FindNextFileA(w1, fd) == 0 && last_error() == pehost::ERROR_INVALID_HANDLE &&
+               FindNextFileW(w1, wfd) == 1 && *reinterpret_cast<u16*>(wfd + 44) == 'C' && FindNextFileW(w1, wfd) == 0 && last_error() == pehost::ERROR_NO_MORE_FILES && FindClose(w1) == 1,
+           "wide searches fill wide names, are not interchangeable with narrow ones and end the same way");
+    expect(FindFirstFileExW(nullptr, 0, wfd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_PATH_NOT_FOUND && FindFirstFileExW(wide("*"), 0, nullptr, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_INVALID_PARAMETER &&
+               FindFirstFileExW(wide("*"), 0, wfd, 1, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_NOT_SUPPORTED, "wide error cases");
+    u64 hs[MAX_SEARCHES];
+    bool eight = true;
+    for (u32 i = 0; i < MAX_SEARCHES; ++i) {
+        hs[i] = FindFirstFileExA("*", 0, fd, 0, nullptr, 0);
+        eight = eight && hs[i] == 0x1000 + 4ull * i;
+    }
+    expect(eight && FindFirstFileExA("*", 0, fd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_NOT_ENOUGH_MEMORY && FindClose(0x1002) == 0 && FindClose(0x2000) == 0, "eight searches can be open, the ninth fails and bad handles are rejected");
+    for (u64 h : hs) FindClose(h);
+    ext.dir_entry = nullptr;
+    expect(FindFirstFileExA("*", 0, fd, 0, nullptr, 0) == INVALID_HANDLE && last_error() == pehost::ERROR_FILE_NOT_FOUND, "without a directory hook nothing is found");
+    ext.dir_entry = &fake_dir;
+
+    expect(VerSetConditionMask(0, 2, 3) == 0x18 && VerSetConditionMask(0, 3, 2) == 0x12 && VerSetConditionMask(VerSetConditionMask(0, 2, 3), 1, 3) == 0x1B && VerSetConditionMask(0, 0x80, 1) == (1ull << 21), "condition masks pack three bits per field");
+    alignas(8) u8 vi[156];
+    auto fill = [&](u32 major, u32 minor, u32 build, u32 platform, u16 spmaj, u16 spmin, u16 suite, u8 product) {
+        for (u8& b : vi) b = 0;
+        *reinterpret_cast<u32*>(vi) = 156;
+        *reinterpret_cast<u32*>(vi + 4) = major;
+        *reinterpret_cast<u32*>(vi + 8) = minor;
+        *reinterpret_cast<u32*>(vi + 12) = build;
+        *reinterpret_cast<u32*>(vi + 16) = platform;
+        *reinterpret_cast<u16*>(vi + 148) = spmaj;
+        *reinterpret_cast<u16*>(vi + 150) = spmin;
+        *reinterpret_cast<u16*>(vi + 152) = suite;
+        vi[154] = product;
+    };
+    auto both = [&](u32 condition) { return VerSetConditionMask(VerSetConditionMask(0, 2, static_cast<u8>(condition)), 1, static_cast<u8>(condition)); };
+    fill(10, 0, 0, 0, 0, 0, 0, 0);
+    set_last_error(0);
+    expect(VerifyVersionInfoA(vi, 3, both(3)) == 1 && last_error() == 0, "Windows 10.0 satisfies at least 10.0");
+    fill(6, 1, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(3)) == 1, "and at least 6.1: a higher major version decides without looking at the minor");
+    fill(11, 0, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(3)) == 0 && last_error() == pehost::ERROR_OLD_WIN_VERSION, "but not 11.0, which fails with ERROR_OLD_WIN_VERSION");
+    fill(10, 1, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(3)) == 0, "and not 10.1: equal major, lower minor");
+    fill(10, 0, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(2)) == 0 && VerifyVersionInfoA(vi, 3, both(4)) == 0, "strictly greater and strictly less than itself fail");
+    fill(9, 99, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(2)) == 1, "9.99 is below 10.0 so strictly greater than it passes");
+    fill(11, 0, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(4)) == 1, "11.0 is above so strictly less than it passes");
+    fill(10, 1, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(4)) == 1 && VerifyVersionInfoA(vi, 3, both(5)) == 1, "10.1 is less than 10.0 with equal major, and less or equal");
+    fill(10, 0, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 3, both(5)) == 1 && VerifyVersionInfoA(vi, 2, VerSetConditionMask(0, 2, 1)) == 1, "less or equal and equal hold for the same version");
+    fill(6, 0, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 2, VerSetConditionMask(0, 2, 1)) == 0 && VerifyVersionInfoA(vi, 2, 0) == 0 && last_error() == pehost::ERROR_OLD_WIN_VERSION, "equality on the wrong version fails and a field without a condition fails");
+    fill(0, 0, 19045, 2, 0, 0, 0, 1);
+    expect(VerifyVersionInfoA(vi, 4, VerSetConditionMask(0, 4, 3)) == 1 && VerifyVersionInfoA(vi, 8, VerSetConditionMask(0, 8, 1)) == 1 && VerifyVersionInfoA(vi, 0x80, VerSetConditionMask(0, 0x80, 1)) == 1 && VerifyVersionInfoA(vi, 0x20, VerSetConditionMask(0, 0x20, 3)) == 1,
+           "the build number, platform, product type and service pack of this system");
+    fill(0, 0, 22000, 1, 1, 0, 1, 3);
+    expect(VerifyVersionInfoA(vi, 4, VerSetConditionMask(0, 4, 3)) == 0 && VerifyVersionInfoA(vi, 8, VerSetConditionMask(0, 8, 1)) == 0 && VerifyVersionInfoA(vi, 0x80, VerSetConditionMask(0, 0x80, 1)) == 0 && VerifyVersionInfoA(vi, 0x20, VerSetConditionMask(0, 0x20, 3)) == 0 && VerifyVersionInfoA(vi, 0x40, 0) == 0,
+           "a newer build, another platform, product type, service pack and a suite all fail");
+    fill(0, 0, 0, 0, 0, 0, 0, 0);
+    expect(VerifyVersionInfoA(vi, 0x40, 0) == 1, "a suite mask of zero is satisfied");
+    set_last_error(0);
+    *reinterpret_cast<u32*>(vi) = 100;
+    expect(VerifyVersionInfoA(vi, 2, 0) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && VerifyVersionInfoA(nullptr, 2, 0) == 0 && VerifyVersionInfoA(vi, 0, 0) == 0 && VerifyVersionInfoA(vi, 0x100, 0) == 0, "a short structure, null and bad type masks are invalid");
+    *reinterpret_cast<u32*>(vi) = 148;
+    expect(VerifyVersionInfoA(vi, 0x20, 0) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && VerifyVersionInfoA(vi, 3, both(3)) == 1, "the extended fields need the extended structure");
+
+    char fm[100];
+    set_last_error(0);
+    expect(FormatMessageA(0x1200, nullptr, 5, 0, fm, 100, nullptr) == 19 && same(fm, "Access is denied.\r\n") && FormatMessageA(0x1200, nullptr, 2, 0x409, fm, 100, nullptr) == detail::text_length(fm), "system messages are formatted into the buffer");
+    char* allocated = nullptr;
+    u32 alen = FormatMessageA(0x1300, nullptr, 50, 0, reinterpret_cast<char*>(&allocated), 0, nullptr);
+    expect(allocated != nullptr && alen == detail::text_length(allocated) && contains(allocated, "not supported") && LocalFree(reinterpret_cast<u64>(allocated)) == 0, "the allocate flag returns a heap block that LocalFree releases");
+    expect(FormatMessageA(0x1200, nullptr, 9999, 0, fm, 100, nullptr) == 0 && last_error() == pehost::ERROR_MR_MID_NOT_FOUND && FormatMessageA(0x1200, nullptr, 5, 0, fm, 10, nullptr) == 0 && last_error() == pehost::ERROR_INSUFFICIENT_BUFFER &&
+               FormatMessageA(0x200, nullptr, 5, 0, fm, 100, nullptr) == 0 && last_error() == pehost::ERROR_INVALID_PARAMETER && FormatMessageA(0x400, nullptr, 5, 0, fm, 100, nullptr) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED,
+           "an unknown message, a short buffer, a missing source and a string source are all reported");
+
+    set_last_error(0);
+    expect(CreateProcessA(nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, nullptr) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && CreateNamedPipeA("x", 0, 0, 0, 0, 0, 0, nullptr) == INVALID_HANDLE && CreateIoCompletionPort(INVALID_HANDLE, 0, 0, 0) == 0 &&
+               CreatePipe(nullptr, nullptr, nullptr, 0) == 0 && GetProcessId(1) == 0 && GetExitCodeProcess(1, nullptr) == 0 && ReleaseSemaphore(1, 1, nullptr) == 0 && OpenSemaphoreA(0, 0, "x") == 0,
+           "the process, pipe and completion port stubs fail with ERROR_NOT_SUPPORTED");
+    expect(WaitForSingleObject(1, 0) == 0xFFFFFFFFu && last_error() == pehost::ERROR_INVALID_HANDLE && GetDriveTypeW(wide("C:\\")) == 1, "waiting on an unknown handle fails and drives are of unknown type");
+
+    namespace vc = pehost::vcrt;
+    const char hay[] = "abcabc";
+    expect(vc::memchr(hay, 'c', 6) == hay + 2 && vc::memchr(hay, 'z', 6) == nullptr && vc::memchr(hay, 'c', 2) == nullptr && vc::memchr(hay, 0, 7) == hay + 6 && vc::memchr(hay, 0x163, 6) == hay + 2, "memchr finds the first byte, honours the length and compares as a byte");
+    const u16 wh[] = { 'a', 'b', 'a', 0 };
+    expect(vc::wcschr(wh, 'a') == wh && vc::wcschr(wh, 0) == wh + 3 && vc::wcschr(wh, 'z') == nullptr && vc::wcsrchr(wh, 'a') == wh + 2 && vc::wcsrchr(wh, 0) == wh + 3 && vc::wcsrchr(wh, 'z') == nullptr, "wcschr and wcsrchr");
+    expect(vc::wcsstr(wh, wide("ba")) == wh + 1 && vc::wcsstr(wh, wide("")) == wh && vc::wcsstr(wh, wide("abab")) == nullptr && vc::wcsstr(wh, wide("aba")) == wh && vc::wcsstr(wh, wide("bb")) == nullptr, "wcsstr");
+    vc::ExceptionData src{ "boom", 1 };
+    vc::ExceptionData dst{ reinterpret_cast<const char*>(1), 7 };
+    vc::__std_exception_copy(&src, &dst);
+    expect(dst.what != src.what && same(dst.what, "boom") && dst.free_it == 1, "copying an owned exception message duplicates it");
+    vc::__std_exception_destroy(&dst);
+    expect(dst.what == nullptr && dst.free_it == 0, "and destroying it releases it");
+    src.free_it = 0;
+    vc::__std_exception_copy(&src, &dst);
+    expect(dst.what == src.what && dst.free_it == 0, "a borrowed message is shared");
+    vc::__std_exception_destroy(&dst);
+    expect(src.what != nullptr, "and destroying the copy leaves the original alone");
+    src.what = nullptr;
+    vc::__std_exception_copy(&src, &dst);
+    expect(dst.what == nullptr, "an empty message copies as empty");
+    FakeTypeInfo ta{ nullptr, nullptr, ".?AVfoo@@" }, tb{ nullptr, nullptr, ".?AVfoo@@" }, tc{ nullptr, nullptr, ".?AVbar@@" };
+    expect(vc::__std_type_info_compare(&ta, &ta) == 0 && vc::__std_type_info_compare(&ta, &tb) == 0 && vc::__std_type_info_compare(&ta, &tc) > 0 && vc::__std_type_info_compare(&tc, &ta) < 0, "type information compares by decorated name");
+    expect(vc::__std_type_info_hash(&ta) == vc::__std_type_info_hash(&tb) && vc::__std_type_info_hash(&ta) != vc::__std_type_info_hash(&tc), "and hashes by it");
+    expect(vc::_get_purecall_handler() == nullptr && vc::_set_purecall_handler(reinterpret_cast<void*>(0x10)) == nullptr && vc::_set_purecall_handler(nullptr) == reinterpret_cast<void*>(0x10) && vc::_set_se_translator(reinterpret_cast<void*>(0x20)) == nullptr &&
+               vc::_set_se_translator(nullptr) == reinterpret_cast<void*>(0x20) && vc::__uncaught_exception() == 0 && vc::__uncaught_exceptions() == 0 && vc::__processing_throw() != nullptr && vc::__current_exception() != vc::__current_exception_context() &&
+               vc::__CxxFrameHandler3(nullptr, nullptr, nullptr, nullptr) == 1 && vc::__CxxFrameHandler4(nullptr, nullptr, nullptr, nullptr) == 1,
+           "handler registration returns the previous handler and the exception state accessors exist");
+    pehost::g_runtime = &g_child_runtime;
+    ChildResult purecall = in_child([] { vc::_purecall(); });
+    ChildResult overrun = in_child([] { vc::__report_gsfailure(0); });
+    ChildResult thrown = in_child([] { vc::_CxxThrowException(nullptr, nullptr); });
+    ChildResult terminated = in_child([] { vc::__std_terminate(); });
+    pehost::g_runtime = &ext;
+    expect(purecall.exited && purecall.code == 3 && contains(purecall.out, "pure virtual") && overrun.exited && static_cast<u32>(overrun.code) == 0xC0000409u && contains(overrun.out, "stack buffer overrun"), "a pure virtual call and a stack overrun end the process with their codes and a message");
+    expect(thrown.exited && static_cast<u32>(thrown.code) == 0xE06D7363u && contains(thrown.out, "C++ exceptions are not supported") && terminated.exited && terminated.code == 3 && contains(terminated.out, "terminate it"), "a thrown C++ exception and std::terminate end the process and say why");
+
+    u64 address = 0;
+    const pehost::ImportTable* all_tables = pehost::all_imports();
+    auto resolved = [&](const char* dll, const char* name) { return pehost::detail::resolve(const_cast<pehost::ImportTable*>(all_tables), dll, name, 0, &address); };
+    expect(resolved("kernel32.dll", "FlsAlloc") && address == reinterpret_cast<u64>(&FlsAlloc) && resolved("api-ms-win-core-fibers-l1-1-1.dll", "FlsAlloc") && resolved("KERNELBASE.dll", "CreateFileW") && address == reinterpret_cast<u64>(&CreateFileW) &&
+               resolved("kernel32.dll", "CreateProcessA") && address == reinterpret_cast<u64>(&CreateProcessA), "the new kernel32 functions and the failing stubs resolve by name and through api sets");
+    expect(resolved("vcruntime140.dll", "memchr") && address == reinterpret_cast<u64>(&vc::memchr) && resolved("VCRUNTIME140_1.dll", "__CxxFrameHandler4") && resolved("vcruntime140.dll", "memcpy") && address == reinterpret_cast<u64>(&pehost::msvcrt::memcpy) &&
+               !resolved("vcruntime140.dll", "FlsAlloc") && !resolved("vcruntime140.dll", "printf"), "vcruntime140 and its x64 companion resolve their own functions and the shared memory routines only");
+    expect(pe::modules::provided("vcruntime140.dll") && same(pe::modules::canonical("VCRUNTIME140_1.dll"), "vcruntime140.dll") && same(pe::modules::canonical("vcruntime140.dll"), "vcruntime140.dll") && !pe::modules::provided("vcruntime140_1.dll"), "the module tables treat both vcruntime names as one provided module");
+    u64 vcrt_module = GetModuleHandleA("vcruntime140.dll");
+    expect(vcrt_module != 0 && vcrt_module != k32 && GetModuleHandleA("VCRUNTIME140_1.DLL") == vcrt_module && LoadLibraryA("vcruntime140.dll") == vcrt_module && GetProcAddress(vcrt_module, "memchr") == reinterpret_cast<void*>(&vc::memchr) && GetProcAddress(vcrt_module, "FlsAlloc") == nullptr,
+           "vcruntime140 is a module with its own handle and function lookup");
+
+    static u8 file[0x10000];
+    usize file_size = 0;
+    decode_b64(pe_sample_mingw_k32, file, &file_size);
+    static pe::Image img;
+    pe::parse(file, file_size, &img);
+    u8* image_base = map_pages(img.size_of_image + 0x20000);
+    image_base = reinterpret_cast<u8*>((reinterpret_cast<u64>(image_base) + 0xFFFF) & ~0xFFFFull);
+    pe::map(img, file, file_size, image_base, img.size_of_image);
+    pehost::Prepared prepared{};
+    prepared.image = img;
+    prepared.base = image_base;
+    prepared.peb = &peb;
+    pehost::attach(prepared, pehost::all_imports(), pehost::Config{ "C:\\dir\\prog.exe arg", "C:\\dir\\prog.exe" });
+    pehost::ProcessParameters* pp = reinterpret_cast<pehost::ProcessParameters*>(peb.process_parameters);
+    expect(pp != nullptr && pp->standard_input == HANDLE_STDIN && pp->standard_output == HANDLE_STDOUT && pp->standard_error == HANDLE_STDERR && pp->length == sizeof(*pp), "the PEB carries process parameters with the standard handles");
+    expect(pp && pp->command_line.length == 19 * 2 && wide_is(reinterpret_cast<const u16*>(pp->command_line.buffer), "C:\\dir\\prog.exe arg") && pp->image_path_name.length == 15 * 2 && wide_is(reinterpret_cast<const u16*>(pp->image_path_name.buffer), "C:\\dir\\prog.exe") &&
+               pp->current_directory.length == 2 && wide_is(reinterpret_cast<const u16*>(pp->current_directory.buffer), "\\") && pp->environment != 0 && pp->dll_path.length == 0,
+           "the command line, image path, current directory, DLL path and environment are filled in");
+    pehost::g_runtime = &g_recording;
+}
+
 int main(int argc, char** argv) {
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
     heap_tests();
@@ -2273,6 +2953,7 @@ int main(int argc, char** argv) {
     msvcrt_tests();
     msvcrt_edge_tests();
     ucrt_tests();
+    extended_tests();
     module_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;

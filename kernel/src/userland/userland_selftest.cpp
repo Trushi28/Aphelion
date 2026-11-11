@@ -45,6 +45,8 @@ extern "C" const u8 pe_dllfail_start[];
 extern "C" const u8 pe_dllfail_end[];
 extern "C" const u8 pe_dyn_start[];
 extern "C" const u8 pe_dyn_end[];
+extern "C" const u8 pe_sysio_start[];
+extern "C" const u8 pe_sysio_end[];
 
 #define BLOB_DECL(name) extern "C" const u8 ublob_##name[]; extern "C" const u8 ublob_##name##_end[]
 
@@ -63,6 +65,7 @@ BLOB_DECL(gsbase);
 BLOB_DECL(gsbad);
 BLOB_DECL(gsiso);
 BLOB_DECL(gszero);
+BLOB_DECL(clockcall);
 BLOB_DECL(fsbase);
 BLOB_DECL(fsbad);
 BLOB_DECL(fsiso);
@@ -150,6 +153,7 @@ const Case g_cases[] = {
     CASE(vmstack, 2, 0),
     CASE(vmshoot, 2, userabi::fault_status(14)),
     CASE(vmrace, 2, 0),
+    CASE(clockcall, 1, 0),
 };
 
 Image image_of(const u8* begin, const u8* end, u32 data_pages) {
@@ -619,7 +623,7 @@ bool put_blob(lens::Domain& d, lens::Lens dir, const char* name, const u8* begin
 bool run_pe(lens::Table& K, lens::Lens root, lens::Lens apps, const char* name, i32 want) {
     lens::Result<lens::Lens> host = lens::open_at(K.domain, apps, "pehost", lens::Right::Read | lens::Right::Execute);
     lens::Result<lens::Lens> prog = lens::open_at(K.domain, apps, name, lens::Right::Read | lens::Right::Delegate);
-    lens::Result<lens::Lens> library = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Right::Read | lens::Right::Delegate);
+    lens::Result<lens::Lens> library = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
     i64 error = -1;
     Process* p = host.ok() && prog.ok() && library.ok() ? launch_file("pehost", K, host.value(), &K, prog.value(), &error, library.value()) : nullptr;
     i32 status = -1;
@@ -670,6 +674,7 @@ bool run_files() {
                put_blob(K.domain, apps, "dllplug.dll", pe_dllplug_start, pe_dllplug_end) &&
                put_blob(K.domain, apps, "dllfail.dll", pe_dllfail_start, pe_dllfail_end) &&
                put_blob(K.domain, apps, "dyn.exe", pe_dyn_start, pe_dyn_end) &&
+               put_blob(K.domain, apps, "sysio.exe", pe_sysio_start, pe_sysio_end) &&
                lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
                lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
     lens::Result<lens::Lens> badw = lens::open_at(K.domain, apps, "bad", lens::Right::Read | lens::Right::Write);
@@ -720,6 +725,7 @@ bool run_files() {
         pe = run_pe(K, root, apps, "crt.exe", 7) && pe;
         pe = run_pe(K, root, apps, "ucrt.exe", 7) && pe;
         pe = run_pe(K, root, apps, "dyn.exe", 7) && pe;
+        pe = run_pe(K, root, apps, "sysio.exe", 6) && pe;
         pe = run_pe(K, root, apps, "dllmath.dll", static_cast<i32>(0xC000007Bu)) && pe;
         pe = run_pe(K, root, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
         pe = run_pe(K, root, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;

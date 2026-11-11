@@ -12,6 +12,8 @@
 #include <cosmos/kheap.hpp>
 #include <cosmos/vmregion.hpp>
 #include <cosmos/apic.hpp>
+#include <cosmos/clock.hpp>
+#include <cosmos/timesrc.hpp>
 #include <cosmos/cpu.hpp>
 #include <cosmos/gdt.hpp>
 #include <cosmos/idt.hpp>
@@ -1093,6 +1095,33 @@ i64 sys_process_kill(idt::Frame* f) {
     return kill(o->proc) ? 0 : handleabi::ERR_CLOSED;
 }
 
+bool invariant_tsc() {
+    static i32 cached = -1;
+    i32 known = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (known >= 0) return known != 0;
+    u32 a, b, c, d;
+    cpu::cpuid(0x80000000u, 0, &a, &b, &c, &d);
+    bool yes = false;
+    if (a >= 0x80000007u) {
+        cpu::cpuid(0x80000007u, 0, &a, &b, &c, &d);
+        yes = (d & (1u << 8)) != 0;
+    }
+    __atomic_store_n(&cached, yes ? 1 : 0, __ATOMIC_RELAXED);
+    return yes;
+}
+
+i64 sys_clock(idt::Frame* f) {
+    Process* p = current_process();
+    userabi::ClockRecord record{};
+    record.uptime_ms = clock::uptime_ms();
+    bool wall = clock::wall_valid();
+    record.wall_ms = wall ? clock::now_ms() : 0;
+    record.tsc_khz = timesrc::tsc_khz();
+    record.flags = (wall ? userabi::CLOCK_WALL_VALID : 0) | (userabi::tsc_usable(record.tsc_khz, timesrc::last().assumed, invariant_tsc()) ? userabi::CLOCK_TSC_USABLE : 0);
+    if (!user_write(p, f->rdi, &record, sizeof(record))) return userabi::ERR_FAULT;
+    return 0;
+}
+
 using SysFn = i64 (*)(idt::Frame*);
 
 const SysFn g_table[userabi::SYS_COUNT] = {
@@ -1129,6 +1158,7 @@ const SysFn g_table[userabi::SYS_COUNT] = {
     &sys_process_create,
     &sys_process_status,
     &sys_process_kill,
+    &sys_clock,
 };
 
 static_assert(vmregion::PTE_WRITABLE == constellation::WRITABLE && vmregion::PTE_NO_EXECUTE == constellation::NO_EXECUTE,

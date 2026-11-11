@@ -98,7 +98,78 @@ u8* read_file(const char* name, u64* size) {
 
 void unmap_memory(u8* at, u64 bytes) { sys::vm_unmap(reinterpret_cast<u64>(at), (bytes + PAGE - 1) / PAGE); }
 
-pehost::Runtime g_runtime = { &exit_process, &write_console, &reserve_memory, &protect_memory, &sleep_ms, &read_file, &unmap_memory };
+u64 read_tsc() {
+    u32 low, high;
+    asm volatile("lfence\n\trdtsc" : "=a"(low), "=d"(high) : : "memory");
+    return (static_cast<u64>(high) << 32) | low;
+}
+
+bool read_clock(pehost::Clock* out) {
+    userabi::ClockRecord record{};
+    if (sys::clock(&record) != 0) return false;
+    if (record.flags & userabi::CLOCK_TSC_USABLE) {
+        out->counter = read_tsc();
+        out->frequency = record.tsc_khz * 1000;
+    } else {
+        out->counter = record.uptime_ms;
+        out->frequency = 1000;
+    }
+    out->wall_valid = (record.flags & userabi::CLOCK_WALL_VALID) != 0;
+    out->wall_ms = out->wall_valid ? record.wall_ms : 0;
+    return true;
+}
+
+constexpr u32 MAX_FILES = 64;
+u64 g_files[MAX_FILES];
+
+i64 file_open_hook(const char* name, u64* size) {
+    if (g_directory == 0) return -1;
+    u64 length = length_of(name);
+    if (!fileabi::path_len_ok(length)) return -1;
+    u32 slot = 0;
+    while (slot < MAX_FILES && g_files[slot] != 0) ++slot;
+    if (slot == MAX_FILES) return -1;
+    u64 handle = 0;
+    if (sys::file_open(g_directory, name, length, RIGHT_READ, &handle) != 0) return -1;
+    fileabi::Stat st{};
+    if (sys::file_stat(handle, &st) != 0 || st.kind != fileabi::KIND_FILE) {
+        sys::handle_close(handle);
+        return -1;
+    }
+    g_files[slot] = handle;
+    *size = st.size;
+    return slot;
+}
+
+i64 file_read_hook(i64 slot, u64 offset, void* buffer, u64 length) {
+    if (slot < 0 || slot >= MAX_FILES || g_files[slot] == 0) return -1;
+    return sys::file_read(g_files[slot], offset, buffer, length);
+}
+
+void file_close_hook(i64 slot) {
+    if (slot < 0 || slot >= MAX_FILES || g_files[slot] == 0) return;
+    sys::handle_close(g_files[slot]);
+    g_files[slot] = 0;
+}
+
+i32 dir_entry_hook(u64 index, char* name, u32 capacity, u64* size, u64* mtime_ms, bool* directory) {
+    if (g_directory == 0 || capacity == 0) return 0;
+    fileabi::DirEntry entry{};
+    if (sys::dir_entry(g_directory, index, &entry) != 0) return 0;
+    u32 n = 0;
+    while (entry.name[n] && n + 1 < capacity) {
+        name[n] = entry.name[n];
+        ++n;
+    }
+    name[n] = 0;
+    *size = entry.size;
+    *mtime_ms = entry.mtime_ms;
+    *directory = entry.kind == fileabi::KIND_DIRECTORY;
+    return 1;
+}
+
+pehost::Runtime g_runtime = { &exit_process, &write_console, &reserve_memory, &protect_memory, &sleep_ms, &read_file, &unmap_memory,
+                              &read_clock, &file_open_hook, &file_read_hook, &file_close_hook, &dir_entry_hook };
 pehost::Prepared g_prepared;
 
 }

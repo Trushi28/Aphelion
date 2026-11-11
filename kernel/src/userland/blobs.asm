@@ -34,6 +34,7 @@ default rel
 %define SYS_PROCESS_CREATE 30
 %define SYS_PROCESS_STATUS 31
 %define SYS_PROCESS_KILL 32
+%define SYS_CLOCK 33
 %define INFO_PROC 0x3030103
 %define INFO_END 0x1030103
 %define INFO_VMO 0x2030303
@@ -1174,6 +1175,64 @@ ENDBLOB threadlimit
     EXIT %3
 %%ok:
 %endmacro
+
+align 16
+BLOB clockcall
+    mov r15, DATA
+    SC SYS_CLOCK, DATA, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 1
+    rdtsc
+    mov rbx, [r15]
+    mov rax, [r15 + 24]
+    test rax, -4
+    jz .flags_ok
+    EXIT 2
+.flags_ok:
+    test al, 2
+    jz .tsc_ok
+    cmp qword [r15 + 16], 0
+    jne .tsc_ok
+    EXIT 3
+.tsc_ok:
+    test al, 1
+    jz .no_wall
+    cmp qword [r15 + 8], 0
+    jne .wall_ok
+    EXIT 4
+.no_wall:
+    cmp qword [r15 + 8], 0
+    je .wall_ok
+    EXIT 5
+.wall_ok:
+    mov r12d, 4000000
+.advance:
+    SC SYS_CLOCK, DATA+0x40, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 6
+    mov rax, [r15 + 0x40]
+    cmp rax, rbx
+    jb .backwards
+    ja .advanced
+    dec r12d
+    jnz .advance
+    EXIT 7
+.backwards:
+    EXIT 8
+.advanced:
+    mov qword [r15 + 0xFF0], 0x1234
+    SC SYS_CLOCK, DATA+0xFF0, 0, 0, 0, 0, 0
+    EXPECT rax, -2, 9
+    cmp qword [r15 + 0xFF0], 0x1234
+    je .untouched
+    EXIT 10
+.untouched:
+    SC SYS_CLOCK, DATA+0xFE0, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 11
+    SC SYS_CLOCK, 0, 0, 0, 0, 0, 0
+    EXPECT rax, -2, 12
+    SC SYS_CLOCK, 0xFFFF800000000000, 0, 0, 0, 0, 0
+    EXPECT rax, -2, 13
+    EXIT 0
+ENDBLOB clockcall
 
 align 16
 BLOB chanecho

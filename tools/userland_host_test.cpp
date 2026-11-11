@@ -111,7 +111,7 @@ static void copy_tests() {
 }
 
 static void abi_tests() {
-    static_assert(userabi::SYS_COUNT == 33, "the native table has thirty-three entries in this series");
+    static_assert(userabi::SYS_COUNT == 34, "the native table has thirty-four entries in this series");
     static_assert(userabi::SYS_THREAD_CREATE == 8 && userabi::SYS_THREAD_EXIT == 9 && userabi::SYS_THREAD_JOIN == 10, "the thread calls follow the FS ones");
     static_assert(!userabi::is_fault_status(userabi::STATUS_KILLED), "a kill is not mistaken for a fault");
     static_assert(userabi::MAX_LIVE_THREADS <= userabi::MAX_THREADS_TOTAL && userabi::MAX_THREADS_TOTAL < procgroup::LIVE_MAX, "the thread limits fit the group word");
@@ -1077,7 +1077,7 @@ static void handle_abi_tests() {
 static void vm_abi_tests() {
     using vmregion::Status;
     expect(userabi::SYS_VMO_CREATE == 18 && userabi::SYS_VM_MAP == 19 && userabi::SYS_VM_UNMAP == 20 && userabi::SYS_VM_PROTECT == 21 &&
-           userabi::SYS_VMO_SIZE == 22 && userabi::SYS_COUNT == 33, "vm abi: syscall numbers 18 to 22");
+           userabi::SYS_VMO_SIZE == 22 && userabi::SYS_COUNT == 34, "vm abi: syscall numbers 18 to 22");
     expect(handleabi::ERR_EXISTS == -12 && handleabi::ERR_NOTMAPPED == -13, "vm abi: new error codes continue the series");
     expect(handleabi::vm_error(Status::Ok) == 0 && handleabi::vm_error(Status::Invalid) == userabi::ERR_INVAL &&
            handleabi::vm_error(Status::Denied) == handleabi::ERR_DENIED && handleabi::vm_error(Status::Exists) == handleabi::ERR_EXISTS &&
@@ -1386,6 +1386,24 @@ static void file_abi_tests() {
            "file abi: the raised code and data limits still fit their regions");
 }
 
+static void clock_abi_tests() {
+    static_assert(userabi::SYS_CLOCK == 33 && userabi::SYS_COUNT == 34, "the clock call is number 33");
+    static_assert(sizeof(userabi::ClockRecord) == 32, "the clock record is four words");
+    expect(__builtin_offsetof(userabi::ClockRecord, uptime_ms) == 0 && __builtin_offsetof(userabi::ClockRecord, wall_ms) == 8 &&
+               __builtin_offsetof(userabi::ClockRecord, tsc_khz) == 16 && __builtin_offsetof(userabi::ClockRecord, flags) == 24,
+           "clock abi: the record fields are at offsets 0, 8, 16 and 24");
+    expect(userabi::CLOCK_WALL_VALID == 1 && userabi::CLOCK_TSC_USABLE == 2 && userabi::CLOCK_FLAGS_ALL == 3 && (userabi::CLOCK_WALL_VALID & userabi::CLOCK_TSC_USABLE) == 0,
+           "clock abi: two distinct flag bits");
+    bool table_ok = true;
+    for (u32 mask = 0; mask < 8; ++mask) {
+        bool invariant = (mask & 1) != 0, assumed = (mask & 2) != 0, known = (mask & 4) != 0;
+        bool want = invariant && !assumed && known;
+        table_ok = table_ok && userabi::tsc_usable(known ? 2000000 : 0, assumed, invariant) == want;
+    }
+    expect(table_ok, "clock abi: the counter is only offered when it is calibrated, measured and invariant");
+    expect(!userabi::tsc_usable(0, false, true) && userabi::tsc_usable(1, false, true) && !userabi::tsc_usable(~0ull, true, true), "clock abi: a zero frequency or an assumed one is never usable");
+}
+
 int main() {
     entry_fence_tests();
     range_tests();
@@ -1404,6 +1422,7 @@ int main() {
     apx_tests();
     apx_layout_tests();
     file_abi_tests();
+    clock_abi_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

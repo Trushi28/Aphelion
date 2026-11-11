@@ -34,12 +34,13 @@ inline bool is(const char* s, const char* whole) {
     return *s == 0;
 }
 
-inline bool provided(const char* home) { return is(home, "kernel32.dll") || is(home, "msvcrt.dll") || is(home, "ucrtbase.dll"); }
+inline bool provided(const char* home) { return is(home, "kernel32.dll") || is(home, "msvcrt.dll") || is(home, "ucrtbase.dll") || is(home, "vcruntime140.dll"); }
 
 inline const char* canonical(const char* dll) {
     if (is(dll, "kernel32.dll") || is(dll, "kernelbase.dll")) return "kernel32.dll";
     if (is(dll, "msvcrt.dll")) return "msvcrt.dll";
     if (is(dll, "ucrtbase.dll")) return "ucrtbase.dll";
+    if (is(dll, "vcruntime140.dll") || is(dll, "vcruntime140_1.dll")) return "vcruntime140.dll";
     if (ends(dll, ".dll")) {
         if (starts(dll, "api-ms-win-crt-")) return "ucrtbase.dll";
         if (starts(dll, "api-ms-win-") || starts(dll, "ext-ms-win-")) return "kernel32.dll";
