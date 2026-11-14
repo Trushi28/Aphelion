@@ -8,6 +8,9 @@ namespace fileabi {
 
 constexpr i64 ERR_NOTFOUND = -15;
 constexpr i64 ERR_WRONGTYPE = -16;
+constexpr i64 ERR_NOTEMPTY = -17;
+constexpr i64 ERR_BUSY = -18;
+constexpr i64 ERR_NOSPACE = -19;
 
 constexpr u32 MAX_PATH = 255;
 constexpr u32 MAX_IO = 1024;
@@ -16,6 +19,12 @@ constexpr u64 MAX_PIPE_BYTES = 65536;
 
 constexpr u32 CREATE_DIRECTORY = 1;
 constexpr u32 CREATE_FLAGS_MASK = CREATE_DIRECTORY;
+
+constexpr u32 UNLINK_DIRECTORY = 1;
+constexpr u32 UNLINK_FLAGS_MASK = UNLINK_DIRECTORY;
+
+constexpr u32 RENAME_REPLACE = 1;
+constexpr u32 RENAME_FLAGS_MASK = RENAME_REPLACE;
 
 constexpr u32 KIND_FILE = 0;
 constexpr u32 KIND_DIRECTORY = 1;
@@ -71,6 +80,9 @@ constexpr i64 error_of(lens::Status s) {
         case Status::NotADirectory:
         case Status::IsADirectory:
         case Status::NotAFile: return ERR_WRONGTYPE;
+        case Status::NotEmpty: return ERR_NOTEMPTY;
+        case Status::Busy: return ERR_BUSY;
+        case Status::NoSpace: return ERR_NOSPACE;
         default: return handleabi::error_of(s);
     }
 }

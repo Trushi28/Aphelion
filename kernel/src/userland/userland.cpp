@@ -62,6 +62,8 @@ struct Process {
     vmregion::Map<> regions;
     orbital::WaitQueue events;
     orbital::WaitQueue done;
+    orbital::WaitQueue futex;
+    volatile u32 futex_seq;
     volatile u32 exited;
     volatile u32 detached;
     volatile u32 reaping;
@@ -130,6 +132,7 @@ void close_handles(Process* p) {
 
 void announce_dying(Process* p) {
     p->events.wake_all();
+    p->futex.wake_all();
     lens::stream_event();
 }
 
@@ -878,6 +881,50 @@ i64 sys_file_create(idt::Frame* f) {
     return 0;
 }
 
+i64 sys_file_unlink(idt::Frame* f) {
+    Process* p = current_process();
+    u64 flags = f->r10;
+    if ((flags & ~static_cast<u64>(fileabi::UNLINK_FLAGS_MASK)) != 0) return userabi::ERR_INVAL;
+    char path[fileabi::MAX_PATH + 1];
+    i64 e = fetch_path(p, f->rsi, f->rdx, path);
+    if (e) return e;
+    bool want_directory = (flags & fileabi::UNLINK_DIRECTORY) != 0;
+    TableGuard guard(p->handles.lock);
+    lens::Lens dir(f->rdi);
+    lens::Result<lens::Lens> probe = lens::open_at(p->handles.domain, dir, path, lens::Right::Read);
+    if (!probe.ok()) return fileabi::error_of(probe.status());
+    lens::Result<lens::NodeKind> kind = lens::kind_of(p->handles.domain, probe.value());
+    (void)lens::close(p->handles.domain, probe.value());
+    if (!kind.ok()) return fileabi::error_of(kind.status());
+    bool is_directory = kind.value() == lens::NodeKind::Folder;
+    if (is_directory != want_directory) return fileabi::ERR_WRONGTYPE;
+    lens::Done d = lens::unlink(p->handles.domain, dir, path);
+    return d.ok() ? 0 : fileabi::error_of(d.status());
+}
+
+i64 sys_file_rename(idt::Frame* f) {
+    Process* p = current_process();
+    u64 flags = f->r9;
+    if ((flags & ~static_cast<u64>(fileabi::RENAME_FLAGS_MASK)) != 0) return userabi::ERR_INVAL;
+    char from[fileabi::MAX_PATH + 1];
+    char to[fileabi::MAX_PATH + 1];
+    i64 e = fetch_path(p, f->rsi, f->rdx, from);
+    if (e) return e;
+    e = fetch_path(p, f->r10, f->r8, to);
+    if (e) return e;
+    TableGuard guard(p->handles.lock);
+    lens::Lens dir(f->rdi);
+    lens::Done d = lens::rename(p->handles.domain, dir, from, dir, to, (flags & fileabi::RENAME_REPLACE) != 0);
+    return d.ok() ? 0 : fileabi::error_of(d.status());
+}
+
+i64 sys_file_resize(idt::Frame* f) {
+    Process* p = current_process();
+    TableGuard guard(p->handles.lock);
+    lens::Done d = lens::resize(p->handles.domain, lens::Lens(f->rdi), f->rsi);
+    return d.ok() ? 0 : fileabi::error_of(d.status());
+}
+
 struct DirPick {
     u64 index;
     u64 seen;
@@ -1111,6 +1158,45 @@ bool invariant_tsc() {
     return yes;
 }
 
+struct FutexWait {
+    Process* p;
+    u32 seen;
+};
+
+bool futex_ready(void* arg) {
+    FutexWait* w = static_cast<FutexWait*>(arg);
+    return __atomic_load_n(&w->p->futex_seq, __ATOMIC_ACQUIRE) != w->seen || group_dying(w->p);
+}
+
+i64 sys_futex_wait(idt::Frame* f) {
+    Process* p = current_process();
+    u64 address = f->rdi;
+    if (!userabi::futex_address_ok(address)) return userabi::ERR_INVAL;
+    u32 expected = static_cast<u32>(f->rsi);
+    if (f->rsi != expected) return userabi::ERR_INVAL;
+    u32 seen = __atomic_load_n(&p->futex_seq, __ATOMIC_ACQUIRE);
+    u32 current = 0;
+    {
+        VmGuard vg(p->vm);
+        SpaceReader reader{ p->space, false };
+        usercopy::Window w = reader.window(address);
+        if (!w.host || w.room < sizeof(u32)) return userabi::ERR_FAULT;
+        current = __atomic_load_n(reinterpret_cast<const u32*>(w.host), __ATOMIC_ACQUIRE);
+    }
+    if (current != expected) return handleabi::ERR_AGAIN;
+    FutexWait w{ p, seen };
+    if (!p->futex.wait_until_for(&futex_ready, &w, f->rdx)) return handleabi::ERR_TIMEDOUT;
+    return 0;
+}
+
+i64 sys_futex_wake(idt::Frame* f) {
+    Process* p = current_process();
+    if (!userabi::futex_address_ok(f->rdi)) return userabi::ERR_INVAL;
+    if (f->rsi == 0) return 0;
+    __atomic_add_fetch(&p->futex_seq, 1u, __ATOMIC_ACQ_REL);
+    return static_cast<i64>(p->futex.wake_all());
+}
+
 i64 sys_clock(idt::Frame* f) {
     Process* p = current_process();
     userabi::ClockRecord record{};
@@ -1160,6 +1246,11 @@ const SysFn g_table[userabi::SYS_COUNT] = {
     &sys_process_status,
     &sys_process_kill,
     &sys_clock,
+    &sys_futex_wait,
+    &sys_futex_wake,
+    &sys_file_unlink,
+    &sys_file_rename,
+    &sys_file_resize,
 };
 
 static_assert(vmregion::PTE_WRITABLE == constellation::WRITABLE && vmregion::PTE_NO_EXECUTE == constellation::NO_EXECUTE,
@@ -1398,7 +1489,7 @@ Process* launch_started(const char* name, lens::Table& table, lens::Lens file, c
     lens::Lens handles[startup::MAX_HANDLES];
     u32 count = 0;
     u32 present = 0;
-    const lens::Lens* wanted[startup::SLOT_COUNT] = { &startup.program, &startup.directory, &startup.input, &startup.output };
+    const lens::Lens* wanted[startup::SLOT_COUNT] = { &startup.program, &startup.directory, &startup.input, &startup.output, &startup.work };
     for (u32 slot = 0; slot < startup::SLOT_COUNT; ++slot) {
         if (wanted[slot]->is_null()) continue;
         present |= 1u << slot;

@@ -35,8 +35,10 @@ struct Teb {
     u64 tls_pointer;
     u64 peb;
     u32 last_error;
-    u32 reserved;
-    u8 gap[0x1480 - 0x70];
+    u32 crt_errno;
+    u64 host_slot;
+    u64 fls_data;
+    u8 gap[0x1480 - 0x80];
     u64 tls_slots[TLS_SLOTS];
 };
 
@@ -57,7 +59,8 @@ struct Peb {
 static_assert(__builtin_offsetof(Teb, stack_base) == 0x08 && __builtin_offsetof(Teb, stack_limit) == 0x10);
 static_assert(__builtin_offsetof(Teb, self) == 0x30 && __builtin_offsetof(Teb, client_process) == 0x40);
 static_assert(__builtin_offsetof(Teb, tls_pointer) == 0x58 && __builtin_offsetof(Teb, peb) == 0x60);
-static_assert(__builtin_offsetof(Teb, last_error) == 0x68);
+static_assert(__builtin_offsetof(Teb, last_error) == 0x68 && __builtin_offsetof(Teb, crt_errno) == 0x6C);
+static_assert(__builtin_offsetof(Teb, host_slot) == 0x70 && __builtin_offsetof(Teb, fls_data) == 0x78);
 static_assert(__builtin_offsetof(Peb, being_debugged) == 0x02 && __builtin_offsetof(Peb, image_base_address) == 0x10);
 static_assert(__builtin_offsetof(Peb, process_parameters) == 0x20 && __builtin_offsetof(Peb, process_heap) == 0x30);
 static_assert(__builtin_offsetof(Teb, tls_slots) == 0x1480);
@@ -199,6 +202,7 @@ i64 load(P& p, const u8* file, usize size, const ImportTable& imports, Prepared*
     teb->client_process = 1;
     teb->client_thread = p.thread_id();
     teb->tls_pointer = reinterpret_cast<u64>(tls_array);
+    teb->fls_data = reinterpret_cast<u64>(tls_array + TLS_SLOTS);
     teb->peb = reinterpret_cast<u64>(peb);
     out->teb = teb;
     out->peb = peb;

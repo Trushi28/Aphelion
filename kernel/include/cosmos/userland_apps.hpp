@@ -1,5 +1,6 @@
 #pragma once
 #include <cosmos/types.hpp>
+#include <cosmos/lens.hpp>
 
 namespace userland::apps {
 
@@ -33,6 +34,8 @@ struct Request {
     u32 env_count = 0;
     const char* input = nullptr;
     u32 input_length = 0;
+    lens::Domain* work_domain = nullptr;
+    lens::Lens work;
     Emit emit = nullptr;
     Interrupted interrupted = nullptr;
     void* ctx = nullptr;

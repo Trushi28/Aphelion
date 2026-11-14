@@ -28,5 +28,8 @@ embed pe_dllfail, "dllfail.dll"
 embed pe_dyn, "dyn.exe"
 embed pe_sysio, "sysio.exe"
 embed pe_argv, "argv.exe"
+embed pe_files, "files.exe"
+embed pe_threads, "threads.exe"
+embed pe_thrdll, "thrdll.dll"
 
 section .note.GNU-stack noalloc noexec nowrite

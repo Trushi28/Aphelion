@@ -24,6 +24,8 @@ extern "C" const u8 apx_echo_start[];
 extern "C" const u8 apx_echo_end[];
 extern "C" const u8 pe_argv_start[];
 extern "C" const u8 pe_argv_end[];
+extern "C" const u8 pe_files_start[];
+extern "C" const u8 pe_files_end[];
 extern "C" const u8 apx_pehost_start[];
 extern "C" const u8 apx_pehost_end[];
 extern "C" const u8 pe_console_start[];
@@ -52,6 +54,10 @@ extern "C" const u8 pe_dyn_start[];
 extern "C" const u8 pe_dyn_end[];
 extern "C" const u8 pe_sysio_start[];
 extern "C" const u8 pe_sysio_end[];
+extern "C" const u8 pe_threads_start[];
+extern "C" const u8 pe_threads_end[];
+extern "C" const u8 pe_thrdll_start[];
+extern "C" const u8 pe_thrdll_end[];
 
 #define BLOB_DECL(name) extern "C" const u8 ublob_##name[]; extern "C" const u8 ublob_##name##_end[]
 
@@ -71,6 +77,9 @@ BLOB_DECL(gsbad);
 BLOB_DECL(gsiso);
 BLOB_DECL(gszero);
 BLOB_DECL(clockcall);
+BLOB_DECL(futexcall);
+BLOB_DECL(futexping);
+BLOB_DECL(futexexit);
 BLOB_DECL(fsbase);
 BLOB_DECL(fsbad);
 BLOB_DECL(fsiso);
@@ -159,6 +168,9 @@ const Case g_cases[] = {
     CASE(vmshoot, 2, userabi::fault_status(14)),
     CASE(vmrace, 2, 0),
     CASE(clockcall, 1, 0),
+    CASE(futexcall, 1, 0),
+    CASE(futexping, 2, 0),
+    CASE(futexexit, 2, 0),
 };
 
 Image image_of(const u8* begin, const u8* end, u32 data_pages) {
@@ -720,17 +732,31 @@ bool run_pe(lens::Table& K, lens::Lens root, lens::Lens apps, const char* name, 
     lens::Result<lens::Lens> host = lens::open_at(K.domain, apps, "pehost", lens::Right::Read | lens::Right::Execute);
     lens::Result<lens::Lens> prog = lens::open_at(K.domain, apps, name, lens::Right::Read | lens::Right::Delegate);
     lens::Result<lens::Lens> library = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
+    (void)lens::remove_tree(K.domain, root, "h3-selftest/pework");
+    bool made = lens::mkdir(K.domain, root, "h3-selftest/pework").ok();
+    lens::Result<lens::Lens> work = made ? lens::open_at(K.domain, root, "h3-selftest/pework", lens::RIGHTS_READ_WRITE | lens::Right::Delegate) : lens::Result<lens::Lens>::fail(lens::Status::NotFound);
     i64 error = -1;
     Process* p = nullptr;
-    if (host.ok() && prog.ok() && library.ok()) {
+    if (host.ok() && prog.ok() && library.ok() && work.ok()) {
         startup.program = prog.value();
         startup.directory = library.value();
+        startup.work = work.value();
         p = launch_started("pehost", K, host.value(), startup, &error);
     }
     i32 status = -1;
     bool good = p && wait(p, &status, WAIT_MS) && status == want;
     good = (p && reap(p)) && good;
+    bool left_clean = true;
+    if (made) {
+        lens::Result<lens::Lens> check = lens::open_at(K.domain, root, "h3-selftest/pework", lens::Right::Read | lens::Right::Enumerate);
+        lens::Result<lens::EnumSummary> listed = check.ok() ? lens::enumerate(K.domain, check.value(), [](void*, const nebula::Entry&) { return true; }, nullptr, true) : lens::Result<lens::EnumSummary>::fail(lens::Status::NotFound);
+        left_clean = listed.ok() && listed.value().visited == 0;
+        if (check.ok()) (void)lens::close(K.domain, check.value());
+    }
     serial::printf("[userland] %s through the PE host: status %d, expected %d%s\n", name, status, want, good ? "" : "  <-- wrong");
+    if (!left_clean) serial::printf("[userland]   the work directory was not left empty\n");
+    good = good && left_clean;
+    (void)lens::remove_tree(K.domain, root, "h3-selftest/pework");
     if (host.ok()) (void)lens::close(K.domain, host.value());
     return good;
 }
@@ -778,6 +804,9 @@ bool run_files() {
                put_blob(K.domain, apps, "dyn.exe", pe_dyn_start, pe_dyn_end) &&
                put_blob(K.domain, apps, "sysio.exe", pe_sysio_start, pe_sysio_end) &&
                put_blob(K.domain, apps, "argv.exe", pe_argv_start, pe_argv_end) &&
+               put_blob(K.domain, apps, "files.exe", pe_files_start, pe_files_end) &&
+               put_blob(K.domain, apps, "threads.exe", pe_threads_start, pe_threads_end) &&
+               put_blob(K.domain, apps, "thrdll.dll", pe_thrdll_start, pe_thrdll_end) &&
                put_blob(K.domain, apps, "echo", apx_echo_start, apx_echo_end) &&
                lens::put(K.domain, apps, "short", lens::text_bytes("APX1 is not enough")).ok() &&
                lens::put(K.domain, apps, "empty", lens::ConstBytes(nullptr, 0)).ok();
@@ -830,6 +859,8 @@ bool run_files() {
         pe = run_pe(K, root, apps, "ucrt.exe", 7) && pe;
         pe = run_pe(K, root, apps, "dyn.exe", 7) && pe;
         pe = run_pe(K, root, apps, "sysio.exe", 6) && pe;
+        pe = run_pe(K, root, apps, "files.exe", 4) && pe;
+        pe = run_pe(K, root, apps, "threads.exe", 0) && pe;
         pe = run_pe(K, root, apps, "dllmath.dll", static_cast<i32>(0xC000007Bu)) && pe;
         pe = run_pe(K, root, apps, "short", static_cast<i32>(0xC000007Bu)) && pe;
         pe = run_pe(K, root, apps, "hello", static_cast<i32>(0xC000007Bu)) && pe;

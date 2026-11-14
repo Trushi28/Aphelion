@@ -6,7 +6,7 @@ namespace startup {
 constexpr u32 MAGIC = 0x54535041u;
 constexpr u16 VERSION = 1;
 constexpr u32 MAX_MESSAGE = 256;
-constexpr u32 MAX_HANDLES = 4;
+constexpr u32 MAX_HANDLES = 5;
 constexpr u32 MAX_ARGS = 16;
 constexpr u32 MAX_ENV = 8;
 
@@ -14,7 +14,8 @@ constexpr u32 PROGRAM = 0;
 constexpr u32 DIRECTORY = 1;
 constexpr u32 STDIN = 2;
 constexpr u32 STDOUT = 3;
-constexpr u32 SLOT_COUNT = 4;
+constexpr u32 WORK = 4;
+constexpr u32 SLOT_COUNT = 5;
 constexpr u32 SLOT_MASK = (1u << SLOT_COUNT) - 1u;
 
 constexpr i32 OK = 0;

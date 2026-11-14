@@ -1,10 +1,11 @@
 #pragma once
 #include "format.hpp"
-#include "win32x.hpp"
+#include "threads.hpp"
 
 namespace pehost::msvcrt {
 
 constexpr i32 ERR_BADF = 9;
+constexpr i32 ERR_AGAIN = 11;
 constexpr i32 ERR_NOMEM = 12;
 constexpr i32 ERR_INVAL = 22;
 constexpr i32 ERR_RANGE = 34;
@@ -46,6 +47,10 @@ struct LConv {
 
 inline File g_iob[3];
 inline i32 g_errno = 0;
+inline i32& errno_ref() {
+    if (!sync::g_sync.multi) return g_errno;
+    return *reinterpret_cast<i32*>(&sync::teb_now()->crt_errno);
+}
 inline i32 g_fmode = 0;
 inline i32 g_commode = 0;
 inline i32 g_app_type = 0;
@@ -90,6 +95,7 @@ inline u32 stream_of(const File* fp) {
 }
 
 inline void console_write(u32 stream, const char* data, u64 length) {
+    sync::Stdio guard;
     while (length) {
         u32 chunk = length > 4096 ? 4096 : static_cast<u32>(length);
         g_runtime->write_console(stream, data, chunk);
@@ -131,17 +137,17 @@ inline void say(const char* text) { console_write(2, text, length_of(text)); }
 
 PEHOST_WINAPI inline File* __iob_func() { return g_iob; }
 
-PEHOST_WINAPI inline i32* _errno() { return &g_errno; }
+PEHOST_WINAPI inline i32* _errno() { return &errno_ref(); }
 
 PEHOST_WINAPI inline u64 fwrite(const void* data, u64 size, u64 count, File* fp) {
     u32 stream = detail::stream_of(fp);
     if (stream == 0) {
-        g_errno = ERR_BADF;
+        errno_ref() = ERR_BADF;
         return 0;
     }
     if (size == 0 || count == 0) return 0;
     if (count > ~0ull / size) {
-        g_errno = ERR_INVAL;
+        errno_ref() = ERR_INVAL;
         return 0;
     }
     detail::console_write(stream, static_cast<const char*>(data), size * count);
@@ -151,7 +157,7 @@ PEHOST_WINAPI inline u64 fwrite(const void* data, u64 size, u64 count, File* fp)
 PEHOST_WINAPI inline i32 fputc(i32 c, File* fp) {
     u32 stream = detail::stream_of(fp);
     if (stream == 0) {
-        g_errno = ERR_BADF;
+        errno_ref() = ERR_BADF;
         return EOF_VALUE;
     }
     char ch = static_cast<char>(c);
@@ -162,7 +168,7 @@ PEHOST_WINAPI inline i32 fputc(i32 c, File* fp) {
 PEHOST_WINAPI inline i32 fputs(const char* s, File* fp) {
     u32 stream = detail::stream_of(fp);
     if (stream == 0) {
-        g_errno = ERR_BADF;
+        errno_ref() = ERR_BADF;
         return EOF_VALUE;
     }
     detail::console_write(stream, s, detail::length_of(s));
@@ -170,6 +176,7 @@ PEHOST_WINAPI inline i32 fputs(const char* s, File* fp) {
 }
 
 PEHOST_WINAPI inline i32 puts(const char* s) {
+    sync::Stdio guard;
     detail::console_write(1, s, detail::length_of(s));
     detail::console_write(1, "\n", 1);
     return 0;
@@ -183,19 +190,20 @@ PEHOST_WINAPI inline i32 putchar(i32 c) {
 
 PEHOST_WINAPI inline i32 fflush(File* fp) {
     if (fp == nullptr || detail::stream_of(fp) != 0 || fp == &g_iob[0]) return 0;
-    g_errno = ERR_BADF;
+    errno_ref() = ERR_BADF;
     return EOF_VALUE;
 }
 
 PEHOST_WINAPI inline i32 vfprintf(File* fp, const char* f, fmt::VaList ap) {
     u32 stream = detail::stream_of(fp);
     if (stream == 0) {
-        g_errno = ERR_BADF;
+        errno_ref() = ERR_BADF;
         return -1;
     }
+    sync::Stdio guard;
     detail::ConsoleSink sink{ stream };
     i64 r = fmt::format(sink, f, ap);
-    if (r < 0) g_errno = ERR_INVAL;
+    if (r < 0) errno_ref() = ERR_INVAL;
     return static_cast<i32>(r);
 }
 
@@ -221,7 +229,7 @@ PEHOST_WINAPI inline i32 _vsnprintf(char* buffer, u64 count, const char* f, fmt:
     detail::BufferSink sink{ buffer, count, 0 };
     i64 r = fmt::format(sink, f, ap);
     if (r < 0) {
-        g_errno = ERR_INVAL;
+        errno_ref() = ERR_INVAL;
         return -1;
     }
     if (static_cast<u64>(r) < count) buffer[r] = 0;
@@ -240,7 +248,7 @@ PEHOST_WINAPI inline i32 vsprintf(char* buffer, const char* f, fmt::VaList ap) {
     detail::BufferSink sink{ buffer, ~0ull >> 1, 0 };
     i64 r = fmt::format(sink, f, ap);
     if (r < 0) {
-        g_errno = ERR_INVAL;
+        errno_ref() = ERR_INVAL;
         return -1;
     }
     buffer[r] = 0;
@@ -257,19 +265,19 @@ PEHOST_WINAPI inline i32 sprintf(char* buffer, const char* f, ...) {
 
 PEHOST_WINAPI inline void* malloc(u64 bytes) {
     void* p = g_world.heap.alloc(bytes);
-    if (!p) g_errno = ERR_NOMEM;
+    if (!p) errno_ref() = ERR_NOMEM;
     return p;
 }
 
 PEHOST_WINAPI inline void* calloc(u64 count, u64 size) {
     if (size != 0 && count > ~0ull / size) {
-        g_errno = ERR_NOMEM;
+        errno_ref() = ERR_NOMEM;
         return nullptr;
     }
     u64 bytes = count * size;
     u8* p = static_cast<u8*>(g_world.heap.alloc(bytes));
     if (!p) {
-        g_errno = ERR_NOMEM;
+        errno_ref() = ERR_NOMEM;
         return nullptr;
     }
     for (u64 i = 0; i < bytes; ++i) p[i] = 0;
@@ -284,7 +292,7 @@ PEHOST_WINAPI inline void* realloc(void* p, u64 bytes) {
         return nullptr;
     }
     void* q = g_world.heap.resize(p, bytes);
-    if (!q) g_errno = ERR_NOMEM;
+    if (!q) errno_ref() = ERR_NOMEM;
     return q;
 }
 
@@ -460,7 +468,7 @@ PEHOST_WINAPI inline void _amsg_exit(i32 code) {
 PEHOST_WINAPI inline void* signal(i32 sig, void* handler) {
     bool valid = sig == 2 || sig == 4 || sig == 8 || sig == 11 || sig == 15 || sig == 21 || sig == 22;
     if (!valid) {
-        g_errno = ERR_INVAL;
+        errno_ref() = ERR_INVAL;
         return reinterpret_cast<void*>(~0ull);
     }
     void* old = g_signals[sig];
@@ -502,9 +510,59 @@ PEHOST_WINAPI inline i32 __getmainargs(i32* argc, char*** argv, char*** envp, i3
     return 0;
 }
 
-PEHOST_WINAPI inline void _lock(i32) {}
+PEHOST_WINAPI inline u64 _beginthreadex(void* security, u32 stack, u32 (PEHOST_WINAPI* start)(void*), void* argument, u32 flags, u32* id) {
+    u64 handle = win32::CreateThread(security, stack, reinterpret_cast<void*>(start), argument, flags, id);
+    if (handle == 0) errno_ref() = ERR_AGAIN;
+    return handle;
+}
 
-PEHOST_WINAPI inline void _unlock(i32) {}
+[[noreturn]] PEHOST_WINAPI inline void _endthreadex(u32 code) { win32::ExitThread(code); }
+
+namespace detail {
+
+struct BeginThread {
+    void (PEHOST_WINAPI* start)(void*);
+    void* argument;
+};
+
+PEHOST_WINAPI inline u32 begin_thread_entry(void* packet) {
+    BeginThread copy = *static_cast<BeginThread*>(packet);
+    g_world.heap.free(packet);
+    copy.start(copy.argument);
+    return 0;
+}
+
+}
+
+PEHOST_WINAPI inline u64 _beginthread(void (PEHOST_WINAPI* start)(void*), u32 stack, void* argument) {
+    detail::BeginThread* packet = static_cast<detail::BeginThread*>(g_world.heap.alloc(sizeof(detail::BeginThread)));
+    if (!packet) {
+        errno_ref() = ERR_AGAIN;
+        return ~0ull;
+    }
+    *packet = detail::BeginThread{ start, argument };
+    u32 id = 0;
+    u64 handle = win32::CreateThread(nullptr, stack, reinterpret_cast<void*>(&detail::begin_thread_entry), packet, CREATE_SUSPENDED, &id);
+    if (handle == 0) {
+        g_world.heap.free(packet);
+        errno_ref() = ERR_AGAIN;
+        return ~0ull;
+    }
+    {
+        sync::Host guard;
+        sync::Object* o = objects::resolve(handle);
+        o->auto_close = true;
+        o->owner = handle;
+    }
+    win32::ResumeThread(handle);
+    return handle;
+}
+
+[[noreturn]] PEHOST_WINAPI inline void _endthread() { win32::ExitThread(0); }
+
+PEHOST_WINAPI inline void _lock(i32) { sync::acquire(sync::g_sync.crt); }
+
+PEHOST_WINAPI inline void _unlock(i32) { sync::release(sync::g_sync.crt); }
 
 PEHOST_WINAPI inline u32 ___lc_codepage_func() { return 0; }
 
@@ -528,13 +586,13 @@ inline const ImportTable* msvcrt_table() {
         PEHOST_FN(strcat), PEHOST_FN(strchr), PEHOST_FN(strrchr), PEHOST_FN(strstr), PEHOST_FN(getenv), PEHOST_FN(strerror),
         PEHOST_FN(localeconv), PEHOST_FN(_onexit), PEHOST_FN(atexit), PEHOST_FN(_cexit), PEHOST_FN(exit), PEHOST_FN(_exit),
         PEHOST_FN(abort), PEHOST_FN(_amsg_exit), PEHOST_FN(signal), PEHOST_FN(__set_app_type), PEHOST_FN(__setusermatherr),
-        PEHOST_FN(_initterm), PEHOST_FN(_initterm_e), PEHOST_FN(__getmainargs), PEHOST_FN(_lock), PEHOST_FN(_unlock),
+        PEHOST_FN(_initterm), PEHOST_FN(_initterm_e), PEHOST_FN(__getmainargs), PEHOST_FN(_lock), PEHOST_FN(_unlock), PEHOST_FN(_beginthreadex), PEHOST_FN(_endthreadex), PEHOST_FN(_beginthread), PEHOST_FN(_endthread),
         PEHOST_FN(___lc_codepage_func), PEHOST_FN(___mb_cur_max_func), PEHOST_FN(__C_specific_handler),
         PEHOST_DATA(_fmode, g_fmode), PEHOST_DATA(_commode, g_commode), PEHOST_DATA(__initenv, g_initenv),
     };
 #undef PEHOST_FN
 #undef PEHOST_DATA
-    static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), kernel32x_table() };
+    static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), kernel32t_table() };
     return &table;
 }
 

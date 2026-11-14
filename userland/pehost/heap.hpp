@@ -16,6 +16,13 @@ public:
     static constexpr u64 LARGEST_CHUNK = 2 * 1024 * 1024;
     static constexpr u64 CAP = 8 * 1024 * 1024;
 
+    using Hook = void (*)();
+
+    void set_lock(Hook lock, Hook unlock) {
+        lock_ = lock;
+        unlock_ = unlock;
+    }
+
     void init(Map map) {
         map_ = map;
         chunk_count_ = 0;
@@ -26,6 +33,7 @@ public:
     }
 
     void* alloc(u64 bytes) {
+        Guard guard(this);
         u64 need = block_for(bytes);
         if (need == 0) return nullptr;
         Block* b = take(need);
@@ -36,6 +44,7 @@ public:
     }
 
     bool free(void* p) {
+        Guard guard(this);
         Block* b = owned(p);
         if (!b) return false;
         --live_;
@@ -44,6 +53,7 @@ public:
     }
 
     void* resize(void* p, u64 bytes) {
+        Guard guard(this);
         if (!p) return alloc(bytes);
         Block* b = owned(p);
         if (!b) return nullptr;
@@ -75,11 +85,15 @@ public:
     }
 
     u64 usable(const void* p) const {
+        Guard guard(this);
         Block* b = owned(const_cast<void*>(p));
         return b ? size_of(b) - HEADER : 0;
     }
 
-    bool owns(const void* p) const { return owned(const_cast<void*>(p)) != nullptr; }
+    bool owns(const void* p) const {
+        Guard guard(this);
+        return owned(const_cast<void*>(p)) != nullptr;
+    }
 
     u64 live() const { return live_; }
     u64 mapped() const { return total_; }
@@ -127,6 +141,16 @@ public:
     }
 
 private:
+    struct Guard {
+        const Heap* heap;
+        explicit Guard(const Heap* h) : heap(h) {
+            if (heap->lock_) heap->lock_();
+        }
+        ~Guard() {
+            if (heap->unlock_) heap->unlock_();
+        }
+    };
+
     struct Block {
         u64 size_flags;
         u64 prev;
@@ -287,6 +311,8 @@ private:
     }
 
     Map map_ = nullptr;
+    Hook lock_ = nullptr;
+    Hook unlock_ = nullptr;
     Chunk chunks_[MAX_CHUNKS] = {};
     u32 chunk_count_ = 0;
     u64 total_ = 0;

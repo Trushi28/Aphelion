@@ -3,6 +3,7 @@
 #include "codec.hpp"
 #include "heap.hpp"
 #include "host.hpp"
+#include "sync.hpp"
 
 namespace pehost {
 
@@ -103,12 +104,14 @@ struct World {
     u32 image_pages = 0;
     u8 page_prot[MAX_IMAGE_PAGES] = {};
     u64 tls_used = 0;
+    Prepared* prepared = nullptr;
     void* unhandled_filter = nullptr;
     char command_line[MAX_COMMAND_LINE] = {};
     u16 command_line_wide[MAX_COMMAND_LINE] = {};
     char module_path[MAX_MODULE_PATH] = {};
     u16 module_path_wide[MAX_MODULE_PATH] = {};
     u16 root_wide[2] = { '\\', 0 };
+    char cwd[256] = {};
     u16 empty_environment[2] = {};
     ProcessParameters parameters = {};
 };
@@ -219,11 +222,21 @@ inline u32 last_error() {
     return code;
 }
 
+namespace threads {
+
+inline bool tls_add(u32 index, const u8* source, u32 template_bytes, u64 total_bytes);
+inline void tls_drop(u32 index);
+
+}
+
 inline void attach(Prepared& run, const ImportTable* imports, const Config& config) {
     World& w = g_world;
+    w.cwd[0] = 0;
     w.heap.init(&detail::heap_map);
     w.imports = imports;
     modules::g_state.builtins = imports;
+    modules::g_state.tls_add = &threads::tls_add;
+    modules::g_state.tls_drop = &threads::tls_drop;
     w.image = run.base;
     u64 pages = run.image.size_of_image / PAGE;
     w.image_pages = pages > MAX_IMAGE_PAGES ? MAX_IMAGE_PAGES : static_cast<u32>(pages);
@@ -237,6 +250,19 @@ inline void attach(Prepared& run, const ImportTable* imports, const Config& conf
         }
     }
     w.tls_used = 0;
+    w.prepared = &run;
+    sync::reset();
+    if (run.teb) {
+        sync::Slot& main_slot = sync::g_sync.slots[0];
+        main_slot.teb = run.teb;
+        main_slot.tls_array = reinterpret_cast<u64*>(run.teb->tls_pointer);
+        main_slot.fls = reinterpret_cast<u64*>(run.teb->fls_data);
+        main_slot.support = run.support;
+        main_slot.stack = run.stack_base;
+        main_slot.stack_bytes = run.stack_bytes;
+        sync::g_sync.next_id = static_cast<u32>(run.teb->client_thread);
+    }
+    w.heap.set_lock(&sync::host_lock, &sync::host_unlock);
     w.unhandled_filter = nullptr;
     detail::copy_text(w.command_line, MAX_COMMAND_LINE, config.command_line);
     detail::copy_text(w.module_path, MAX_MODULE_PATH, config.module_path);
@@ -300,11 +326,16 @@ PEHOST_WINAPI inline u64 GetStdHandle(u32 which) {
     }
 }
 
+inline i32 write_file_handle(u64 handle, const void* data, u32 length, u32* written, void* overlapped);
+
 PEHOST_WINAPI inline i32 WriteFile(u64 handle, const void* data, u32 length, u32* written, void* overlapped) {
     if (written) *written = 0;
     if (handle != HANDLE_STDOUT && handle != HANDLE_STDERR) {
-        set_last_error(ERROR_INVALID_HANDLE);
-        return 0;
+        if (handle == HANDLE_STDIN || handle == INVALID_HANDLE) {
+            set_last_error(ERROR_INVALID_HANDLE);
+            return 0;
+        }
+        return write_file_handle(handle, data, length, written, overlapped);
     }
     if (overlapped != nullptr) {
         set_last_error(ERROR_INVALID_PARAMETER);
@@ -387,11 +418,29 @@ PEHOST_WINAPI inline u64 HeapSize(u64 heap, u32, const void* p) {
     return g_world.heap.usable(p);
 }
 
+namespace locks {
+
+inline void clear_tls_slot(u32 index) {
+    Teb* mine = pehost::detail::current_teb();
+    mine->tls_slots[index] = 0;
+    for (u32 i = 0; i < sync::MAX_SLOTS; ++i) {
+        Teb* t = sync::g_sync.slots[i].teb;
+        if (t && t != mine) t->tls_slots[index] = 0;
+    }
+}
+
+inline volatile i32* cs_count(CriticalSection* cs) { return &cs->lock_count; }
+
+inline volatile u32* cs_tokens(CriticalSection* cs) { return reinterpret_cast<volatile u32*>(&cs->lock_semaphore); }
+
+}
+
 PEHOST_WINAPI inline u32 TlsAlloc() {
+    sync::Host guard;
     for (u32 i = 0; i < TLS_SLOTS; ++i) {
         if (g_world.tls_used & (1ull << i)) continue;
         g_world.tls_used |= 1ull << i;
-        detail::current_teb()->tls_slots[i] = 0;
+        locks::clear_tls_slot(i);
         return i;
     }
     set_last_error(ERROR_NOT_ENOUGH_MEMORY);
@@ -399,12 +448,13 @@ PEHOST_WINAPI inline u32 TlsAlloc() {
 }
 
 PEHOST_WINAPI inline i32 TlsFree(u32 index) {
+    sync::Host guard;
     if (index >= TLS_SLOTS || !(g_world.tls_used & (1ull << index))) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     g_world.tls_used &= ~(1ull << index);
-    detail::current_teb()->tls_slots[index] = 0;
+    locks::clear_tls_slot(index);
     return 1;
 }
 
@@ -442,21 +492,57 @@ PEHOST_WINAPI inline void DeleteCriticalSection(CriticalSection* cs) {
 }
 
 PEHOST_WINAPI inline void EnterCriticalSection(CriticalSection* cs) {
-    ++cs->lock_count;
-    ++cs->recursion_count;
-    cs->owning_thread = detail::current_thread_id();
+    u64 me = detail::current_thread_id();
+    if (__atomic_add_fetch(locks::cs_count(cs), 1, __ATOMIC_SEQ_CST) == 0) {
+        cs->owning_thread = me;
+        cs->recursion_count = 1;
+        return;
+    }
+    if (cs->recursion_count > 0 && cs->owning_thread == me) {
+        ++cs->recursion_count;
+        return;
+    }
+    volatile u32* tokens = locks::cs_tokens(cs);
+    for (;;) {
+        u32 have = sync::load(tokens);
+        if (have != 0) {
+            if (sync::cas(tokens, have, have - 1)) break;
+            continue;
+        }
+        sync::block(tokens, 0, sync::FOREVER);
+    }
+    cs->owning_thread = me;
+    cs->recursion_count = 1;
 }
 
 PEHOST_WINAPI inline i32 TryEnterCriticalSection(CriticalSection* cs) {
-    if (cs->recursion_count != 0 && cs->owning_thread != detail::current_thread_id()) return 0;
-    EnterCriticalSection(cs);
-    return 1;
+    u64 me = detail::current_thread_id();
+    i32 expected = -1;
+    if (__atomic_compare_exchange_n(locks::cs_count(cs), &expected, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        cs->owning_thread = me;
+        cs->recursion_count = 1;
+        return 1;
+    }
+    if (cs->recursion_count > 0 && cs->owning_thread == me) {
+        __atomic_add_fetch(locks::cs_count(cs), 1, __ATOMIC_SEQ_CST);
+        ++cs->recursion_count;
+        return 1;
+    }
+    return 0;
 }
 
 PEHOST_WINAPI inline void LeaveCriticalSection(CriticalSection* cs) {
     if (cs->recursion_count == 0) return;
-    --cs->lock_count;
-    if (--cs->recursion_count == 0) cs->owning_thread = 0;
+    if (--cs->recursion_count > 0) {
+        __atomic_sub_fetch(locks::cs_count(cs), 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+    cs->owning_thread = 0;
+    if (__atomic_sub_fetch(locks::cs_count(cs), 1, __ATOMIC_SEQ_CST) >= 0) {
+        volatile u32* tokens = locks::cs_tokens(cs);
+        sync::add(tokens, 1);
+        sync::wake(tokens);
+    }
 }
 
 PEHOST_WINAPI inline const char* GetCommandLineA() { return g_world.command_line; }
@@ -464,6 +550,7 @@ PEHOST_WINAPI inline const char* GetCommandLineA() { return g_world.command_line
 PEHOST_WINAPI inline const u16* GetCommandLineW() { return g_world.command_line_wide; }
 
 PEHOST_WINAPI inline u64 GetModuleHandleA(const char* name) {
+    sync::Loader guard;
     if (name == nullptr) return reinterpret_cast<u64>(g_world.image);
     u64 token = detail::module_token(name);
     if (token == 0) {
@@ -477,6 +564,7 @@ PEHOST_WINAPI inline u64 GetModuleHandleA(const char* name) {
 }
 
 PEHOST_WINAPI inline u64 LoadLibraryA(const char* name) {
+    sync::Loader guard;
     if (name == nullptr) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -491,6 +579,7 @@ PEHOST_WINAPI inline u64 LoadLibraryA(const char* name) {
 }
 
 PEHOST_WINAPI inline u64 LoadLibraryW(const u16* name) {
+    sync::Loader guard;
     if (name == nullptr) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -512,6 +601,7 @@ PEHOST_WINAPI inline u64 LoadLibraryW(const u16* name) {
 }
 
 PEHOST_WINAPI inline i32 FreeLibrary(u64 module) {
+    sync::Loader guard;
     if (detail::module_name(module) != nullptr) return 1;
     i32 found = modules::find_base(module);
     if (found < 0 || modules::g_state.items[found].refs == 0) {
@@ -524,6 +614,7 @@ PEHOST_WINAPI inline i32 FreeLibrary(u64 module) {
 }
 
 PEHOST_WINAPI inline u64 GetModuleHandleW(const u16* name) {
+    sync::Loader guard;
     if (name == nullptr) return reinterpret_cast<u64>(g_world.image);
     u32 n = 0;
     while (name[n] && n < 63) ++n;
@@ -542,6 +633,7 @@ PEHOST_WINAPI inline u64 GetModuleHandleW(const u16* name) {
 }
 
 PEHOST_WINAPI inline void* GetProcAddress(u64 module, const char* name) {
+    sync::Loader guard;
     bool by_ordinal = reinterpret_cast<u64>(name) < 0x10000;
     const char* dll = detail::module_name(module);
     if (dll != nullptr) {
@@ -567,6 +659,7 @@ PEHOST_WINAPI inline void* GetProcAddress(u64 module, const char* name) {
 }
 
 PEHOST_WINAPI inline u32 GetModuleFileNameA(u64 module, char* buffer, u32 size) {
+    sync::Loader guard;
     const char* path = g_world.module_path;
     if (module != 0 && module != reinterpret_cast<u64>(g_world.image)) {
         i32 found = modules::find_base(module);
@@ -606,7 +699,18 @@ PEHOST_WINAPI inline void* SetUnhandledExceptionFilter(void* filter) {
 }
 
 PEHOST_WINAPI inline void Sleep(u32 milliseconds) {
-    if (g_runtime->sleep_ms) g_runtime->sleep_ms(milliseconds);
+    if (milliseconds == 0 || !sync::available()) {
+        if (g_runtime->sleep_ms) g_runtime->sleep_ms(milliseconds);
+        return;
+    }
+    sync::Slot& me = sync::current();
+    u64 span = milliseconds == 0xFFFFFFFFu ? sync::FOREVER : milliseconds;
+    sync::Deadline deadline(span);
+    for (;;) {
+        i32 r = sync::block(&me.private_word, 0, deadline.remaining());
+        if (r == 1) break;
+        if (span != sync::FOREVER && (!deadline.clocked || deadline.expired())) break;
+    }
 }
 
 PEHOST_WINAPI inline u64 VirtualQuery(const void* address, MemoryBasicInformation* info, u64 length) {

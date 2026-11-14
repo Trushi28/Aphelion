@@ -5,6 +5,7 @@
 #include "pe_samples.hpp"
 #include "pe_samples_mingw.hpp"
 #include "pe_samples_run.hpp"
+#include "pe_linux_threads.hpp"
 
 extern "C" {
 int printf(const char*, ...);
@@ -132,7 +133,7 @@ struct Linux {
     int log_fd = -1;
     char logbuf[4096];
     u32 loglen = 0;
-    Region regions[64];
+    Region regions[160];
     u32 region_count = 0;
     Protect protects[256];
     u32 protect_count = 0;
@@ -160,7 +161,7 @@ struct Linux {
     u8* reserve(u64 bytes, bool image) {
         ++reserves;
         if (fail_reserve_at != 0 && reserves == fail_reserve_at) return nullptr;
-        if (region_count == 64) return nullptr;
+        if (region_count == 160) return nullptr;
         u64 span = bytes + 0x10000;
         i64 r = lx(SYS_MMAP, 0, span, 3, 0x22, static_cast<u64>(-1), 0);
         if (!mapped(r)) return nullptr;
@@ -232,7 +233,15 @@ i64 child_write(u32 stream, const void* data, u32 length) {
     return lx(SYS_WRITE, static_cast<u64>(g_out_fd), reinterpret_cast<u64>(data), length);
 }
 
-u8* child_reserve(u64 bytes) { return g_platform.reserve(bytes, false); }
+volatile u32 g_reserve_lock = 0;
+
+u8* child_reserve(u64 bytes) {
+    while (__atomic_exchange_n(&g_reserve_lock, 1, __ATOMIC_ACQUIRE)) {
+    }
+    u8* r = g_platform.reserve(bytes, false);
+    __atomic_store_n(&g_reserve_lock, 0, __ATOMIC_RELEASE);
+    return r;
+}
 
 bool child_protect(u8* at, u64 bytes, u32 prot) { return g_platform.protect(at, bytes, prot); }
 
@@ -358,6 +367,163 @@ i32 child_dir_entry(u64 index, char* name, u32 capacity, u64* size, u64* mtime_m
     return result;
 }
 
+i64 g_work_fd = -1;
+i64 g_work_slots[32];
+bool g_work_slots_ready = false;
+
+void work_slots_init() {
+    if (g_work_slots_ready) return;
+    for (i64& f : g_work_slots) f = -1;
+    g_work_slots_ready = true;
+}
+
+i64 work_error(i64 e) {
+    switch (-e) {
+        case 2:
+        case 20: return pehost::FS_NOT_FOUND;
+        case 21: return pehost::FS_WRONG_TYPE;
+        case 17: return pehost::FS_EXISTS;
+        case 39: return pehost::FS_NOT_EMPTY;
+        case 28: return pehost::FS_NO_SPACE;
+        case 1:
+        case 13: return pehost::FS_DENIED;
+        default: return pehost::FS_FAILED;
+    }
+}
+
+bool work_stat_fd(i64 fd, pehost::FsInfo* info) {
+    u8 st[144];
+    if (lx(5, static_cast<u64>(fd), reinterpret_cast<u64>(st)) != 0) return false;
+    u32 mode = *reinterpret_cast<u32*>(st + 24);
+    info->kind = (mode & 0170000) == 0040000 ? pehost::FS_DIRECTORY : pehost::FS_FILE;
+    info->size = info->kind == pehost::FS_DIRECTORY ? 0 : *reinterpret_cast<u64*>(st + 48);
+    info->mtime_ms = *reinterpret_cast<u64*>(st + 88) * 1000ull + *reinterpret_cast<u64*>(st + 96) / 1000000ull;
+    info->reserved = 0;
+    return true;
+}
+
+i64 work_adopt_fd(i64 fd, pehost::FsInfo* info) {
+    work_slots_init();
+    if (!work_stat_fd(fd, info)) {
+        lx(SYS_CLOSE, static_cast<u64>(fd));
+        return pehost::FS_FAILED;
+    }
+    for (u32 i = 0; i < 32; ++i) {
+        if (g_work_slots[i] < 0) {
+            g_work_slots[i] = fd;
+            return i;
+        }
+    }
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    return pehost::FS_NO_SPACE;
+}
+
+i64 work_fd_of(i64 slot) {
+    work_slots_init();
+    return slot >= 0 && slot < 32 ? g_work_slots[slot] : -1;
+}
+
+i64 child_fs_open(const char* path, u32 want, pehost::FsInfo* info) {
+    u64 flags = (want & pehost::FS_WANT_WRITE) ? 2 : 0;
+    flags |= 0x80000;
+    const char* target = path[0] ? path : ".";
+    i64 fd = lx(257, static_cast<u64>(g_work_fd), reinterpret_cast<u64>(target), flags);
+    if (fd < 0) return work_error(fd);
+    return work_adopt_fd(fd, info);
+}
+
+i64 child_fs_create(const char* path, u32 directory, u32 want, pehost::FsInfo* info) {
+    if (directory) {
+        i64 e = lx(258, static_cast<u64>(g_work_fd), reinterpret_cast<u64>(path), 0755);
+        return e < 0 ? work_error(e) : 0;
+    }
+    i64 fd = lx(257, static_cast<u64>(g_work_fd), reinterpret_cast<u64>(path), 2 | 0x40 | 0x80 | 0x80000, 0644);
+    if (fd < 0) return work_error(fd);
+    return work_adopt_fd(fd, info);
+}
+
+i64 child_fs_read(i64 slot, u64 offset, void* buffer, u64 length) {
+    i64 fd = work_fd_of(slot);
+    if (fd < 0) return pehost::FS_FAILED;
+    i64 n = lx(17, static_cast<u64>(fd), reinterpret_cast<u64>(buffer), length, offset);
+    return n < 0 ? work_error(n) : n;
+}
+
+i64 child_fs_write(i64 slot, u64 offset, const void* buffer, u64 length) {
+    i64 fd = work_fd_of(slot);
+    if (fd < 0) return pehost::FS_FAILED;
+    i64 n = lx(18, static_cast<u64>(fd), reinterpret_cast<u64>(buffer), length, offset);
+    return n < 0 ? work_error(n) : n;
+}
+
+i64 child_fs_resize(i64 slot, u64 size) {
+    i64 fd = work_fd_of(slot);
+    if (fd < 0) return pehost::FS_FAILED;
+    i64 e = lx(77, static_cast<u64>(fd), size);
+    return e < 0 ? work_error(e) : 0;
+}
+
+void child_fs_close(i64 slot) {
+    i64 fd = work_fd_of(slot);
+    if (fd < 0) return;
+    lx(SYS_CLOSE, static_cast<u64>(fd));
+    g_work_slots[slot] = -1;
+}
+
+i64 child_fs_stat(i64 slot, pehost::FsInfo* info) {
+    i64 fd = work_fd_of(slot);
+    return fd >= 0 && work_stat_fd(fd, info) ? 0 : pehost::FS_FAILED;
+}
+
+i64 child_fs_remove(const char* path, u32 directory) {
+    i64 e = lx(263, static_cast<u64>(g_work_fd), reinterpret_cast<u64>(path), directory ? 0x200 : 0);
+    if (e == -20 && directory) return pehost::FS_WRONG_TYPE;
+    return e < 0 ? work_error(e) : 0;
+}
+
+i64 child_fs_rename(const char* from, const char* to, u32 replace) {
+    i64 e = lx(316, static_cast<u64>(g_work_fd), reinterpret_cast<u64>(from), static_cast<u64>(g_work_fd), reinterpret_cast<u64>(to), replace ? 0 : 1);
+    return e < 0 ? work_error(e) : 0;
+}
+
+i32 child_fs_entry(i64 slot, u64 index, char* name, u32 capacity, pehost::FsInfo* info) {
+    i64 fd = work_fd_of(slot);
+    if (fd < 0 || capacity == 0) return -1;
+    lx(8, static_cast<u64>(fd), 0, 0);
+    static char buffer[32768];
+    u64 seen = 0;
+    for (;;) {
+        i64 got = lx(217, static_cast<u64>(fd), reinterpret_cast<u64>(buffer), sizeof(buffer));
+        if (got < 0) return -1;
+        if (got == 0) return 1;
+        for (i64 at = 0; at < got;) {
+            u16 reclen = *reinterpret_cast<u16*>(buffer + at + 16);
+            const char* entry = buffer + at + 19;
+            at += reclen;
+            if (entry[0] == '.' && (entry[1] == 0 || (entry[1] == '.' && entry[2] == 0))) continue;
+            if (seen++ != index) continue;
+            u32 n = 0;
+            while (entry[n] && n + 1 < capacity) {
+                name[n] = entry[n];
+                ++n;
+            }
+            name[n] = 0;
+            u8 st[144];
+            info->size = 0;
+            info->mtime_ms = 0;
+            info->kind = pehost::FS_FILE;
+            info->reserved = 0;
+            if (lx(262, static_cast<u64>(fd), reinterpret_cast<u64>(entry), reinterpret_cast<u64>(st), 0) == 0) {
+                u32 mode = *reinterpret_cast<u32*>(st + 24);
+                info->kind = (mode & 0170000) == 0040000 ? pehost::FS_DIRECTORY : pehost::FS_FILE;
+                info->size = info->kind == pehost::FS_DIRECTORY ? 0 : *reinterpret_cast<u64*>(st + 48);
+                info->mtime_ms = *reinterpret_cast<u64*>(st + 88) * 1000ull + *reinterpret_cast<u64*>(st + 96) / 1000000ull;
+            }
+            return 0;
+        }
+    }
+}
+
 const char* g_stdin_text = nullptr;
 u32 g_stdin_length = 0;
 u32 g_stdin_position = 0;
@@ -388,7 +554,22 @@ void seed_child_environment() {
     }
 }
 
-pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap, &child_clock, &child_file_open, &child_file_read, &child_file_close, &child_dir_entry, &child_read_stdin };
+pehost::Runtime g_runtime = { &child_exit, &child_write, &child_reserve, &child_protect, &child_sleep, &child_read_file, &child_unmap, &child_clock, &child_file_open, &child_file_read, &child_file_close, &child_dir_entry, &child_read_stdin,
+                              &linux_threads::futex_wait, &linux_threads::futex_wake, &linux_threads::spawn, &linux_threads::set_teb };
+
+void install_work_hooks() {
+    bool on = g_work_fd >= 0;
+    g_runtime.fs_open = on ? &child_fs_open : nullptr;
+    g_runtime.fs_create = on ? &child_fs_create : nullptr;
+    g_runtime.fs_read = on ? &child_fs_read : nullptr;
+    g_runtime.fs_write = on ? &child_fs_write : nullptr;
+    g_runtime.fs_resize = on ? &child_fs_resize : nullptr;
+    g_runtime.fs_close = on ? &child_fs_close : nullptr;
+    g_runtime.fs_stat = on ? &child_fs_stat : nullptr;
+    g_runtime.fs_remove = on ? &child_fs_remove : nullptr;
+    g_runtime.fs_rename = on ? &child_fs_rename : nullptr;
+    g_runtime.fs_entry = on ? &child_fs_entry : nullptr;
+}
 
 const char* g_command_line = "pe.exe";
 
@@ -429,6 +610,7 @@ void run_child(const u8* file, usize size, Result* r) {
         g_status_fd = ps[1];
         g_platform.reset();
         g_platform.log_fd = pl[1];
+        install_work_hooks();
         pehost::g_runtime = &g_runtime;
         pehost::ImportTable table = imports();
         i64 st = pehost::load(g_platform, file, size, table, &g_prepared);
@@ -946,6 +1128,13 @@ int main(int argc, char** argv) {
         const char* line = "pe.exe";
         for (int i = 3; i < argc; ++i) {
             if (equals(argv[i], "--dlls") && i + 1 < argc) g_dll_dir = argv[++i];
+            else if (equals(argv[i], "--work") && i + 1 < argc) {
+                g_work_fd = lx(2, reinterpret_cast<u64>(argv[++i]), 0x10000 | 0x80000);
+                if (g_work_fd < 0) {
+                    printf("cannot open the work directory\n");
+                    return 2;
+                }
+            }
             else if (equals(argv[i], "--env") && i + 1 < argc && g_env_seed_count < 8) g_env_seed[g_env_seed_count++] = argv[++i];
             else if (equals(argv[i], "--stdin") && i + 1 < argc) {
                 g_stdin_text = argv[++i];

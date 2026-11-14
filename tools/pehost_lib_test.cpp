@@ -1,5 +1,7 @@
 #include "../userland/pehost/ucrt.hpp"
 #include "pe_samples_mingw.hpp"
+#include "pe_linux_threads.hpp"
+#include <cstdio>
 
 extern "C" {
 int printf(const char*, ...);
@@ -3022,8 +3024,986 @@ void extended_tests() {
     pehost::g_runtime = &g_recording;
 }
 
+
+namespace thr {
+
+constexpr u32 SLOTS = 8;
+
+pehost::Teb g_tebs[SLOTS];
+u64 g_fls[SLOTS][pehost::MAX_FLS];
+void (*g_fn)(u32, void*) = nullptr;
+void* g_arg = nullptr;
+volatile u32 g_finished = 0;
+
+u8* reserve(u64 bytes) { return map_pages(bytes); }
+
+bool clock(pehost::Clock* out) {
+    u64 spec[2];
+    lx(228, 1, reinterpret_cast<u64>(spec));
+    out->counter = spec[0] * 1000000000ull + spec[1];
+    out->frequency = 1000000000ull;
+    out->wall_ms = 0;
+    out->wall_valid = false;
+    return true;
+}
+
+pehost::Runtime g_runtime = { &rec_exit, &rec_write, &reserve, &rec_protect, &rec_sleep, nullptr, nullptr, &clock, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              &linux_threads::futex_wait, &linux_threads::futex_wake, &linux_threads::spawn, &linux_threads::set_teb };
+
+pehost::Runtime g_child_runtime = { &child_exit_process, &child_console, &reserve, nullptr, nullptr, nullptr, nullptr, &clock, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    &linux_threads::futex_wait, &linux_threads::futex_wake, &linux_threads::spawn, &linux_threads::set_teb };
+
+void prepare_main(pehost::Runtime* runtime) {
+    pehost::g_runtime = runtime;
+    pehost::sync::reset();
+    pehost::Teb& t = g_tebs[0];
+    t = pehost::Teb{};
+    t.self = reinterpret_cast<u64>(&t);
+    t.client_thread = 77;
+    t.client_process = 5;
+    t.fls_data = reinterpret_cast<u64>(g_fls[0]);
+    linux_threads::set_teb(&t);
+    pehost::World& w = pehost::g_world;
+    w.heap.init(&reserve);
+    w.heap.set_lock(&pehost::sync::host_lock, &pehost::sync::host_unlock);
+    w.tls_used = 0;
+    pehost::g_extra = pehost::Extra{};
+    pehost::sync::g_sync.slots[0].teb = &t;
+    pehost::sync::g_sync.slots[0].fls = g_fls[0];
+    pehost::sync::enter_multi();
+}
+
+void entry(u64 index) {
+    pehost::sync::Slot& s = pehost::sync::g_sync.slots[index];
+    pehost::Teb& t = g_tebs[index];
+    t = pehost::Teb{};
+    t.self = reinterpret_cast<u64>(&t);
+    t.client_thread = 100 + index;
+    t.client_process = 5;
+    t.host_slot = index;
+    t.fls_data = reinterpret_cast<u64>(g_fls[index]);
+    linux_threads::set_teb(&t);
+    g_fn(static_cast<u32>(index), g_arg);
+    s.running = false;
+    pehost::sync::add(&g_finished, 1);
+    pehost::sync::wake(&g_finished);
+}
+
+void start(u32 index) {
+    pehost::sync::Slot& s = pehost::sync::g_sync.slots[index];
+    s.used = true;
+    s.running = true;
+    s.teb = &g_tebs[index];
+    s.fls = g_fls[index];
+    linux_threads::spawn(&entry, index, nullptr);
+}
+
+void run(u32 count, void (*fn)(u32, void*), void* arg) {
+    g_fn = fn;
+    g_arg = arg;
+    g_finished = 0;
+    for (u32 i = 1; i <= count; ++i) start(i);
+    for (;;) {
+        u32 seen = pehost::sync::load(&g_finished);
+        if (seen >= count) break;
+        linux_threads::futex_wait(&g_finished, seen, 1000);
+    }
+    for (u32 i = 1; i <= count; ++i) pehost::sync::g_sync.slots[i].used = false;
+}
+
+void pause_ms(u32 ms) { pehost::win32::Sleep(ms); }
+
+bool settle(volatile u32* value, u32 wanted, u32 limit_ms) {
+    for (u32 waited = 0; waited < limit_ms; waited += 5) {
+        if (pehost::sync::load(value) >= wanted) return true;
+        pause_ms(5);
+    }
+    return pehost::sync::load(value) >= wanted;
+}
+
+struct Counter {
+    pehost::CriticalSection cs;
+    volatile u64 value;
+};
+
+void count_with_section(u32, void* arg) {
+    Counter* c = static_cast<Counter*>(arg);
+    for (u32 i = 0; i < 20000; ++i) {
+        pehost::win32::EnterCriticalSection(&c->cs);
+        pehost::win32::EnterCriticalSection(&c->cs);
+        c->value = c->value + 1;
+        pehost::win32::LeaveCriticalSection(&c->cs);
+        pehost::win32::LeaveCriticalSection(&c->cs);
+    }
+}
+
+struct Pair {
+    u64 lock;
+    volatile u64 a;
+    volatile u64 b;
+    volatile u32 torn;
+    volatile u32 readers_at_once;
+    volatile u32 inside;
+};
+
+void use_srw(u32 index, void* arg) {
+    Pair* p = static_cast<Pair*>(arg);
+    for (u32 i = 0; i < 4000; ++i) {
+        if (index % 2 == 0) {
+            pehost::win32::AcquireSRWLockExclusive(&p->lock);
+            p->a = p->a + 1;
+            p->b = p->b + 1;
+            pehost::win32::ReleaseSRWLockExclusive(&p->lock);
+        } else {
+            pehost::win32::AcquireSRWLockShared(&p->lock);
+            u32 now = pehost::sync::add(&p->inside, 1);
+            if (now > 1) p->readers_at_once = 1;
+            if (p->a != p->b) p->torn = 1;
+            pehost::sync::add(&p->inside, static_cast<u32>(-1));
+            pehost::win32::ReleaseSRWLockShared(&p->lock);
+        }
+    }
+}
+
+struct Queue {
+    u64 lock;
+    u64 not_empty;
+    u64 not_full;
+    u32 items[8];
+    u32 head, tail, count;
+    volatile u32 producers_left;
+    volatile u64 sum;
+    volatile u32 taken;
+};
+
+void queue_role(u32 index, void* arg) {
+    using namespace pehost::win32;
+    Queue* q = static_cast<Queue*>(arg);
+    if (index <= 2) {
+        for (u32 n = 1; n <= 500; ++n) {
+            AcquireSRWLockExclusive(&q->lock);
+            while (q->count == 8) SleepConditionVariableSRW(&q->not_full, &q->lock, 0xFFFFFFFFu, 0);
+            q->items[q->tail] = n;
+            q->tail = (q->tail + 1) % 8;
+            ++q->count;
+            ReleaseSRWLockExclusive(&q->lock);
+            WakeAllConditionVariable(&q->not_empty);
+        }
+        AcquireSRWLockExclusive(&q->lock);
+        --q->producers_left;
+        ReleaseSRWLockExclusive(&q->lock);
+        WakeAllConditionVariable(&q->not_empty);
+    } else {
+        for (;;) {
+            AcquireSRWLockExclusive(&q->lock);
+            while (q->count == 0 && q->producers_left != 0) SleepConditionVariableSRW(&q->not_empty, &q->lock, 0xFFFFFFFFu, 0);
+            if (q->count == 0) {
+                ReleaseSRWLockExclusive(&q->lock);
+                return;
+            }
+            u32 v = q->items[q->head];
+            q->head = (q->head + 1) % 8;
+            --q->count;
+            q->sum = q->sum + v;
+            q->taken = q->taken + 1;
+            ReleaseSRWLockExclusive(&q->lock);
+            WakeAllConditionVariable(&q->not_full);
+        }
+    }
+}
+
+struct Waiters {
+    u64 handle;
+    volatile u32 woken;
+    volatile u32 result;
+};
+
+void wait_on_handle(u32, void* arg) {
+    Waiters* w = static_cast<Waiters*>(arg);
+    u32 r = pehost::win32::WaitForSingleObject(w->handle, 0xFFFFFFFFu);
+    w->result = r;
+    pehost::sync::add(&w->woken, 1);
+}
+
+struct Once {
+    u64 once;
+    volatile u32 runs;
+    volatile u32 seen_ok;
+};
+
+PEHOST_WINAPI i32 once_init(u64*, void* parameter, void** context) {
+    Once* o = static_cast<Once*>(parameter);
+    pehost::win32::Sleep(30);
+    pehost::sync::add(&o->runs, 1);
+    *context = reinterpret_cast<void*>(0x1230);
+    return 1;
+}
+
+void use_once(u32, void* arg) {
+    Once* o = static_cast<Once*>(arg);
+    void* context = nullptr;
+    if (pehost::win32::InitOnceExecuteOnce(&o->once, &once_init, o, &context) && context == reinterpret_cast<void*>(0x1230) && o->runs == 1) pehost::sync::add(&o->seen_ok, 1);
+}
+
+struct Address {
+    volatile u32 value;
+    volatile u32 woken;
+    volatile u32 result;
+};
+
+void wait_on_address(u32, void* arg) {
+    Address* a = static_cast<Address*>(arg);
+    u32 expect = 0;
+    a->result = static_cast<u32>(pehost::win32::WaitOnAddress(&a->value, &expect, 4, 0xFFFFFFFFu));
+    pehost::sync::add(&a->woken, 1);
+}
+
+void churn_heap(u32 index, void*) {
+    pehost::Heap& h = pehost::g_world.heap;
+    u8* held[64] = {};
+    u32 sizes[64] = {};
+    u64 state = 0x9E3779B97F4A7C15ull * index;
+    for (u32 round = 0; round < 6000; ++round) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        u32 slot = static_cast<u32>(state % 64);
+        if (held[slot]) {
+            for (u32 k = 0; k < sizes[slot]; ++k) {
+                if (held[slot][k] != static_cast<u8>(index)) pehost::g_world.tls_used |= 1ull << 63;
+            }
+            h.free(held[slot]);
+            held[slot] = nullptr;
+        } else {
+            sizes[slot] = static_cast<u32>(state >> 20) % 700 + 1;
+            held[slot] = static_cast<u8*>(h.alloc(sizes[slot]));
+            for (u32 k = 0; k < sizes[slot]; ++k) held[slot][k] = static_cast<u8>(index);
+        }
+    }
+    for (u32 slot = 0; slot < 64; ++slot) {
+        if (held[slot]) h.free(held[slot]);
+    }
+}
+
+struct Fls {
+    u32 slot;
+    volatile u32 set;
+    volatile u32 freed;
+};
+
+void set_fls(u32 index, void* arg) {
+    Fls* f = static_cast<Fls*>(arg);
+    pehost::win32::FlsSetValue(f->slot, reinterpret_cast<void*>(0x100 + index));
+    pehost::sync::add(&f->set, 1);
+    while (pehost::sync::load(&f->freed) == 0) pehost::win32::Sleep(2);
+}
+
+u32 g_fls_callbacks = 0;
+PEHOST_WINAPI void count_fls(void*) { pehost::sync::add(&g_fls_callbacks, 1); }
+
+struct Abandon {
+    u64 mutex;
+    volatile u32 held;
+    volatile u32 result;
+    volatile u32 error;
+};
+
+void hold_mutex(u32, void* arg) {
+    Abandon* a = static_cast<Abandon*>(arg);
+    pehost::win32::WaitForSingleObject(a->mutex, 0xFFFFFFFFu);
+    pehost::sync::store(&a->held, 1);
+    pause_ms(60);
+    pehost::sync::Host guard;
+    pehost::objects::abandon_mutexes(pehost::detail::current_thread_id());
+}
+
+void release_foreign(u32, void* arg) {
+    Abandon* a = static_cast<Abandon*>(arg);
+    pehost::set_last_error(0);
+    a->result = static_cast<u32>(pehost::win32::ReleaseMutex(a->mutex));
+    a->error = pehost::last_error();
+}
+
+void block_forever(u32, void* arg) { pehost::win32::WaitForSingleObject(*static_cast<u64*>(arg), 0xFFFFFFFFu); }
+
+void signal_later(u32, void* arg) {
+    pause_ms(150);
+    pehost::win32::SetEvent(*static_cast<u64*>(arg));
+}
+
+}
+
+void thread_tests() {
+    using namespace pehost::win32;
+    using namespace pehost;
+    thr::prepare_main(&thr::g_runtime);
+
+    static thr::Counter counter;
+    InitializeCriticalSection(&counter.cs);
+    thr::run(4, thr::count_with_section, &counter);
+    expect(counter.value == 4 * 20000 && counter.cs.lock_count == -1 && counter.cs.recursion_count == 0 && counter.cs.owning_thread == 0, "four threads incrementing under a recursive critical section lose no update");
+    EnterCriticalSection(&counter.cs);
+    static volatile u32 entered = 0;
+    entered = 0;
+    thr::run(1, [](u32, void* arg) {
+        CriticalSection* cs = static_cast<CriticalSection*>(arg);
+        entered = TryEnterCriticalSection(cs) ? 1 : 2;
+    }, &counter.cs);
+    expect(entered == 2, "TryEnter from another thread fails while the section is held");
+    LeaveCriticalSection(&counter.cs);
+
+    static thr::Pair pair;
+    pair = thr::Pair{};
+    InitializeSRWLock(&pair.lock);
+    thr::run(4, thr::use_srw, &pair);
+    expect(pair.a == 8000 && pair.a == pair.b && pair.torn == 0 && pair.lock == 0, "SRW writers exclude readers and each other");
+
+    static thr::Queue queue;
+    queue = thr::Queue{};
+    queue.producers_left = 2;
+    thr::run(4, thr::queue_role, &queue);
+    expect(queue.sum == 2ull * (500 * 501 / 2) && queue.taken == 1000 && queue.count == 0, "two producers and two consumers move 1000 items through condition variables without loss");
+
+    static thr::Waiters auto_reset[3];
+    u64 event = CreateEventA(nullptr, 0, 0, nullptr);
+    expect(event != 0, "an auto-reset event is created");
+    for (thr::Waiters& w : auto_reset) w = thr::Waiters{ event, 0, 99 };
+    thr::g_fn = [](u32 index, void* arg) { thr::wait_on_handle(index, static_cast<thr::Waiters*>(arg) + (index - 1)); };
+    thr::g_arg = auto_reset;
+    thr::g_finished = 0;
+    for (u32 i = 1; i <= 3; ++i) thr::start(i);
+    thr::pause_ms(80);
+    u32 total = 0;
+    for (thr::Waiters& w : auto_reset) total += w.woken;
+    expect(total == 0, "waiters on an unsignalled event stay blocked");
+    SetEvent(event);
+    thr::pause_ms(120);
+    total = 0;
+    for (thr::Waiters& w : auto_reset) total += w.woken;
+    expect(total == 1, "setting an auto-reset event releases exactly one waiter");
+    for (u32 expected_total = 2; expected_total <= 3; ++expected_total) {
+        SetEvent(event);
+        for (u32 waited = 0; waited < 1000; waited += 5) {
+            total = 0;
+            for (thr::Waiters& w : auto_reset) total += w.woken;
+            if (total == expected_total) break;
+            thr::pause_ms(5);
+        }
+    }
+    total = 0;
+    for (thr::Waiters& w : auto_reset) total += w.woken;
+    expect(total == 3 && WaitForSingleObject(event, 0) == WAIT_TIMEOUT, "each further set releases one more waiter and leaves the event reset");
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 3) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    for (u32 i = 1; i <= 3; ++i) sync::g_sync.slots[i].used = false;
+    CloseHandle(event);
+
+    u64 manual = CreateEventA(nullptr, 1, 0, nullptr);
+    for (thr::Waiters& w : auto_reset) w = thr::Waiters{ manual, 0, 99 };
+    thr::g_finished = 0;
+    for (u32 i = 1; i <= 3; ++i) thr::start(i);
+    thr::pause_ms(60);
+    SetEvent(manual);
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 3) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    for (u32 i = 1; i <= 3; ++i) sync::g_sync.slots[i].used = false;
+    expect(auto_reset[0].woken && auto_reset[1].woken && auto_reset[2].woken && WaitForSingleObject(manual, 0) == WAIT_OBJECT_0 && ResetEvent(manual) == 1 && WaitForSingleObject(manual, 0) == WAIT_TIMEOUT,
+           "a manual-reset event releases every waiter and stays set until reset");
+    CloseHandle(manual);
+
+    u64 first = CreateEventA(nullptr, 1, 0, nullptr);
+    u64 second = CreateEventA(nullptr, 1, 1, nullptr);
+    u64 both[2] = { first, second };
+    expect(WaitForMultipleObjects(2, both, 0, 0) == WAIT_OBJECT_0 + 1 && WaitForMultipleObjects(2, both, 1, 0) == WAIT_TIMEOUT, "wait-any reports the signalled index and wait-all needs every handle");
+    SetEvent(first);
+    expect(WaitForMultipleObjects(2, both, 1, 0) == WAIT_OBJECT_0 && WaitForMultipleObjects(0, both, 0, 0) == WAIT_FAILED && last_error() == ERROR_INVALID_PARAMETER, "wait-all succeeds once all are signalled and a zero count is refused");
+    u64 bad[2] = { first, 0x9990 };
+    expect(WaitForMultipleObjects(2, bad, 0, 0) == WAIT_FAILED && last_error() == ERROR_INVALID_HANDLE && WaitForSingleObject(0x1234, 0) == WAIT_FAILED, "an unknown handle makes a wait fail");
+    CloseHandle(first);
+    expect(WaitForSingleObject(first, 0) == WAIT_FAILED && CloseHandle(first) == 0 && last_error() == ERROR_INVALID_HANDLE, "a closed event handle is invalid");
+    CloseHandle(second);
+
+    u64 named = CreateEventA(nullptr, 1, 0, "shared-name");
+    u64 again = CreateEventA(nullptr, 0, 1, "shared-name");
+    expect(named != 0 && again != 0 && again != named && last_error() == ERROR_ALREADY_EXISTS && OpenEventA(0, 0, "shared-name") != 0 && OpenEventA(0, 0, "other-name") == 0 && last_error() == pehost::ERROR_OBJECT_NOT_FOUND,
+           "named events share one object and opening a missing name fails");
+    SetEvent(named);
+    expect(WaitForSingleObject(again, 0) == WAIT_OBJECT_0, "a second handle to a named event sees the same state");
+    expect(CreateMutexA(nullptr, 0, "shared-name") == 0 && last_error() == ERROR_INVALID_HANDLE, "a name used by another kind of object is refused");
+    CloseHandle(named);
+    CloseHandle(again);
+
+    static thr::Abandon abandon;
+    abandon = thr::Abandon{};
+    abandon.mutex = CreateMutexA(nullptr, 0, nullptr);
+    static thr::Waiters wait_mutex;
+    wait_mutex = thr::Waiters{ abandon.mutex, 0, 99 };
+    thr::g_fn = [](u32 index, void*) {
+        if (index == 1) thr::hold_mutex(index, &abandon);
+        else {
+            while (sync::load(&abandon.held) == 0) win32::Sleep(2);
+            u32 timed = WaitForSingleObject(abandon.mutex, 20);
+            thr::release_foreign(index, &abandon);
+            abandon.result = (abandon.result << 8) | timed;
+            wait_mutex.result = WaitForSingleObject(abandon.mutex, 0xFFFFFFFFu);
+            ReleaseMutex(abandon.mutex);
+        }
+    };
+    thr::g_arg = nullptr;
+    thr::g_finished = 0;
+    thr::start(1);
+    thr::start(2);
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 2) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    sync::g_sync.slots[1].used = sync::g_sync.slots[2].used = false;
+    expect(abandon.result == WAIT_TIMEOUT && abandon.error == ERROR_NOT_OWNER && wait_mutex.result == WAIT_ABANDONED_0, "a held mutex times out for others, refuses a foreign release and is reported abandoned when its owner ends");
+    expect(WaitForSingleObject(abandon.mutex, 0) == WAIT_OBJECT_0 && ReleaseMutex(abandon.mutex) == 1 && ReleaseMutex(abandon.mutex) == 0 && last_error() == ERROR_NOT_OWNER, "after the abandoned owner is replaced the mutex works normally");
+    CloseHandle(abandon.mutex);
+
+    u64 mutex = CreateMutexA(nullptr, 1, nullptr);
+    expect(WaitForSingleObject(mutex, 0) == WAIT_OBJECT_0 && ReleaseMutex(mutex) == 1 && ReleaseMutex(mutex) == 1 && ReleaseMutex(mutex) == 0, "a mutex is recursive and counts its holds");
+    CloseHandle(mutex);
+
+    u64 semaphore = CreateSemaphoreA(nullptr, 0, 5, nullptr);
+    expect(semaphore != 0 && CreateSemaphoreA(nullptr, 3, 2, nullptr) == 0 && last_error() == ERROR_INVALID_PARAMETER && WaitForSingleObject(semaphore, 0) == WAIT_TIMEOUT, "a semaphore starts at its initial count and bad counts are refused");
+    static thr::Waiters sem_waiters[3];
+    for (thr::Waiters& w : sem_waiters) w = thr::Waiters{ semaphore, 0, 99 };
+    thr::g_fn = [](u32 index, void* arg) { thr::wait_on_handle(index, static_cast<thr::Waiters*>(arg) + (index - 1)); };
+    thr::g_arg = sem_waiters;
+    thr::g_finished = 0;
+    for (u32 i = 1; i <= 3; ++i) thr::start(i);
+    thr::pause_ms(60);
+    i32 previous = -1;
+    expect(ReleaseSemaphore(semaphore, 3, &previous) == 1 && previous == 0, "releasing a semaphore reports the previous count");
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 3) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    for (u32 i = 1; i <= 3; ++i) sync::g_sync.slots[i].used = false;
+    expect(sem_waiters[0].woken && sem_waiters[1].woken && sem_waiters[2].woken && WaitForSingleObject(semaphore, 0) == WAIT_TIMEOUT, "three waiters each take one unit");
+    expect(ReleaseSemaphore(semaphore, 6, nullptr) == 0 && last_error() == ERROR_TOO_MANY_POSTS && ReleaseSemaphore(semaphore, 0, nullptr) == 0 && ReleaseSemaphore(semaphore, 5, nullptr) == 1, "a release past the maximum or of nothing is refused");
+    CloseHandle(semaphore);
+
+    static thr::Once once;
+    once = thr::Once{};
+    thr::run(4, thr::use_once, &once);
+    expect(once.runs == 1 && once.seen_ok == 4 && (once.once & 3) == 2, "four threads racing InitOnceExecuteOnce run the initialiser once and all see its context");
+
+    static thr::Address address;
+    address = thr::Address{};
+    thr::g_fn = thr::wait_on_address;
+    thr::g_arg = &address;
+    thr::g_finished = 0;
+    thr::start(1);
+    thr::pause_ms(60);
+    expect(address.woken == 0, "WaitOnAddress blocks while the value is unchanged");
+    address.value = 1;
+    WakeByAddressAll(const_cast<u32*>(&address.value));
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 1) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    sync::g_sync.slots[1].used = false;
+    u32 zero = 0, one = 1;
+    expect(address.woken == 1 && address.result == 1 && WaitOnAddress(&address.value, &zero, 4, 0) == 1 && WaitOnAddress(&address.value, &one, 4, 20) == 0 && last_error() == ERROR_TIMEOUT && WaitOnAddress(&address.value, &one, 3, 0) == 0 && last_error() == ERROR_INVALID_PARAMETER,
+           "a change plus a wake ends the wait, a different value returns at once and a timeout is ERROR_TIMEOUT");
+
+    g_world.tls_used = 0;
+    thr::run(4, thr::churn_heap, nullptr);
+    expect((g_world.tls_used >> 63) == 0 && g_world.heap.check() && g_world.heap.live() == 0, "four threads allocating and freeing at once corrupt nothing and leak nothing");
+
+    static thr::Fls fls;
+    fls = thr::Fls{};
+    fls.slot = FlsAlloc(&thr::count_fls);
+    thr::g_fls_callbacks = 0;
+    thr::g_fn = thr::set_fls;
+    thr::g_arg = &fls;
+    thr::g_finished = 0;
+    for (u32 i = 1; i <= 3; ++i) thr::start(i);
+    thr::settle(&fls.set, 3, 2000);
+    FlsSetValue(fls.slot, reinterpret_cast<void*>(0x55));
+    expect(FlsGetValue(fls.slot) == reinterpret_cast<void*>(0x55) && FlsGetValue(fls.slot) != reinterpret_cast<void*>(0x101), "fiber local values are separate per thread");
+    FlsFree(fls.slot);
+    sync::store(&fls.freed, 1);
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 3) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    for (u32 i = 1; i <= 3; ++i) sync::g_sync.slots[i].used = false;
+    expect(thr::g_fls_callbacks == 4, "freeing an FLS slot runs the callback for the value in every thread");
+
+    static u64 never;
+    never = CreateEventA(nullptr, 1, 0, nullptr);
+    static u64 later;
+    later = CreateEventA(nullptr, 1, 0, nullptr);
+    thr::g_fn = thr::signal_later;
+    thr::g_arg = &later;
+    thr::g_finished = 0;
+    thr::start(1);
+    expect(WaitForSingleObject(later, 0xFFFFFFFFu) == WAIT_OBJECT_0, "an infinite wait that a slower thread will end is not mistaken for a deadlock");
+    for (;;) {
+        u32 seen = sync::load(&thr::g_finished);
+        if (seen >= 1) break;
+        linux_threads::futex_wait(&thr::g_finished, seen, 1000);
+    }
+    sync::g_sync.slots[1].used = false;
+
+    ChildResult deadlocked = in_child([] {
+        thr::prepare_main(&thr::g_child_runtime);
+        static u64 a, b;
+        a = pehost::win32::CreateEventA(nullptr, 1, 0, nullptr);
+        b = pehost::win32::CreateEventA(nullptr, 1, 0, nullptr);
+        thr::g_fn = thr::block_forever;
+        thr::g_arg = &b;
+        thr::start(1);
+        pehost::win32::Sleep(100);
+        pehost::win32::WaitForSingleObject(a, 0xFFFFFFFFu);
+    });
+    ChildResult lock_cycle = in_child([] {
+        thr::prepare_main(&thr::g_child_runtime);
+        static pehost::CriticalSection x, y;
+        InitializeCriticalSection(&x);
+        InitializeCriticalSection(&y);
+        thr::g_fn = [](u32, void*) {
+            EnterCriticalSection(&y);
+            pehost::win32::Sleep(80);
+            EnterCriticalSection(&x);
+        };
+        EnterCriticalSection(&x);
+        thr::start(1);
+        pehost::win32::Sleep(40);
+        EnterCriticalSection(&y);
+    });
+    expect(deadlocked.exited && static_cast<u32>(deadlocked.code) == STATUS_POSSIBLE_DEADLOCK && contains(deadlocked.out, "no other thread can end"), "two threads each waiting forever on an event nobody will set stop the process");
+    expect(lock_cycle.exited && static_cast<u32>(lock_cycle.code) == STATUS_POSSIBLE_DEADLOCK, "two threads taking two critical sections in opposite order stop the process");
+
+    sync::reset();
+    g_world.heap.set_lock(nullptr, nullptr);
+    pehost::g_runtime = &g_recording;
+}
+
+
+struct MemNode {
+    bool used;
+    bool dir;
+    char path[64];
+    u8 data[512];
+    u64 size;
+};
+
+MemNode g_mem[24];
+i64 g_mem_slot[48];
+int g_mem_opens = 0;
+int g_mem_closes = 0;
+u64 g_mem_write_cap = 1u << 20;
+u64 g_mem_read_cap = 1u << 20;
+i64 g_mem_space = -1;
+
+u32 mem_len(const char* s) {
+    u32 n = 0;
+    while (s[n]) ++n;
+    return n;
+}
+
+int mem_find(const char* path) {
+    for (int i = 0; i < 24; ++i) {
+        if (g_mem[i].used && same(g_mem[i].path, path)) return i;
+    }
+    return -1;
+}
+
+void mem_parent(const char* path, char* out) {
+    u32 n = mem_len(path);
+    while (n > 0 && path[n - 1] != '/') --n;
+    u32 up = n == 0 ? 0 : n - 1;
+    for (u32 i = 0; i < up; ++i) out[i] = path[i];
+    out[up] = 0;
+}
+
+int mem_add(const char* path, bool dir) {
+    for (int i = 0; i < 24; ++i) {
+        if (g_mem[i].used) continue;
+        g_mem[i].used = true;
+        g_mem[i].dir = dir;
+        g_mem[i].size = 0;
+        u32 n = mem_len(path);
+        for (u32 k = 0; k <= n; ++k) g_mem[i].path[k] = path[k];
+        return i;
+    }
+    return -1;
+}
+
+void mem_info(int node, pehost::FsInfo* info) {
+    if (!info) return;
+    info->kind = node < 0 || g_mem[node].dir ? pehost::FS_DIRECTORY : pehost::FS_FILE;
+    info->size = node < 0 || g_mem[node].dir ? 0 : g_mem[node].size;
+    info->mtime_ms = 5000;
+    info->reserved = 0;
+}
+
+i64 mem_open_slot(int node, pehost::FsInfo* info) {
+    for (i64 i = 0; i < 48; ++i) {
+        if (g_mem_slot[i] == -100) {
+            g_mem_slot[i] = node;
+            ++g_mem_opens;
+            mem_info(node, info);
+            return i;
+        }
+    }
+    return pehost::FS_NO_SPACE;
+}
+
+i64 mem_fs_open(const char* path, u32, pehost::FsInfo* info) {
+    if (path[0] == 0) return mem_open_slot(-1, info);
+    int n = mem_find(path);
+    if (n < 0) return pehost::FS_NOT_FOUND;
+    return mem_open_slot(n, info);
+}
+
+i64 mem_fs_create(const char* path, u32 directory, u32, pehost::FsInfo* info) {
+    char parent[64];
+    mem_parent(path, parent);
+    if (parent[0]) {
+        int p = mem_find(parent);
+        if (p < 0) return pehost::FS_NOT_FOUND;
+        if (!g_mem[p].dir) return pehost::FS_WRONG_TYPE;
+    }
+    if (mem_find(path) >= 0) return pehost::FS_EXISTS;
+    int n = mem_add(path, directory != 0);
+    if (n < 0) return pehost::FS_NO_SPACE;
+    if (directory) return 0;
+    return mem_open_slot(n, info);
+}
+
+i64 mem_fs_read(i64 slot, u64 offset, void* buffer, u64 length) {
+    int n = static_cast<int>(g_mem_slot[slot]);
+    if (n < 0 || g_mem[n].dir) return pehost::FS_WRONG_TYPE;
+    if (offset >= g_mem[n].size) return 0;
+    u64 take = g_mem[n].size - offset;
+    if (take > length) take = length;
+    if (take > g_mem_read_cap) take = g_mem_read_cap;
+    for (u64 i = 0; i < take; ++i) static_cast<u8*>(buffer)[i] = g_mem[n].data[offset + i];
+    return static_cast<i64>(take);
+}
+
+i64 mem_fs_write(i64 slot, u64 offset, const void* buffer, u64 length) {
+    int n = static_cast<int>(g_mem_slot[slot]);
+    if (n < 0 || g_mem[n].dir) return pehost::FS_WRONG_TYPE;
+    if (g_mem_space == 0) return pehost::FS_NO_SPACE;
+    if (offset + length > sizeof(g_mem[n].data)) return pehost::FS_NO_SPACE;
+    u64 take = length < g_mem_write_cap ? length : g_mem_write_cap;
+    if (g_mem_space > 0 && take > static_cast<u64>(g_mem_space)) take = static_cast<u64>(g_mem_space);
+    for (u64 i = 0; i < take; ++i) g_mem[n].data[offset + i] = static_cast<const u8*>(buffer)[i];
+    if (offset + take > g_mem[n].size) g_mem[n].size = offset + take;
+    if (g_mem_space > 0) g_mem_space -= static_cast<i64>(take);
+    return static_cast<i64>(take);
+}
+
+i64 mem_fs_resize(i64 slot, u64 size) {
+    int n = static_cast<int>(g_mem_slot[slot]);
+    if (n < 0 || g_mem[n].dir || size > sizeof(g_mem[n].data)) return pehost::FS_NO_SPACE;
+    for (u64 i = g_mem[n].size; i < size; ++i) g_mem[n].data[i] = 0;
+    g_mem[n].size = size;
+    return 0;
+}
+
+void mem_fs_close(i64 slot) {
+    if (g_mem_slot[slot] != -100) ++g_mem_closes;
+    g_mem_slot[slot] = -100;
+}
+
+i64 mem_fs_stat(i64 slot, pehost::FsInfo* info) {
+    mem_info(static_cast<int>(g_mem_slot[slot]), info);
+    return 0;
+}
+
+bool mem_has_children(const char* path) {
+    u32 n = mem_len(path);
+    for (int i = 0; i < 24; ++i) {
+        if (!g_mem[i].used || mem_len(g_mem[i].path) <= n + 1) continue;
+        bool prefix = true;
+        for (u32 k = 0; k < n; ++k) {
+            if (g_mem[i].path[k] != path[k]) prefix = false;
+        }
+        if (prefix && g_mem[i].path[n] == '/') return true;
+    }
+    return false;
+}
+
+i64 mem_fs_remove(const char* path, u32 directory) {
+    int n = mem_find(path);
+    if (n < 0) return pehost::FS_NOT_FOUND;
+    if (g_mem[n].dir != (directory != 0)) return pehost::FS_WRONG_TYPE;
+    if (g_mem[n].dir && mem_has_children(path)) return pehost::FS_NOT_EMPTY;
+    g_mem[n].used = false;
+    return 0;
+}
+
+i64 mem_fs_rename(const char* from, const char* to, u32 replace) {
+    int a = mem_find(from);
+    if (a < 0) return pehost::FS_NOT_FOUND;
+    char parent[64];
+    mem_parent(to, parent);
+    if (parent[0] && mem_find(parent) < 0) return pehost::FS_NOT_FOUND;
+    int b = mem_find(to);
+    if (b >= 0) {
+        if (!replace) return pehost::FS_EXISTS;
+        g_mem[b].used = false;
+    }
+    u32 n = mem_len(to);
+    for (u32 k = 0; k <= n; ++k) g_mem[a].path[k] = to[k];
+    return 0;
+}
+
+i32 mem_fs_entry(i64 slot, u64 index, char* name, u32 capacity, pehost::FsInfo* info) {
+    int dir = static_cast<int>(g_mem_slot[slot]);
+    const char* base = dir < 0 ? "" : g_mem[dir].path;
+    u32 n = mem_len(base);
+    u64 seen = 0;
+    for (int i = 0; i < 24; ++i) {
+        if (!g_mem[i].used) continue;
+        const char* p = g_mem[i].path;
+        const char* leaf = p;
+        if (n) {
+            bool prefix = mem_len(p) > n + 1 && p[n] == '/';
+            for (u32 k = 0; k < n && prefix; ++k) prefix = p[k] == base[k];
+            if (!prefix) continue;
+            leaf = p + n + 1;
+        }
+        bool nested = false;
+        for (u32 k = 0; leaf[k]; ++k) nested = nested || leaf[k] == '/';
+        if (nested) continue;
+        if (seen++ != index) continue;
+        u32 k = 0;
+        for (; leaf[k] && k + 1 < capacity; ++k) name[k] = leaf[k];
+        name[k] = 0;
+        mem_info(i, info);
+        return 0;
+    }
+    return 1;
+}
+
+void mem_reset() {
+    for (MemNode& n : g_mem) n = MemNode{};
+    for (i64& s : g_mem_slot) s = -100;
+    g_mem_opens = g_mem_closes = 0;
+    g_mem_write_cap = g_mem_read_cap = 1u << 20;
+    g_mem_space = -1;
+    pehost::g_extra = pehost::Extra{};
+    for (pehost::Search& s : pehost::g_searches) s = pehost::Search{};
+    pehost::g_world.cwd[0] = 0;
+}
+
+void fsys_tests() {
+    using namespace pehost::win32;
+    using namespace pehost;
+    static pehost::Teb teb;
+    teb.self = reinterpret_cast<u64>(&teb);
+    teb.client_thread = 77;
+    teb.client_process = 5;
+    lx(SYS_ARCH_PRCTL, 0x1001, reinterpret_cast<u64>(&teb));
+    static pehost::Runtime rt = g_recording;
+    rt.file_open = &fake_open;
+    rt.file_read = &fake_read;
+    rt.file_close = &fake_close;
+    rt.dir_entry = &fake_dir;
+    rt.fs_open = &mem_fs_open;
+    rt.fs_create = &mem_fs_create;
+    rt.fs_read = &mem_fs_read;
+    rt.fs_write = &mem_fs_write;
+    rt.fs_resize = &mem_fs_resize;
+    rt.fs_close = &mem_fs_close;
+    rt.fs_stat = &mem_fs_stat;
+    rt.fs_remove = &mem_fs_remove;
+    rt.fs_rename = &mem_fs_rename;
+    rt.fs_entry = &mem_fs_entry;
+    pehost::g_runtime = &rt;
+    mem_reset();
+    constexpr u32 R = 0x80000000u, W = 0x40000000u;
+    char full[300];
+    char* part = nullptr;
+    auto full_of = [&](const char* in) {
+        SetLastError(0);
+        u32 n = GetFullPathNameA(in, sizeof(full), full, &part);
+        return n;
+    };
+
+    expect(full_of("a\\b") == 4 && same(full, "\\a\\b") && same(part, "b"), "fsys: a relative name resolves against the root");
+    expect(full_of("..\\..\\x") == 2 && same(full, "\\x"), "fsys: dot-dot stops at the root");
+    expect(full_of("C:\\a\\.\\b\\..\\c") == 4 && same(full, "\\a\\c"), "fsys: C:, dot and dot-dot are resolved and the drive is dropped");
+    expect(full_of("c:rel") == 4 && same(full, "\\rel"), "fsys: a drive-relative name is relative to the working directory");
+    expect(full_of("A:x") == 4 && same(full, "A:\\x"), "fsys: A: names the program directory");
+    expect(full_of("d1\\") == 3 && same(full, "\\d1"), "fsys: a trailing separator is dropped");
+    expect(full_of("D:\\x") == 0 && GetLastError() == 3, "fsys: another drive is ERROR_PATH_NOT_FOUND");
+    expect(full_of("\\\\srv\\share") == 0 && GetLastError() == 3, "fsys: a network name is ERROR_PATH_NOT_FOUND");
+    expect(full_of("a<b") == 0 && GetLastError() == 123, "fsys: a forbidden character is ERROR_INVALID_NAME");
+    expect(full_of("a*b") == 4 && same(full, "\\a*b"), "fsys: a wildcard is allowed in a full path");
+    expect(full_of("A:\\x\\y") == 0 && GetLastError() == 3, "fsys: the program directory has no subdirectories");
+    char longname[300];
+    for (u32 i = 0; i < 299; ++i) longname[i] = 'x';
+    longname[299] = 0;
+    expect(full_of(longname) == 0 && GetLastError() == 123, "fsys: a name of 299 bytes is ERROR_INVALID_NAME");
+
+    expect(CreateDirectoryA("d1", nullptr) == 1 && CreateDirectoryA("d1\\d2", nullptr) == 1, "fsys: directories are created");
+    expect(CreateDirectoryA("d1", nullptr) == 0 && GetLastError() == 183, "fsys: a directory that exists is ERROR_ALREADY_EXISTS");
+    expect(CreateDirectoryA("x\\y", nullptr) == 0 && GetLastError() == 3, "fsys: a directory under a missing one is ERROR_PATH_NOT_FOUND");
+    expect(CreateDirectoryA("\\", nullptr) == 0 && GetLastError() == 5, "fsys: the root cannot be created");
+
+    g_mem_write_cap = 7;
+    g_mem_read_cap = 5;
+    u64 h = CreateFileA("d1\\f.txt", R | W, 0, nullptr, 1, 0x80, 0);
+    expect(h != INVALID_HANDLE && GetLastError() == 0, "fsys: CREATE_NEW makes a file");
+    u32 done = 0;
+    const char* text = "0123456789ABCDEFGHIJ";
+    expect(WriteFile(h, text, 20, &done, nullptr) == 1 && done == 20 && GetFileSize(h, nullptr) == 20, "fsys: a write of 20 bytes through 7-byte hook calls is complete");
+    char back[40];
+    for (u32 i = 0; i < 40; ++i) back[i] = 0;
+    expect(SetFilePointer(h, 0, nullptr, 0) == 0 && ReadFile(h, back, 20, &done, nullptr) == 1 && done == 20 && same(back, text), "fsys: a read of 20 bytes through 5-byte hook calls is complete");
+    expect(ReadFile(h, back, 20, &done, nullptr) == 1 && done == 0, "fsys: a read at the end returns nothing");
+    expect(SetFilePointer(h, 5, nullptr, 0) == 5 && SetEndOfFile(h) == 1 && GetFileSize(h, nullptr) == 5, "fsys: SetEndOfFile cuts at the position");
+    expect(CloseHandle(h) == 1 && g_mem_opens == g_mem_closes, "fsys: closing releases the host handle");
+
+    g_mem_write_cap = 1u << 20;
+    g_mem_read_cap = 1u << 20;
+    h = CreateFileA("d1\\f.txt", W, 0, nullptr, 3, 0x80, 0);
+    g_mem_space = 10;
+    done = 99;
+    SetLastError(0);
+    expect(WriteFile(h, text, 20, &done, nullptr) == 0 && GetLastError() == 112 && done == 10, "fsys: a disk that fills mid-write is ERROR_DISK_FULL with the bytes that fitted");
+    g_mem_space = 0;
+    SetLastError(0);
+    expect(WriteFile(h, text, 5, &done, nullptr) == 0 && GetLastError() == 112, "fsys: a disk that is full is ERROR_DISK_FULL");
+    g_mem_space = -1;
+    CloseHandle(h);
+
+    SetLastError(0);
+    expect(CreateFileA("d1\\f.txt", W, 0, nullptr, 1, 0x80, 0) == INVALID_HANDLE && GetLastError() == 80, "fsys: CREATE_NEW on an existing file is ERROR_FILE_EXISTS");
+    expect(CreateFileA("d1\\f.txt\\x", R, 0, nullptr, 3, 0x80, 0) == INVALID_HANDLE && GetLastError() == 3, "fsys: a file used as a directory is ERROR_PATH_NOT_FOUND when opening");
+    expect(CreateFileA("d1\\f.txt\\x", W, 0, nullptr, 1, 0x80, 0) == INVALID_HANDLE && GetLastError() == 3, "fsys: and when creating");
+    expect(CreateFileA("d1\\none", R, 0, nullptr, 3, 0x80, 0) == INVALID_HANDLE && GetLastError() == 2, "fsys: a missing file is ERROR_FILE_NOT_FOUND");
+    expect(CreateFileA("d1", R, 0, nullptr, 3, 0x80, 0) == INVALID_HANDLE && GetLastError() == 5, "fsys: a directory needs backup semantics");
+    h = CreateFileA("d1", R, 0, nullptr, 3, 0x02000000u, 0);
+    u8 info[52];
+    expect(h != INVALID_HANDLE && GetFileInformationByHandle(h, info) == 1 && (*reinterpret_cast<u32*>(info) & 0x10) != 0, "fsys: a directory opens with backup semantics and says it is one");
+    SetLastError(0);
+    expect(ReadFile(h, back, 4, &done, nullptr) == 0, "fsys: reading a directory handle fails");
+    CloseHandle(h);
+    expect(g_mem_opens == g_mem_closes, "fsys: every refusal above left no host handle open");
+
+    h = CreateFileA("d1\\tmp", R | W, 0, nullptr, 1, 0x80 | 0x04000000u, 0);
+    expect(h != INVALID_HANDLE && mem_find("d1/tmp") >= 0, "fsys: a delete-on-close file exists while open");
+    CloseHandle(h);
+    expect(mem_find("d1/tmp") < 0 && g_mem_opens == g_mem_closes, "fsys: and is removed when closed");
+
+    u64 many[33];
+    int opened = 0;
+    for (int i = 0; i < 33; ++i) {
+        many[i] = CreateFileA("d1\\f.txt", R, 0, nullptr, 3, 0x80, 0);
+        if (many[i] != INVALID_HANDLE) ++opened;
+    }
+    expect(opened == 32 && GetLastError() == 8, "fsys: the 33rd open file is ERROR_NOT_ENOUGH_MEMORY");
+    for (int i = 0; i < 33; ++i) {
+        if (many[i] != INVALID_HANDLE) CloseHandle(many[i]);
+    }
+    expect(g_mem_opens == g_mem_closes, "fsys: the limit opened nothing it did not close");
+
+    expect(CopyFileA("d1\\f.txt", "d1\\g.txt", 1) == 1 && mem_find("d1/g.txt") >= 0 && g_mem[mem_find("d1/g.txt")].size == g_mem[mem_find("d1/f.txt")].size && g_mem[mem_find("d1/g.txt")].size > 0 && memcmp(g_mem[mem_find("d1/g.txt")].data, g_mem[mem_find("d1/f.txt")].data, g_mem[mem_find("d1/f.txt")].size) == 0, "fsys: CopyFile copies the content");
+    SetLastError(0);
+    expect(CopyFileA("d1\\f.txt", "d1\\g.txt", 1) == 0 && GetLastError() == 80 && g_mem_opens == g_mem_closes, "fsys: fail-if-exists is ERROR_FILE_EXISTS and closes the source");
+    expect(MoveFileA("d1\\g.txt", "d1\\d2\\h.txt") == 1 && mem_find("d1/d2/h.txt") >= 0 && mem_find("d1/g.txt") < 0, "fsys: MoveFile crosses directories");
+    SetLastError(0);
+    expect(MoveFileA("d1\\f.txt", "d1\\d2\\h.txt") == 0 && GetLastError() == 183, "fsys: a move onto a file is ERROR_ALREADY_EXISTS");
+    expect(MoveFileExA("d1\\f.txt", "d1\\d2\\h.txt", 1) == 1 && mem_find("d1/f.txt") < 0, "fsys: MOVEFILE_REPLACE_EXISTING replaces it");
+    SetLastError(0);
+    expect(MoveFileA("d1\\d2\\h.txt", "nodir\\h.txt") == 0 && GetLastError() == 3, "fsys: a move into a missing directory is ERROR_PATH_NOT_FOUND");
+    SetLastError(0);
+    expect(MoveFileA("d1\\none", "d1\\x") == 0 && GetLastError() == 2, "fsys: a move of a missing file is ERROR_FILE_NOT_FOUND");
+
+    SetLastError(0);
+    expect(DeleteFileA("d1\\d2") == 0 && GetLastError() == 5, "fsys: DeleteFile on a directory is ERROR_ACCESS_DENIED");
+    expect(RemoveDirectoryA("d1\\d2\\h.txt") == 0 && GetLastError() == 267, "fsys: RemoveDirectory on a file is ERROR_DIRECTORY");
+    expect(RemoveDirectoryA("d1\\d2") == 0 && GetLastError() == 145, "fsys: RemoveDirectory on a full directory is ERROR_DIR_NOT_EMPTY");
+    expect(DeleteFileA("d1\\d2\\h.txt") == 1 && RemoveDirectoryA("d1\\d2") == 1, "fsys: a file then its directory are removed");
+    expect(DeleteFileA("d1\\d2\\h.txt") == 0 && GetLastError() == 3, "fsys: deleting a file in a removed directory is ERROR_PATH_NOT_FOUND");
+    expect(DeleteFileA("d1\\none") == 0 && GetLastError() == 2, "fsys: deleting a missing file is ERROR_FILE_NOT_FOUND");
+    expect(DeleteFileA("nodir\\x") == 0 && GetLastError() == 3, "fsys: deleting under a missing directory is ERROR_PATH_NOT_FOUND");
+
+    h = CreateFileA("d1\\keep.txt", W, 0, nullptr, 1, 0x80, 0);
+    CloseHandle(h);
+    expect(SetCurrentDirectoryA("d1") == 1 && GetCurrentDirectoryA(sizeof(full), full) == 3 && same(full, "\\d1"), "fsys: SetCurrentDirectory enters a directory");
+    SetLastError(0);
+    expect(SetCurrentDirectoryA("keep.txt") == 0 && GetLastError() == 267 && same(g_world.cwd, "d1"), "fsys: a file cannot be entered and the directory stays");
+    h = CreateFileA("keep.txt", R, 0, nullptr, 3, 0x80, 0);
+    expect(h != INVALID_HANDLE, "fsys: a relative name uses the working directory");
+    CloseHandle(h);
+    u8 find[320];
+    u64 s = FindFirstFileA("*", find);
+    int seen = 0;
+    bool balanced = false;
+    if (s != INVALID_HANDLE) {
+        balanced = g_mem_opens == g_mem_closes;
+        do {
+            ++seen;
+        } while (FindNextFileA(s, find));
+        FindClose(s);
+    }
+    expect(seen == 1 && balanced, "fsys: a search lists the working directory and holds no host handle between calls");
+    s = FindFirstFileA("..\\*", find);
+    expect(s != INVALID_HANDLE && (*reinterpret_cast<u32*>(find) & 0x10) != 0, "fsys: a search names another directory with dot-dot");
+    if (s != INVALID_HANDLE) FindClose(s);
+    SetLastError(0);
+    expect(FindFirstFileA("nodir\\*", find) == INVALID_HANDLE && GetLastError() == 3, "fsys: a search in a missing directory is ERROR_PATH_NOT_FOUND");
+    SetLastError(0);
+    expect(FindFirstFileA("*.zz", find) == INVALID_HANDLE && GetLastError() == 2, "fsys: a search with no match is ERROR_FILE_NOT_FOUND");
+    s = FindFirstFileA("A:\\*.txt", find);
+    expect(s != INVALID_HANDLE && find[44] == 'a', "fsys: A:\\ lists the program directory");
+    if (s != INVALID_HANDLE) FindClose(s);
+    SetCurrentDirectoryA("\\");
+
+    Runtime partial = rt;
+    partial.fs_remove = nullptr;
+    partial.fs_create = nullptr;
+    partial.fs_resize = nullptr;
+    partial.fs_rename = nullptr;
+    pehost::g_runtime = &partial;
+    SetLastError(0);
+    expect(DeleteFileA("d1\\f.txt") == 0 && GetLastError() == 5, "fsys: a host without removal refuses DeleteFile with ERROR_ACCESS_DENIED");
+    expect(CreateDirectoryA("d9", nullptr) == 0 && GetLastError() == 5, "fsys: and CreateDirectory");
+    expect(MoveFileA("d1\\f.txt", "d1\\z") == 0 && GetLastError() == 5, "fsys: and MoveFile");
+    expect(CreateFileA("d1\\new", W, 0, nullptr, 1, 0x80, 0) == INVALID_HANDLE && GetLastError() == 5, "fsys: and file creation");
+    h = CreateFileA("d1\\keep.txt", W, 0, nullptr, 3, 0x80, 0);
+    expect(h != INVALID_HANDLE && SetEndOfFile(h) == 0 && GetLastError() == 5, "fsys: and SetEndOfFile");
+    CloseHandle(h);
+
+    Runtime legacy = rt;
+    legacy.fs_open = nullptr;
+    pehost::g_runtime = &legacy;
+    SetLastError(0);
+    expect(CreateFileA("a.txt", W, 0, nullptr, 3, 0x80, 0) == INVALID_HANDLE && GetLastError() == 5, "fsys: without file-system hooks writing is still ERROR_ACCESS_DENIED");
+    expect(GetCurrentDirectoryA(sizeof(full), full) == 1 && same(full, "\\"), "fsys: and the current directory is the root");
+    expect(DeleteFileA("a.txt") == 0 && GetLastError() == 5, "fsys: and deleting is refused");
+    h = CreateFileA("a.txt", R, 0, nullptr, 3, 0x80, 0);
+    expect(h != INVALID_HANDLE && GetFileSize(h, nullptr) == 11, "fsys: and a program file still opens by its plain name");
+    CloseHandle(h);
+    expect(g_mem_opens == g_mem_closes, "fsys: no host handle is open at the end");
+    pehost::g_runtime = &g_recording;
+}
+
 int main(int argc, char** argv) {
     g_quick = argc > 1 && argv[1][0] == '-' && argv[1][1] == 'q';
+    setvbuf(stdout, nullptr, _IONBF, 0);
     heap_tests();
     codec_tests();
     format_tests();
@@ -3037,6 +4017,8 @@ int main(int argc, char** argv) {
     ucrt_tests();
     extended_tests();
     module_tests();
+    thread_tests();
+    fsys_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

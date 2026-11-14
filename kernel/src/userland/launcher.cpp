@@ -41,6 +41,12 @@ extern "C" const u8 pe_sysio_start[];
 extern "C" const u8 pe_sysio_end[];
 extern "C" const u8 pe_argv_start[];
 extern "C" const u8 pe_argv_end[];
+extern "C" const u8 pe_files_start[];
+extern "C" const u8 pe_files_end[];
+extern "C" const u8 pe_threads_start[];
+extern "C" const u8 pe_threads_end[];
+extern "C" const u8 pe_thrdll_start[];
+extern "C" const u8 pe_thrdll_end[];
 
 namespace userland::apps {
 
@@ -70,6 +76,9 @@ const Entry ENTRIES[] = {
     { "dyn.exe", pe_dyn_start, pe_dyn_end },
     { "sysio.exe", pe_sysio_start, pe_sysio_end },
     { "argv.exe", pe_argv_start, pe_argv_end },
+    { "files.exe", pe_files_start, pe_files_end },
+    { "threads.exe", pe_threads_start, pe_threads_end },
+    { "thrdll.dll", pe_thrdll_start, pe_thrdll_end },
 };
 
 constexpr const char* DIRECTORY = "apps";
@@ -303,6 +312,14 @@ Report run(const Request& request) {
     lens::Result<lens::Lens> cwd = lens::open_at(g_table.domain, root, DIRECTORY, lens::Right::Read | lens::Right::Enumerate | lens::Right::Delegate);
     prepared = cwd.ok();
     if (prepared) begin.directory = cwd.value();
+    if (prepared && request.work_domain && !request.work.is_null()) {
+        lens::Result<lens::Rights> have = lens::rights_of(*request.work_domain, request.work);
+        if (have.ok()) {
+            lens::Rights mine = have.value() & (lens::RIGHTS_READ_WRITE | lens::Right::Delegate);
+            lens::Result<lens::Lens> work = lens::delegate(*request.work_domain, request.work, g_table.domain, mine);
+            if (work.ok()) begin.work = work.value();
+        }
+    }
     if (prepared && request.input) {
         lens::Lens reader, writer;
         usize size = request.input_length ? request.input_length : 1;

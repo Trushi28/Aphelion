@@ -409,7 +409,7 @@ int main(void) {
     check(as_u64(w1) >= as_u64(w0) + 1000000 && as_u64(w1) - as_u64(w0) < 50000000, "the system time advances by about the sleep");
     printf("sysio clock: %lld Hz, slept %llu us, ticks %llu ms\n", (long long)frequency.QuadPart, t1 - t0, (unsigned long long)(k1 - k0));
 
-    HANDLE h = CreateFileA("sysio.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = CreateFileA("A:\\sysio.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     check(h != INVALID_HANDLE_VALUE, "open the program file");
     LARGE_INTEGER size;
     size.QuadPart = 0;
@@ -436,7 +436,7 @@ int main(void) {
     }
 
     WIN32_FIND_DATAA fd;
-    HANDLE s = FindFirstFileA("*.exe", &fd);
+    HANDLE s = FindFirstFileA("A:\\*.exe", &fd);
     int found_self = 0;
     int listed = 0;
     DWORD self_size = 0;
@@ -457,9 +457,9 @@ int main(void) {
     SetLastError(0);
     h = CreateFileA("nosuch.bin", GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
     check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND, "a missing file is ERROR_FILE_NOT_FOUND");
-    h = CreateFileA("sysio.exe", GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    h = CreateFileA("A:\\sysio.exe", GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED, "writing is denied");
-    check(GetFileAttributesA("sysio.exe") != INVALID_FILE_ATTRIBUTES && GetFileAttributesA("nosuch.bin") == INVALID_FILE_ATTRIBUTES, "file attributes");
+    check(GetFileAttributesA("A:\\sysio.exe") != INVALID_FILE_ATTRIBUTES && GetFileAttributesA("nosuch.bin") == INVALID_FILE_ATTRIBUTES, "file attributes");
 
     char env[16];
     check(SetEnvironmentVariableA("Aphelion", "yes") && GetEnvironmentVariableA("APHELION", env, sizeof(env)) == 3 && strcmp(env, "yes") == 0, "environment variables ignore case");
@@ -474,6 +474,289 @@ int main(void) {
 
     printf("sysio done failures=%d\n", failures);
     return failures ? 1 : 6;
+}
+C
+
+cat > "$OUT/files.c" <<'C'
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+static int failures;
+static char big[20000];
+static char back[20000];
+
+static void check(int ok, const char *what) {
+    if (!ok) {
+        failures++;
+        printf("FAIL %s\n", what);
+    }
+}
+
+static int is_dir(const char *path) {
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static int is_file(const char *path) {
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static int put(const char *path, const void *data, DWORD length) {
+    DWORD done = 0;
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    int ok;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    ok = WriteFile(h, data, length, &done, NULL) && done == length;
+    return CloseHandle(h) && ok;
+}
+
+static long get(const char *path, void *buf, DWORD cap) {
+    DWORD got = 0;
+    long total = 0;
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    while ((DWORD)total < cap && ReadFile(h, (char *)buf + total, cap - (DWORD)total, &got, NULL) && got > 0) total += (long)got;
+    CloseHandle(h);
+    return total;
+}
+
+static DWORD open_error(const char *path, DWORD access, DWORD disposition, DWORD flags) {
+    HANDLE h;
+    SetLastError(0);
+    h = CreateFileA(path, access, 0, NULL, disposition, FILE_ATTRIBUTE_NORMAL | flags, NULL);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError();
+    CloseHandle(h);
+    return 0;
+}
+
+static int same_wide(const WCHAR *a, const WCHAR *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static int list(const char *pattern, int *directories) {
+    WIN32_FIND_DATAA fd;
+    int count = 0;
+    HANDLE s = FindFirstFileA(pattern, &fd);
+    if (directories) *directories = 0;
+    if (s == INVALID_HANDLE_VALUE) return -1;
+    do {
+        count++;
+        if (directories && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) (*directories)++;
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) count += 1000;
+    } while (FindNextFileA(s, &fd));
+    FindClose(s);
+    return count;
+}
+
+int main(void) {
+    char text[64];
+    char *part = NULL;
+    DWORD got = 0;
+    DWORD n;
+    HANDLE h;
+    int i, count, dirs;
+    BY_HANDLE_FILE_INFORMATION info;
+    FILETIME ft;
+
+    check(!is_file("ftest") && !is_dir("ftest"), "the work directory starts without the test directory");
+    check(CreateDirectoryA("ftest", NULL) && is_dir("ftest"), "CreateDirectory makes a directory");
+    SetLastError(0);
+    check(!CreateDirectoryA("ftest", NULL) && GetLastError() == ERROR_ALREADY_EXISTS, "creating it again is ERROR_ALREADY_EXISTS");
+    SetLastError(0);
+    check(!CreateDirectoryA("ftest\\a\\b", NULL) && GetLastError() == ERROR_PATH_NOT_FOUND, "a directory under a missing one is ERROR_PATH_NOT_FOUND");
+    check(CreateDirectoryA("ftest\\a", NULL) && CreateDirectoryA("ftest/a/b", NULL) && is_dir("ftest\\a\\b") && is_dir("ftest/a/b"), "nested directories, with either separator");
+    check(open_error("ftest\\a*b", GENERIC_WRITE, CREATE_NEW, 0) == ERROR_INVALID_NAME, "a wildcard in a file name is ERROR_INVALID_NAME");
+
+    check(put("ftest\\hello.txt", "hello, world\n", 13), "create a file and write it");
+    check(get("ftest\\hello.txt", back, sizeof(back)) == 13 && memcmp(back, "hello, world\n", 13) == 0, "the file reads back as written");
+    h = CreateFileA("ftest\\hello.txt", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE && GetFileSize(h, NULL) == 13 && GetFileType(h) == FILE_TYPE_DISK, "size and type of an open file");
+    memset(&info, 0, sizeof(info));
+    check(h != INVALID_HANDLE_VALUE && GetFileInformationByHandle(h, &info) && info.nFileSizeLow == 13 && info.nFileSizeHigh == 0 &&
+          (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0, "GetFileInformationByHandle describes a file");
+    check(h != INVALID_HANDLE_VALUE && GetFileTime(h, NULL, NULL, &ft) && (ft.dwHighDateTime | ft.dwLowDateTime) != 0, "GetFileTime gives a time");
+    SetLastError(0);
+    check(h != INVALID_HANDLE_VALUE && !WriteFile(h, "x", 1, &got, NULL) && GetLastError() == ERROR_ACCESS_DENIED, "writing through a read-only handle is ERROR_ACCESS_DENIED");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+
+    check(open_error("ftest\\hello.txt", GENERIC_WRITE, CREATE_NEW, 0) == ERROR_FILE_EXISTS, "CREATE_NEW on an existing file is ERROR_FILE_EXISTS");
+    check(open_error("ftest\\none.txt", GENERIC_READ, OPEN_EXISTING, 0) == ERROR_FILE_NOT_FOUND, "a missing file is ERROR_FILE_NOT_FOUND");
+    check(open_error("ftest\\nodir\\none.txt", GENERIC_READ, OPEN_EXISTING, 0) == ERROR_PATH_NOT_FOUND, "a missing directory is ERROR_PATH_NOT_FOUND");
+    check(open_error("ftest\\hello.txt\\x", GENERIC_READ, OPEN_EXISTING, 0) == ERROR_PATH_NOT_FOUND, "a file used as a directory is ERROR_PATH_NOT_FOUND");
+    check(open_error("ftest\\hello.txt\\x", GENERIC_WRITE, CREATE_NEW, 0) == ERROR_PATH_NOT_FOUND, "creating under a file is ERROR_PATH_NOT_FOUND");
+    check(open_error("ftest\\none.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0) == ERROR_FILE_NOT_FOUND && !is_file("ftest\\none.txt"), "TRUNCATE_EXISTING does not create");
+
+    SetLastError(0);
+    h = CreateFileA("ftest\\new.txt", GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE && GetLastError() == 0, "OPEN_ALWAYS creates a missing file without an error");
+    check(h != INVALID_HANDLE_VALUE && WriteFile(h, "abc", 3, &got, NULL) && got == 3 && CloseHandle(h), "write the new file");
+    SetLastError(0);
+    h = CreateFileA("ftest\\new.txt", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE && GetLastError() == ERROR_ALREADY_EXISTS && GetFileSize(h, NULL) == 3, "OPEN_ALWAYS on an existing file keeps it and sets ERROR_ALREADY_EXISTS");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    SetLastError(0);
+    h = CreateFileA("ftest\\new.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE && GetLastError() == ERROR_ALREADY_EXISTS && GetFileSize(h, NULL) == 0, "CREATE_ALWAYS on an existing file empties it and sets ERROR_ALREADY_EXISTS");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    check(put("ftest\\new.txt", "abc", 3), "write it again");
+
+    h = CreateFileA("ftest\\pos.bin", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE, "create a file for reading and writing");
+    if (h != INVALID_HANDLE_VALUE) {
+        memset(back, 0, 16);
+        check(WriteFile(h, "0123456789", 10, &got, NULL) && got == 10, "write ten bytes");
+        check(SetFilePointer(h, 0, NULL, FILE_END) == 10 && WriteFile(h, "AB", 2, &got, NULL) && GetFileSize(h, NULL) == 12, "append at the end");
+        check(SetFilePointer(h, 3, NULL, FILE_BEGIN) == 3 && WriteFile(h, "xyz", 3, &got, NULL) && got == 3, "overwrite in the middle");
+        check(SetFilePointer(h, 0, NULL, FILE_BEGIN) == 0 && ReadFile(h, back, 12, &got, NULL) && got == 12 && memcmp(back, "012xyz6789AB", 12) == 0, "the middle write landed and nothing else changed");
+        check(SetFilePointer(h, 5, NULL, FILE_BEGIN) == 5 && SetEndOfFile(h) && GetFileSize(h, NULL) == 5, "SetEndOfFile truncates at the position");
+        check(SetFilePointer(h, 0, NULL, FILE_BEGIN) == 0 && ReadFile(h, back, 16, &got, NULL) && got == 5 && memcmp(back, "012xy", 5) == 0, "the truncated file keeps its start");
+        check(SetFilePointer(h, -2, NULL, FILE_END) == 3, "seek back from the end");
+        check(CloseHandle(h), "close");
+    }
+
+    h = CreateFileA("ftest\\seq.txt", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    check(h != INVALID_HANDLE_VALUE && WriteFile(h, "ab", 2, &got, NULL) && WriteFile(h, "cd", 2, &got, NULL) && WriteFile(h, "ef", 2, &got, NULL) && GetFileSize(h, NULL) == 6, "writes one after another follow each other");
+    if (h != INVALID_HANDLE_VALUE) {
+        memset(back, 0, 16);
+        check(SetFilePointer(h, 0, NULL, FILE_BEGIN) == 0 && ReadFile(h, back, 4, &got, NULL) && got == 4 && ReadFile(h, back + 4, 4, &got, NULL) && got == 2 && memcmp(back, "abcdef", 6) == 0, "reads one after another follow each other");
+        check(ReadFile(h, back, 4, &got, NULL) && got == 0, "a read at the end returns nothing");
+        CloseHandle(h);
+    }
+    check(DeleteFileA("ftest\\seq.txt"), "delete it");
+    SetLastError(0);
+    check(!CreateDirectoryA("\\", NULL) && GetLastError() == ERROR_ACCESS_DENIED, "the root cannot be created");
+
+    for (i = 0; i < (int)sizeof(big); i++) big[i] = (char)(i * 7 + i / 251);
+    check(put("ftest\\big.bin", big, sizeof(big)), "one write of twenty thousand bytes");
+    check(get("ftest\\big.bin", back, sizeof(back)) == (long)sizeof(big) && memcmp(back, big, sizeof(big)) == 0, "and one read of them returns every byte");
+
+    check(GetCurrentDirectoryA(sizeof(text), text) == 1 && strcmp(text, "\\") == 0, "the working directory starts at the root");
+    check(SetCurrentDirectoryA("ftest") && GetCurrentDirectoryA(sizeof(text), text) == 6 && strcmp(text, "\\ftest") == 0, "SetCurrentDirectory enters a directory");
+    check(is_file("hello.txt") && is_dir("a\\b") && is_file("..\\ftest\\hello.txt") && is_file("\\ftest\\hello.txt") && is_file("C:\\ftest\\hello.txt") && is_dir(".") && is_dir(".."), "names resolve against it, and absolutely");
+    check(is_dir("..\\..\\..") && is_file("..\\..\\ftest\\hello.txt"), "dot-dot stops at the root");
+    SetLastError(0);
+    check(!SetCurrentDirectoryA("nodir") && GetLastError() == ERROR_FILE_NOT_FOUND, "entering a missing directory fails");
+    SetLastError(0);
+    check(!SetCurrentDirectoryA("hello.txt") && GetLastError() == ERROR_DIRECTORY, "entering a file fails with ERROR_DIRECTORY");
+    count = list("*", &dirs);
+    check(count == 5 && dirs == 1, "it holds four files and one directory and no dot entries");
+    check(SetCurrentDirectoryA("a\\b") && GetCurrentDirectoryA(sizeof(text), text) == 10 && strcmp(text, "\\ftest\\a\\b") == 0, "enter a nested directory");
+    check(GetCurrentDirectoryA(3, text) == 11, "a buffer that is too small is told the size it needs");
+    check(SetCurrentDirectoryA("\\") && GetCurrentDirectoryA(sizeof(text), text) == 1, "back to the root");
+
+    n = GetFullPathNameA("ftest\\a\\..\\hello.txt", sizeof(text), text, &part);
+    check(n == 16 && strcmp(text, "\\ftest\\hello.txt") == 0 && part != NULL && strcmp(part, "hello.txt") == 0, "GetFullPathName removes dot-dot and finds the file part");
+
+    check(list("ftest\\*", &dirs) == 5 && dirs == 1, "FindFirstFile lists a subdirectory");
+    check(list("ftest\\*.bin", NULL) == 2 && list("ftest\\h*", NULL) == 1 && list("ftest\\hello.txt", NULL) == 1, "patterns select by name");
+    check(list("ftest\\a\\*", &dirs) == 1 && dirs == 1 && list("\\ftest\\a\\b\\*", NULL) == -1, "a nested search and an empty directory");
+    SetLastError(0);
+    check(list("ftest\\zzz*", NULL) == -1 && GetLastError() == ERROR_FILE_NOT_FOUND, "no match is ERROR_FILE_NOT_FOUND");
+    SetLastError(0);
+    check(list("nodir\\*", NULL) == -1 && GetLastError() == ERROR_PATH_NOT_FOUND, "a missing directory is ERROR_PATH_NOT_FOUND");
+    check(list("\\*", &dirs) >= 1 && dirs >= 1, "the root lists the test directory");
+
+    check(CreateDirectoryA("ftest\\many", NULL), "a directory for many files");
+    for (i = 0; i < 40; i++) {
+        sprintf(text, "ftest\\many\\f%02d.txt", i);
+        if (!put(text, text, (DWORD)strlen(text))) break;
+    }
+    check(i == 40, "forty files are created");
+    {
+        WIN32_FIND_DATAA fd;
+        int seen[40];
+        int total = 0, repeated = 0;
+        HANDLE s;
+        memset(seen, 0, sizeof(seen));
+        s = FindFirstFileA("ftest\\many\\*", &fd);
+        if (s != INVALID_HANDLE_VALUE) {
+            do {
+                int k = (fd.cFileName[1] - '0') * 10 + (fd.cFileName[2] - '0');
+                total++;
+                if (strlen(fd.cFileName) == 7 && fd.cFileName[0] == 'f' && k >= 0 && k < 40) {
+                    if (seen[k]) repeated++;
+                    seen[k] = 1;
+                } else repeated++;
+            } while (FindNextFileA(s, &fd));
+            FindClose(s);
+        }
+        for (i = 0; i < 40; i++) total -= seen[i];
+        check(total == 0 && repeated == 0, "a search returns each of the forty exactly once");
+    }
+    for (i = 0; i < 40; i++) {
+        sprintf(text, "ftest\\many\\f%02d.txt", i);
+        if (!DeleteFileA(text)) break;
+    }
+    check(i == 40 && RemoveDirectoryA("ftest\\many") && !is_dir("ftest\\many"), "and they are deleted one by one with their directory");
+
+    check(MoveFileA("ftest\\hello.txt", "ftest\\a\\b\\moved.txt") && !is_file("ftest\\hello.txt") && get("ftest\\a\\b\\moved.txt", back, sizeof(back)) == 13, "MoveFile moves a file into another directory");
+    SetLastError(0);
+    check(!MoveFileA("ftest\\none.txt", "ftest\\x.txt") && GetLastError() == ERROR_FILE_NOT_FOUND, "moving a missing file is ERROR_FILE_NOT_FOUND");
+    SetLastError(0);
+    check(!MoveFileA("ftest\\new.txt", "ftest\\pos.bin") && GetLastError() == ERROR_ALREADY_EXISTS && is_file("ftest\\new.txt"), "moving onto an existing file is ERROR_ALREADY_EXISTS");
+    check(MoveFileExA("ftest\\new.txt", "ftest\\pos.bin", MOVEFILE_REPLACE_EXISTING) && !is_file("ftest\\new.txt") && get("ftest\\pos.bin", back, sizeof(back)) == 3, "MOVEFILE_REPLACE_EXISTING replaces it");
+    check(MoveFileA("ftest\\a", "ftest\\renamed") && !is_dir("ftest\\a") && get("ftest\\renamed\\b\\moved.txt", back, sizeof(back)) == 13, "a directory is renamed with what is in it");
+
+    check(CopyFileA("ftest\\renamed\\b\\moved.txt", "ftest\\copy.txt", TRUE) && get("ftest\\copy.txt", back, sizeof(back)) == 13 && is_file("ftest\\renamed\\b\\moved.txt"), "CopyFile copies and keeps the source");
+    SetLastError(0);
+    check(!CopyFileA("ftest\\renamed\\b\\moved.txt", "ftest\\copy.txt", TRUE) && GetLastError() == ERROR_FILE_EXISTS, "copying onto a file with fail-if-exists is ERROR_FILE_EXISTS");
+    check(CopyFileA("ftest\\big.bin", "ftest\\copy.txt", FALSE) && get("ftest\\copy.txt", back, sizeof(back)) == (long)sizeof(big) && memcmp(back, big, sizeof(big)) == 0, "copying over it replaces the content, all twenty thousand bytes");
+
+    SetLastError(0);
+    check(!DeleteFileA("ftest\\none.txt") && GetLastError() == ERROR_FILE_NOT_FOUND, "deleting a missing file is ERROR_FILE_NOT_FOUND");
+    SetLastError(0);
+    check(!DeleteFileA("ftest\\nodir\\x") && GetLastError() == ERROR_PATH_NOT_FOUND, "deleting under a missing directory is ERROR_PATH_NOT_FOUND");
+    SetLastError(0);
+    check(!DeleteFileA("ftest\\renamed") && GetLastError() == ERROR_ACCESS_DENIED && is_dir("ftest\\renamed"), "DeleteFile on a directory is ERROR_ACCESS_DENIED");
+    SetLastError(0);
+    check(!RemoveDirectoryA("ftest\\copy.txt") && GetLastError() == ERROR_DIRECTORY && is_file("ftest\\copy.txt"), "RemoveDirectory on a file is ERROR_DIRECTORY");
+    SetLastError(0);
+    check(!RemoveDirectoryA("ftest\\renamed") && GetLastError() == ERROR_DIR_NOT_EMPTY, "RemoveDirectory on a directory with files is ERROR_DIR_NOT_EMPTY");
+    check(DeleteFileA("ftest\\renamed\\b\\moved.txt") && !is_file("ftest\\renamed\\b\\moved.txt") && RemoveDirectoryA("ftest\\renamed\\b") && RemoveDirectoryA("ftest\\renamed") && !is_dir("ftest\\renamed"), "empty directories are removed");
+
+    h = CreateFileA("ftest\\temp.tmp", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    check(h != INVALID_HANDLE_VALUE && is_file("ftest\\temp.tmp"), "a delete-on-close file exists while open");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    check(!is_file("ftest\\temp.tmp"), "and is gone once closed");
+
+    check(open_error("ftest", GENERIC_READ, OPEN_EXISTING, 0) == ERROR_ACCESS_DENIED, "opening a directory without backup semantics is ERROR_ACCESS_DENIED");
+    h = CreateFileA("ftest", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    memset(&info, 0, sizeof(info));
+    check(h != INVALID_HANDLE_VALUE && GetFileInformationByHandle(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY), "a directory opens with backup semantics");
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+
+    {
+        WIN32_FIND_DATAW wf;
+        HANDLE s;
+        h = CreateFileW(L"ftest\\w\u00e9.txt", GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        check(h != INVALID_HANDLE_VALUE && WriteFile(h, "w", 1, &got, NULL) && CloseHandle(h), "CreateFileW with a non-ASCII name");
+        check(GetFileAttributesW(L"ftest\\w\u00e9.txt") != INVALID_FILE_ATTRIBUTES, "found by GetFileAttributesW");
+        s = FindFirstFileW(L"ftest\\w*", &wf);
+        check(s != INVALID_HANDLE_VALUE && same_wide(wf.cFileName, L"w\u00e9.txt"), "listed by FindFirstFileW");
+        if (s != INVALID_HANDLE_VALUE) FindClose(s);
+        check(MoveFileW(L"ftest\\w\u00e9.txt", L"ftest\\w2.txt") && DeleteFileW(L"ftest\\w2.txt") && CreateDirectoryW(L"ftest\\d\u00e9", NULL) && RemoveDirectoryW(L"ftest\\d\u00e9"), "the wide move, delete and directory calls");
+    }
+
+    check(is_file("A:\\files.exe") && is_dir("A:\\") && list("A:\\*.exe", NULL) >= 1, "A: is the read-only program directory");
+    check(get("A:\\files.exe", back, sizeof(back)) > 1024 && back[0] == 'M' && back[1] == 'Z', "a program file reads from it");
+    check(open_error("A:\\files.exe", GENERIC_WRITE, OPEN_EXISTING, 0) == ERROR_ACCESS_DENIED, "it cannot be written");
+    SetLastError(0);
+    check(!DeleteFileA("A:\\files.exe") && GetLastError() == ERROR_ACCESS_DENIED, "nor deleted");
+    SetLastError(0);
+    check(!CreateDirectoryA("A:\\made", NULL) && GetLastError() == ERROR_ACCESS_DENIED, "nor given new directories");
+    check(open_error("D:\\x", GENERIC_READ, OPEN_EXISTING, 0) == ERROR_PATH_NOT_FOUND, "another drive is ERROR_PATH_NOT_FOUND");
+
+    check(DeleteFileA("ftest\\pos.bin") && DeleteFileA("ftest\\big.bin") && DeleteFileA("ftest\\copy.txt"), "clean up");
+    check(list("ftest\\*", NULL) == -1 && RemoveDirectoryA("ftest") && !is_dir("ftest"), "the test directory is empty and removed");
+
+    printf("files done failures=%d\n", failures);
+    return failures ? 1 : 4;
 }
 C
 
@@ -506,6 +789,305 @@ int main(void) {
     FILE *f = fopen("x.txt", "r");
     printf("%d %ld %p\n", v[0], strtol("12", NULL, 10), (void *)f);
     return (int)time(NULL) & 1;
+}
+C
+
+cat > "$OUT/threads.c" <<'C'
+#include <windows.h>
+#include <process.h>
+#include <stdio.h>
+#include <errno.h>
+
+static int failures;
+
+static void check(int ok, const char *what) {
+    if (!ok) {
+        failures++;
+        printf("FAIL %s\n", what);
+    }
+}
+
+static __thread int tls_value = 7;
+static DWORD tls_slot;
+static CRITICAL_SECTION section;
+static volatile long guarded;
+static HANDLE ping, pong;
+static volatile long rounds_seen;
+static HANDLE items_available;
+static volatile long consumed;
+static volatile long queue_total;
+static SRWLOCK queue_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE queue_ready = CONDITION_VARIABLE_INIT;
+static int queue_items[16];
+static int queue_count;
+static int queue_closed;
+static long long queue_sum;
+static HANDLE gate;
+static volatile long ran_before_resume;
+static volatile long started;
+
+static DWORD WINAPI return_code(LPVOID p) { return (DWORD)(size_t)p + 5; }
+
+static DWORD WINAPI count_guarded(LPVOID p) {
+    int i;
+    (void)p;
+    for (i = 0; i < 5000; i++) {
+        EnterCriticalSection(&section);
+        EnterCriticalSection(&section);
+        guarded = guarded + 1;
+        LeaveCriticalSection(&section);
+        LeaveCriticalSection(&section);
+    }
+    return 0;
+}
+
+static DWORD WINAPI ponger(LPVOID p) {
+    int i;
+    (void)p;
+    for (i = 0; i < 200; i++) {
+        WaitForSingleObject(ping, INFINITE);
+        rounds_seen++;
+        SetEvent(pong);
+    }
+    return 0;
+}
+
+static DWORD WINAPI consumer(LPVOID p) {
+    (void)p;
+    for (;;) {
+        if (WaitForSingleObject(items_available, 2000) != WAIT_OBJECT_0) return 1;
+        if (InterlockedDecrement(&queue_total) < 0) {
+            InterlockedIncrement(&queue_total);
+            return 0;
+        }
+        InterlockedIncrement(&consumed);
+    }
+}
+
+static DWORD WINAPI thread_locals(LPVOID p) {
+    int mine = (int)(size_t)p;
+    DWORD id = GetCurrentThreadId();
+    int ok = tls_value == 7;
+    tls_value = 100 + mine;
+    TlsSetValue(tls_slot, (LPVOID)(size_t)(200 + mine));
+    SetLastError(300 + mine);
+    errno = 400 + mine;
+    Sleep(20);
+    ok = ok && GetLastError() == (DWORD)(300 + mine) && tls_value == 100 + mine && (size_t)TlsGetValue(tls_slot) == (size_t)(200 + mine) && errno == 400 + mine && GetCurrentThreadId() == id;
+    return ok ? 0 : 1;
+}
+
+static DWORD WINAPI producer(LPVOID p) {
+    int n;
+    (void)p;
+    for (n = 1; n <= 300; n++) {
+        AcquireSRWLockExclusive(&queue_lock);
+        while (queue_count == 16) SleepConditionVariableSRW(&queue_ready, &queue_lock, INFINITE, 0);
+        queue_items[queue_count++] = n;
+        ReleaseSRWLockExclusive(&queue_lock);
+        WakeAllConditionVariable(&queue_ready);
+    }
+    AcquireSRWLockExclusive(&queue_lock);
+    queue_closed++;
+    ReleaseSRWLockExclusive(&queue_lock);
+    WakeAllConditionVariable(&queue_ready);
+    return 0;
+}
+
+static DWORD WINAPI queue_taker(LPVOID p) {
+    (void)p;
+    for (;;) {
+        AcquireSRWLockExclusive(&queue_lock);
+        while (queue_count == 0 && queue_closed < 2) SleepConditionVariableSRW(&queue_ready, &queue_lock, INFINITE, 0);
+        if (queue_count == 0) {
+            ReleaseSRWLockExclusive(&queue_lock);
+            return 0;
+        }
+        queue_sum += queue_items[--queue_count];
+        ReleaseSRWLockExclusive(&queue_lock);
+        WakeAllConditionVariable(&queue_ready);
+    }
+}
+
+static DWORD WINAPI mark_started(LPVOID p) {
+    (void)p;
+    ran_before_resume = 1;
+    started = 1;
+    return 9;
+}
+
+static DWORD WINAPI wait_gate(LPVOID p) {
+    (void)p;
+    WaitForSingleObject(gate, INFINITE);
+    return 0;
+}
+
+static DWORD WINAPI exits_early(LPVOID p) {
+    (void)p;
+    ExitThread(33);
+    return 1;
+}
+
+static unsigned __stdcall via_crt(void *p) {
+    if ((size_t)p == 1) _endthreadex(44);
+    return 45;
+}
+
+static void __cdecl legacy_thread(void *p) { InterlockedExchange((volatile long *)p, 77); }
+
+int main(void) {
+    HANDLE h, many[3], held[8];
+    DWORD code, id, main_id = GetCurrentThreadId();
+    int i;
+    unsigned crt_id;
+
+    tls_slot = TlsAlloc();
+    InitializeCriticalSection(&section);
+    ping = CreateEventA(NULL, FALSE, FALSE, NULL);
+    pong = CreateEventA(NULL, FALSE, FALSE, NULL);
+    items_available = CreateSemaphoreA(NULL, 0, 1000, NULL);
+    gate = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+    h = CreateThread(NULL, 0, return_code, (LPVOID)37, 0, &id);
+    check(h != NULL && id != 0 && id != main_id, "CreateThread returns a handle and a distinct thread id");
+    check(WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && GetExitCodeThread(h, &code) && code == 42, "a thread's return value is its exit code");
+    check(GetThreadId(h) == id && CloseHandle(h), "GetThreadId names it and the handle closes");
+
+    h = CreateThread(NULL, 0, count_guarded, NULL, 0, NULL);
+    many[0] = h;
+    many[1] = CreateThread(NULL, 0, count_guarded, NULL, 0, NULL);
+    many[2] = CreateThread(NULL, 0, count_guarded, NULL, 0, NULL);
+    check(WaitForMultipleObjects(3, many, TRUE, 10000) == WAIT_OBJECT_0 && guarded == 15000, "three threads under a critical section lose no update");
+    for (i = 0; i < 3; i++) CloseHandle(many[i]);
+
+    h = CreateThread(NULL, 0, ponger, NULL, 0, NULL);
+    for (i = 0; i < 200; i++) {
+        SetEvent(ping);
+        if (WaitForSingleObject(pong, 5000) != WAIT_OBJECT_0) break;
+    }
+    check(i == 200 && rounds_seen == 200 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0, "two threads hand control back and forth through events 200 times");
+    CloseHandle(h);
+
+    queue_total = 60;
+    many[0] = CreateThread(NULL, 0, consumer, NULL, 0, NULL);
+    many[1] = CreateThread(NULL, 0, consumer, NULL, 0, NULL);
+    many[2] = CreateThread(NULL, 0, consumer, NULL, 0, NULL);
+    ReleaseSemaphore(items_available, 20, NULL);
+    ReleaseSemaphore(items_available, 40, NULL);
+    ReleaseSemaphore(items_available, 3, NULL);
+    check(WaitForMultipleObjects(3, many, TRUE, 10000) == WAIT_OBJECT_0 && consumed == 60, "three semaphore consumers take exactly the units released");
+    for (i = 0; i < 3; i++) CloseHandle(many[i]);
+
+    for (i = 0; i < 3; i++) many[i] = CreateThread(NULL, 0, thread_locals, (LPVOID)(size_t)i, 0, NULL);
+    check(WaitForMultipleObjects(3, many, TRUE, 10000) == WAIT_OBJECT_0, "the threads finished");
+    for (i = 0; i < 3; i++) {
+        GetExitCodeThread(many[i], &code);
+        check(code == 0, "thread-local variable, TLS slot, last error and errno are separate per thread and start fresh");
+        CloseHandle(many[i]);
+    }
+    check(tls_value == 7 && TlsGetValue(tls_slot) == NULL, "the main thread's own values are untouched");
+
+    many[0] = CreateThread(NULL, 0, producer, NULL, 0, NULL);
+    many[1] = CreateThread(NULL, 0, producer, NULL, 0, NULL);
+    many[2] = CreateThread(NULL, 0, queue_taker, NULL, 0, NULL);
+    held[0] = CreateThread(NULL, 0, queue_taker, NULL, 0, NULL);
+    check(WaitForSingleObject(many[0], 10000) == WAIT_OBJECT_0 && WaitForSingleObject(many[1], 10000) == WAIT_OBJECT_0 && WaitForSingleObject(many[2], 10000) == WAIT_OBJECT_0 && WaitForSingleObject(held[0], 10000) == WAIT_OBJECT_0 && queue_sum == 2LL * 300 * 301 / 2,
+          "SRW locks and condition variables move 600 items from two producers to two takers");
+    for (i = 0; i < 3; i++) CloseHandle(many[i]);
+    CloseHandle(held[0]);
+
+    h = CreateThread(NULL, 0, mark_started, NULL, CREATE_SUSPENDED, NULL);
+    Sleep(60);
+    check(h != NULL && !ran_before_resume && GetExitCodeThread(h, &code) && code == STILL_ACTIVE, "a suspended thread does not run");
+    check(ResumeThread(h) == 1 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && ran_before_resume && GetExitCodeThread(h, &code) && code == 9, "ResumeThread starts it");
+    CloseHandle(h);
+
+    h = CreateThread(NULL, 0, exits_early, NULL, 0, NULL);
+    check(WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && GetExitCodeThread(h, &code) && code == 33, "ExitThread ends a thread with its code");
+    CloseHandle(h);
+
+    h = (HANDLE)_beginthreadex(NULL, 0, via_crt, (void *)1, 0, &crt_id);
+    check(h != NULL && crt_id != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && GetExitCodeThread(h, &code) && code == 44, "_endthreadex ends a thread with its code");
+    CloseHandle(h);
+    h = (HANDLE)_beginthreadex(NULL, 0, via_crt, (void *)0, 0, NULL);
+    check(h != NULL && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0 && GetExitCodeThread(h, &code) && code == 45, "_beginthreadex passes the return value on");
+    CloseHandle(h);
+    {
+        volatile long flag = 0;
+        uintptr_t legacy = _beginthread(legacy_thread, 0, (void *)&flag);
+        check(legacy != (uintptr_t)-1, "_beginthread starts a thread");
+        for (i = 0; i < 200 && flag == 0; i++) Sleep(10);
+        check(flag == 77, "and it runs");
+    }
+
+    for (i = 0; i < 40; i++) {
+        h = CreateThread(NULL, 0, return_code, (LPVOID)(size_t)i, 0, NULL);
+        if (h == NULL) break;
+        if (WaitForSingleObject(h, 5000) != WAIT_OBJECT_0 || !GetExitCodeThread(h, &code) || code != (DWORD)(i + 5)) break;
+        CloseHandle(h);
+    }
+    check(i == 40, "forty threads one after another run, though the kernel only creates sixteen");
+
+    for (i = 0; i < 7; i++) held[i] = CreateThread(NULL, 0, wait_gate, NULL, 0, NULL);
+    for (i = 0; i < 7; i++) {
+        if (held[i] == NULL) break;
+    }
+    check(i == 7, "seven threads can wait at once next to the main thread");
+    h = CreateThread(NULL, 0, return_code, NULL, 0, NULL);
+    check(h == NULL && GetLastError() == ERROR_NOT_ENOUGH_MEMORY, "an eighth extra thread is refused with ERROR_NOT_ENOUGH_MEMORY");
+    SetEvent(gate);
+    check(WaitForMultipleObjects(7, held, TRUE, 5000) == WAIT_OBJECT_0, "releasing the gate lets all seven finish");
+    for (i = 0; i < 7; i++) CloseHandle(held[i]);
+    h = CreateThread(NULL, 0, return_code, (LPVOID)1, 0, NULL);
+    check(h != NULL && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0, "a finished thread's place can be used again");
+    CloseHandle(h);
+
+    {
+        HMODULE dll = LoadLibraryA("thrdll.dll");
+        int (*attaches)(void) = dll ? (int (*)(void))GetProcAddress(dll, "thread_attaches") : NULL;
+        int (*detaches)(void) = dll ? (int (*)(void))GetProcAddress(dll, "thread_detaches") : NULL;
+        int (*local)(int) = dll ? (int (*)(int))GetProcAddress(dll, "dll_local") : NULL;
+        check(dll != NULL && attaches && detaches && local, "a DLL with thread notifications and a thread-local variable loads");
+        if (attaches && detaches && local) {
+            int before = attaches();
+            check(local(5) == 105 && local(1) == 106, "its thread-local variable starts at 100 for the main thread");
+            h = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)local, (LPVOID)7, 0, NULL);
+            WaitForSingleObject(h, 5000);
+            GetExitCodeThread(h, &code);
+            check(code == 107, "and starts again at 100 in a new thread");
+            CloseHandle(h);
+            check(attaches() == before + 1, "DLL_THREAD_ATTACH reached the DLL once for the new thread");
+            for (i = 0; i < 100 && detaches() < 1; i++) Sleep(10);
+            check(detaches() == 1, "DLL_THREAD_DETACH reached it when the thread ended");
+            check(local(1) == 107, "the main thread's copy was not disturbed");
+        }
+    }
+
+    printf("threads done failures=%d\n", failures);
+    return failures ? 1 : 0;
+}
+C
+
+cat > "$OUT/thrdll.c" <<'C'
+#include <windows.h>
+
+static volatile long attached;
+static volatile long detached;
+static __thread int local_value = 100;
+
+__declspec(dllexport) int thread_attaches(void) { return (int)attached; }
+__declspec(dllexport) int thread_detaches(void) { return (int)detached; }
+__declspec(dllexport) DWORD WINAPI dll_local(LPVOID add) {
+    local_value += (int)(size_t)add;
+    return (DWORD)local_value;
+}
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    (void)h;
+    (void)reserved;
+    if (reason == DLL_THREAD_ATTACH) InterlockedIncrement(&attached);
+    if (reason == DLL_THREAD_DETACH) InterlockedIncrement(&detached);
+    return TRUE;
 }
 C
 
@@ -552,13 +1134,16 @@ $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -shared "$OUT/dllplug.c" -o "$OUT/dllplug.
 $CC -O1 -s -shared -nostdlib -Wl,-e,DllMain "$OUT/dllfail.c" -o "$OUT/dllfail.dll"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/dyn.c" "$OUT/dllchain.dll" -o "$OUT/dyn.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/sysio.c" -o "$OUT/sysio.exe"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/files.c" -o "$OUT/files.exe"
 $CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/argv.c" -o "$OUT/argv.exe"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 -static-libgcc -shared "$OUT/thrdll.c" -o "$OUT/thrdll.dll"
+$CC -O1 -s -D__USE_MINGW_ANSI_STDIO=0 "$OUT/threads.c" -o "$OUT/threads.exe"
 $CC -O2 -Wl,--no-dynamicbase -Wl,--disable-reloc-section "$OUT/stdio.c" -o "$OUT/stdio-fixed.exe"
 $CC -O2 -s "$OUT/stdio.c" -o "$OUT/stdio-stripped.exe"
 $CC -O2 -ffreestanding -fno-stack-protector -nostdlib -Wl,-e,entry -Wl,--subsystem,console "$OUT/k32.c" -o "$OUT/k32.exe" -lkernel32
 
 if [ -x "$PEINFO" ]; then
-    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn sysio argv; do
+    for f in stdio stdio-fixed stdio-stripped crt ucrt k32 dyn sysio argv files; do
         echo "================ $f.exe"
         "$PEINFO" "$OUT/$f.exe" || true
     done

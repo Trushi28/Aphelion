@@ -14,6 +14,8 @@ constexpr u32 PAGE = 4096;
 constexpr u64 BASE_ALIGN = 0x10000;
 constexpr u32 REASON_DETACH = 0;
 constexpr u32 REASON_ATTACH = 1;
+constexpr u32 REASON_THREAD_ATTACH = 2;
+constexpr u32 REASON_THREAD_DETACH = 3;
 constexpr u32 ERROR_NO_MEMORY = 8;
 constexpr u32 ERROR_NOT_FOUND = 126;
 constexpr u32 ERROR_PROC_NOT_FOUND = 127;
@@ -26,6 +28,7 @@ struct Module {
     bool attaching;
     bool attached;
     bool rooted;
+    bool no_thread_calls;
     u32 refs;
     char key[NAME_BYTES];
     u8* base;
@@ -48,6 +51,8 @@ struct State {
     u32 order_count;
     bool tls_taken[TLS_LIMIT];
     u64* tls_array;
+    bool (*tls_add)(u32 index, const u8* source, u32 template_bytes, u64 total_bytes);
+    void (*tls_drop)(u32 index);
     const ImportTable* builtins;
     u32 nesting;
     u32 cause;
@@ -75,9 +80,13 @@ struct PlatformCall {
 };
 
 inline void reset(const ImportTable* builtins) {
+    auto add = g_state.tls_add;
+    auto drop = g_state.tls_drop;
     u8* raw = reinterpret_cast<u8*>(&g_state);
     for (usize i = 0; i < sizeof(g_state); ++i) raw[i] = 0;
     g_state.builtins = builtins;
+    g_state.tls_add = add;
+    g_state.tls_drop = drop;
 }
 
 inline bool normalise(const char* path, char* key, char* spelled) {
@@ -170,6 +179,7 @@ void unload(i32 index, Call& call) {
     Module& m = g_state.items[index];
     for (u32 i = 0; i < m.dep_count; ++i) release(m.deps[i], call);
     if (m.tls_block) {
+        if (g_state.tls_drop) g_state.tls_drop(m.tls_index);
         if (g_state.tls_array) g_state.tls_array[m.tls_index] = 0;
         g_state.tls_taken[m.tls_index] = false;
         g_runtime->unmap(m.tls_block, (m.tls_bytes + PAGE - 1) / PAGE * PAGE);
@@ -348,6 +358,11 @@ inline i32 load_image(const char* spelled, const char* key, const ImportTable* b
             discard_slot(slot);
             break;
         }
+        if (tls.present && g_state.tls_add && !g_state.tls_add(tls_index, base + tls.template_rva, tls.template_bytes, tls_bytes)) {
+            *error = ERROR_NO_MEMORY;
+            discard_slot(slot);
+            break;
+        }
         if (tls.present) {
             const u8* from = base + tls.template_rva;
             for (u32 i = 0; i < tls.template_bytes; ++i) tls_block[i] = from[i];
@@ -437,6 +452,31 @@ void process_detach(Call& call) {
     if (g_state.exiting) return;
     g_state.exiting = true;
     while (g_state.order_count) detach_module(g_state.order[g_state.order_count - 1], 1, call);
+}
+
+template <class Call>
+void notify_threads(u32 reason, Call& call) {
+    bool attaching = reason == REASON_THREAD_ATTACH;
+    for (u32 n = 0; n < g_state.order_count; ++n) {
+        u32 at = attaching ? n : g_state.order_count - 1 - n;
+        const Module& m = g_state.items[g_state.order[at]];
+        if (m.no_thread_calls || !m.used) continue;
+        u64 module = reinterpret_cast<u64>(m.base);
+        if (attaching) {
+            for (u32 i = 0; i < m.tls.callback_count; ++i) call(m.tls.callbacks[i], module, reason, 0);
+            if (m.entry_rva) call(module + m.entry_rva, module, reason, 0);
+        } else {
+            if (m.entry_rva) call(module + m.entry_rva, module, reason, 0);
+            for (u32 i = 0; i < m.tls.callback_count; ++i) call(m.tls.callbacks[i], module, reason, 0);
+        }
+    }
+}
+
+inline bool disable_thread_calls(u64 handle) {
+    i32 index = find_base(handle);
+    if (index < 0) return false;
+    g_state.items[index].no_thread_calls = true;
+    return true;
 }
 
 inline void install_tls(u64* tls_array) {

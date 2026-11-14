@@ -707,6 +707,10 @@ int run_program(Shell& sh, Io& io, const char* name, u32 argc, char** argv, Repo
         request.input = io.in_size ? reinterpret_cast<const char*>(io.in) : empty;
         request.input_length = static_cast<u32>(io.in_size > ~0u ? ~0u : io.in_size);
     }
+    if (sh.cursor.ready && sh.cursor.depth <= lens::MAX_DEPTH) {
+        request.work_domain = &sh.cursor.domain;
+        request.work = sh.cursor.stack[sh.cursor.depth];
+    }
     request.emit = &run_emit;
     request.interrupted = &run_interrupted;
     request.ctx = &ctx;

@@ -1,4 +1,6 @@
 #pragma once
+#include "fsys.hpp"
+#include "objects.hpp"
 #include "win32.hpp"
 
 namespace pehost {
@@ -11,10 +13,10 @@ constexpr u32 ERROR_BROKEN_PIPE = 109;
 constexpr u32 ERROR_NEGATIVE_SEEK = 131;
 constexpr u32 ERROR_ENVVAR_NOT_FOUND = 203;
 constexpr u32 ERROR_TIMEOUT = 1460;
+constexpr u32 ERROR_GEN_FAILURE = 31;
 constexpr u32 ERROR_OLD_WIN_VERSION = 1150;
 constexpr u32 INVALID_FILE_ATTRIBUTES = 0xFFFFFFFFu;
 constexpr u32 FLS_OUT_OF_INDEXES = 0xFFFFFFFFu;
-constexpr u32 STATUS_POSSIBLE_DEADLOCK = 0xC0000194u;
 constexpr u32 STATUS_NOT_SUPPORTED = 0xC00000BBu;
 constexpr u32 MAX_FLS = 128;
 constexpr u32 MAX_OPEN_FILES = 32;
@@ -28,7 +30,6 @@ constexpr u64 FILETIME_UNIX_EPOCH_MS = 11644473600000ull;
 struct FlsSlot {
     bool used;
     void (PEHOST_WINAPI* callback)(void*);
-    u64 value;
 };
 
 struct OpenFile {
@@ -36,6 +37,10 @@ struct OpenFile {
     i64 platform;
     u64 size;
     u64 position;
+    bool work;
+    bool writable;
+    bool directory;
+    bool delete_on_close;
 };
 
 struct EnvVar {
@@ -46,11 +51,15 @@ struct EnvVar {
 
 struct Extra {
     FlsSlot fls[MAX_FLS];
+    u64 fallback_fls[MAX_FLS];
     OpenFile files[MAX_OPEN_FILES];
+    char delete_paths[MAX_OPEN_FILES][256];
     EnvVar env[MAX_ENV];
 };
 
 inline Extra g_extra;
+
+static_assert((TLS_SLOTS + MAX_FLS) * 8 <= PAGE);
 
 namespace detail {
 
@@ -58,6 +67,8 @@ inline u64 scale_ms(u64 counter, u64 frequency) {
     if (frequency == 0) return 0;
     return counter / frequency * 1000 + counter % frequency * 1000 / frequency;
 }
+
+inline u64 filetime_of(u64 ms) { return (ms + FILETIME_UNIX_EPOCH_MS) * 10000; }
 
 inline void put_filetime(void* at, u64 value) {
     u32* two = static_cast<u32*>(at);
@@ -68,26 +79,6 @@ inline void put_filetime(void* at, u64 value) {
 inline bool read_clock(Clock* out) {
     if (!g_runtime->clock) return false;
     return g_runtime->clock(out) && out->frequency != 0;
-}
-
-inline void say_error(const char* text) { g_runtime->write_console(2, text, text_length(text)); }
-
-inline void hex32(char* out, u32 v) {
-    const char* digits = "0123456789ABCDEF";
-    for (u32 i = 0; i < 8; ++i) out[i] = digits[(v >> (28 - 4 * i)) & 15];
-    out[8] = 0;
-}
-
-[[noreturn]] inline void stop(const char* what, u32 code) {
-    char tail[16];
-    hex32(tail, code);
-    say_error("\n[pehost] ");
-    say_error(what);
-    say_error(" (status 0x");
-    say_error(tail);
-    say_error(")\n");
-    g_runtime->exit_process(code);
-    for (;;) asm volatile("ud2");
 }
 
 inline bool narrow_name(const u16* wide, char* out) {
@@ -251,10 +242,47 @@ PEHOST_WINAPI inline i32 InitializeCriticalSectionAndSpinCount(CriticalSection* 
 
 PEHOST_WINAPI inline u32 SetCriticalSectionSpinCount(CriticalSection*, u32) { return 0; }
 
+namespace syncd {
+
+inline u64* fls_values_of(const Teb* t) { return t->fls_data ? reinterpret_cast<u64*>(t->fls_data) : g_extra.fallback_fls; }
+
+inline u32 fls_arrays(u64** out) {
+    u32 n = 0;
+    u64* mine = fls_values_of(pehost::detail::current_teb());
+    out[n++] = mine;
+    for (u32 i = 0; i < sync::MAX_SLOTS; ++i) {
+        const sync::Slot& s = sync::g_sync.slots[i];
+        if (s.used && s.fls && s.fls != mine) out[n++] = s.fls;
+    }
+    return n;
+}
+
+}
+
+inline void fls_thread_exit(u64* values) {
+    for (u32 i = 0; i < MAX_FLS; ++i) {
+        void (PEHOST_WINAPI* callback)(void*) = nullptr;
+        u64 value = 0;
+        {
+            sync::Host guard;
+            if (g_extra.fls[i].used && g_extra.fls[i].callback && values[i]) {
+                callback = g_extra.fls[i].callback;
+                value = values[i];
+            }
+            values[i] = 0;
+        }
+        if (callback) callback(reinterpret_cast<void*>(value));
+    }
+}
+
 PEHOST_WINAPI inline u32 FlsAlloc(void (PEHOST_WINAPI* callback)(void*)) {
+    sync::Host guard;
     for (u32 i = 0; i < MAX_FLS; ++i) {
         if (!g_extra.fls[i].used) {
-            g_extra.fls[i] = FlsSlot{ true, callback, 0 };
+            g_extra.fls[i] = FlsSlot{ true, callback };
+            u64* arrays[sync::MAX_SLOTS];
+            u32 n = syncd::fls_arrays(arrays);
+            for (u32 k = 0; k < n; ++k) arrays[k][i] = 0;
             return i;
         }
     }
@@ -263,93 +291,284 @@ PEHOST_WINAPI inline u32 FlsAlloc(void (PEHOST_WINAPI* callback)(void*)) {
 }
 
 PEHOST_WINAPI inline i32 FlsFree(u32 index) {
-    if (index >= MAX_FLS || !g_extra.fls[index].used) {
-        set_last_error(ERROR_INVALID_PARAMETER);
-        return 0;
+    void (PEHOST_WINAPI* callback)(void*) = nullptr;
+    u64 pending[sync::MAX_SLOTS];
+    u32 pending_count = 0;
+    {
+        sync::Host guard;
+        if (index >= MAX_FLS || !g_extra.fls[index].used) {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        callback = g_extra.fls[index].callback;
+        g_extra.fls[index] = FlsSlot{ false, nullptr };
+        u64* arrays[sync::MAX_SLOTS];
+        u32 n = syncd::fls_arrays(arrays);
+        for (u32 k = 0; k < n; ++k) {
+            if (arrays[k][index]) pending[pending_count++] = arrays[k][index];
+            arrays[k][index] = 0;
+        }
     }
-    FlsSlot slot = g_extra.fls[index];
-    g_extra.fls[index] = FlsSlot{ false, nullptr, 0 };
-    if (slot.callback && slot.value) slot.callback(reinterpret_cast<void*>(slot.value));
+    if (callback) {
+        for (u32 k = 0; k < pending_count; ++k) callback(reinterpret_cast<void*>(pending[k]));
+    }
     return 1;
 }
 
 PEHOST_WINAPI inline void* FlsGetValue(u32 index) {
+    sync::Host guard;
     if (index >= MAX_FLS || !g_extra.fls[index].used) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
     set_last_error(0);
-    return reinterpret_cast<void*>(g_extra.fls[index].value);
+    return reinterpret_cast<void*>(syncd::fls_values_of(detail::current_teb())[index]);
 }
 
 PEHOST_WINAPI inline i32 FlsSetValue(u32 index, void* value) {
+    sync::Host guard;
     if (index >= MAX_FLS || !g_extra.fls[index].used) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    g_extra.fls[index].value = reinterpret_cast<u64>(value);
+    syncd::fls_values_of(detail::current_teb())[index] = reinterpret_cast<u64>(value);
     return 1;
+}
+
+namespace syncd {
+
+constexpr u32 SRW_EXCLUSIVE = 1;
+constexpr u32 SRW_SHARED_UNIT = 2;
+
+inline volatile u32* srw_state(u64* lock) { return reinterpret_cast<volatile u32*>(lock); }
+inline volatile u32* srw_waiters(u64* lock) { return reinterpret_cast<volatile u32*>(lock) + 1; }
+
+inline void srw_wait(u64* lock, u32 observed) {
+    sync::add(srw_waiters(lock), 1);
+    if (sync::load(srw_state(lock)) == observed) sync::block(srw_state(lock), observed, sync::FOREVER);
+    sync::add(srw_waiters(lock), static_cast<u32>(-1));
+}
+
+inline void srw_released(u64* lock) {
+    if (sync::load(srw_waiters(lock)) != 0) sync::wake(srw_state(lock));
+}
+
+inline bool timed_wait(volatile u32* word, u32 expected, u32 milliseconds) {
+    if (milliseconds == 0xFFFFFFFFu) {
+        sync::block(word, expected, sync::FOREVER);
+        return true;
+    }
+    if (!sync::available() || milliseconds == 0) {
+        if (g_runtime->sleep_ms) g_runtime->sleep_ms(milliseconds);
+        return false;
+    }
+    return sync::block(word, expected, milliseconds) == 0;
+}
+
 }
 
 PEHOST_WINAPI inline void InitializeSRWLock(u64* lock) { *lock = 0; }
 
+PEHOST_WINAPI inline u8 TryAcquireSRWLockExclusive(u64* lock) { return sync::cas(syncd::srw_state(lock), 0, syncd::SRW_EXCLUSIVE) ? 1 : 0; }
+
 PEHOST_WINAPI inline void AcquireSRWLockExclusive(u64* lock) {
-    if (*lock != 0) detail::stop("a lock was taken that no other thread can release", STATUS_POSSIBLE_DEADLOCK);
-    *lock = 1;
+    for (;;) {
+        if (sync::cas(syncd::srw_state(lock), 0, syncd::SRW_EXCLUSIVE)) return;
+        u32 now = sync::load(syncd::srw_state(lock));
+        if (now != 0) syncd::srw_wait(lock, now);
+    }
 }
 
-PEHOST_WINAPI inline void ReleaseSRWLockExclusive(u64* lock) { *lock = 0; }
-
-PEHOST_WINAPI inline u8 TryAcquireSRWLockExclusive(u64* lock) {
-    if (*lock != 0) return 0;
-    *lock = 1;
-    return 1;
-}
-
-PEHOST_WINAPI inline void AcquireSRWLockShared(u64* lock) {
-    if (*lock & 1) detail::stop("a lock was taken that no other thread can release", STATUS_POSSIBLE_DEADLOCK);
-    *lock += 2;
-}
-
-PEHOST_WINAPI inline void ReleaseSRWLockShared(u64* lock) {
-    if (*lock >= 2) *lock -= 2;
+PEHOST_WINAPI inline void ReleaseSRWLockExclusive(u64* lock) {
+    sync::store(syncd::srw_state(lock), 0);
+    syncd::srw_released(lock);
 }
 
 PEHOST_WINAPI inline u8 TryAcquireSRWLockShared(u64* lock) {
-    if (*lock & 1) return 0;
-    *lock += 2;
-    return 1;
+    for (;;) {
+        u32 now = sync::load(syncd::srw_state(lock));
+        if (now & syncd::SRW_EXCLUSIVE) return 0;
+        if (sync::cas(syncd::srw_state(lock), now, now + syncd::SRW_SHARED_UNIT)) return 1;
+    }
+}
+
+PEHOST_WINAPI inline void AcquireSRWLockShared(u64* lock) {
+    for (;;) {
+        u32 now = sync::load(syncd::srw_state(lock));
+        if (!(now & syncd::SRW_EXCLUSIVE)) {
+            if (sync::cas(syncd::srw_state(lock), now, now + syncd::SRW_SHARED_UNIT)) return;
+            continue;
+        }
+        syncd::srw_wait(lock, now);
+    }
+}
+
+PEHOST_WINAPI inline void ReleaseSRWLockShared(u64* lock) {
+    for (;;) {
+        u32 now = sync::load(syncd::srw_state(lock));
+        if (now < syncd::SRW_SHARED_UNIT || (now & syncd::SRW_EXCLUSIVE)) return;
+        if (sync::cas(syncd::srw_state(lock), now, now - syncd::SRW_SHARED_UNIT)) {
+            if (now - syncd::SRW_SHARED_UNIT == 0) syncd::srw_released(lock);
+            return;
+        }
+    }
 }
 
 PEHOST_WINAPI inline void InitializeConditionVariable(u64* variable) { *variable = 0; }
 
-PEHOST_WINAPI inline void WakeConditionVariable(u64*) {}
+PEHOST_WINAPI inline void WakeConditionVariable(u64* variable) {
+    volatile u32* sequence = reinterpret_cast<volatile u32*>(variable);
+    volatile u32* waiters = sequence + 1;
+    if (sync::load(waiters) == 0) return;
+    sync::add(sequence, 1);
+    sync::wake(sequence);
+}
 
-PEHOST_WINAPI inline void WakeAllConditionVariable(u64*) {}
+PEHOST_WINAPI inline void WakeAllConditionVariable(u64* variable) { WakeConditionVariable(variable); }
 
-inline i32 wait_without_waker(u32 milliseconds) {
-    if (milliseconds == 0xFFFFFFFFu) detail::stop("a wait that no other thread can end", STATUS_POSSIBLE_DEADLOCK);
-    if (g_runtime->sleep_ms) g_runtime->sleep_ms(milliseconds);
+PEHOST_WINAPI inline i32 SleepConditionVariableSRW(u64* variable, u64* lock, u32 milliseconds, u32 flags) {
+    volatile u32* sequence = reinterpret_cast<volatile u32*>(variable);
+    volatile u32* waiters = sequence + 1;
+    bool shared = (flags & 1) != 0;
+    sync::add(waiters, 1);
+    u32 seen = sync::load(sequence);
+    if (shared) ReleaseSRWLockShared(lock);
+    else ReleaseSRWLockExclusive(lock);
+    bool woken = syncd::timed_wait(sequence, seen, milliseconds);
+    sync::add(waiters, static_cast<u32>(-1));
+    if (shared) AcquireSRWLockShared(lock);
+    else AcquireSRWLockExclusive(lock);
+    if (!woken) set_last_error(ERROR_TIMEOUT);
+    return woken ? 1 : 0;
+}
+
+PEHOST_WINAPI inline i32 SleepConditionVariableCS(u64* variable, CriticalSection* cs, u32 milliseconds) {
+    volatile u32* sequence = reinterpret_cast<volatile u32*>(variable);
+    volatile u32* waiters = sequence + 1;
+    sync::add(waiters, 1);
+    u32 seen = sync::load(sequence);
+    i32 depth = cs->recursion_count;
+    for (i32 i = 0; i < depth; ++i) LeaveCriticalSection(cs);
+    bool woken = syncd::timed_wait(sequence, seen, milliseconds);
+    sync::add(waiters, static_cast<u32>(-1));
+    for (i32 i = 0; i < depth; ++i) EnterCriticalSection(cs);
+    if (!woken) set_last_error(ERROR_TIMEOUT);
+    return woken ? 1 : 0;
+}
+
+PEHOST_WINAPI inline i32 InitOnceBeginInitialize(u64* once, u32 flags, i32* pending, void** context) {
+    constexpr u32 ASYNC = 2, CHECK_ONLY = 1;
+    volatile u32* word = reinterpret_cast<volatile u32*>(once);
+    for (;;) {
+        u32 now = sync::load(word);
+        u32 state = now & 3;
+        if (state == 2) {
+            if (pending) *pending = 0;
+            if (context) *context = reinterpret_cast<void*>(*once & ~3ull);
+            return 1;
+        }
+        if (flags & CHECK_ONLY) {
+            set_last_error(ERROR_GEN_FAILURE);
+            return 0;
+        }
+        if (state == 0) {
+            if (!sync::cas(word, now, now | 1)) continue;
+            if (pending) *pending = 1;
+            return 1;
+        }
+        if (flags & ASYNC) {
+            if (pending) *pending = 1;
+            return 1;
+        }
+        sync::block(word, now, sync::FOREVER);
+    }
+}
+
+PEHOST_WINAPI inline i32 InitOnceComplete(u64* once, u32 flags, void* context) {
+    constexpr u32 FAILED = 4;
+    volatile u32* word = reinterpret_cast<volatile u32*>(once);
+    u64 value = reinterpret_cast<u64>(context);
+    if ((value & 3) != 0) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (flags & FAILED) {
+        sync::store(word, 0);
+        sync::wake(word);
+        return 1;
+    }
+    __atomic_store_n(once, value | 2, __ATOMIC_SEQ_CST);
+    sync::wake(word);
+    return 1;
+}
+
+PEHOST_WINAPI inline i32 InitOnceExecuteOnce(u64* once, i32 (PEHOST_WINAPI* function)(u64*, void*, void**), void* parameter, void** context) {
+    i32 pending = 0;
+    void* stored = nullptr;
+    if (!InitOnceBeginInitialize(once, 0, &pending, &stored)) return 0;
+    if (!pending) {
+        if (context) *context = stored;
+        return 1;
+    }
+    void* made = nullptr;
+    i32 ok = function(once, parameter, &made);
+    if (!ok) {
+        InitOnceComplete(once, 4, nullptr);
+        return 0;
+    }
+    if (!InitOnceComplete(once, 0, made)) return 0;
+    if (context) *context = made;
+    return 1;
+}
+
+PEHOST_WINAPI inline void InitOnceInitialize(u64* once) { *once = 0; }
+
+namespace syncd {
+
+constexpr u32 ADDRESS_BUCKETS = 64;
+inline volatile u32 g_address_buckets[ADDRESS_BUCKETS];
+
+inline volatile u32* address_bucket(const void* address) {
+    u64 a = reinterpret_cast<u64>(address) >> 2;
+    return &g_address_buckets[(a ^ (a >> 6) ^ (a >> 12)) % ADDRESS_BUCKETS];
+}
+
+inline bool same_bytes(const volatile void* a, const void* b, u64 size) {
+    const volatile u8* x = static_cast<const volatile u8*>(a);
+    const u8* y = static_cast<const u8*>(b);
+    for (u64 i = 0; i < size; ++i) {
+        if (x[i] != y[i]) return false;
+    }
+    return true;
+}
+
+}
+
+PEHOST_WINAPI inline i32 WaitOnAddress(volatile void* address, void* compare, u64 size, u32 milliseconds) {
+    if (address == nullptr || compare == nullptr || (size != 1 && size != 2 && size != 4 && size != 8)) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    volatile u32* bucket = syncd::address_bucket(const_cast<const void*>(address));
+    sync::Deadline deadline(milliseconds == 0xFFFFFFFFu ? sync::FOREVER : milliseconds);
+    for (;;) {
+        u32 seen = sync::load(bucket);
+        if (!syncd::same_bytes(address, compare, size)) return 1;
+        if (milliseconds == 0 || deadline.expired()) break;
+        if (sync::block(bucket, seen, deadline.remaining()) == 1) break;
+        if (sync::load(bucket) != seen) return 1;
+    }
     set_last_error(ERROR_TIMEOUT);
     return 0;
 }
 
-PEHOST_WINAPI inline i32 SleepConditionVariableSRW(u64*, u64* lock, u32 milliseconds, u32 flags) {
-    bool shared = (flags & 1) != 0;
-    if (shared) ReleaseSRWLockShared(lock);
-    else ReleaseSRWLockExclusive(lock);
-    i32 r = wait_without_waker(milliseconds);
-    if (shared) AcquireSRWLockShared(lock);
-    else AcquireSRWLockExclusive(lock);
-    return r;
+PEHOST_WINAPI inline void WakeByAddressSingle(void* address) {
+    volatile u32* bucket = syncd::address_bucket(address);
+    sync::add(bucket, 1);
+    sync::wake(bucket);
 }
 
-PEHOST_WINAPI inline i32 SleepConditionVariableCS(u64*, CriticalSection* cs, u32 milliseconds) {
-    LeaveCriticalSection(cs);
-    i32 r = wait_without_waker(milliseconds);
-    EnterCriticalSection(cs);
-    return r;
-}
+PEHOST_WINAPI inline void WakeByAddressAll(void* address) { WakeByAddressSingle(address); }
 
 PEHOST_WINAPI inline void RtlCaptureContext(u8* context) {
     for (u32 i = 0; i < 1232; ++i) context[i] = 0;
@@ -387,6 +606,7 @@ PEHOST_WINAPI inline void* RtlVirtualUnwind(u32, u64, u64, void*, void*, void*, 
 }
 
 PEHOST_WINAPI inline u32 GetModuleFileNameW(u64 module, u16* buffer, u32 size) {
+    sync::Loader guard;
     char narrow[MAX_MODULE_PATH];
     u32 n = GetModuleFileNameA(module, narrow, sizeof(narrow));
     if (n == 0) return 0;
@@ -410,6 +630,7 @@ PEHOST_WINAPI inline u32 GetModuleFileNameW(u64 module, u16* buffer, u32 size) {
 }
 
 PEHOST_WINAPI inline u64 LoadLibraryExA(const char* name, u64 reserved, u32 flags) {
+    sync::Loader guard;
     if (reserved != 0 || (flags & (0x1 | 0x2 | 0x10 | 0x20 | 0x40)) != 0) {
         set_last_error(reserved != 0 ? ERROR_INVALID_PARAMETER : ERROR_NOT_SUPPORTED);
         return 0;
@@ -418,6 +639,7 @@ PEHOST_WINAPI inline u64 LoadLibraryExA(const char* name, u64 reserved, u32 flag
 }
 
 PEHOST_WINAPI inline u64 LoadLibraryExW(const u16* name, u64 reserved, u32 flags) {
+    sync::Loader guard;
     if (reserved != 0 || (flags & (0x1 | 0x2 | 0x10 | 0x20 | 0x40)) != 0) {
         set_last_error(reserved != 0 ? ERROR_INVALID_PARAMETER : ERROR_NOT_SUPPORTED);
         return 0;
@@ -426,6 +648,7 @@ PEHOST_WINAPI inline u64 LoadLibraryExW(const u16* name, u64 reserved, u32 flags
 }
 
 PEHOST_WINAPI inline i32 GetModuleHandleExW(u32 flags, const void* what, u64* out) {
+    sync::Loader guard;
     if (out == nullptr || (flags & ~7u) != 0 || (flags & 3) == 3) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -522,53 +745,145 @@ PEHOST_WINAPI inline i32 FlushFileBuffers(u64 handle) {
     return 0;
 }
 
-PEHOST_WINAPI inline i32 CloseHandle(u64 handle) {
-    if (detail::is_std_handle(handle)) return 1;
+inline i32 write_file_handle(u64 handle, const void* data, u32 length, u32* written, void* overlapped) {
+    if (overlapped != nullptr) {
+        set_last_error(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    sync::Host guard;
     OpenFile* f = detail::file_of(handle);
     if (!f) {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
     }
-    if (g_runtime->file_close) g_runtime->file_close(f->platform);
-    *f = OpenFile{ false, 0, 0, 0 };
+    if (!f->work || !f->writable || f->directory || !g_runtime->fs_write) {
+        set_last_error(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    if (length == 0) return 1;
+    i64 n = fsys::write_at(f->platform, f->position, data, length);
+    if (n < 0) {
+        set_last_error(fsys::translate(n, ERROR_ACCESS_DENIED));
+        return 0;
+    }
+    f->position += static_cast<u64>(n);
+    if (f->position > f->size) f->size = f->position;
+    if (written) *written = static_cast<u32>(n);
+    if (static_cast<u64>(n) != length) {
+        set_last_error(fsys::E_DISK_FULL);
+        return 0;
+    }
     return 1;
 }
 
+PEHOST_WINAPI inline i32 CloseHandle(u64 handle) {
+    if (detail::is_std_handle(handle)) return 1;
+    if (objects::is_object_handle(handle)) {
+        if (objects::close(handle)) return 1;
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    sync::Host guard;
+    OpenFile* f = detail::file_of(handle);
+    if (!f) {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    u32 index = static_cast<u32>(f - g_extra.files);
+    if (f->work) {
+        if (g_runtime->fs_close) g_runtime->fs_close(f->platform);
+        if (f->delete_on_close && g_runtime->fs_remove) g_runtime->fs_remove(g_extra.delete_paths[index], 0);
+    } else if (g_runtime->file_close) {
+        g_runtime->file_close(f->platform);
+    }
+    *f = OpenFile{};
+    g_extra.delete_paths[index][0] = 0;
+    return 1;
+}
+
+inline u32 free_file_slot() {
+    for (u32 i = 0; i < MAX_OPEN_FILES; ++i) {
+        if (!g_extra.files[i].used) return i;
+    }
+    return MAX_OPEN_FILES;
+}
+
 PEHOST_WINAPI inline u64 CreateFileA(const char* name, u32 access, u32, void*, u32 disposition, u32 flags, u64) {
+    sync::Host guard;
     if (name == nullptr) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE;
     }
     if (detail::equal_text(name, "CONOUT$")) return HANDLE_STDOUT;
     if (detail::equal_text(name, "CONIN$")) return HANDLE_STDIN;
-    bool writes = (access & (0x40000000u | 0x10000000u | 0x2 | 0x4 | 0x40000)) != 0;
     if (flags & 0x40000000u) {
         set_last_error(ERROR_NOT_SUPPORTED);
         return INVALID_HANDLE;
     }
-    if (!detail::plain_file_name(name)) {
-        set_last_error(ERROR_PATH_NOT_FOUND);
-        return INVALID_HANDLE;
-    }
-    if (writes || (disposition != 3 && disposition != 4)) {
-        set_last_error(ERROR_ACCESS_DENIED);
-        return INVALID_HANDLE;
-    }
-    u64 size = 0;
-    i64 platform = detail::open_for_read(name, &size);
-    if (platform < 0) {
-        set_last_error(disposition == 4 ? ERROR_ACCESS_DENIED : ERROR_FILE_NOT_FOUND);
-        return INVALID_HANDLE;
-    }
-    for (u32 i = 0; i < MAX_OPEN_FILES; ++i) {
-        if (!g_extra.files[i].used) {
-            g_extra.files[i] = OpenFile{ true, platform, size, 0 };
-            return FILE_HANDLE_BASE + 4ull * i;
+    if (!fsys::enabled()) {
+        bool writes = (access & (0x40000000u | 0x10000000u | 0x2 | 0x4 | 0x40000)) != 0;
+        if (!detail::plain_file_name(name)) {
+            set_last_error(ERROR_PATH_NOT_FOUND);
+            return INVALID_HANDLE;
         }
+        if (writes || (disposition != 3 && disposition != 4)) {
+            set_last_error(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE;
+        }
+        u64 size = 0;
+        i64 platform = detail::open_for_read(name, &size);
+        if (platform < 0) {
+            set_last_error(disposition == 4 ? ERROR_ACCESS_DENIED : ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE;
+        }
+        for (u32 i = 0; i < MAX_OPEN_FILES; ++i) {
+            if (!g_extra.files[i].used) {
+                g_extra.files[i] = OpenFile{ true, platform, size, 0, false, false, false, false };
+                return FILE_HANDLE_BASE + 4ull * i;
+            }
+        }
+        if (g_runtime->file_close) g_runtime->file_close(platform);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE;
     }
-    if (g_runtime->file_close) g_runtime->file_close(platform);
-    set_last_error(ERROR_NOT_ENOUGH_MEMORY);
-    return INVALID_HANDLE;
+    fsys::Resolved r;
+    u32 e = fsys::resolve(name, &r);
+    if (e) {
+        set_last_error(e);
+        return INVALID_HANDLE;
+    }
+    u32 slot = free_file_slot();
+    if (slot == MAX_OPEN_FILES) {
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE;
+    }
+    bool writes = fsys::wants_write(access);
+    if (r.program) {
+        if (writes || r.length == 0 || (disposition != 3 && disposition != 4)) {
+            set_last_error(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE;
+        }
+        u64 size = 0;
+        i64 platform = detail::open_for_read(r.rel, &size);
+        if (platform < 0) {
+            set_last_error(disposition == 4 ? ERROR_ACCESS_DENIED : ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE;
+        }
+        g_extra.files[slot] = OpenFile{ true, platform, size, 0, false, false, false, false };
+        return FILE_HANDLE_BASE + 4ull * slot;
+    }
+    fsys::Opened opened;
+    e = fsys::open_path(r, access, disposition, flags, &opened);
+    if (e) {
+        set_last_error(e);
+        return INVALID_HANDLE;
+    }
+    bool directory = opened.info.kind == FS_DIRECTORY;
+    bool remove_later = (flags & fsys::FLAG_DELETE_ON_CLOSE) != 0 && !directory;
+    g_extra.files[slot] = OpenFile{ true, opened.handle, opened.info.size, 0, true, writes, directory, remove_later };
+    if (remove_later) detail::copy_text(g_extra.delete_paths[slot], sizeof(g_extra.delete_paths[slot]), r.rel);
+    set_last_error(opened.existed && (disposition == fsys::CREATE_ALWAYS || disposition == fsys::OPEN_ALWAYS) ? fsys::E_ALREADY_EXISTS : 0);
+    return FILE_HANDLE_BASE + 4ull * slot;
 }
 
 PEHOST_WINAPI inline u64 CreateFileW(const u16* name, u32 access, u32 share, void* security, u32 disposition, u32 flags, u64 model) {
@@ -599,10 +914,26 @@ PEHOST_WINAPI inline i32 ReadFile(u64 handle, void* buffer, u32 length, u32* rea
         }
         return 1;
     }
+    sync::Host guard;
     OpenFile* f = detail::file_of(handle);
     if (!f) {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
+    }
+    if (f->work) {
+        if (f->directory) {
+            set_last_error(ERROR_INVALID_FUNCTION);
+            return 0;
+        }
+        if (length == 0) return 1;
+        i64 n = fsys::read_at(f->platform, f->position, buffer, length);
+        if (n < 0) {
+            set_last_error(fsys::translate(n, ERROR_ACCESS_DENIED));
+            return 0;
+        }
+        f->position += static_cast<u64>(n);
+        if (read) *read = static_cast<u32>(n);
+        return 1;
     }
     if (f->position >= f->size || length == 0) return 1;
     u64 want = f->size - f->position;
@@ -623,17 +954,38 @@ PEHOST_WINAPI inline i32 ReadFile(u64 handle, void* buffer, u32 length, u32* rea
     return 1;
 }
 
+inline void refresh_size(OpenFile* f) {
+    if (!f->work || !g_runtime->fs_stat) return;
+    FsInfo info{};
+    if (g_runtime->fs_stat(f->platform, &info) == 0) f->size = info.size;
+}
+
 PEHOST_WINAPI inline i32 GetFileSizeEx(u64 handle, i64* size) {
+    sync::Host guard;
     OpenFile* f = detail::file_of(handle);
     if (!f || size == nullptr) {
         set_last_error(f ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE);
         return 0;
     }
+    refresh_size(f);
     *size = static_cast<i64>(f->size);
     return 1;
 }
 
+PEHOST_WINAPI inline u32 GetFileSize(u64 handle, u32* high) {
+    i64 size = 0;
+    if (!GetFileSizeEx(handle, &size)) return 0xFFFFFFFFu;
+    if (high) *high = static_cast<u32>(static_cast<u64>(size) >> 32);
+    else if (static_cast<u64>(size) >> 32) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0xFFFFFFFFu;
+    }
+    set_last_error(0);
+    return static_cast<u32>(size);
+}
+
 PEHOST_WINAPI inline i32 SetFilePointerEx(u64 handle, i64 distance, i64* position, u32 method) {
+    sync::Host guard;
     OpenFile* f = detail::file_of(handle);
     if (!f) {
         set_last_error(ERROR_INVALID_HANDLE);
@@ -643,7 +995,10 @@ PEHOST_WINAPI inline i32 SetFilePointerEx(u64 handle, i64 distance, i64* positio
     switch (method) {
         case 0: base = 0; break;
         case 1: base = static_cast<i64>(f->position); break;
-        case 2: base = static_cast<i64>(f->size); break;
+        case 2:
+            refresh_size(f);
+            base = static_cast<i64>(f->size);
+            break;
         default:
             set_last_error(ERROR_INVALID_PARAMETER);
             return 0;
@@ -658,32 +1013,131 @@ PEHOST_WINAPI inline i32 SetFilePointerEx(u64 handle, i64 distance, i64* positio
     return 1;
 }
 
-PEHOST_WINAPI inline i32 SetEndOfFile(u64 handle) {
-    set_last_error(detail::file_of(handle) ? ERROR_ACCESS_DENIED : ERROR_INVALID_HANDLE);
-    return 0;
+PEHOST_WINAPI inline u32 SetFilePointer(u64 handle, i32 low, i32* high, u32 method) {
+    i64 distance = high ? (static_cast<i64>(*high) << 32) | static_cast<u32>(low) : static_cast<i64>(low);
+    i64 position = 0;
+    if (!SetFilePointerEx(handle, distance, &position, method)) return 0xFFFFFFFFu;
+    if (high) *high = static_cast<i32>(position >> 32);
+    set_last_error(0);
+    return static_cast<u32>(position);
 }
 
-inline u32 attributes_of(const char* name, u64* size) {
-    if (!detail::plain_file_name(name)) {
-        set_last_error(ERROR_PATH_NOT_FOUND);
+PEHOST_WINAPI inline i32 SetEndOfFile(u64 handle) {
+    sync::Host guard;
+    OpenFile* f = detail::file_of(handle);
+    if (!f) {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if (!f->work || !f->writable || f->directory || !g_runtime->fs_resize) {
+        set_last_error(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    i64 e = g_runtime->fs_resize(f->platform, f->position);
+    if (e != 0) {
+        set_last_error(fsys::translate(e, ERROR_ACCESS_DENIED));
+        return 0;
+    }
+    f->size = f->position;
+    return 1;
+}
+
+PEHOST_WINAPI inline i32 GetFileInformationByHandle(u64 handle, u8* data) {
+    sync::Host guard;
+    OpenFile* f = detail::file_of(handle);
+    if (!f || data == nullptr) {
+        set_last_error(f ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    FsInfo info{};
+    info.size = f->size;
+    info.kind = f->directory ? FS_DIRECTORY : FS_FILE;
+    if (f->work && g_runtime->fs_stat && g_runtime->fs_stat(f->platform, &info) == 0) f->size = info.size;
+    for (u32 i = 0; i < 52; ++i) data[i] = 0;
+    u64 stamp = detail::filetime_of(info.mtime_ms);
+    *reinterpret_cast<u32*>(data) = info.kind == FS_DIRECTORY ? fsys::ATTRIBUTE_DIRECTORY : fsys::ATTRIBUTE_NORMAL;
+    detail::put_filetime(data + 4, stamp);
+    detail::put_filetime(data + 12, stamp);
+    detail::put_filetime(data + 20, stamp);
+    *reinterpret_cast<u32*>(data + 32) = static_cast<u32>(info.size >> 32);
+    *reinterpret_cast<u32*>(data + 36) = static_cast<u32>(info.size);
+    *reinterpret_cast<u32*>(data + 40) = 1;
+    return 1;
+}
+
+PEHOST_WINAPI inline i32 GetFileTime(u64 handle, void* creation, void* access, void* written) {
+    sync::Host guard;
+    OpenFile* f = detail::file_of(handle);
+    if (!f) {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    FsInfo info{};
+    if (!f->work || !g_runtime->fs_stat || g_runtime->fs_stat(f->platform, &info) != 0) {
+        set_last_error(ERROR_NOT_SUPPORTED);
+        return 0;
+    }
+    u64 stamp = detail::filetime_of(info.mtime_ms);
+    if (creation) detail::put_filetime(creation, stamp);
+    if (access) detail::put_filetime(access, stamp);
+    if (written) detail::put_filetime(written, stamp);
+    return 1;
+}
+
+inline u32 attributes_of(const char* name, u64* size, u64* mtime, bool* timed) {
+    if (timed) *timed = false;
+    if (!fsys::enabled()) {
+        if (!detail::plain_file_name(name)) {
+            set_last_error(ERROR_PATH_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+        i64 platform = detail::open_for_read(name, size);
+        if (platform < 0) {
+            set_last_error(ERROR_FILE_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+        if (g_runtime->file_close) g_runtime->file_close(platform);
+        return 0x80;
+    }
+    fsys::Resolved r;
+    u32 e = fsys::resolve(name, &r);
+    if (e) {
+        set_last_error(e);
         return INVALID_FILE_ATTRIBUTES;
     }
-    i64 platform = detail::open_for_read(name, size);
-    if (platform < 0) {
-        set_last_error(ERROR_FILE_NOT_FOUND);
+    if (r.program) {
+        if (r.length == 0) return fsys::ATTRIBUTE_DIRECTORY;
+        i64 platform = detail::open_for_read(r.rel, size);
+        if (platform < 0) {
+            set_last_error(ERROR_FILE_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+        if (g_runtime->file_close) g_runtime->file_close(platform);
+        return fsys::ATTRIBUTE_NORMAL;
+    }
+    FsInfo info{};
+    if (r.length == 0) {
+        i64 h = g_runtime->fs_open("", FS_WANT_LIST, &info);
+        if (h < 0) return fsys::ATTRIBUTE_DIRECTORY;
+        g_runtime->fs_close(h);
+    } else if (!fsys::stat_path(r, &info)) {
+        set_last_error(fsys::missing_error(r));
         return INVALID_FILE_ATTRIBUTES;
     }
-    if (g_runtime->file_close) g_runtime->file_close(platform);
-    return 0x80;
+    if (size) *size = info.kind == FS_DIRECTORY ? 0 : info.size;
+    if (mtime) *mtime = info.mtime_ms;
+    if (timed) *timed = true;
+    return info.kind == FS_DIRECTORY ? fsys::ATTRIBUTE_DIRECTORY : fsys::ATTRIBUTE_NORMAL;
 }
 
 PEHOST_WINAPI inline u32 GetFileAttributesA(const char* name) {
+    sync::Host guard;
     if (name == nullptr) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return INVALID_FILE_ATTRIBUTES;
     }
     u64 size = 0;
-    return attributes_of(name, &size);
+    return attributes_of(name, &size, nullptr, nullptr);
 }
 
 PEHOST_WINAPI inline u32 GetFileAttributesW(const u16* name) {
@@ -696,15 +1150,24 @@ PEHOST_WINAPI inline u32 GetFileAttributesW(const u16* name) {
 }
 
 PEHOST_WINAPI inline i32 GetFileAttributesExA(const char* name, u32 level, u8* data) {
+    sync::Host guard;
     if (name == nullptr || data == nullptr || level != 0) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
     u64 size = 0;
-    u32 attributes = attributes_of(name, &size);
+    u64 mtime = 0;
+    bool timed = false;
+    u32 attributes = attributes_of(name, &size, &mtime, &timed);
     if (attributes == INVALID_FILE_ATTRIBUTES) return 0;
     for (u32 i = 0; i < 36; ++i) data[i] = 0;
     *reinterpret_cast<u32*>(data) = attributes;
+    if (timed) {
+        u64 stamp = detail::filetime_of(mtime);
+        detail::put_filetime(data + 4, stamp);
+        detail::put_filetime(data + 12, stamp);
+        detail::put_filetime(data + 20, stamp);
+    }
     *reinterpret_cast<u32*>(data + 28) = static_cast<u32>(size >> 32);
     *reinterpret_cast<u32*>(data + 32) = static_cast<u32>(size);
     return 1;
@@ -724,12 +1187,114 @@ inline i32 deny() {
     return 0;
 }
 
-PEHOST_WINAPI inline i32 DeleteFileA(const char*) { return deny(); }
-PEHOST_WINAPI inline i32 DeleteFileW(const u16*) { return deny(); }
-PEHOST_WINAPI inline i32 RemoveDirectoryA(const char*) { return deny(); }
-PEHOST_WINAPI inline i32 CreateDirectoryW(const u16*, void*) { return deny(); }
-PEHOST_WINAPI inline i32 MoveFileExW(const u16*, const u16*, u32) { return deny(); }
-PEHOST_WINAPI inline i32 SetFileAttributesA(const char*, u32) { return deny(); }
+inline i32 finish(u32 error) {
+    if (error == 0) return 1;
+    set_last_error(error);
+    return 0;
+}
+
+inline u32 prepare(const char* name, fsys::Resolved* r) {
+    if (name == nullptr) return ERROR_INVALID_PARAMETER;
+    return fsys::resolve(name, r);
+}
+
+PEHOST_WINAPI inline i32 DeleteFileA(const char* name) {
+    sync::Host guard;
+    if (!fsys::enabled()) return deny();
+    fsys::Resolved r;
+    u32 e = prepare(name, &r);
+    return finish(e ? e : fsys::delete_file(r));
+}
+
+PEHOST_WINAPI inline i32 DeleteFileW(const u16* name) {
+    char narrow[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(name, narrow)) return finish(name == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return DeleteFileA(narrow);
+}
+
+PEHOST_WINAPI inline i32 RemoveDirectoryA(const char* name) {
+    sync::Host guard;
+    if (!fsys::enabled()) return deny();
+    fsys::Resolved r;
+    u32 e = prepare(name, &r);
+    return finish(e ? e : fsys::remove_directory(r));
+}
+
+PEHOST_WINAPI inline i32 RemoveDirectoryW(const u16* name) {
+    char narrow[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(name, narrow)) return finish(name == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return RemoveDirectoryA(narrow);
+}
+
+PEHOST_WINAPI inline i32 CreateDirectoryA(const char* name, void*) {
+    sync::Host guard;
+    if (!fsys::enabled()) return deny();
+    fsys::Resolved r;
+    u32 e = prepare(name, &r);
+    return finish(e ? e : fsys::make_directory(r));
+}
+
+PEHOST_WINAPI inline i32 CreateDirectoryW(const u16* name, void* security) {
+    char narrow[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(name, narrow)) return finish(name == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return CreateDirectoryA(narrow, security);
+}
+
+inline i32 move_names(const char* from, const char* to, u32 flags) {
+    sync::Host guard;
+    if (!fsys::enabled()) return deny();
+    if (flags & ~0xBu) return finish(ERROR_NOT_SUPPORTED);
+    if (flags & 0x4) return finish(ERROR_NOT_SUPPORTED);
+    fsys::Resolved a, b;
+    u32 e = prepare(from, &a);
+    if (e == 0) e = prepare(to, &b);
+    return finish(e ? e : fsys::move_path(a, b, (flags & 1) != 0));
+}
+
+PEHOST_WINAPI inline i32 MoveFileExA(const char* from, const char* to, u32 flags) { return move_names(from, to, flags); }
+
+PEHOST_WINAPI inline i32 MoveFileA(const char* from, const char* to) { return move_names(from, to, 0); }
+
+PEHOST_WINAPI inline i32 MoveFileExW(const u16* from, const u16* to, u32 flags) {
+    char a[MAX_NAME * 3 + 1];
+    char b[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(from, a) || !detail::narrow_name(to, b)) return finish(from == nullptr || to == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return move_names(a, b, flags);
+}
+
+PEHOST_WINAPI inline i32 MoveFileW(const u16* from, const u16* to) { return MoveFileExW(from, to, 0); }
+
+PEHOST_WINAPI inline i32 CopyFileA(const char* from, const char* to, i32 fail_if_exists) {
+    sync::Host guard;
+    if (!fsys::enabled()) return deny();
+    fsys::Resolved a, b;
+    u32 e = prepare(from, &a);
+    if (e == 0) e = prepare(to, &b);
+    return finish(e ? e : fsys::copy_file(a, b, fail_if_exists != 0));
+}
+
+PEHOST_WINAPI inline i32 CopyFileW(const u16* from, const u16* to, i32 fail_if_exists) {
+    char a[MAX_NAME * 3 + 1];
+    char b[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(from, a) || !detail::narrow_name(to, b)) return finish(from == nullptr || to == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return CopyFileA(a, b, fail_if_exists);
+}
+
+PEHOST_WINAPI inline i32 SetFileAttributesA(const char* name, u32 attributes) {
+    sync::Host guard;
+    if (!fsys::enabled()) return deny();
+    u64 size = 0;
+    u32 now = attributes_of(name, &size, nullptr, nullptr);
+    if (now == INVALID_FILE_ATTRIBUTES) return 0;
+    if (attributes & 0x1) return finish(ERROR_NOT_SUPPORTED);
+    return 1;
+}
+
+PEHOST_WINAPI inline i32 SetFileAttributesW(const u16* name, u32 attributes) {
+    char narrow[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(name, narrow)) return finish(name == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return SetFileAttributesA(narrow, attributes);
+}
 
 inline u32 root_directory(char* out, u32 cap) {
     if (cap < 2) return 2;
@@ -738,22 +1303,57 @@ inline u32 root_directory(char* out, u32 cap) {
     return 1;
 }
 
+inline u32 current_directory_text(char* out, u32 cap) {
+    u32 n = 0;
+    if (cap < 2) return 2;
+    out[n++] = '\\';
+    for (u32 i = 0; g_world.cwd[i]; ++i) {
+        if (n + 1 >= cap) return n + 2;
+        out[n++] = g_world.cwd[i] == '/' ? '\\' : g_world.cwd[i];
+    }
+    out[n] = 0;
+    return n;
+}
+
 PEHOST_WINAPI inline u32 GetCurrentDirectoryA(u32 size, char* buffer) {
-    if (size < 2) return 2;
-    return root_directory(buffer, size);
+    sync::Host guard;
+    char text[MAX_NAME + 4];
+    u32 n = current_directory_text(text, sizeof(text));
+    if (n + 1 > size) return n + 1;
+    for (u32 i = 0; i <= n; ++i) buffer[i] = text[i];
+    return n;
 }
 
 PEHOST_WINAPI inline u32 GetCurrentDirectoryW(u32 size, u16* buffer) {
-    if (size < 2) return 2;
-    buffer[0] = '\\';
-    buffer[1] = 0;
-    return 1;
+    sync::Host guard;
+    char text[MAX_NAME + 4];
+    u32 n = current_directory_text(text, sizeof(text));
+    if (n + 1 > size) return n + 1;
+    for (u32 i = 0; i <= n; ++i) buffer[i] = static_cast<u8>(text[i]);
+    return n;
+}
+
+PEHOST_WINAPI inline i32 SetCurrentDirectoryA(const char* name) {
+    sync::Host guard;
+    if (!fsys::enabled()) {
+        if (name && name[0] == '\\' && name[1] == 0) return 1;
+        set_last_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    fsys::Resolved r;
+    u32 e = prepare(name, &r);
+    return finish(e ? e : fsys::change_directory(r));
 }
 
 PEHOST_WINAPI inline i32 SetCurrentDirectoryW(const u16* name) {
-    if (name && name[0] == '\\' && name[1] == 0) return 1;
-    set_last_error(ERROR_FILE_NOT_FOUND);
-    return 0;
+    if (!fsys::enabled()) {
+        if (name && name[0] == '\\' && name[1] == 0) return 1;
+        set_last_error(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    char narrow[MAX_NAME * 3 + 1];
+    if (!detail::narrow_name(name, narrow)) return finish(name == nullptr ? ERROR_INVALID_PARAMETER : ERROR_PATH_NOT_FOUND);
+    return SetCurrentDirectoryA(narrow);
 }
 
 PEHOST_WINAPI inline u32 GetFullPathNameA(const char* name, u32 size, char* buffer, char** file_part) {
@@ -763,10 +1363,25 @@ PEHOST_WINAPI inline u32 GetFullPathNameA(const char* name, u32 size, char* buff
     }
     char full[MAX_NAME + 4];
     u32 n = 0;
-    bool absolute = name[0] == '\\' || name[0] == '/' || (name[1] == ':' && name[0] != 0);
-    if (!absolute) full[n++] = '\\';
-    for (u32 i = 0; name[i] && n + 1 < sizeof(full); ++i) full[n++] = name[i];
-    full[n] = 0;
+    if (fsys::enabled()) {
+        sync::Host guard;
+        fsys::Resolved r;
+        u32 e = fsys::resolve(name, &r, true);
+        if (e) {
+            set_last_error(e);
+            return 0;
+        }
+        n = fsys::format_full(r, full, sizeof(full));
+        if (n == 0) {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    } else {
+        bool absolute = name[0] == '\\' || name[0] == '/' || (name[1] == ':' && name[0] != 0);
+        if (!absolute) full[n++] = '\\';
+        for (u32 i = 0; name[i] && n + 1 < sizeof(full); ++i) full[n++] = name[i];
+        full[n] = 0;
+    }
     if (n + 1 > size) return n + 1;
     for (u32 i = 0; i <= n; ++i) buffer[i] = full[i];
     if (file_part) {
@@ -833,6 +1448,7 @@ inline bool env_name_ok(const char* name) {
 }
 
 PEHOST_WINAPI inline i32 SetEnvironmentVariableA(const char* name, const char* value) {
+    sync::Host guard;
     if (!env_name_ok(name) || (value && detail::text_length(value) + 1 > MAX_ENV_VALUE)) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -865,6 +1481,7 @@ PEHOST_WINAPI inline i32 SetEnvironmentVariableA(const char* name, const char* v
 }
 
 PEHOST_WINAPI inline i32 SetEnvironmentVariableW(const u16* name, const u16* value) {
+    sync::Host guard;
     char n[MAX_ENV_NAME * 3 + 1];
     char v[MAX_ENV_VALUE * 3 + 1];
     if (!detail::narrow_name(name, n)) {
@@ -888,6 +1505,7 @@ PEHOST_WINAPI inline i32 SetEnvironmentVariableW(const u16* name, const u16* val
 }
 
 PEHOST_WINAPI inline u32 GetEnvironmentVariableA(const char* name, char* buffer, u32 size) {
+    sync::Host guard;
     EnvVar* e = env_find(name ? name : "");
     if (!e) {
         set_last_error(ERROR_ENVVAR_NOT_FOUND);
@@ -900,6 +1518,7 @@ PEHOST_WINAPI inline u32 GetEnvironmentVariableA(const char* name, char* buffer,
 }
 
 PEHOST_WINAPI inline u32 GetEnvironmentVariableW(const u16* name, u16* buffer, u32 size) {
+    sync::Host guard;
     char n[MAX_ENV_NAME * 3 + 1];
     if (!detail::narrow_name(name, n)) {
         set_last_error(ERROR_ENVVAR_NOT_FOUND);
@@ -920,6 +1539,7 @@ PEHOST_WINAPI inline u32 GetEnvironmentVariableW(const u16* name, u16* buffer, u
 }
 
 PEHOST_WINAPI inline u16* GetEnvironmentStringsW() {
+    sync::Host guard;
     u64 units = 1;
     for (const EnvVar& e : g_extra.env) {
         if (e.used) units += detail::text_length(e.name) + detail::text_length(e.value) + 2;
@@ -1142,7 +1762,9 @@ constexpr u32 ERROR_MR_MID_NOT_FOUND = 317;
 struct Search {
     bool used;
     bool wide;
+    bool program;
     u64 next;
+    char dir[fsys::TEXT_MAX + 1];
     char pattern[MAX_NAME + 1];
 };
 
@@ -1169,13 +1791,32 @@ inline bool wildcard_match(const char* pattern, const char* name) {
     return *name == 0;
 }
 
-inline u64 filetime_of(u64 ms) { return (ms + FILETIME_UNIX_EPOCH_MS) * 10000; }
-
 }
 
 namespace win32 {
 
-inline bool search_step(Search& s, u8* data) {
+inline bool fill_find_data(const Search& s, u8* data, const char* name, u64 size, u64 mtime, bool directory) {
+    u32 n = detail::text_length(name);
+    for (u32 i = 0; i < (s.wide ? 592u : 320u); ++i) data[i] = 0;
+    u64 stamp = detail::filetime_of(mtime);
+    *reinterpret_cast<u32*>(data) = directory ? fsys::ATTRIBUTE_DIRECTORY : fsys::ATTRIBUTE_NORMAL;
+    detail::put_filetime(data + 4, stamp);
+    detail::put_filetime(data + 12, stamp);
+    detail::put_filetime(data + 20, stamp);
+    *reinterpret_cast<u32*>(data + 28) = static_cast<u32>(size >> 32);
+    *reinterpret_cast<u32*>(data + 32) = static_cast<u32>(size);
+    if (s.wide) {
+        i64 w = codec::utf8_to_utf16(reinterpret_cast<const u8*>(name), n, reinterpret_cast<u16*>(data + 44), 259, false);
+        if (w < 0) return false;
+        reinterpret_cast<u16*>(data + 44)[w] = 0;
+        return true;
+    }
+    if (n > 259) return false;
+    for (u32 i = 0; i <= n; ++i) data[44 + i] = static_cast<u8>(name[i]);
+    return true;
+}
+
+inline bool search_step_program(Search& s, u8* data) {
     if (!g_runtime->dir_entry) return false;
     for (;;) {
         char name[256];
@@ -1184,26 +1825,35 @@ inline bool search_step(Search& s, u8* data) {
         i32 r = g_runtime->dir_entry(s.next++, name, sizeof(name), &size, &mtime, &directory);
         if (r <= 0) return false;
         if (!detail::wildcard_match(s.pattern, name)) continue;
-        u32 attributes = directory ? 0x10 : 0x80;
-        u64 stamp = detail::filetime_of(mtime);
-        for (u32 i = 0; i < (s.wide ? 592u : 320u); ++i) data[i] = 0;
-        *reinterpret_cast<u32*>(data) = attributes;
-        detail::put_filetime(data + 4, stamp);
-        detail::put_filetime(data + 12, stamp);
-        detail::put_filetime(data + 20, stamp);
-        *reinterpret_cast<u32*>(data + 28) = static_cast<u32>(size >> 32);
-        *reinterpret_cast<u32*>(data + 32) = static_cast<u32>(size);
-        u32 n = detail::text_length(name);
-        if (s.wide) {
-            i64 w = codec::utf8_to_utf16(reinterpret_cast<const u8*>(name), n, reinterpret_cast<u16*>(data + 44), 259, false);
-            if (w < 0) continue;
-            reinterpret_cast<u16*>(data + 44)[w] = 0;
-        } else {
-            if (n > 259) continue;
-            for (u32 i = 0; i <= n; ++i) data[44 + i] = static_cast<u8>(name[i]);
-        }
-        return true;
+        if (fill_find_data(s, data, name, size, mtime, directory)) return true;
     }
+}
+
+inline bool search_step_work(Search& s, u8* data) {
+    FsInfo info{};
+    i64 h = g_runtime->fs_open(s.dir, FS_WANT_LIST, &info);
+    if (h < 0) return false;
+    if (info.kind != FS_DIRECTORY) {
+        g_runtime->fs_close(h);
+        return false;
+    }
+    bool found = false;
+    for (;;) {
+        char name[256];
+        FsInfo entry{};
+        if (g_runtime->fs_entry(h, s.next++, name, sizeof(name), &entry) != 0) break;
+        if (!detail::wildcard_match(s.pattern, name)) continue;
+        if (fill_find_data(s, data, name, entry.size, entry.mtime_ms, entry.kind == FS_DIRECTORY)) {
+            found = true;
+            break;
+        }
+    }
+    g_runtime->fs_close(h);
+    return found;
+}
+
+inline bool search_step(Search& s, u8* data) {
+    return s.program ? search_step_program(s, data) : search_step_work(s, data);
 }
 
 inline bool search_pattern(const char* text, char* out) {
@@ -1221,18 +1871,72 @@ inline bool search_pattern(const char* text, char* out) {
     return true;
 }
 
+inline u32 split_search(const char* text, Search& s) {
+    if (text == nullptr || text[0] == 0) return ERROR_PATH_NOT_FOUND;
+    u32 n = fsys::length_of(text);
+    if (n > fsys::TEXT_MAX) return fsys::E_INVALID_NAME;
+    u32 split = n;
+    while (split > 0 && !fsys::is_separator(text[split - 1])) --split;
+    if (split == 0 && n >= 2 && text[1] == ':') split = 2;
+    char directory[fsys::TEXT_MAX + 2];
+    if (split == 0) {
+        directory[0] = '.';
+        directory[1] = 0;
+    } else {
+        for (u32 i = 0; i < split; ++i) directory[i] = text[i];
+        directory[split] = 0;
+    }
+    const char* leaf = text + split;
+    u32 leaf_length = n - split;
+    if (leaf_length == 0) return fsys::E_INVALID_NAME;
+    bool dots = true;
+    for (u32 i = 0; i < leaf_length; ++i) {
+        if (leaf[i] != '.') dots = false;
+    }
+    if (dots) return ERROR_FILE_NOT_FOUND;
+    if (!fsys::component_ok(leaf, leaf_length, true)) return fsys::E_INVALID_NAME;
+    fsys::Resolved r;
+    u32 e = fsys::resolve(directory, &r);
+    if (e) return e == fsys::E_INVALID_NAME ? e : ERROR_PATH_NOT_FOUND;
+    if (r.program) {
+        if (r.length != 0) return ERROR_PATH_NOT_FOUND;
+        s.program = true;
+        s.dir[0] = 0;
+    } else {
+        FsInfo info{};
+        if (!fsys::stat_path(r, &info) || info.kind != FS_DIRECTORY) return ERROR_PATH_NOT_FOUND;
+        s.program = false;
+        detail::copy_text(s.dir, sizeof(s.dir), r.rel);
+    }
+    detail::copy_text(s.pattern, sizeof(s.pattern), leaf);
+    if (leaf_length == 3 && leaf[0] == '*' && leaf[1] == '.' && leaf[2] == '*') s.pattern[1] = 0;
+    return 0;
+}
+
 inline u64 begin_search(const char* pattern, u8* data, bool wide) {
-    char plain[MAX_NAME + 1];
-    if (!search_pattern(pattern, plain)) {
-        set_last_error(ERROR_PATH_NOT_FOUND);
-        return INVALID_HANDLE;
+    sync::Host guard;
+    Search probe{};
+    probe.wide = wide;
+    if (fsys::enabled()) {
+        u32 e = split_search(pattern, probe);
+        if (e) {
+            set_last_error(e);
+            return INVALID_HANDLE;
+        }
+    } else {
+        char plain[MAX_NAME + 1];
+        if (!search_pattern(pattern, plain)) {
+            set_last_error(ERROR_PATH_NOT_FOUND);
+            return INVALID_HANDLE;
+        }
+        probe.program = true;
+        detail::copy_text(probe.pattern, sizeof(probe.pattern), plain);
     }
     for (u32 i = 0; i < MAX_SEARCHES; ++i) {
         if (g_searches[i].used) continue;
+        g_searches[i] = probe;
         g_searches[i].used = true;
-        g_searches[i].wide = wide;
         g_searches[i].next = 0;
-        detail::copy_text(g_searches[i].pattern, sizeof(g_searches[i].pattern), plain);
         if (!search_step(g_searches[i], data)) {
             g_searches[i].used = false;
             set_last_error(ERROR_FILE_NOT_FOUND);
@@ -1273,6 +1977,7 @@ PEHOST_WINAPI inline u64 FindFirstFileA(const char* pattern, u8* data) { return 
 PEHOST_WINAPI inline u64 FindFirstFileW(const u16* pattern, u8* data) { return FindFirstFileExW(pattern, 0, data, 0, nullptr, 0); }
 
 PEHOST_WINAPI inline i32 FindNextFileA(u64 handle, u8* data) {
+    sync::Host guard;
     Search* s = search_of(handle, false);
     if (!s || data == nullptr) {
         set_last_error(ERROR_INVALID_HANDLE);
@@ -1286,6 +1991,7 @@ PEHOST_WINAPI inline i32 FindNextFileA(u64 handle, u8* data) {
 }
 
 PEHOST_WINAPI inline i32 FindNextFileW(u64 handle, u8* data) {
+    sync::Host guard;
     Search* s = search_of(handle, true);
     if (!s || data == nullptr) {
         set_last_error(ERROR_INVALID_HANDLE);
@@ -1299,6 +2005,7 @@ PEHOST_WINAPI inline i32 FindNextFileW(u64 handle, u8* data) {
 }
 
 PEHOST_WINAPI inline i32 FindClose(u64 handle) {
+    sync::Host guard;
     if (handle < SEARCH_HANDLE_BASE || (handle - SEARCH_HANDLE_BASE) % 4 != 0 || (handle - SEARCH_HANDLE_BASE) / 4 >= MAX_SEARCHES ||
         !g_searches[(handle - SEARCH_HANDLE_BASE) / 4].used) {
         set_last_error(ERROR_INVALID_HANDLE);
@@ -1451,7 +2158,6 @@ PEHOST_WINAPI inline u64 CreateNamedPipeA(const char*, u32, u32, u32, u32, u32, 
 PEHOST_WINAPI inline i32 ConnectNamedPipe(u64, void*) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 CreatePipe(u64*, u64*, void*, u32) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 CreateProcessA(const char*, char*, void*, void*, i32, u32, void*, const char*, void*, void*) { return unsupported_false(); }
-PEHOST_WINAPI inline i32 DuplicateHandle(u64, u64, u64, u64*, u32, i32, u32) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 SetHandleInformation(u64, u32, u32) { return unsupported_false(); }
 PEHOST_WINAPI inline u64 CreateIoCompletionPort(u64, u64, u64, u32) {
     set_last_error(ERROR_NOT_SUPPORTED);
@@ -1460,11 +2166,6 @@ PEHOST_WINAPI inline u64 CreateIoCompletionPort(u64, u64, u64, u32) {
 PEHOST_WINAPI inline i32 GetQueuedCompletionStatus(u64, u32*, u64*, void**, u32) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 PostQueuedCompletionStatus(u64, u32, u64, void*) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 GetOverlappedResult(u64, void*, u32*, i32) { return unsupported_false(); }
-PEHOST_WINAPI inline i32 ReleaseSemaphore(u64, i32, i32*) { return unsupported_false(); }
-PEHOST_WINAPI inline u64 OpenSemaphoreA(u32, i32, const char*) {
-    set_last_error(ERROR_NOT_SUPPORTED);
-    return 0;
-}
 PEHOST_WINAPI inline i32 GenerateConsoleCtrlEvent(u32, u32) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 QueryInformationJobObject(u64, u32, void*, u32, u32*) { return unsupported_false(); }
 PEHOST_WINAPI inline i32 GetSystemTimes(u64*, u64*, u64*) { return unsupported_false(); }
@@ -1475,10 +2176,6 @@ PEHOST_WINAPI inline u32 GetProcessId(u64) {
 }
 PEHOST_WINAPI inline i32 GetExitCodeProcess(u64, u32*) { return unsupported_false(); }
 PEHOST_WINAPI inline u32 GetDriveTypeW(const u16*) { return 1; }
-PEHOST_WINAPI inline u32 WaitForSingleObject(u64, u32) {
-    set_last_error(ERROR_INVALID_HANDLE);
-    return 0xFFFFFFFFu;
-}
 
 }
 
@@ -1487,11 +2184,11 @@ namespace pehost {
 inline const ImportTable* kernel32_stub_table() {
 #define PEHOST_S(name) { "kernel32.dll", #name, reinterpret_cast<void*>(&win32::name) }
     static const Import items[] = {
-        PEHOST_S(CreateNamedPipeA), PEHOST_S(ConnectNamedPipe), PEHOST_S(CreatePipe), PEHOST_S(CreateProcessA), PEHOST_S(DuplicateHandle),
+        PEHOST_S(CreateNamedPipeA), PEHOST_S(ConnectNamedPipe), PEHOST_S(CreatePipe), PEHOST_S(CreateProcessA), 
         PEHOST_S(SetHandleInformation), PEHOST_S(CreateIoCompletionPort), PEHOST_S(GetQueuedCompletionStatus), PEHOST_S(PostQueuedCompletionStatus),
-        PEHOST_S(GetOverlappedResult), PEHOST_S(ReleaseSemaphore), PEHOST_S(OpenSemaphoreA), PEHOST_S(GenerateConsoleCtrlEvent),
+        PEHOST_S(GetOverlappedResult), PEHOST_S(GenerateConsoleCtrlEvent),
         PEHOST_S(QueryInformationJobObject), PEHOST_S(GetSystemTimes), PEHOST_S(WriteConsoleOutputA), PEHOST_S(GetProcessId),
-        PEHOST_S(GetExitCodeProcess), PEHOST_S(GetDriveTypeW), PEHOST_S(WaitForSingleObject),
+        PEHOST_S(GetExitCodeProcess), PEHOST_S(GetDriveTypeW),
     };
 #undef PEHOST_S
     static const ImportTable table{ items, sizeof(items) / sizeof(items[0]), kernel32_table() };
@@ -1541,6 +2238,40 @@ inline const ImportTable* kernel32x_table() {
         PEHOST_K(WakeAllConditionVariable),
         PEHOST_K(SleepConditionVariableSRW),
         PEHOST_K(SleepConditionVariableCS),
+        PEHOST_K(CreateEventA),
+        PEHOST_K(CreateEventW),
+        PEHOST_K(CreateEventExA),
+        PEHOST_K(CreateEventExW),
+        PEHOST_K(OpenEventA),
+        PEHOST_K(OpenEventW),
+        PEHOST_K(SetEvent),
+        PEHOST_K(ResetEvent),
+        PEHOST_K(CreateMutexA),
+        PEHOST_K(CreateMutexW),
+        PEHOST_K(CreateMutexExA),
+        PEHOST_K(CreateMutexExW),
+        PEHOST_K(OpenMutexA),
+        PEHOST_K(OpenMutexW),
+        PEHOST_K(ReleaseMutex),
+        PEHOST_K(CreateSemaphoreA),
+        PEHOST_K(CreateSemaphoreW),
+        PEHOST_K(CreateSemaphoreExA),
+        PEHOST_K(CreateSemaphoreExW),
+        PEHOST_K(OpenSemaphoreA),
+        PEHOST_K(OpenSemaphoreW),
+        PEHOST_K(ReleaseSemaphore),
+        PEHOST_K(WaitForSingleObject),
+        PEHOST_K(WaitForSingleObjectEx),
+        PEHOST_K(WaitForMultipleObjects),
+        PEHOST_K(WaitForMultipleObjectsEx),
+        PEHOST_K(DuplicateHandle),
+        PEHOST_K(InitOnceBeginInitialize),
+        PEHOST_K(InitOnceComplete),
+        PEHOST_K(InitOnceExecuteOnce),
+        PEHOST_K(InitOnceInitialize),
+        PEHOST_K(WaitOnAddress),
+        PEHOST_K(WakeByAddressSingle),
+        PEHOST_K(WakeByAddressAll),
         PEHOST_K(RtlCaptureContext),
         PEHOST_K(RtlLookupFunctionEntry),
         PEHOST_K(RtlPcToFileHeader),
@@ -1570,8 +2301,12 @@ inline const ImportTable* kernel32x_table() {
         PEHOST_K(CreateFileW),
         PEHOST_K(ReadFile),
         PEHOST_K(GetFileSizeEx),
+        PEHOST_K(GetFileSize),
         PEHOST_K(SetFilePointerEx),
+        PEHOST_K(SetFilePointer),
         PEHOST_K(SetEndOfFile),
+        PEHOST_K(GetFileInformationByHandle),
+        PEHOST_K(GetFileTime),
         PEHOST_K(GetFileAttributesA),
         PEHOST_K(GetFileAttributesW),
         PEHOST_K(GetFileAttributesExA),
@@ -1579,11 +2314,20 @@ inline const ImportTable* kernel32x_table() {
         PEHOST_K(DeleteFileA),
         PEHOST_K(DeleteFileW),
         PEHOST_K(RemoveDirectoryA),
+        PEHOST_K(RemoveDirectoryW),
+        PEHOST_K(CreateDirectoryA),
         PEHOST_K(CreateDirectoryW),
+        PEHOST_K(MoveFileA),
+        PEHOST_K(MoveFileW),
+        PEHOST_K(MoveFileExA),
         PEHOST_K(MoveFileExW),
+        PEHOST_K(CopyFileA),
+        PEHOST_K(CopyFileW),
         PEHOST_K(SetFileAttributesA),
+        PEHOST_K(SetFileAttributesW),
         PEHOST_K(GetCurrentDirectoryA),
         PEHOST_K(GetCurrentDirectoryW),
+        PEHOST_K(SetCurrentDirectoryA),
         PEHOST_K(SetCurrentDirectoryW),
         PEHOST_K(GetFullPathNameA),
         PEHOST_K(GetFullPathNameW),

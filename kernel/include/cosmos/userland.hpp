@@ -34,6 +34,7 @@ struct Startup {
     lens::Lens directory;
     lens::Lens input;
     lens::Lens output;
+    lens::Lens work;
 };
 
 Process* launch_started(const char* name, lens::Table& table, lens::Lens file, const Startup& startup, i64* error);

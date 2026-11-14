@@ -2404,8 +2404,8 @@ static void test_channel_handles() {
     CHECK_L(chan_send(*t, a, "ordered", ordered, 2), Status::Denied, "a bad handle later in the list refuses the send");
     CHECK(lens::is_live(t->domain, d) && lens::is_live(t->domain, nodel), "and the earlier handle keeps its value, nothing was moved and put back");
 
-    Lens five[5];
-    CHECK_L(lens::channel::send(*t, a, txt("five"), five, 5), Status::TooLarge, "more than four handles is refused");
+    Lens too_many[lens::channel::MAX_HANDLES + 1];
+    CHECK_L(lens::channel::send(*t, a, txt("many"), too_many, lens::channel::MAX_HANDLES + 1), Status::TooLarge, "more handles than a message can carry are refused");
 
     Lens p_r, p_w;
     CHECK(lens::make_pipe(t->domain, 64, &p_r, &p_w).ok(), "a pipe");

@@ -359,8 +359,8 @@ test-pe:
 
 test-pehost:
 	@mkdir -p $(BUILD)
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_host_test.cpp -o $(BUILD)/pehost_host_test
-	g++ -std=c++20 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_lib_test.cpp -o $(BUILD)/pehost_lib_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_host_test.cpp -o $(BUILD)/pehost_host_test
+	g++ -std=c++20 -O1 -g -w -pthread -fsanitize=address,undefined -fno-sanitize-recover=undefined $(unit_inc_pehost) tools/pehost_lib_test.cpp -o $(BUILD)/pehost_lib_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_host_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD)/pehost_lib_test
 	g++ -std=c++20 -O2 -w -I$(KDIR)/include tools/peinfo.cpp -o $(BUILD)/peinfo
@@ -373,11 +373,15 @@ test-pehost:
 	grep '^ *[0-9][0-9]*  ' $(BUILD)/pe-gaps.txt | sed 's/^ *[0-9]*  //' | LC_ALL=C sort > $(BUILD)/pe-gaps-peinfo.txt && \
 	$(BUILD)/pehost_host_test --run tools/pe-samples/bin/gaps.exe 2>&1 | sed -n 's/^\[pehost\] missing import //p' | LC_ALL=C sort > $(BUILD)/pe-gaps-host.txt && \
 	cmp $(BUILD)/pe-gaps-peinfo.txt $(BUILD)/pe-gaps-host.txt && echo "coverage report: a program needing fopen, qsort, strtol and time is reported with exactly those gaps" || { echo "the coverage report for gaps.exe is wrong"; cat $(BUILD)/pe-gaps.txt; exit 1; }
-	@$(BUILD)/pehost_host_test --run tools/pe-samples/bin/sysio.exe --dlls tools/pe-samples/bin > $(BUILD)/pe-sysio.txt 2>&1; grep -q 'sysio done failures=0' $(BUILD)/pe-sysio.txt && grep -q 'exit status 6' $(BUILD)/pe-sysio.txt && \
+	@rm -rf $(BUILD)/pehost-work && mkdir -p $(BUILD)/pehost-work && $(BUILD)/pehost_host_test --run tools/pe-samples/bin/sysio.exe --dlls tools/pe-samples/bin --work $(BUILD)/pehost-work > $(BUILD)/pe-sysio.txt 2>&1; grep -q 'sysio done failures=0' $(BUILD)/pe-sysio.txt && grep -q 'exit status 6' $(BUILD)/pe-sysio.txt && \
 	echo "sysio.exe: a program using the clock, file and search calls runs under the host harness and passes its own checks" || { echo "sysio.exe failed under the host harness"; cat $(BUILD)/pe-sysio.txt; exit 1; }
 	@$(BUILD)/pehost_host_test --run tools/pe-samples/bin/argv.exe --dlls tools/pe-samples/bin 'argv.exe x "a \"q\" b" "" back\' --env 'GREETING=hi there' --env SHELL=helm --stdin 'ab' > $(BUILD)/pe-argv.txt 2>&1; \
 	printf 'argc=5\nargv[0]=<argv.exe>\nargv[1]=<x>\nargv[2]=<a "q" b>\nargv[3]=<>\nargv[4]=<back\\>\ncmdline=<argv.exe x "a \\"q\\" b" "" back\\>\nmodule=<pe.exe>\nGREETING=<hi there>\nSHELL=<helm>\nstdin 2 bytes\nab[host] exit status 5 (0x5)\n' | cmp - $(BUILD)/pe-argv.txt && \
 	echo "argv.exe: arguments, environment and standard input reach a program under the host harness exactly as given" || { echo "argv.exe failed under the host harness"; cat $(BUILD)/pe-argv.txt; exit 1; }
+	@rm -rf $(BUILD)/pehost-work && mkdir -p $(BUILD)/pehost-work && $(BUILD)/pehost_host_test --run tools/pe-samples/bin/files.exe --dlls tools/pe-samples/bin --work $(BUILD)/pehost-work > $(BUILD)/pe-files.txt 2>&1; grep -q 'files done failures=0' $(BUILD)/pe-files.txt && grep -q 'exit status 4' $(BUILD)/pe-files.txt && test -z "$$(ls -A $(BUILD)/pehost-work)" && \
+	echo "files.exe: a program that makes, writes, lists, moves, copies and deletes files in subdirectories runs under the host harness against a real directory, and leaves it empty" || { echo "files.exe failed under the host harness"; cat $(BUILD)/pe-files.txt; exit 1; }
+	@$(BUILD)/pehost_host_test --run tools/pe-samples/bin/threads.exe --dlls tools/pe-samples/bin > $(BUILD)/pe-threads.txt 2>&1; grep -q 'threads done failures=0' $(BUILD)/pe-threads.txt && grep -q 'exit status 0' $(BUILD)/pe-threads.txt && \
+	echo "threads.exe: a program with threads, events, mutexes, semaphores, SRW locks and thread-local storage runs under the host harness and passes its own checks" || { echo "threads.exe failed under the host harness"; cat $(BUILD)/pe-threads.txt; exit 1; }
 	@mkdir -p $(BUILD)/pe-alone && cp tools/pe-samples/bin/dyn.exe $(BUILD)/pe-alone/ && rm -f $(BUILD)/pe-alone/*.dll; \
 	$(BUILD)/peinfo --coverage --supported docs/pe-supported.txt $(BUILD)/pe-alone/dyn.exe > $(BUILD)/pe-alone.txt; test $$? -eq 1 && grep -q 'dllchain.dll!add3' $(BUILD)/pe-alone.txt && \
 	echo "coverage report: a program whose DLL is not beside it is reported as missing that DLL's imports" || { echo "the coverage report for a program without its DLL is wrong"; cat $(BUILD)/pe-alone.txt; exit 1; }

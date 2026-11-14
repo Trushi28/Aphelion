@@ -112,7 +112,7 @@ static void copy_tests() {
 }
 
 static void abi_tests() {
-    static_assert(userabi::SYS_COUNT == 34, "the native table has thirty-four entries in this series");
+    static_assert(userabi::SYS_COUNT == 39, "the native table has thirty-nine entries in this series");
     static_assert(userabi::SYS_THREAD_CREATE == 8 && userabi::SYS_THREAD_EXIT == 9 && userabi::SYS_THREAD_JOIN == 10, "the thread calls follow the FS ones");
     static_assert(!userabi::is_fault_status(userabi::STATUS_KILLED), "a kill is not mistaken for a fault");
     static_assert(userabi::MAX_LIVE_THREADS <= userabi::MAX_THREADS_TOTAL && userabi::MAX_THREADS_TOTAL < procgroup::LIVE_MAX, "the thread limits fit the group word");
@@ -1078,7 +1078,7 @@ static void handle_abi_tests() {
 static void vm_abi_tests() {
     using vmregion::Status;
     expect(userabi::SYS_VMO_CREATE == 18 && userabi::SYS_VM_MAP == 19 && userabi::SYS_VM_UNMAP == 20 && userabi::SYS_VM_PROTECT == 21 &&
-           userabi::SYS_VMO_SIZE == 22 && userabi::SYS_COUNT == 34, "vm abi: syscall numbers 18 to 22");
+           userabi::SYS_VMO_SIZE == 22 && userabi::SYS_COUNT == 39, "vm abi: syscall numbers 18 to 22");
     expect(handleabi::ERR_EXISTS == -12 && handleabi::ERR_NOTMAPPED == -13, "vm abi: new error codes continue the series");
     expect(handleabi::vm_error(Status::Ok) == 0 && handleabi::vm_error(Status::Invalid) == userabi::ERR_INVAL &&
            handleabi::vm_error(Status::Denied) == handleabi::ERR_DENIED && handleabi::vm_error(Status::Exists) == handleabi::ERR_EXISTS &&
@@ -1361,8 +1361,14 @@ static void file_abi_tests() {
            "file abi: not-found, exists and wrong-type have their own codes");
     expect(fileabi::error_of(Status::Denied) == handleabi::ERR_DENIED && fileabi::error_of(Status::NotReady) == handleabi::ERR_AGAIN &&
                fileabi::error_of(Status::Closed) == handleabi::ERR_CLOSED && fileabi::error_of(Status::StaleLens) == handleabi::ERR_BADHANDLE &&
-               fileabi::error_of(Status::NoSpace) == userabi::ERR_LIMIT,
+               fileabi::error_of(Status::TableFull) == userabi::ERR_LIMIT && fileabi::error_of(Status::ReadOnly) == handleabi::ERR_DENIED,
            "file abi: other statuses keep the handle ABI codes");
+    expect(fileabi::error_of(Status::NotEmpty) == fileabi::ERR_NOTEMPTY && fileabi::error_of(Status::Busy) == fileabi::ERR_BUSY && fileabi::error_of(Status::NoSpace) == fileabi::ERR_NOSPACE,
+           "file abi: a directory that is not empty, a busy file and a full disk have their own codes");
+    expect(fileabi::ERR_NOTEMPTY == -17 && fileabi::ERR_BUSY == -18 && fileabi::ERR_NOSPACE == -19 && fileabi::ERR_NOTEMPTY != fileabi::ERR_WRONGTYPE,
+           "file abi: the new error numbers");
+    expect(userabi::SYS_FILE_UNLINK == 36 && userabi::SYS_FILE_RENAME == 37 && userabi::SYS_FILE_RESIZE == 38 && fileabi::UNLINK_FLAGS_MASK == 1 && fileabi::RENAME_FLAGS_MASK == 1,
+           "file abi: unlink, rename and resize are numbers 36 to 38 with one flag each");
     bool distinct = true;
     const i64 codes[] = { userabi::ERR_NOSYS, userabi::ERR_FAULT, userabi::ERR_INVAL, userabi::ERR_LIMIT, handleabi::ERR_AGAIN, handleabi::ERR_CLOSED,
                           handleabi::ERR_DENIED, handleabi::ERR_BADHANDLE, handleabi::ERR_TOOBIG, handleabi::ERR_TIMEDOUT, handleabi::ERR_CANCELLED,
@@ -1388,7 +1394,7 @@ static void file_abi_tests() {
 }
 
 static void clock_abi_tests() {
-    static_assert(userabi::SYS_CLOCK == 33 && userabi::SYS_COUNT == 34, "the clock call is number 33");
+    static_assert(userabi::SYS_CLOCK == 33 && userabi::SYS_COUNT == 39, "the clock call is number 33");
     static_assert(sizeof(userabi::ClockRecord) == 32, "the clock record is four words");
     expect(__builtin_offsetof(userabi::ClockRecord, uptime_ms) == 0 && __builtin_offsetof(userabi::ClockRecord, wall_ms) == 8 &&
                __builtin_offsetof(userabi::ClockRecord, tsc_khz) == 16 && __builtin_offsetof(userabi::ClockRecord, flags) == 24,
@@ -1452,7 +1458,8 @@ static void startup_tests() {
                             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                             "cccccccccccccccccccccccccc" };
     expect(startup::encode(split, 3, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_TOO_LARGE, "startup: the limit applies to the sum of all strings");
-    expect(startup::encode(argv, 1, nullptr, 0, 0x10, buf, sizeof(buf), &len) == startup::ERR_MALFORMED, "startup: a presence bit past the table is refused");
+    expect(startup::encode(argv, 1, nullptr, 0, 0x20, buf, sizeof(buf), &len) == startup::ERR_MALFORMED, "startup: a presence bit past the table is refused");
+    expect(startup::encode(argv, 1, nullptr, 0, 0x10, buf, sizeof(buf), &len) == startup::OK, "startup: the working directory is the fifth slot");
     expect(startup::encode(argv, 1, nullptr, 0, 0, buf, sizeof(startup::Header) - 1, &len) == startup::ERR_MALFORMED, "startup: a buffer smaller than the header is refused");
     const char* holes[] = { "a", nullptr };
     expect(startup::encode(holes, 2, nullptr, 0, 0, buf, sizeof(buf), &len) == startup::ERR_MALFORMED, "startup: a null string is refused");
@@ -1491,8 +1498,8 @@ static void startup_tests() {
     bad[14] = 1;
     expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: a nonzero reserved field is refused");
     fresh();
-    bad[10] = 0x1F;
-    expect(startup::decode(bad, len, 5, &p) == startup::ERR_MALFORMED, "startup: a presence bit past the table is refused on decode");
+    bad[10] = 0x3F;
+    expect(startup::decode(bad, len, 6, &p) == startup::ERR_MALFORMED, "startup: a presence bit past the table is refused on decode");
     fresh();
     bad[12] = static_cast<u8>(bad[12] + 1);
     expect(startup::decode(bad, len, 3, &p) == startup::ERR_MALFORMED, "startup: a text length that disagrees with the message is refused");
@@ -1508,6 +1515,16 @@ static void startup_tests() {
     flood[13] = static_cast<u8>(flood_text >> 8);
     flood[6] = 1;
     expect(startup::decode(flood, startup::MAX_MESSAGE, 0, &p) == startup::ERR_MALFORMED && p.argc == 0, "startup: a message of empty strings cannot write past the parsed lists");
+}
+
+static void futex_abi_tests() {
+    static_assert(userabi::SYS_FUTEX_WAIT == 34 && userabi::SYS_FUTEX_WAKE == 35 && userabi::SYS_COUNT == 39, "the futex calls are numbers 34 and 35");
+    expect(userabi::futex_address_ok(0x800000) && userabi::futex_address_ok(4) && userabi::futex_address_ok(userabi::USER_LIMIT - 4), "futex: aligned user addresses, including the last word below the limit, are accepted");
+    expect(!userabi::futex_address_ok(0) && !userabi::futex_address_ok(1) && !userabi::futex_address_ok(2) && !userabi::futex_address_ok(3) && !userabi::futex_address_ok(0x800002),
+           "futex: null and every misalignment are refused");
+    expect(!userabi::futex_address_ok(userabi::USER_LIMIT) && !userabi::futex_address_ok(userabi::USER_LIMIT - 2) && !userabi::futex_address_ok(0xFFFF800000000000ull) && !userabi::futex_address_ok(~0ull & ~3ull),
+           "futex: the user limit, kernel addresses and the top of the address space are refused");
+    expect(userabi::FUTEX_FOREVER == ~0ull, "futex: all ones means wait without a timeout");
 }
 
 int main() {
@@ -1530,6 +1547,7 @@ int main() {
     file_abi_tests();
     clock_abi_tests();
     startup_tests();
+    futex_abi_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

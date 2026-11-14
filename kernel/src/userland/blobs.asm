@@ -35,6 +35,8 @@ default rel
 %define SYS_PROCESS_STATUS 31
 %define SYS_PROCESS_KILL 32
 %define SYS_CLOCK 33
+%define SYS_FUTEX_WAIT 34
+%define SYS_FUTEX_WAKE 35
 %define INFO_PROC 0x3030103
 %define INFO_END 0x1030103
 %define INFO_VMO 0x2030303
@@ -1235,6 +1237,139 @@ BLOB clockcall
 ENDBLOB clockcall
 
 align 16
+BLOB futexcall
+    mov r15, DATA
+    mov dword [r15 + 0x100], 0
+    SC SYS_FUTEX_WAIT, DATA+0x100, 1, 0, 0, 0, 0
+    EXPECT rax, -5, 1
+    SC SYS_FUTEX_WAIT, DATA+0x100, 0, 0, 0, 0, 0
+    EXPECT rax, -10, 2
+    SC SYS_CLOCK, DATA+0x200, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 3
+    SC SYS_FUTEX_WAIT, DATA+0x100, 0, 40, 0, 0, 0
+    EXPECT rax, -10, 4
+    SC SYS_CLOCK, DATA+0x240, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 5
+    mov rax, [r15 + 0x240]
+    sub rax, [r15 + 0x200]
+    cmp rax, 30
+    jae .slept
+    EXIT 6
+.slept:
+    cmp rax, 400
+    jbe .not_long
+    EXIT 7
+.not_long:
+    SC SYS_FUTEX_WAIT, DATA+0x101, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 8
+    SC SYS_FUTEX_WAIT, DATA+0x102, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 9
+    SC SYS_FUTEX_WAIT, 0, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 10
+    SC SYS_FUTEX_WAIT, 0xFFFF800000000000, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 11
+    SC SYS_FUTEX_WAIT, 0x00007FFFFFFFFFFC, 0, 0, 0, 0, 0
+    EXPECT rax, -2, 12
+    SC SYS_FUTEX_WAIT, 0x0000800000000000, 0, 0, 0, 0, 0
+    EXPECT rax, -3, 13
+    SC SYS_FUTEX_WAIT, 0x0000700000000000, 0, 0, 0, 0, 0
+    EXPECT rax, -2, 14
+    mov r9, 0x100000000
+    SC SYS_FUTEX_WAIT, DATA+0x100, r9, 0, 0, 0, 0
+    EXPECT rax, -3, 15
+    SC SYS_FUTEX_WAKE, DATA+0x100, 1, 0, 0, 0, 0
+    EXPECT rax, 0, 16
+    SC SYS_FUTEX_WAKE, DATA+0x100, 0, 0, 0, 0, 0
+    EXPECT rax, 0, 17
+    SC SYS_FUTEX_WAKE, DATA+0x101, 1, 0, 0, 0, 0
+    EXPECT rax, -3, 18
+    SC SYS_FUTEX_WAKE, 0, 1, 0, 0, 0, 0
+    EXPECT rax, -3, 19
+    SC SYS_FUTEX_WAKE, 0xFFFF800000000000, 1, 0, 0, 0, 0
+    EXPECT rax, -3, 20
+    mov dword [r15 + 0x100], 7
+    SC SYS_FUTEX_WAIT, DATA+0x100, 7, 0, 0, 0, 0
+    EXPECT rax, -10, 21
+    SC SYS_FUTEX_WAIT, DATA+0x100, 0, 0, 0, 0, 0
+    EXPECT rax, -5, 22
+    EXIT 0
+ENDBLOB futexcall
+
+align 16
+BLOB futexping
+    mov r15, DATA
+    mov dword [r15 + 0x100], 0
+    mov qword [r15 + 0x108], 0
+    TSPAWNL .child, STK0, 1
+    mov r14, rax
+    mov r12d, 2000
+.round:
+    mov dword [r15 + 0x100], 1
+    SC SYS_FUTEX_WAKE, DATA+0x100, 1, 0, 0, 0, 0
+.back:
+    cmp dword [r15 + 0x100], 0
+    je .turn_done
+    SC SYS_FUTEX_WAIT, DATA+0x100, 1, -1, 0, 0, 0
+    cmp rax, 0
+    je .back
+    cmp rax, -5
+    je .back
+    EXIT 2
+.turn_done:
+    dec r12d
+    jnz .round
+    mov dword [r15 + 0x100], 2
+    SC SYS_FUTEX_WAKE, DATA+0x100, 1, 0, 0, 0, 0
+    mov rdi, r14
+    mov eax, SYS_THREAD_JOIN
+    syscall
+    EXPECT rax, 9, 3
+    cmp qword [r15 + 0x108], 2000
+    je .counted
+    EXIT 4
+.counted:
+    EXIT 0
+.child:
+    mov r15, DATA
+.look:
+    mov eax, [r15 + 0x100]
+    cmp eax, 1
+    je .mine
+    cmp eax, 2
+    je .quit
+    SC SYS_FUTEX_WAIT, DATA+0x100, 0, -1, 0, 0, 0
+    cmp rax, 0
+    je .look
+    cmp rax, -5
+    je .look
+    TEXIT 99
+.mine:
+    inc qword [r15 + 0x108]
+    mov dword [r15 + 0x100], 0
+    SC SYS_FUTEX_WAKE, DATA+0x100, 1, 0, 0, 0, 0
+    jmp .look
+.quit:
+    TEXIT 9
+ENDBLOB futexping
+
+align 16
+BLOB futexexit
+    mov r15, DATA
+    mov dword [r15 + 0x100], 0
+    TSPAWNL .child, STK0, 1
+    mov r12d, 3000
+.spin:
+    mov eax, SYS_YIELD
+    syscall
+    dec r12d
+    jnz .spin
+    EXIT 0
+.child:
+    SC SYS_FUTEX_WAIT, DATA+0x100, 0, -1, 0, 0, 0
+    TEXIT 77
+ENDBLOB futexexit
+
+align 16
 BLOB chanecho
     mov r15, DATA
     mov r14, rdi
@@ -1332,7 +1467,7 @@ BLOB chanlimits
     EXPECT rax, INFO_END, 5
     SC SYS_CHANNEL_SEND, r14, DATA+0x500, 257, 0, 0, 0
     EXPECT rax, -9, 6
-    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 0, DATA+0x210, 5, 0
+    SC SYS_CHANNEL_SEND, r14, DATA+0x500, 0, DATA+0x210, 6, 0
     EXPECT rax, -9, 7
     mov [r15 + 0x210], r14
     SC SYS_CHANNEL_SEND, r14, DATA+0x500, 1, DATA+0x210, 1, 0

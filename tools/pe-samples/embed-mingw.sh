@@ -23,6 +23,6 @@ cp "$W/k32.exe" bin/k32.exe
 cp "$W/stdio-stripped.exe" bin/stdio.exe
 cp "$W/crt.exe" bin/crt.exe
 cp "$W/ucrt.exe" bin/ucrt.exe
-for f in dllmath.dll dllchain.dll dllplug.dll dllfail.dll dyn.exe sysio.exe argv.exe; do cp "$W/$f" "bin/$f"; done
+for f in dllmath.dll dllchain.dll dllplug.dll dllfail.dll dyn.exe sysio.exe argv.exe files.exe threads.exe thrdll.dll; do cp "$W/$f" "bin/$f"; done
 cp "$W/gaps.exe" bin/gaps.exe
 rm -rf "$W"

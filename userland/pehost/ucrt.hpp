@@ -86,7 +86,7 @@ PEHOST_WINAPI inline File* __acrt_iob_func(u32 index) { return index < 3 ? &msvc
 PEHOST_WINAPI inline i32 __stdio_common_vfprintf(u64, File* fp, const char* f, void*, fmt::VaList ap) { return msvcrt::vfprintf(fp, f, ap); }
 
 PEHOST_WINAPI inline i32 __stdio_common_vfwprintf(u64, File*, const u16*, void*, fmt::VaList) {
-    msvcrt::g_errno = msvcrt::ERR_INVAL;
+    msvcrt::errno_ref() = msvcrt::ERR_INVAL;
     return -1;
 }
 
@@ -94,7 +94,7 @@ PEHOST_WINAPI inline i32 __stdio_common_vsprintf(u64 options, char* buffer, u64 
     msvcrt::detail::BufferSink sink{ buffer, count, 0 };
     i64 r = fmt::format(sink, f, ap);
     if (r < 0) {
-        msvcrt::g_errno = msvcrt::ERR_INVAL;
+        msvcrt::errno_ref() = msvcrt::ERR_INVAL;
         if (count) buffer[0] = 0;
         return -1;
     }
@@ -262,7 +262,7 @@ inline const ImportTable* all_imports() {
         PEHOST_SHARED(strncpy), PEHOST_SHARED(strcat), PEHOST_SHARED(strchr), PEHOST_SHARED(strrchr), PEHOST_SHARED(strstr),
         PEHOST_SHARED(getenv), PEHOST_SHARED(strerror), PEHOST_SHARED(localeconv), PEHOST_SHARED(_onexit), PEHOST_SHARED(_cexit),
         PEHOST_SHARED(exit), PEHOST_SHARED(_exit), PEHOST_SHARED(abort), PEHOST_SHARED(signal), PEHOST_SHARED(_initterm),
-        PEHOST_SHARED(_initterm_e), PEHOST_SHARED(__C_specific_handler), PEHOST_SHARED(__setusermatherr),
+        PEHOST_SHARED(_initterm_e), PEHOST_SHARED(_beginthreadex), PEHOST_SHARED(_endthreadex), PEHOST_SHARED(_beginthread), PEHOST_SHARED(_endthread), PEHOST_SHARED(__C_specific_handler), PEHOST_SHARED(__setusermatherr),
         PEHOST_UCRT(__acrt_iob_func), PEHOST_UCRT(__stdio_common_vfprintf), PEHOST_UCRT(__stdio_common_vfwprintf),
         PEHOST_UCRT(__stdio_common_vsprintf), PEHOST_UCRT(_configure_narrow_argv), PEHOST_UCRT(_configure_wide_argv),
         PEHOST_UCRT(__p___argc), PEHOST_UCRT(__p___argv), PEHOST_UCRT(__p___wargv), PEHOST_UCRT(__p__environ),

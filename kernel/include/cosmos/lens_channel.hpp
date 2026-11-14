@@ -12,7 +12,7 @@ struct Table {
 namespace channel {
 
 constexpr u32 MAX_BYTES = 256;
-constexpr u32 MAX_HANDLES = 4;
+constexpr u32 MAX_HANDLES = 5;
 constexpr u32 QUEUE_DEPTH = 16;
 constexpr u32 STREAM_TYPE = 0x4C4E4843;
 

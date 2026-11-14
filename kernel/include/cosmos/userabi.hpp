@@ -37,7 +37,12 @@ constexpr u64 SYS_PROCESS_CREATE = 30;
 constexpr u64 SYS_PROCESS_STATUS = 31;
 constexpr u64 SYS_PROCESS_KILL = 32;
 constexpr u64 SYS_CLOCK = 33;
-constexpr u64 SYS_COUNT = 34;
+constexpr u64 SYS_FUTEX_WAIT = 34;
+constexpr u64 SYS_FUTEX_WAKE = 35;
+constexpr u64 SYS_FILE_UNLINK = 36;
+constexpr u64 SYS_FILE_RENAME = 37;
+constexpr u64 SYS_FILE_RESIZE = 38;
+constexpr u64 SYS_COUNT = 39;
 
 constexpr i64 ERR_NOSYS = -1;
 constexpr i64 ERR_FAULT = -2;
@@ -45,6 +50,8 @@ constexpr i64 ERR_INVAL = -3;
 constexpr i64 ERR_LIMIT = -4;
 
 constexpr u64 DEBUG_WRITE_MAX = 512;
+constexpr u64 FUTEX_FOREVER = ~0ull;
+
 
 constexpr u64 CLOCK_WALL_VALID = 1;
 constexpr u64 CLOCK_TSC_USABLE = 2;
@@ -74,6 +81,7 @@ constexpr u32 MAX_LIVE_THREADS = 8;
 constexpr u32 MAX_THREADS_TOTAL = 16;
 
 constexpr u64 USER_LIMIT = 0x0000800000000000ull;
+constexpr bool futex_address_ok(u64 address) { return address != 0 && (address & 3) == 0 && address <= USER_LIMIT - 4; }
 
 constexpr u64 CODE_BASE = 0x0000000000400000ull;
 constexpr u64 DATA_BASE = 0x0000000000800000ull;
