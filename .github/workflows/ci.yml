@@ -5,8 +5,14 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Not a nightly build. This only wakes up weekly to ask tools/ci-quiet.sh whether
+  # the repository has been quiet for five days and not yet been checked.
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -32,11 +38,23 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           range=""
           case "$EVENT" in
             pull_request) range="origin/$BASE_REF...$AFTER" ;;
             push) range="$BEFORE..$AFTER" ;;
+            schedule)
+              # Do nothing unless the repository has been quiet and not yet checked.
+              if ! tools/ci-quiet.sh; then
+                {
+                  echo 'units=[]'
+                  echo 'boot=false'
+                  echo 'boot_matrix=[{"disk":"nvme","cores":1}]'
+                  echo 'fuzz_matrix=[{"disk":"nvme","rounds":16}]'
+                } | tee -a "$GITHUB_OUTPUT"
+                exit 0
+              fi ;;
           esac
           tools/ci-affected.sh "$range" | tee -a "$GITHUB_OUTPUT"
 
