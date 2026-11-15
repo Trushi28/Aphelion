@@ -10,17 +10,20 @@ This series lets the kernel run unprivileged code in its own address space, ente
 | `swapgs` on every ring-3 interrupt entry and exit, paranoid entry for NMI, #DF and #MC | `kernel/src/arch/x86_64/isr.asm` |
 | Per-core `CoreLocal` (user rsp scratch, kernel rsp) reachable through GS | `gdt.hpp`, `gdt.cpp` |
 | MSR setup per core (EFER.SCE, STAR, LSTAR, FMASK, GS bases) | `userland::init_core` |
-| Process table, address-space build, thread launch, teardown | `kernel/src/userland/userland.cpp` |
+| Process table, address-space build, thread launch, teardown, kill, reaping | `kernel/src/userland/process.cpp` (shared types and declarations in `internal.hpp`) |
+| Starting a process from an APX file, the start-up message | `kernel/src/userland/spawn.cpp` |
+| Syscall table, `syscall_dispatch`, per-core MSR setup | `kernel/src/userland/syscall.cpp` |
+| Syscall handlers by area: base and clock, threads and futex, handles and channels, memory, files and processes | `sys_base.cpp`, `sys_thread.cpp`, `sys_handle.cpp`, `sys_vm.cpp`, `sys_file.cpp` (all in `kernel/src/userland/`) |
 | Native syscall ABI constants | `kernel/include/cosmos/userabi.hpp` |
 | Safe user memory copy | `kernel/include/cosmos/usercopy.hpp` |
 | User-fault hook (terminate the process instead of panicking) | `idt::set_user_fault_handler` |
 | Per-thread user GS and FS bases: saved and restored on every context switch | `usergs.hpp`, `orbital.cpp` (`arrive`) |
 | `lfence` after the conditional `swapgs`, and the byte-level check that it stays there | `isr.asm`, `entrycheck.hpp`, `userland_selftest.cpp` |
-| Policy for NMI, #DF and #MC from ring 3, frame quarantine | `ringabort.hpp`, `userland.cpp`, `idt.cpp` |
+| Policy for NMI, #DF and #MC from ring 3, frame quarantine | `ringabort.hpp`, `fault.cpp`, `idt.cpp` |
 | `IST_MCE` stack, `CR4.MCE` | `gdt.cpp`, `percore.cpp` |
-| Threads in a process, group exit and external kill | `procgroup.hpp`, `userland.cpp`, `idt.cpp` (return-to-user hook) |
-| Per-process handle table, channels that carry handles, handle syscalls | `lens_channel.hpp`, `lens_channel.cpp`, `lens.cpp` (`detach`, `attach`), `lens_stream.cpp` (`acquire`, `await_streams`), `handleabi.hpp`, `userland.cpp` |
-| Memory objects, per-process region table, `vm_map`, `vm_unmap`, `vm_protect` | `memobj.hpp`, `memobj.cpp`, `vmregion.hpp`, `userland.cpp` |
+| Threads in a process, group exit and external kill | `procgroup.hpp`, `slotpub.hpp`, `process.cpp`, `sys_thread.cpp`, `idt.cpp` (return-to-user hook) |
+| Per-process handle table, channels that carry handles, handle syscalls | `lens_channel.hpp`, `lens_channel.cpp`, `lens.cpp` (`detach`, `attach`), `lens_stream.cpp` (`acquire`, `await_streams`), `handleabi.hpp`, `sys_handle.cpp` |
+| Memory objects, per-process region table, `vm_map`, `vm_unmap`, `vm_protect` | `memobj.hpp`, `memobj.cpp`, `vmregion.hpp`, `sys_vm.cpp` |
 | Page tables freed when a user range is unmapped | `vmm.cpp` (`reclaim_tables`) |
 | Ring-3 test programs (including x87, SSE and AVX state checks) and orchestrator | `blobs.asm`, `userland_selftest.cpp` |
 | Host tests for copy, ABI and GS-switch rules | `tools/userland_host_test.cpp` (`make test-userland`) |
@@ -265,7 +268,7 @@ Limits: one message means at most 240 bytes of text and 15 arguments plus the na
 - The kernel half of H3 (the file and pipe syscalls, `process_create`, the process handle, the sweeper, APX loading) has been compiled and linked; the APX parser and the ABI helpers are covered by host tests (an independent oracle checks every truncation, every single-byte and single-bit change and 400,000 random header rewrites, and mutation checks on the parser) and the C++ and Python packers produce identical images. The ring-3 programs ran under an emulator against a model of the syscalls. The handlers themselves have not been booted by me.
 - The thread count is capped at 16 per process.
 - A kill has no inter-processor interrupt behind it, so its latency is bounded by the timer tick and by scheduling, not by a fixed number.
-- The thread and kill tests were run on the host only as assembly logic under an emulator against a model of the syscalls; the kernel side (`userland.cpp`, the return hook, `user_enter` with an argument) has been compiled and linked but not booted by me.
+- The thread and kill tests were run on the host only as assembly logic under an emulator against a model of the syscalls; the kernel side (`process.cpp` and `sys_thread.cpp`, the return hook, `user_enter` with an argument) has been compiled and linked but not booted by me.
 - `CR4.FSGSBASE` is off, so ring 3 cannot use `wrgsbase`. Turning it on needs a different test than the GS sign in the paranoid entry, because user code could then put a kernel-half value in GS.
 - The #DF and #MC termination paths are not exercised by any boot test. Software cannot raise either from ring 3 (`int 8` and `int 18` fault with #GP because their gates have DPL 0), and nothing can self-inject them. Their decision logic (`ringabort.hpp`) is covered by host tests including mutation checks, and the code compiles and links, but the first real run of those paths will be on hardware or under QEMU's `mce` monitor command.
 - Machine-check bank registers are read through the legacy MSR addresses (`0x401` and up). Newer AMD parts with scalable MCA expose banks at other addresses, so on the target laptop the bank contents may read differently from what the policy expects. The effect is conservative: an unrecognised state panics rather than killing a process.

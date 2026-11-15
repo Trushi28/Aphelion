@@ -608,7 +608,7 @@ Satellite* spawn_in(const char* name, EntryFn entry, void* arg, constellation::S
     }
     s->id = __atomic_add_fetch(&g_next_id, 1u, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_spawned, 1ull, __ATOMIC_RELAXED);
-    if (id_out) *id_out = s->id;
+    if (id_out) __atomic_store_n(id_out, s->id, __ATOMIC_RELEASE);
     u64 f = cpu::irq_save();
     place(s, apic::id());
     cpu::irq_restore(f);

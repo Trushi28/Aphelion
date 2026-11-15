@@ -328,7 +328,11 @@ bool run_kill() {
             ok = false;
             continue;
         }
-        if (t.settle_ms) orbital::sleep_ms(t.settle_ms);
+        if (t.settle_ms >= 40) {
+            for (u32 waited = 0; waited < 5000 && (live_threads(p) != t.threads || threads_created(p) != t.threads); waited += 5) orbital::sleep_ms(5);
+        } else if (t.settle_ms) {
+            orbital::sleep_ms(t.settle_ms);
+        }
         u32 running = live_threads(p);
         u64 started = clock::uptime_ms();
         bool requested = kill(p);

@@ -5,6 +5,7 @@
 #include <cosmos/ringabort.hpp>
 #include <cosmos/entrycheck.hpp>
 #include <cosmos/procgroup.hpp>
+#include <cosmos/slotpub.hpp>
 #include <cosmos/handleabi.hpp>
 #include <cosmos/vmregion.hpp>
 #include <cosmos/apx.hpp>
@@ -12,6 +13,7 @@
 #include <cosmos/startup.hpp>
 #include <stdio.h>
 #include <pthread.h>
+#include <sched.h>
 
 static int g_failures = 0;
 
@@ -1527,6 +1529,127 @@ static void futex_abi_tests() {
     expect(userabi::FUTEX_FOREVER == ~0ull, "futex: all ones means wait without a timeout");
 }
 
+
+static void slotpub_sequential_tests() {
+    slotpub::Roster<4> r;
+    r.reset();
+    expect(r.count() == 0 && !r.visible(0) && !r.visible(3) && !r.visible(4), "slotpub: a fresh roster has nothing reserved and nothing visible");
+    expect(r.reserve() == 0 && r.reserve() == 1 && r.count() == 2, "slotpub: indices are handed out in order and counted");
+    expect(!r.visible(0) && !r.visible(1), "slotpub: a reserved slot is not visible until it is published");
+    r.publish(1);
+    expect(!r.visible(0) && r.visible(1), "slotpub: publishing one slot does not publish its neighbour");
+    expect(r.reserve() == 2 && r.reserve() == 3 && r.reserve() == 4 && r.reserve() == 4 && r.count() == 4, "slotpub: a full roster reports its size and stops counting");
+    expect(!r.visible(4) && !r.visible(~0u), "slotpub: an index past the end is never visible");
+    r.reset();
+    expect(r.count() == 0 && !r.visible(1), "slotpub: reset forgets every reservation and publication");
+}
+
+struct SlotPayload {
+    u64 a, b, c, d;
+};
+
+constexpr u32 SLOT_COUNT = 16;
+constexpr u32 SLOT_WRITERS = 4;
+
+struct SlotTable {
+    slotpub::Roster<SLOT_COUNT> roster;
+    SlotPayload slots[SLOT_COUNT];
+    bool publish_first;
+    volatile u32 finished_writers;
+    u32 seen_twice;
+    u32 torn;
+    u32 checked;
+    u32 owner[SLOT_COUNT];
+};
+
+static bool payload_whole(const SlotPayload& p) {
+    return p.a != 0 && p.b == ~p.a && p.c == p.a * 3 && p.d == (p.a ^ 0x5555555555555555ull);
+}
+
+static void* slot_writer(void* arg) {
+    SlotTable* t = static_cast<SlotTable*>(arg);
+    for (;;) {
+        u32 index = t->roster.reserve();
+        if (index >= SLOT_COUNT) break;
+        __atomic_add_fetch(&t->owner[index], 1u, __ATOMIC_RELAXED);
+        SlotPayload& p = t->slots[index];
+        u64 a = static_cast<u64>(index) + 1;
+        if (t->publish_first) t->roster.publish(index);
+        p.a = a;
+        sched_yield();
+        p.b = ~a;
+        sched_yield();
+        p.c = a * 3;
+        sched_yield();
+        p.d = a ^ 0x5555555555555555ull;
+        if (!t->publish_first) t->roster.publish(index);
+        sched_yield();
+    }
+    __atomic_add_fetch(&t->finished_writers, 1u, __ATOMIC_ACQ_REL);
+    return nullptr;
+}
+
+static void* slot_reader(void* arg) {
+    SlotTable* t = static_cast<SlotTable*>(arg);
+    while (__atomic_load_n(&t->finished_writers, __ATOMIC_ACQUIRE) < SLOT_WRITERS) {
+        u32 n = t->roster.count();
+        for (u32 i = 0; i < n; ++i) {
+            if (!t->roster.visible(i)) continue;
+            ++t->checked;
+            if (!payload_whole(t->slots[i])) ++t->torn;
+        }
+        sched_yield();
+    }
+    return nullptr;
+}
+
+static void slotpub_run(SlotTable& t, bool publish_first) {
+    t.roster.reset();
+    t.publish_first = publish_first;
+    t.finished_writers = 0;
+    t.seen_twice = 0;
+    t.torn = 0;
+    t.checked = 0;
+    for (u32 i = 0; i < SLOT_COUNT; ++i) {
+        t.slots[i] = SlotPayload{};
+        t.owner[i] = 0;
+    }
+    pthread_t writers[SLOT_WRITERS];
+    pthread_t reader;
+    pthread_create(&reader, nullptr, &slot_reader, &t);
+    for (u32 i = 0; i < SLOT_WRITERS; ++i) pthread_create(&writers[i], nullptr, &slot_writer, &t);
+    for (u32 i = 0; i < SLOT_WRITERS; ++i) pthread_join(writers[i], nullptr);
+    pthread_join(reader, nullptr);
+    for (u32 i = 0; i < SLOT_COUNT; ++i)
+        if (t.owner[i] != 1) ++t.seen_twice;
+}
+
+static void slotpub_race_tests() {
+    static SlotTable t;
+    u32 torn_total = 0;
+    u32 checked_total = 0;
+    u32 duplicate_total = 0;
+    bool all_published = true;
+    for (u32 round = 0; round < 200; ++round) {
+        slotpub_run(t, false);
+        torn_total += t.torn;
+        checked_total += t.checked;
+        duplicate_total += t.seen_twice;
+        for (u32 i = 0; i < SLOT_COUNT; ++i) all_published = all_published && t.roster.visible(i) && payload_whole(t.slots[i]);
+        all_published = all_published && t.roster.count() == SLOT_COUNT;
+    }
+    expect(duplicate_total == 0, "slotpub: 200 races of 4 writers, no index is ever handed to two of them");
+    expect(all_published, "slotpub: every slot ends published, whole, and the roster reports exactly its size");
+    expect(checked_total > 0 && torn_total == 0, "slotpub: a reader never sees a published slot that is only partly written");
+
+    u32 caught = 0;
+    for (u32 round = 0; round < 200 && caught == 0; ++round) {
+        slotpub_run(t, true);
+        caught += t.torn;
+    }
+    expect(caught > 0, "slotpub: publishing before the slot is written is caught by the same test (it has teeth)");
+}
+
 int main() {
     entry_fence_tests();
     range_tests();
@@ -1548,6 +1671,8 @@ int main() {
     clock_abi_tests();
     startup_tests();
     futex_abi_tests();
+    slotpub_sequential_tests();
+    slotpub_race_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }
