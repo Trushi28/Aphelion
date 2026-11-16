@@ -38,13 +38,13 @@ This series lets the kernel run unprivileged code in its own address space, ente
 - `syscall` runs with IF, TF, DF, AC, NT and IOPL cleared (`SFMASK`). Clearing AC matters because a user-set AC would turn SMAP off for the kernel.
 - The kernel never dereferences a user virtual address. `usercopy` translates each page through the process page tables and reads or writes through the direct map, so SMAP never needs to be lifted and a bad pointer cannot fault in ring 0.
 - `sysret` is used only when the return RIP is below the canonical hole. Otherwise the process is terminated, because `sysret` with a non-canonical RCX faults in ring 0 on Intel.
-- The flags `sysret` restores come from user-controlled R11 and are masked to the arithmetic flags plus IF.
+- The flags `sysret` restores come from user-controlled R11 and are masked with `SYSRET_KEEP` (`0xCD5`): carry, parity, auxiliary carry, zero, sign, direction and overflow are kept, and IF is always set. Direction and overflow are the process's own state, so keeping them costs nothing; trap, nested task, I/O privilege level and the rest are cleared.
 - Both interrupt entry stubs execute `lfence` after the conditional `swapgs` join point, so a mispredicted branch cannot run kernel code on a user GS base (the speculative-`swapgs` class). `syscall_entry` swaps unconditionally and needs no fence. The self-test reads the emitted bytes of `isr_common` and `isr_paranoid` and fails if an `lfence` does not follow the first `swapgs` within a few bytes, so removing the fence breaks the boot test.
 - The kernel stack for `syscall` comes from `CoreLocal.kernel_rsp`, which `gdt::set_kernel_stack` updates together with `TSS.rsp0` on every context switch.
 
-## Native syscall ABI (R subset)
+## Native syscall ABI
 
-Number in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, result in `rax`. Everything except `rax`, `rcx` and `r11` is preserved. Errors are small negative numbers.
+Number in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, result in `rax`. Everything except `rax`, `rcx` and `r11` is preserved. Errors are small negative numbers. This is the one table of all 39 calls, numbers 0 to 38; the sections below explain them.
 
 | Nr | Name | Arguments | Result |
 |---|---|---|---|
@@ -71,10 +71,26 @@ Number in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, result in `rax`. Eve
 | 20 | vm_unmap | address, pages | 0, or -13 if any page of the range is not mapped (nothing is changed) |
 | 21 | vm_protect | address, pages, protection | 0, or -13 if any page of the range is not mapped, -7 if the new protection is beyond what the mapping may have (nothing is changed) |
 | 22 | vmo_size | memory object handle | the size in pages, or -3 for a handle that is not a memory object |
+| 23 | file_open | dir, path, path_len, rights, out | 0, handle in `*out` |
+| 24 | file_read | handle, offset, buf, len | bytes read, 0 at end of file or when a pipe's writer is gone |
+| 25 | file_write | handle, offset, buf, len | bytes written |
+| 26 | file_stat | handle, out | 0, 32-byte record: size, mtime_ms, kind (0 file, 1 directory, 2 stream), links, flags |
+| 27 | file_create | dir, path, path_len, rights, flags, out | 0; flag 1 makes a directory and `out` is not written |
+| 28 | dir_entry | dir, index, out | 0 and a 280-byte record, or 1 when `index` is past the end |
+| 29 | pipe_create | capacity, out[2] | 0, read end then write end |
+| 30 | process_create | file, arg handle or 0, out, flags (0) | 0, process handle in `*out` |
+| 31 | process_status | process handle, out | 0 and the status as a 64-bit value, or -5 while it runs |
+| 32 | process_kill | process handle | 0, or -6 if it is already ending |
+| 33 | clock | out | 0 and a 32-byte record: uptime_ms, wall_ms (0 unless the wall clock is trusted), tsc_khz, flags (1 wall valid, 2 TSC usable) |
+| 34 | futex_wait | address, expected, timeout in ms or all ones for none | 0 when woken, -5 at once when the word no longer holds `expected`, -10 on timeout, -3 for an address that is null, not 4-byte aligned or not in user space |
+| 35 | futex_wake | address, count | 0, the number woken is not reported |
+| 36 | file_unlink | dir, path, path_len, flags | 0; flag 1 means the target must be a directory, flag 0 that it must be a file, and a mismatch is -16; -17 for a directory that is not empty, -18 for a node in use, -15 not found. Needs the Unlink right on `dir` |
+| 37 | file_rename | dir, from, from_len, to, to_len, flags | 0; both paths are relative to `dir` and may be in different directories of the same realm; flag 1 replaces an existing target, otherwise an existing target is -12. Needs the Rename right on `dir`, and Unlink as well when replacing |
+| 38 | file_resize | handle, size | 0; the handle needs Write |
 
 The GS and FS bases are per thread and independent of each other. A new thread reads 0 for both. A base need not point at mapped memory; an access through `gs:` or `fs:` to an unmapped address faults like any other. A Linux ELF executor uses FS for thread-local storage and a Windows PE host uses GS for the TEB, so both are native.
 
-Errors: -1 no such call, -2 bad pointer, -3 bad argument, -4 limit, -5 would block, -6 peer closed, -7 right missing or protection refused, -8 bad or stale handle, -9 message or buffer too big, -10 timed out, -11 cancelled, -12 address range already mapped, -13 address range not mapped.
+Errors: -1 no such call, -2 bad pointer, -3 bad argument, -4 limit, -5 would block, -6 peer closed, -7 right missing or protection refused, -8 bad or stale handle, -9 message or buffer too big, -10 timed out, -11 cancelled, -12 address range already mapped, -13 address range not mapped, -14 an image that fails validation, -15 not found, -16 wrong kind of object, -17 directory not empty, -18 node busy, -19 no space left. A call number of 39 or more returns -1.
 
 ## Handles and channels (H1)
 
@@ -157,24 +173,7 @@ Limits and things that are deliberately not done:
 
 A file or directory handle is a Lens like any other, so a process can only reach what it was handed. `file_open` and `file_create` take a directory handle and a relative path; the result can never be wider than the directory handle (rights are checked as a subset), `..`, absolute paths and a realm prefix are refused with -3, and a handle given to a process is the root of everything it can name. The new syscalls, 23 to 32:
 
-| nr | call | arguments | result |
-|---|---|---|---|
-| 23 | `file_open` | dir, path, path_len, rights, out | 0, handle in `*out` |
-| 24 | `file_read` | handle, offset, buf, len | bytes read, 0 at end of file or when a pipe's writer is gone |
-| 25 | `file_write` | handle, offset, buf, len | bytes written |
-| 26 | `file_stat` | handle, out | 0, 32-byte record: size, mtime_ms, kind (0 file, 1 directory, 2 stream), links, flags |
-| 27 | `file_create` | dir, path, path_len, rights, flags, out | 0; flag 1 makes a directory and `out` is not written |
-| 28 | `dir_entry` | dir, index, out | 0 and a 280-byte record, or 1 when `index` is past the end |
-| 29 | `pipe_create` | capacity, out[2] | 0, read end then write end |
-| 30 | `process_create` | file, arg handle or 0, out, flags (0) | 0, process handle in `*out` |
-| 31 | `process_status` | process handle, out | 0 and the status as a 64-bit value, or -5 while it runs |
-| 32 | `process_kill` | process handle | 0, or -6 if it is already ending |
-| 33 | `clock` | out | 0 and a 32-byte record: uptime_ms, wall_ms (0 unless the wall clock is trusted), tsc_khz, flags (1 wall valid, 2 TSC usable) |
-| 34 | `futex_wait` | address, expected, timeout in ms or all ones for none | 0 when woken, -5 at once when the word no longer holds `expected`, -10 on timeout, -3 for an address that is null, not 4-byte aligned or not in user space |
-| 35 | `futex_wake` | address, count | 0, the number woken is not reported |
-| 36 | `file_unlink` | dir, path, path_len, flags | 0; flag 1 means the target must be a directory, flag 0 that it must be a file, and a mismatch is -16; -17 for a directory that is not empty, -18 for a node in use, -15 not found. Needs the Unlink right on `dir` |
-| 37 | `file_rename` | dir, from, from_len, to, to_len, flags | 0; both paths are relative to `dir` and may be in different directories of the same realm; flag 1 replaces an existing target, otherwise an existing target is -12. Needs the Rename right on `dir`, and Unlink as well when replacing |
-| 38 | `file_resize` | handle, size | 0; the handle needs Write |
+The table of calls 23 to 38 is in [Native syscall ABI](#native-syscall-abi).
 
 New error codes: -14 for an image that fails validation, -15 not found, -16 wrong kind of object (a directory where a file is needed or the reverse), and since W5d.3 -17 for a directory that is not empty, -18 for a node that is busy and -19 for no space left. Everything else uses the codes from H1 and H2; -12 is "already exists" here too. A transfer moves at most 1024 bytes per call and returns the count, so callers loop. Pipes never block: an empty read or a full write returns -5, and `handle_wait` is how a process sleeps until a pipe is readable or writable. A pipe's read end carries Read and the write end carries Write, so the direction cannot be reversed by a process that holds only one end. A closed write end gives readers end-of-file once the buffer is drained; a closed read end makes writes return -6.
 
@@ -192,6 +191,27 @@ Limits and things that are deliberately not done:
 - A process can create children until the 16 process slots are gone, and there is no per-process quota. Child threads and memory are limited per process as before.
 - `process_create` itself still gives the child only the one handle. Arguments, environment and standard input travel on top of that handle, as the start-up contract below.
 - Nothing from R2.3 through H3 has been booted by me. The syscall handlers, `process_create` on real cores, kill-on-close from a dying parent and the lazy sweeper have been compiled and linked, and the ring-3 programs have run under an emulator against a model of the syscalls, but only your boots count.
+
+## The syscall fuzzer
+
+`userland/sysfuzz` is a ring-3 program that the boot self-test runs on every boot. It exits with status 0 when every check held and prints one summary line. It takes an optional seed as its first argument; the same seed gives the same sequence of calls, though thread timing still varies. It can also be started from the shell as `run sysfuzz [seed]`. In the sandbox that finished with status 0 on one core; on two cores one run took 16 seconds and others had not finished after 80 seconds, which is the two-core scheduling slowness described in the roadmap, not a hang in the program (a progress counter showed it advancing). It does these things:
+
+- **Garbage sweep.** About 6,000 calls to every call number except `exit`, `thread_exit` and `thread_create`, with arguments drawn from small numbers, all-ones, the user limit and the addresses just under it, kernel-half addresses, unmapped low pages, pointers into its own scratch buffer, handles that are live, handles that were closed, and random 64-bit values. Calls are reshaped now and then so that they get past argument checks (a real memory object for `vm_map`, a real channel for `channel_send`). Calls that could block are given a timeout of a few milliseconds or the non-blocking flag. Numbers past the table must return -1.
+- **Registers.** Every call runs through an assembly stub that loads known values into `rbx`, `rbp` and `r12` to `r15`, and the call's own arguments into the argument registers, and checks that all of them came back unchanged. Only `rax`, `rcx` and `r11` may change.
+- **Result range.** A result must be at least -19, and -1 is only allowed for a number past the table.
+- **Output buffers that run into an unmapped page.** For nine calls that write a result (`channel_create`, `vmo_create`, `handle_narrow`, `pipe_create`, `clock`, `file_stat`, `dir_entry`, `process_status`, `channel_recv`) the buffer starts in a mapped page and ends in an unmapped one. The call must return -2 and the mapped part must still hold its marker bytes; the same call on a fully mapped buffer must write.
+- **Handle slots.** The program counts how many channels it can create when it starts. After bad output pointers, after the whole sweep and after each race it counts again and the number must be the same, so a call that makes a handle and loses it is found without knowing which call it was.
+- **Copies racing unmaps.** A second thread maps and unmaps the page that `channel_create`, `vmo_create` and `handle_narrow` write to. The page is also mapped at a second, stable address, so the caller can read what the kernel wrote. A call that fails must have written nothing; a call that succeeds must have written handles that can be closed.
+- **Handles racing closes.** One thread closes and recreates handles while another uses them in `handle_info`, `handle_narrow`, `channel_send`, `channel_recv`, `handle_wait` and `handle_close`.
+- **Refusals.** `thread_create` with a null or kernel-half entry or stack, `thread_join` of an id that is zero, too large or the caller's own, a GS or FS base in the canonical hole, and `futex_wait` on null, unaligned and top-of-space addresses, each with the expected error.
+
+It was shown to fail when the kernel is wrong. A syscall that changed `rbx` was reported as a register anomaly. A user copy that wrote in two halves failed six of the nine buffer checks. `channel_create` and `handle_narrow` returned success without delivering their handles when the buffer was unmapped between the probe and the write (ENGINEERING 99); the fuzzer failed three checks on the old code with the window widened by a yield, and none after the fix.
+
+What it does not do:
+- About twenty of the 39 calls succeed at least once during a run; the rest are only seen refusing. `process_create`, `process_kill`, `file_*` and `dir_entry` need a file or process handle that the program does not have, so they only meet bad handles.
+- `exit` and `thread_exit` are not fuzzed, and `thread_create` is only fuzzed with arguments that must be refused, because a thread that starts at a bad address ends the whole process.
+- The races depend on timing. On one core the two threads yield to each other to alternate; on several cores they run for real, and the window in `channel_create` is a few instructions wide, so a clean run does not prove it is closed.
+- It has run only under QEMU, not on hardware.
 
 ## Building ring-3 programs (W2a)
 

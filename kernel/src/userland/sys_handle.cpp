@@ -39,7 +39,10 @@ i64 sys_handle_narrow(idt::Frame* f) {
     lens::Result<lens::Lens> r = lens::narrow(p->handles.domain, lens::Lens(f->rdi), lens::Rights::from_bits(static_cast<u32>(f->rsi)));
     if (!r.ok()) return handleabi::error_of(r.status());
     u64 raw = r.value().raw;
-    user_write(p, f->rdx, &raw, sizeof(raw));
+    if (!user_write(p, f->rdx, &raw, sizeof(raw))) {
+        (void)lens::close(p->handles.domain, r.value());
+        return userabi::ERR_FAULT;
+    }
     return 0;
 }
 
@@ -52,7 +55,12 @@ i64 sys_channel_create(idt::Frame* f) {
     if (!d.ok()) return handleabi::error_of(d.status());
     pair[0] = a.raw;
     pair[1] = b.raw;
-    user_write(p, f->rdi, pair, sizeof(pair));
+    if (!user_write(p, f->rdi, pair, sizeof(pair))) {
+        TableGuard guard(p->handles.lock);
+        (void)lens::close(p->handles.domain, a);
+        (void)lens::close(p->handles.domain, b);
+        return userabi::ERR_FAULT;
+    }
     return 0;
 }
 
@@ -120,7 +128,7 @@ i64 sys_handle_wait(idt::Frame* f) {
     lens::unpin(streams, static_cast<u32>(count));
     if (!r.ok()) return handleabi::error_of(r.status());
     for (u64 i = 0; i < count; ++i) entries[i].got = waits[i].got.bits;
-    user_write(p, f->rdi, entries, count * sizeof(handleabi::WaitEntry));
+    if (!user_write(p, f->rdi, entries, count * sizeof(handleabi::WaitEntry))) return userabi::ERR_FAULT;
     return static_cast<i64>(r.value());
 }
 

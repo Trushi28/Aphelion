@@ -13,6 +13,8 @@ extern "C" const u8 apx_echo_start[];
 extern "C" const u8 apx_echo_end[];
 extern "C" const u8 apx_pehost_start[];
 extern "C" const u8 apx_pehost_end[];
+extern "C" const u8 apx_sysfuzz_start[];
+extern "C" const u8 apx_sysfuzz_end[];
 extern "C" const u8 pe_console_start[];
 extern "C" const u8 pe_console_end[];
 extern "C" const u8 pe_k32_start[];
@@ -62,6 +64,7 @@ const Entry ENTRIES[] = {
     { "hello", apx_hello_start, apx_hello_end },
     { "echo", apx_echo_start, apx_echo_end },
     { "pehost", apx_pehost_start, apx_pehost_end },
+    { "sysfuzz", apx_sysfuzz_start, apx_sysfuzz_end },
     { "console.exe", pe_console_start, pe_console_end },
     { "k32.exe", pe_k32_start, pe_k32_end },
     { "teb.exe", pe_teb_start, pe_teb_end },

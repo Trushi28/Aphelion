@@ -28,6 +28,8 @@ extern "C" const u8 pe_files_start[];
 extern "C" const u8 pe_files_end[];
 extern "C" const u8 apx_pehost_start[];
 extern "C" const u8 apx_pehost_end[];
+extern "C" const u8 apx_sysfuzz_start[];
+extern "C" const u8 apx_sysfuzz_end[];
 extern "C" const u8 pe_console_start[];
 extern "C" const u8 pe_console_end[];
 extern "C" const u8 pe_k32_start[];
@@ -794,6 +796,7 @@ bool run_files() {
                put_apx(K.domain, apps, "bad", ublob_apxspin, ublob_apxspin_end, 0, nullptr, 0) &&
                lens::put(K.domain, apps, "hello", lens::ConstBytes(apx_hello_start, static_cast<usize>(apx_hello_end - apx_hello_start))).ok() &&
                put_blob(K.domain, apps, "pehost", apx_pehost_start, apx_pehost_end) &&
+               put_blob(K.domain, apps, "sysfuzz", apx_sysfuzz_start, apx_sysfuzz_end) &&
                put_blob(K.domain, apps, "console.exe", pe_console_start, pe_console_end) &&
                put_blob(K.domain, apps, "k32.exe", pe_k32_start, pe_k32_end) &&
                put_blob(K.domain, apps, "teb.exe", pe_teb_start, pe_teb_end) &&
@@ -851,6 +854,19 @@ bool run_files() {
         good = (p && reap(p)) && good;
         serial::printf("[userland] a C++ program built by the userland toolchain, with initialised data, zeroed data, floating point and a syscall: status %d%s\n",
                         status, good ? "" : "  <-- wrong");
+        ok = good && ok;
+    }
+    {
+        lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "sysfuzz", run);
+        i64 error = -1;
+        u64 started = clock::uptime_ms();
+        Process* p = f.ok() ? launch_file(nullptr, K, f.value(), nullptr, lens::Lens(), &error) : nullptr;
+        i32 status = -1;
+        bool good = p && wait(p, &status, WAIT_MS) && status == 0;
+        u64 took = clock::uptime_ms() - started;
+        good = (p && reap(p)) && good;
+        serial::printf("[userland] syscall fuzzer from ring 3 (garbage arguments to every call, output buffers across unmapped pages, copies racing unmaps, handles racing closes): status %d after %lu ms%s\n",
+                        status, took, good ? "" : "  <-- wrong");
         ok = good && ok;
     }
     {

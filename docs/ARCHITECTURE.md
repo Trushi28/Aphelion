@@ -73,7 +73,7 @@ protected and unmapped, and every core must see the change at once.
 into every new space, so a later kernel mapping is visible in all of them without touching any space. User spaces
 (`create_space`, `space_map`, `space_unmap`, `space_protect`, `activate`, `destroy_space`) only accept addresses
 below `USER_LIMIT`, set the U/S bit at every level, and refuse writable+executable mappings. A user-space change
-only shoots down the cores that currently have that space loaded. Nothing runs in ring 3 yet; this is the groundwork.
+only shoots down the cores that currently have that space loaded. Programs run in ring 3 in these spaces; see [RING3.md](RING3.md).
 
 **Firmware tables.** The direct map no longer aliases reserved memory above 4 GiB. `map_firmware()` hands out a
 pointer for any physical range: the direct-map address when it is already covered, otherwise an uncached,
@@ -83,11 +83,12 @@ read-only, non-executable window at `FIRMWARE_REGION_BASE`. ACPI parsing goes th
 boot stops with a message instead of quietly dropping the rest.
 
 **Known limits.** Firmware windows made by `map_firmware()` are never unmapped, and the window has a fixed budget. Page tables
-emptied by `unmap` are not freed. There is no page-fault handler yet, so any fault is a panic. Physical frames have no
+emptied by `unmap` are not freed. A page fault in the kernel is a panic; a fault taken in ring 3 ends the process (see [RING3.md](RING3.md)). Physical frames have no
 reference counts, so nothing can be shared copy-on-write. The DMA table holds at most 256 live buffers.
 
 **Per-core protections.** Besides NX, WP and PAT, each core turns on SMEP and SMAP when the CPU has them. SMAP is
-safe today because the kernel never touches user addresses; the copy-from-user path will need `stac`/`clac`.
+never lifted: the kernel does not touch user addresses directly. `usercopy` walks the process page tables and copies
+through the direct map, so no `stac`/`clac` is needed.
 
 ### Scheduler (Orbital)
 

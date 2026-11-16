@@ -21,8 +21,9 @@ A from-scratch, non-POSIX x86_64 operating system, written in C++20.
 
 Aphelion boots through [Limine](https://github.com/limine-bootloader/limine) into a higher-half
 freestanding kernel. It has no GRUB, no multiboot2, no legacy 8259 PIC and no VGA text mode. It is an
-early-stage hobby project: the kernel, scheduler, storage drivers and filesystem work, and there is
-no user space yet.
+early-stage hobby project: the kernel, scheduler, storage drivers and filesystem work, and programs
+run in ring 3 through a native syscall interface. A Windows (PE) program host runs in user space; no
+Linux or macOS loader exists yet.
 
 ## About
 
@@ -66,11 +67,13 @@ None of the following exists yet. This is the direction:
 
 - [x] Boot, memory management, SMP, scheduler
 - [x] Block drivers and Stellar FS
-- [ ] User space: ring 3, system calls, processes, IPC, ELF loader
+- [x] User space: ring 3, system calls, processes, threads, handles and channels, memory objects, files and pipes
+- [ ] ELF loader
+- [ ] PE loader: a user-space host runs small MinGW programs on Aphelion; an unmodified MSVC-built `ninja.exe` runs some commands under the host test harness only, and the C++ standard library DLL is not provided
+- [ ] Mach-O loader
 - [ ] Rust toolchain support and a service manager
 - [ ] Audio driver and voice pipeline
 - [ ] On-device model runtime
-- [ ] PE and Mach-O loaders
 
 ## Building
 
@@ -215,7 +218,9 @@ kernel/
     drivers/    framebuffer, serial, keyboard, input queue, klog, virtio-blk, AHCI, NVMe, xHCI, USB storage
     fs/         Stellar FS, the Nebula namespace and its realms
     shell/      Helm: parser, line editor, commands
+    userland/   ring 3: processes, threads, syscalls, fault policy, bundled programs
   include/cosmos/
+userland/       programs that run in ring 3: C runtime, hello, echo, the PE host, the syscall fuzzer
 tools/          host-side tests, the font baker, the CI boot and shell checks
 docs/
 ```
@@ -224,6 +229,8 @@ docs/
 
 - [Architecture](docs/ARCHITECTURE.md): memory, scheduler, drivers and interrupts
 - [Stellar FS](docs/STELLAR.md): filesystem design, snapshots and known limitations
+- [Ring 3](docs/RING3.md): the native syscall table, handles, threads, memory objects, files, fault policy
+- [Windows programs](docs/WINDOWS.md): the user-space PE host and what it does and does not support
 - [Engineering notes](docs/ENGINEERING.md): bugs found and fixed along the way
 
 ## License

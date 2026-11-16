@@ -14,6 +14,7 @@ global %1_end
 embed apx_hello, "userland/hello.apx"
 embed apx_echo, "userland/echo.apx"
 embed apx_pehost, "userland/pehost.apx"
+embed apx_sysfuzz, "userland/sysfuzz.apx"
 embed pe_console, "console.exe"
 embed pe_k32, "k32.exe"
 embed pe_teb, "teb.exe"

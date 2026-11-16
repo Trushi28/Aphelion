@@ -85,7 +85,7 @@ TEST_ISO := $(BUILD)/aphelion-test.iso
 BUILD_ASM_DEPS := $(BUILD)/$(KDIR)/src/console/fontblob.o
 
 USER_DIR := $(BUILD)/userland
-USER_PROGRAMS := hello echo pehost
+USER_PROGRAMS := hello echo pehost sysfuzz
 USER_CXX ?= g++
 USER_FLAGS := -std=c++20 -O2 -Wall -Wextra -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pic -fno-pie \
               -fno-threadsafe-statics -nostdlib -static -no-pie -Wl,-z,max-page-size=0x1000 -Wl,-z,norelro -Wl,--build-id=none \

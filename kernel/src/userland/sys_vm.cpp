@@ -140,4 +140,3 @@ static_assert(vmregion::PTE_WRITABLE == constellation::WRITABLE && vmregion::PTE
               "the region table's page flags must match the VMM");
 
 static_assert(userabi::USER_LIMIT == constellation::USER_LIMIT, "the native ABI and the VMM must agree on the user limit");
-
