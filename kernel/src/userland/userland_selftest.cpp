@@ -778,7 +778,7 @@ bool run_files() {
     lens::Lens root = rootr.value();
     (void)lens::remove_tree(K.domain, root, "h3-selftest");
     ok = lens::mkdir(K.domain, root, "h3-selftest").ok() && lens::mkdir(K.domain, root, "h3-selftest/apps").ok() &&
-         lens::mkdir(K.domain, root, "h3-selftest/work").ok();
+         lens::mkdir(K.domain, root, "h3-selftest/work").ok() && lens::mkdir(K.domain, root, "h3-selftest/fuzz").ok();
     lens::Result<lens::Lens> appsr = lens::open_at(K.domain, root, "h3-selftest/apps", lens::Rights::all());
     if (!ok || !appsr.ok()) {
         serial::writeln("[userland] file cases: could not prepare the test directories");
@@ -858,16 +858,27 @@ bool run_files() {
     }
     {
         lens::Result<lens::Lens> f = lens::open_at(K.domain, apps, "sysfuzz", run);
+        lens::Result<lens::Lens> fuzzdir = lens::open_at(K.domain, root, "h3-selftest/fuzz", lens::Rights::all());
+        lens::Result<lens::Lens> scratch = fuzzdir.ok() ? lens::narrow(K.domain, fuzzdir.value(), lens::RIGHTS_READ_WRITE | lens::Right::Delegate) : lens::Result<lens::Lens>::fail(lens::Status::Denied);
+        lens::Result<lens::Lens> given = lens::narrow(K.domain, apps, lens::Right::Read | lens::Right::Enumerate | lens::Right::Execute | lens::Right::Delegate);
         i64 error = -1;
         u64 started = clock::uptime_ms();
-        Process* p = f.ok() ? launch_file(nullptr, K, f.value(), nullptr, lens::Lens(), &error) : nullptr;
+        Process* p = f.ok() && scratch.ok() && given.ok() ? launch_file(nullptr, K, f.value(), &K, scratch.value(), &error, given.value()) : nullptr;
         i32 status = -1;
-        bool good = p && wait(p, &status, WAIT_MS) && status == 0;
+        if (!p) serial::printf("[userland] syscall fuzzer could not be launched: error %ld\n", error);
+        bool good = p && wait(p, &status, 90000) && status == 0;
         u64 took = clock::uptime_ms() - started;
         good = (p && reap(p)) && good;
-        serial::printf("[userland] syscall fuzzer from ring 3 (garbage arguments to every call, output buffers across unmapped pages, copies racing unmaps, handles racing closes): status %d after %lu ms%s\n",
-                        status, took, good ? "" : "  <-- wrong");
-        ok = good && ok;
+        bool contained = !lens::open_at(K.domain, root, "h3-selftest/sysfuzz-esc", lens::Right::Read).ok() &&
+                         !lens::open_at(K.domain, root, "sysfuzz-esc", lens::Right::Read).ok() &&
+                         !lens::open_at(K.domain, apps, "sysfuzz-esc", lens::Right::Read).ok();
+        for (u32 i = 0; i < 300 && live_processes() != 0; ++i) {
+            (void)sweep_detached();
+            if (live_processes() != 0) orbital::sleep_ms(10);
+        }
+        serial::printf("[userland] syscall fuzzer from ring 3 (garbage arguments to every call, output buffers across unmapped pages, copies racing unmaps, handles racing closes, a scratch directory, pipes, child processes): status %d after %lu ms, nothing created outside its directory: %s, no process left: %s%s\n",
+                        status, took, contained ? "yes" : "NO", live_processes() == 0 ? "yes" : "NO", good && contained && live_processes() == 0 ? "" : "  <-- wrong");
+        ok = good && contained && live_processes() == 0 && ok;
     }
     {
         bool pe = run_pe(K, root, apps, "console.exe", 9);
