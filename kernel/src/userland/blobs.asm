@@ -1357,12 +1357,7 @@ BLOB futexexit
     mov r15, DATA
     mov dword [r15 + 0x100], 0
     TSPAWNL .child, STK0, 1
-    mov r12d, 3000
-.spin:
-    mov eax, SYS_YIELD
-    syscall
-    dec r12d
-    jnz .spin
+    SC SYS_FUTEX_WAIT, DATA+0x140, 0, 100, 0, 0, 0
     EXIT 0
 .child:
     SC SYS_FUTEX_WAIT, DATA+0x100, 0, -1, 0, 0, 0

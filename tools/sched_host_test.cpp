@@ -38,6 +38,24 @@ static void bootcfg_tests() {
     expect(c.storage == Storage::Off && c.rejected == 1, "bootcfg: usb must match exactly and falls back to the safe default");
     expect(__builtin_strcmp(name(Storage::Usb), "usb") == 0 && __builtin_strcmp(name(Storage::Off), "off") == 0 && __builtin_strcmp(name(Storage::Auto), "auto") == 0,
            "bootcfg: storage names round-trip");
+    c = parse("mode=test sysfuzz_seed=12345");
+    expect(c.sysfuzz_seed == 12345 && c.mode == Mode::Test && c.rejected == 0, "bootcfg: sysfuzz_seed takes a decimal number");
+    c = parse("mode=test");
+    expect(c.sysfuzz_seed == 0, "bootcfg: the fuzzer seed defaults to zero");
+    c = parse("sysfuzz_seed=18446744073709551615");
+    expect(c.sysfuzz_seed == 18446744073709551615ull && c.rejected == 0, "bootcfg: the largest 64-bit seed is accepted");
+    c = parse("sysfuzz_seed=18446744073709551616");
+    expect(c.sysfuzz_seed == 0 && c.rejected == 1, "bootcfg: a seed that does not fit 64 bits is rejected");
+    c = parse("sysfuzz_seed=99999999999999999999999");
+    expect(c.sysfuzz_seed == 0 && c.rejected == 1, "bootcfg: a seed far past 64 bits is rejected");
+    c = parse("sysfuzz_seed=12x4");
+    expect(c.sysfuzz_seed == 0 && c.rejected == 1, "bootcfg: a seed with a non-digit is rejected");
+    c = parse("sysfuzz_seed=-5");
+    expect(c.sysfuzz_seed == 0 && c.rejected == 1, "bootcfg: a negative seed is rejected");
+    c = parse("sysfuzz_seed=");
+    expect(c.sysfuzz_seed == 0 && c.rejected == 1, "bootcfg: an empty seed is rejected");
+    c = parse("sysfuzz_seed=7 sysfuzz_seed=9");
+    expect(c.sysfuzz_seed == 9 && c.rejected == 0, "bootcfg: the last seed given wins");
     c = parse("timer=hpet");
     expect(c.timer == TimerPref::Hpet, "bootcfg: timer=hpet");
     c = parse("timer=pm");

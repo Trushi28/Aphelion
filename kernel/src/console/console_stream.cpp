@@ -1,5 +1,5 @@
 #include <cosmos/console_stream.hpp>
-#include <cosmos/corona.hpp>
+#include <cosmos/cornea.hpp>
 #include <cosmos/input.hpp>
 #include <cosmos/serial.hpp>
 
@@ -27,7 +27,7 @@ public:
         while (done < src.len) {
             u32 chunk = src.len - done > 4096 ? 4096 : static_cast<u32>(src.len - done);
             const char* text = reinterpret_cast<const char*>(src.ptr) + done;
-            corona::write(text, chunk);
+            cornea::write(text, chunk);
             serial::console_write(text, chunk);
             done += chunk;
         }

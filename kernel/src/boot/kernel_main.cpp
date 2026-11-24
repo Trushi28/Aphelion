@@ -24,7 +24,7 @@
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/lens_text.hpp>
 #include <cosmos/console_stream.hpp>
-#include <cosmos/corona.hpp>
+#include <cosmos/cornea.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
 #include <cosmos/ahci.hpp>
@@ -235,10 +235,10 @@ static void boot_framebuffer(BootState& s) {
     info.blue_shift = lfb->blue_mask_shift;
     s.console_started = fb::init(info);
     if (!s.console_started)
-        serial::writeln("[boot] the Corona console could not start (the framebuffer is not 32 bits per pixel with an aligned pitch); continuing on serial only");
+        serial::writeln("[boot] the Cornea console could not start (the framebuffer is not 32 bits per pixel with an aligned pitch); continuing on serial only");
     fb::clear(0x0A0A14);
     fb::printf(0x8FD3FF, "Aphelion\n");
-    fb::printf(0xB0B0C0, "non-POSIX x86_64 kernel -- Corona console online\n\n");
+    fb::printf(0xB0B0C0, "non-POSIX x86_64 kernel -- Cornea console online\n\n");
 
     serial::printf("[boot] framebuffer %lux%lu @ %u bpp\n", info.width, info.height, info.bpp);
 }
@@ -333,15 +333,15 @@ static void boot_heap() {
 static void boot_console_buffer(const BootState& s) {
     if (s.console_started) {
         bool buffered = fb::enable_backbuffer();
-        corona::Metrics cm = corona::metrics();
-        serial::printf("[console] Corona %lux%lu cells of %lux%lu px on a %lux%lu framebuffer, %s\n",
+        cornea::Metrics cm = cornea::metrics();
+        serial::printf("[console] Cornea %lux%lu cells of %lux%lu px on a %lux%lu framebuffer, %s\n",
                         static_cast<u64>(cm.cols), static_cast<u64>(cm.rows), static_cast<u64>(cm.cell_w), static_cast<u64>(cm.cell_h),
                         cm.fb_width, cm.fb_height,
                         buffered ? "RAM backbuffer on (the write-combined framebuffer is only ever written)" : "no backbuffer, drawing straight to the framebuffer");
         u32 history = fb::enable_scrollback();
         if (history) serial::printf("[console] scrollback holds %lu lines\n", static_cast<u64>(history));
         else serial::writeln("[console] scrollback unavailable, PageUp does nothing");
-        bool console_ok = corona::selftest();
+        bool console_ok = cornea::selftest();
         serial::printf("[selftest] console: %s\n", console_ok ? "ok" : "MISMATCH");
     }
 }
@@ -608,7 +608,7 @@ static void boot_start_scheduler(const BootState& s) {
     fb::printf(0x8FD3FF, "\nOrbital scheduler: bringing up this core...\n");
     clock::sync();
     orbital::init_core();
-    corona::enable_locking();
+    cornea::enable_locking();
     if (s.test_mode) boottest::spawn_test_tasks();
 }
 

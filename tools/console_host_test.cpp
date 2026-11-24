@@ -1,8 +1,8 @@
-#define CORONA_HOST_TEST 1
+#define CORNEA_HOST_TEST 1
 #include <cosmos/types.hpp>
-#include "../kernel/src/console/corona_font.cpp"
+#include "../kernel/src/console/cornea_font.cpp"
 #include "../kernel/src/console/term.cpp"
-#include "../kernel/src/console/corona.cpp"
+#include "../kernel/src/console/cornea.cpp"
 #include <stdio.h>
 #include <stdlib.h>
 #include <initializer_list>
@@ -91,7 +91,7 @@ static void expect(bool cond, const char* what) {
 }
 
 static bool load_blob() {
-    FILE* f = fopen("kernel/data/corona-fonts.bin", "rb");
+    FILE* f = fopen("kernel/data/cornea-fonts.bin", "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
@@ -149,7 +149,7 @@ static void utf8_tests() {
 static term::Cell g_grid[40 * 12];
 static term::Terminal g_t;
 
-static term::Palette test_palette() { return corona::theme(); }
+static term::Palette test_palette() { return cornea::theme(); }
 
 static void fresh(u32 cols = 20, u32 rows = 6) {
     g_t.init(g_grid, cols, rows, test_palette());
@@ -374,13 +374,13 @@ struct Screen {
         info.red_shift = 16;
         info.green_shift = 8;
         info.blue_shift = 0;
-        if (!corona::init(info, g_blob.data(), g_blob.size())) {
-            printf("corona init failed\n");
+        if (!cornea::init(info, g_blob.data(), g_blob.size())) {
+            printf("cornea init failed\n");
             exit(2);
         }
         if (backbuffer) {
             back.assign(static_cast<size_t>(width) * height, 0);
-            corona::enable_backbuffer(back.data(), back.size() * 4);
+            cornea::enable_backbuffer(back.data(), back.size() * 4);
         }
     }
     Vec<u32> visible() const {
@@ -394,8 +394,8 @@ struct Screen {
 };
 
 static Vec<u32> full_redraw_snapshot(Screen& s) {
-    corona::terminal().mark_all_dirty();
-    corona::flush();
+    cornea::terminal().mark_all_dirty();
+    cornea::flush();
     return s.visible();
 }
 
@@ -437,32 +437,32 @@ static void random_stream(Str& out, unsigned& seed, int n) {
 
 static void render_tests() {
     Screen s(800, 480, true);
-    corona::Metrics m = corona::metrics();
-    expect(m.cell_w == 9 && m.cell_h == 20 && m.cols == 86 && m.rows == 23 && m.backbuffer, "corona: the small face and grid size for an 800x480 screen");
+    cornea::Metrics m = cornea::metrics();
+    expect(m.cell_w == 9 && m.cell_h == 20 && m.cols == 86 && m.rows == 23 && m.backbuffer, "cornea: the small face and grid size for an 800x480 screen");
 
     u32 bg = 0x0A0A14;
     bool margin_clear = true;
     for (u32 x = 0; x < 800; ++x) if (s.at(x, 0) != bg) margin_clear = false;
-    expect(margin_clear, "corona: the margins are filled with the void colour");
+    expect(margin_clear, "cornea: the margins are filled with the void colour");
 
-    corona::write("A");
+    cornea::write("A");
     u32 ox = (800 - m.cols * 9) / 2, oy = (480 - m.rows * 20) / 2;
     int ink = 0;
     for (u32 y = 0; y < 20; ++y)
         for (u32 x = 0; x < 9; ++x)
             if (s.at(ox + x, oy + y) != bg) ++ink;
-    expect(ink > 12 && ink < 160, "corona: a glyph puts ink in its cell");
-    expect(s.at(ox + 9 + 1, oy + 2) == 0xFFB347, "corona: the cursor is a filled amber block on the next cell");
-    corona::write("\x1b[2J\x1b[H");
+    expect(ink > 12 && ink < 160, "cornea: a glyph puts ink in its cell");
+    expect(s.at(ox + 9 + 1, oy + 2) == 0xFFB347, "cornea: the cursor is a filled amber block on the next cell");
+    cornea::write("\x1b[2J\x1b[H");
 
-    expect(corona::selftest(), "corona: the boot self-test passes");
+    expect(cornea::selftest(), "cornea: the boot self-test passes");
 
     unsigned seed = 12345;
     bool all_equal = true;
     for (int trial = 0; trial < 40 && all_equal; ++trial) {
         Str stream;
         random_stream(stream, seed, 60 + trial * 7);
-        corona::write(stream.c_str(), static_cast<u32>(stream.size()));
+        cornea::write(stream.c_str(), static_cast<u32>(stream.size()));
         Vec<u32> incremental = s.visible();
         Vec<u32> redraw = full_redraw_snapshot(s);
         if (incremental != redraw) {
@@ -470,14 +470,14 @@ static void render_tests() {
             all_equal = false;
         }
     }
-    expect(all_equal, "corona: incremental rendering with pixel scrolling equals a full redraw");
+    expect(all_equal, "cornea: incremental rendering with pixel scrolling equals a full redraw");
 
     Vec<u32> shown = s.visible();
     bool back_matches = true;
     for (size_t i = 0; i < shown.size(); ++i) if (shown[i] != s.back[i]) { back_matches = false; break; }
-    expect(back_matches, "corona: the screen shows exactly what the backbuffer holds");
+    expect(back_matches, "cornea: the screen shows exactly what the backbuffer holds");
 
-    corona::write("\x1b[2J\x1b[H\x1b[?25h");
+    cornea::write("\x1b[2J\x1b[H\x1b[?25h");
     {
         unsigned seed3 = 4242;
         bool eq = true;
@@ -491,7 +491,7 @@ static void render_tests() {
                 if (j < stream.size() && d[i] == 0x1b) ++j;
                 else if ((static_cast<unsigned char>(d[i]) & 0xC0) == 0xC0)
                     while (j < stream.size() && (static_cast<unsigned char>(d[j]) & 0xC0) == 0x80) ++j;
-                corona::write(stream.c_str() + i, static_cast<u32>(j - i));
+                cornea::write(stream.c_str() + i, static_cast<u32>(j - i));
                 i = j;
                 {
                     Vec<u32> inc = s.visible();
@@ -504,17 +504,17 @@ static void render_tests() {
                 }
             }
         }
-        expect(eq, "corona: key-by-key editing equals a full redraw at every step");
+        expect(eq, "cornea: key-by-key editing equals a full redraw at every step");
     }
-    corona::write("\x1b[?25h\x1b[2J\x1b[H");
+    cornea::write("\x1b[?25h\x1b[2J\x1b[H");
     for (int i = 0; i < 400; ++i) {
         char line[64];
         snprintf(line, sizeof(line), "line %d \xE2\x95\x91 \xCE\xA9\n", i);
-        corona::write(line);
+        cornea::write(line);
     }
     Vec<u32> after = s.visible();
     Vec<u32> redraw = full_redraw_snapshot(s);
-    expect(after == redraw, "corona: a long scrolling run ends identical to a full redraw");
+    expect(after == redraw, "cornea: a long scrolling run ends identical to a full redraw");
 
     {
         Screen direct(800, 480, false, 16);
@@ -523,28 +523,28 @@ static void render_tests() {
         for (int trial = 0; trial < 25 && eq; ++trial) {
             Str stream;
             random_stream(stream, seed2, 80);
-            corona::write(stream.c_str(), static_cast<u32>(stream.size()));
+            cornea::write(stream.c_str(), static_cast<u32>(stream.size()));
             Vec<u32> inc = direct.visible();
             Vec<u32> full = full_redraw_snapshot(direct);
             if (inc != full) eq = false;
         }
-        expect(eq, "corona: direct mode with a padded pitch equals a full redraw");
-        corona::write("\x1b[2J\x1b[H");
-        corona::write("x");
-        expect(corona::selftest() == false, "corona: the self-test refuses to run away from the start of a line");
+        expect(eq, "cornea: direct mode with a padded pitch equals a full redraw");
+        cornea::write("\x1b[2J\x1b[H");
+        cornea::write("x");
+        expect(cornea::selftest() == false, "cornea: the self-test refuses to run away from the start of a line");
     }
 
     {
         Screen big(1920, 1200, true);
-        corona::Metrics bm = corona::metrics();
-        expect(bm.cell_w == 11 && bm.cell_h == 24 && bm.cols == 172 && bm.rows == 49, "corona: the medium face for a 1920x1200 panel");
-        corona::write("\x1b[1;38;2;255;179;71mAphelion\x1b[0m \xE2\x82\xB9\n");
-        expect(corona::selftest(), "corona: the self-test passes on the medium face");
+        cornea::Metrics bm = cornea::metrics();
+        expect(bm.cell_w == 11 && bm.cell_h == 24 && bm.cols == 172 && bm.rows == 49, "cornea: the medium face for a 1920x1200 panel");
+        cornea::write("\x1b[1;38;2;255;179;71mAphelion\x1b[0m \xE2\x82\xB9\n");
+        expect(cornea::selftest(), "cornea: the self-test passes on the medium face");
     }
     {
         Screen huge(3840, 2160, true);
-        corona::Metrics hm = corona::metrics();
-        expect(hm.cell_w == 14 && hm.cell_h == 31 && hm.cols <= term::MAX_COLS && hm.rows <= term::MAX_ROWS, "corona: the large face for a 4K panel stays within the grid limits");
+        cornea::Metrics hm = cornea::metrics();
+        expect(hm.cell_w == 14 && hm.cell_h == 31 && hm.cols <= term::MAX_COLS && hm.rows <= term::MAX_ROWS, "cornea: the large face for a 4K panel stays within the grid limits");
     }
     {
         fb::Info bad{};
@@ -552,9 +552,9 @@ static void render_tests() {
         mem.assign(64 * 64, 0);
         bad.base = reinterpret_cast<volatile u8*>(mem.data());
         bad.width = 64; bad.height = 64; bad.pitch = 256; bad.bpp = 24;
-        expect(!corona::init(bad, g_blob.data(), g_blob.size()), "corona: a framebuffer that is not 32 bits per pixel is refused");
+        expect(!cornea::init(bad, g_blob.data(), g_blob.size()), "cornea: a framebuffer that is not 32 bits per pixel is refused");
         bad.bpp = 32; bad.pitch = 258;
-        expect(!corona::init(bad, g_blob.data(), g_blob.size()), "corona: an unaligned pitch is refused");
+        expect(!cornea::init(bad, g_blob.data(), g_blob.size()), "cornea: an unaligned pitch is refused");
     }
 }
 
@@ -562,80 +562,80 @@ static void scrollback_render_tests() {
     Screen s(800, 480, true);
     Vec<term::Cell> mem;
     mem.assign(static_cast<size_t>(200) * 86, term::Cell{});
-    u32 lines = corona::enable_scrollback(mem.data(), mem.size() * sizeof(term::Cell));
-    expect(lines == 200, "corona: scrollback sizes itself from the memory it is given");
-    expect(corona::scrollback_bytes_per_line() == 86 * sizeof(term::Cell), "corona: one history line costs one row of cells");
+    u32 lines = cornea::enable_scrollback(mem.data(), mem.size() * sizeof(term::Cell));
+    expect(lines == 200, "cornea: scrollback sizes itself from the memory it is given");
+    expect(cornea::scrollback_bytes_per_line() == 86 * sizeof(term::Cell), "cornea: one history line costs one row of cells");
 
     for (int i = 0; i < 100; ++i) {
         char line[64];
         snprintf(line, sizeof(line), "scroll line %d\n", i);
-        corona::write(line);
+        cornea::write(line);
     }
-    expect(corona::scrollback_lines() == 78 && corona::view_offset() == 0, "corona: lines that scrolled away are counted");
+    expect(cornea::scrollback_lines() == 78 && cornea::view_offset() == 0, "cornea: lines that scrolled away are counted");
     Vec<u32> live = s.visible();
     u32 amber_live = 0;
     for (size_t i = 0; i < live.size(); ++i) if (live[i] == 0xFFB347) ++amber_live;
-    expect(amber_live > 0, "corona: the cursor shows at the bottom");
+    expect(amber_live > 0, "cornea: the cursor shows at the bottom");
 
     bool steps_equal = true;
     const i32 moves[] = {1, 5, 21, 30, -3, -40, 100, 2, -1, -200};
     for (i32 mv : moves) {
-        corona::scroll_view(mv);
+        cornea::scroll_view(mv);
         Vec<u32> inc = s.visible();
         if (inc != full_redraw_snapshot(s)) { printf("  view differs after moving %d\n", mv); steps_equal = false; }
     }
-    expect(steps_equal, "corona: every scroll step equals a full redraw");
-    expect(corona::view_offset() == 0 && s.visible() == live, "corona: scrolling back to the bottom restores the exact live screen");
+    expect(steps_equal, "cornea: every scroll step equals a full redraw");
+    expect(cornea::view_offset() == 0 && s.visible() == live, "cornea: scrolling back to the bottom restores the exact live screen");
 
-    corona::scroll_view(10);
+    cornea::scroll_view(10);
     Vec<u32> back = s.visible();
     u32 amber_back = 0;
     for (size_t i = 0; i < back.size(); ++i) if (back[i] == 0xFFB347) ++amber_back;
-    expect(back != live && amber_back == 0, "corona: the view differs from the live screen and the cursor is hidden");
+    expect(back != live && amber_back == 0, "cornea: the view differs from the live screen and the cursor is hidden");
     bool matches = true;
     for (size_t i = 0; i < back.size(); ++i) if (back[i] != s.back[i]) { matches = false; break; }
-    expect(matches, "corona: the screen shows what the backbuffer holds while scrolled back");
+    expect(matches, "cornea: the screen shows what the backbuffer holds while scrolled back");
 
-    corona::write("x");
-    expect(corona::view_offset() == 0, "corona: output snaps the view to the bottom");
+    cornea::write("x");
+    expect(cornea::view_offset() == 0, "cornea: output snaps the view to the bottom");
     Vec<u32> after = s.visible();
-    expect(after == full_redraw_snapshot(s), "corona: the snapped screen equals a full redraw");
+    expect(after == full_redraw_snapshot(s), "cornea: the snapped screen equals a full redraw");
 
-    expect(!corona::scroll_view(-1) && corona::snap_to_live() == false, "corona: nothing to do at the bottom");
-    corona::scroll_view(7);
-    expect(corona::snap_to_live() && corona::view_offset() == 0, "corona: snap_to_live returns to the bottom");
+    expect(!cornea::scroll_view(-1) && cornea::snap_to_live() == false, "cornea: nothing to do at the bottom");
+    cornea::scroll_view(7);
+    expect(cornea::snap_to_live() && cornea::view_offset() == 0, "cornea: snap_to_live returns to the bottom");
 
     unsigned seed = 99;
     bool eq = true;
     for (int trial = 0; trial < 30 && eq; ++trial) {
         Str stream;
         random_stream(stream, seed, 80);
-        corona::write(stream.c_str(), static_cast<u32>(stream.size()));
-        if (trial % 3 == 0) corona::scroll_view(1 + trial);
+        cornea::write(stream.c_str(), static_cast<u32>(stream.size()));
+        if (trial % 3 == 0) cornea::scroll_view(1 + trial);
         if (s.visible() != full_redraw_snapshot(s)) { printf("  scrollback trial %d differs\n", trial); eq = false; }
     }
-    expect(eq, "corona: random output with scrolling and scrollback equals a full redraw");
+    expect(eq, "cornea: random output with scrolling and scrollback equals a full redraw");
 
-    corona::write("\x1b[0m\x1b[r\x1b[?7h\x1b[2J\x1b[H\x1b[?25h");
-    corona::write("\x1b[41m  \x1b[0mX");
+    cornea::write("\x1b[0m\x1b[r\x1b[?7h\x1b[2J\x1b[H\x1b[?25h");
+    cornea::write("\x1b[41m  \x1b[0mX");
     const u32 ox = (800 - 86 * 9) / 2, oy = (480 - 23 * 20) / 2;
     bool red = true;
     for (u32 y = 0; y < 20; ++y)
         for (u32 x = 0; x < 18; ++x)
             if (s.at(ox + x, oy + y) != 0xFF6B7A) red = false;
-    expect(red, "corona: a run of coloured blanks fills exactly its cells");
-    expect(s.at(ox + 36, oy + 0) == 0x0A0A14 && s.at(ox - 1, oy + 5) == 0x0A0A14, "corona: and nothing around it");
-    expect(s.visible() == full_redraw_snapshot(s), "corona: the run survives a full redraw");
+    expect(red, "cornea: a run of coloured blanks fills exactly its cells");
+    expect(s.at(ox + 36, oy + 0) == 0x0A0A14 && s.at(ox - 1, oy + 5) == 0x0A0A14, "cornea: and nothing around it");
+    expect(s.visible() == full_redraw_snapshot(s), "cornea: the run survives a full redraw");
 }
 
 static int ink_of(const u8* g, u32 n) {
     int total = 0;
-    for (u32 i = 0; i < n; ++i) total += corona::font::coverage(g, i);
+    for (u32 i = 0; i < n; ++i) total += cornea::font::coverage(g, i);
     return total;
 }
 
 static void font_tests() {
-    using namespace corona::font;
+    using namespace cornea::font;
     expect(load(g_blob.data(), g_blob.size()) && face_count() == 3, "font: the baked blob loads with three faces");
     expect(!load(g_blob.data(), 200), "font: a truncated blob is refused");
     Vec<u8> corrupt = g_blob;
@@ -719,7 +719,7 @@ static void font_tests() {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (!load_blob()) {
-        printf("cannot read kernel/data/corona-fonts.bin (run from the repository root)\n");
+        printf("cannot read kernel/data/cornea-fonts.bin (run from the repository root)\n");
         return 2;
     }
     utf8_tests();

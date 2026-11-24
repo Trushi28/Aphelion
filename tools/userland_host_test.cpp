@@ -1650,6 +1650,153 @@ static void slotpub_race_tests() {
     expect(caught > 0, "slotpub: publishing before the slot is written is caught by the same test (it has teeth)");
 }
 
+
+struct SyscallRows {
+    u32 count;
+    u64 number[64];
+    char name[64][32];
+};
+
+static usize read_whole_file(const char* path, char* buffer, usize capacity) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    usize n = fread(buffer, 1, capacity - 1, f);
+    fclose(f);
+    buffer[n] = 0;
+    return n;
+}
+
+static bool name_char(char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; }
+
+static bool starts_with_at(const char* text, const char* word) {
+    for (; *word; ++word, ++text)
+        if (*text != *word) return false;
+    return true;
+}
+
+static void rows_from_doc(const char* text, SyscallRows* out) {
+    out->count = 0;
+    const char* section = nullptr;
+    for (const char* p = text; *p; ++p)
+        if ((p == text || p[-1] == '\n') && starts_with_at(p, "## Native syscall ABI")) {
+            section = p;
+            break;
+        }
+    if (!section) return;
+    for (const char* p = section; *p;) {
+        const char* line = p;
+        if (line != section && starts_with_at(line, "## ")) break;
+        if (line[0] == '|' && line[1] == ' ' && line[2] >= '0' && line[2] <= '9') {
+            const char* q = line + 2;
+            u64 n = 0;
+            while (*q >= '0' && *q <= '9') n = n * 10 + static_cast<u64>(*q++ - '0');
+            if (q[0] == ' ' && q[1] == '|' && q[2] == ' ' && out->count < 64) {
+                q += 3;
+                u32 len = 0;
+                while (name_char(*q) && len < 31) out->name[out->count][len++] = *q++;
+                out->name[out->count][len] = 0;
+                out->number[out->count++] = n;
+            }
+        }
+        while (*p && *p != '\n') ++p;
+        if (*p) ++p;
+    }
+}
+
+static void rows_from_dispatch_source(const char* text, SyscallRows* out) {
+    out->count = 0;
+    const char* p = text;
+    for (; *p; ++p)
+        if (starts_with_at(p, "g_table[")) break;
+    for (; *p && out->count < 64; ++p) {
+        if (p[0] == '&' && starts_with_at(p + 1, "sys_")) {
+            const char* q = p + 5;
+            u32 len = 0;
+            while (name_char(*q) && len < 31) out->name[out->count][len++] = *q++;
+            out->name[out->count][len] = 0;
+            out->number[out->count] = out->count;
+            ++out->count;
+        }
+        if (p[0] == '}' && p[1] == ';') break;
+    }
+}
+
+static void rows_from_abi_header(const char* text, SyscallRows* out) {
+    out->count = 0;
+    for (const char* p = text; *p && out->count < 64; ++p) {
+        if (!((p == text || p[-1] == '\n') && starts_with_at(p, "constexpr u64 SYS_"))) continue;
+        const char* q = p + 18;
+        char upper[32];
+        u32 len = 0;
+        while (((*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '_') && len < 31) upper[len++] = *q++;
+        upper[len] = 0;
+        if (__builtin_strcmp(upper, "COUNT") == 0) continue;
+        while (*q == ' ' || *q == '=') ++q;
+        u64 n = 0;
+        while (*q >= '0' && *q <= '9') n = n * 10 + static_cast<u64>(*q++ - '0');
+        for (u32 i = 0; i < len; ++i) out->name[out->count][i] = (upper[i] >= 'A' && upper[i] <= 'Z') ? static_cast<char>(upper[i] - 'A' + 'a') : upper[i];
+        out->name[out->count][len] = 0;
+        out->number[out->count++] = n;
+    }
+}
+
+static u32 syscall_table_problems(const SyscallRows& doc, const SyscallRows& dispatch, const SyscallRows& abi, u32 expected) {
+    u32 problems = 0;
+    if (doc.count != expected) ++problems;
+    if (dispatch.count != expected) ++problems;
+    if (abi.count != expected) ++problems;
+    for (u32 i = 0; i < doc.count && i < dispatch.count; ++i) {
+        if (doc.number[i] != i) ++problems;
+        if (__builtin_strcmp(doc.name[i], dispatch.name[i]) != 0) ++problems;
+        bool found = false;
+        for (u32 k = 0; k < abi.count; ++k)
+            if (abi.number[k] == i && __builtin_strcmp(abi.name[k], doc.name[i]) == 0) found = true;
+        if (!found) ++problems;
+    }
+    return problems;
+}
+
+static void syscall_table_doc_tests() {
+    static char doc_text[1 << 19];
+    static char source_text[1 << 16];
+    static char abi_text[1 << 16];
+    static SyscallRows doc;
+    static SyscallRows dispatch;
+    static SyscallRows abi;
+    bool read = read_whole_file("docs/RING3.md", doc_text, sizeof(doc_text)) && read_whole_file("kernel/src/userland/syscall.cpp", source_text, sizeof(source_text)) &&
+                read_whole_file("kernel/include/cosmos/userabi.hpp", abi_text, sizeof(abi_text));
+    expect(read, "syscall table: the documentation, the dispatch table and the ABI header can be read from the repository root");
+    if (!read) return;
+    rows_from_doc(doc_text, &doc);
+    rows_from_dispatch_source(source_text, &dispatch);
+    rows_from_abi_header(abi_text, &abi);
+    expect(doc.count == userabi::SYS_COUNT && dispatch.count == userabi::SYS_COUNT && abi.count == userabi::SYS_COUNT, "syscall table: the document, the dispatch table and the ABI header each list every call");
+    expect(syscall_table_problems(doc, dispatch, abi, userabi::SYS_COUNT) == 0, "syscall table: the RING3.md table, the dispatch table and the SYS_ numbers agree on every number and name");
+
+    static SyscallRows broken;
+    broken = doc;
+    __builtin_memcpy(broken.name[3], doc.name[4], 32);
+    expect(syscall_table_problems(broken, dispatch, abi, userabi::SYS_COUNT) > 0, "syscall table: a renamed documentation row is noticed");
+    broken = doc;
+    broken.count = doc.count - 1;
+    expect(syscall_table_problems(broken, dispatch, abi, userabi::SYS_COUNT) > 0, "syscall table: a missing documentation row is noticed");
+    broken = doc;
+    broken.number[7] = 8;
+    expect(syscall_table_problems(broken, dispatch, abi, userabi::SYS_COUNT) > 0, "syscall table: a row with the wrong number is noticed");
+    static SyscallRows reordered;
+    reordered = dispatch;
+    __builtin_memcpy(reordered.name[10], dispatch.name[11], 32);
+    expect(syscall_table_problems(doc, reordered, abi, userabi::SYS_COUNT) > 0, "syscall table: a dispatch table out of order is noticed");
+    static SyscallRows wrong_abi;
+    wrong_abi = abi;
+    wrong_abi.number[5] = 6;
+    expect(syscall_table_problems(doc, dispatch, wrong_abi, userabi::SYS_COUNT) > 0, "syscall table: a SYS_ constant with the wrong number is noticed");
+    static SyscallRows extra;
+    extra = dispatch;
+    extra.count = dispatch.count + 1;
+    expect(syscall_table_problems(doc, extra, abi, userabi::SYS_COUNT) > 0, "syscall table: a call added to the dispatch table and not documented is noticed");
+}
+
 int main() {
     entry_fence_tests();
     range_tests();
@@ -1673,6 +1820,7 @@ int main() {
     futex_abi_tests();
     slotpub_sequential_tests();
     slotpub_race_tests();
+    syscall_table_doc_tests();
     printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }

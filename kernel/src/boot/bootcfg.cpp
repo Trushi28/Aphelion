@@ -28,6 +28,19 @@ void reject(Span word, Config& c, const char* why) {
     ++c.rejected;
 }
 
+bool parse_u64(Span s, u64* out) {
+    if (s.n == 0) return false;
+    u64 v = 0;
+    for (u32 i = 0; i < s.n; ++i) {
+        if (s.p[i] < '0' || s.p[i] > '9') return false;
+        u64 d = static_cast<u64>(s.p[i] - '0');
+        if (v > (~0ull - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    *out = v;
+    return true;
+}
+
 void apply(Span word, Config& c, bool& storage_set) {
     u32 eq = 0;
     while (eq < word.n && word.p[eq] != '=') ++eq;
@@ -50,6 +63,10 @@ void apply(Span word, Config& c, bool& storage_set) {
         else if (equals(value, "pm")) c.timer = TimerPref::Pm;
         else if (equals(value, "pit")) c.timer = TimerPref::Pit;
         else reject(word, c, "timer is auto, hpet, pm or pit");
+    } else if (equals(key, "sysfuzz_seed")) {
+        u64 v = 0;
+        if (parse_u64(value, &v)) c.sysfuzz_seed = v;
+        else reject(word, c, "sysfuzz_seed is a decimal number that fits 64 bits");
     } else {
         reject(word, c, "unknown key");
     }

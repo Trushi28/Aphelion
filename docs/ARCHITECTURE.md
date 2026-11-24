@@ -213,8 +213,10 @@ its own around every request, always acquired in that order. `Mutex` still yield
 
 ### Boot words and the timer
 
-Limine passes the kernel command line; `bootcfg` reads three space-separated words from it, `mode=shell|test`,
-`storage=auto|off|usb` and `timer=auto|hpet|pm|pit`. An unknown word is reported and ignored. `storage` defaults to
+Limine passes the kernel command line; `bootcfg` reads four space-separated words from it, `mode=shell|test`,
+`storage=auto|off|usb`, `timer=auto|hpet|pm|pit` and `sysfuzz_seed=<decimal number>` (the seed of the ring-3 syscall fuzzer
+in the test self-test; zero or absent means the built-in sequence; `make iso TEST_SEED=<n>` writes it into the test entry and
+`tools/ci-seeds.sh` runs several seeds). An unknown word, or a seed that is not a decimal number that fits 64 bits, is reported and ignored. `storage` defaults to
 `off` in shell mode and `auto` in test mode. With `storage=off` no virtio, AHCI or NVMe driver is started and no
 filesystem is mounted, so nothing on the machine can write to a disk. **A boot with no command line is still test
 mode with storage on**, so every configuration the Makefile generates names both words explicitly.
@@ -246,9 +248,9 @@ Resolution is one second until the scheduler starts and 10 ms after. Ticks are l
 bounds the error. A TSC-based clock would not lose ticks, but APs do not necessarily start with synchronised
 counters and Satellites migrate between cores, so it is not used.
 
-### Console (Corona)
+### Console (Cornea)
 
-`framebuffer.hpp` is now a thin compatibility layer over `corona`. Corona is a character-cell terminal drawn
+`framebuffer.hpp` is now a thin compatibility layer over `cornea`. Cornea is a character-cell terminal drawn
 into the Limine framebuffer. The emulator (`term.cpp`) is pure and host-tested: UTF-8 in, a grid of
 `{glyph + attributes, fg, bg}` cells out, with SGR (16 colours, 256-colour and 24-bit), cursor movement, erase,
 insert and delete for characters and lines, scroll regions, save/restore cursor, autowrap and OSC swallowing. It
@@ -264,24 +266,24 @@ screen redraws only the rows that held text, and runs of blank cells with the sa
 one `rep stosq` per pixel row instead of being drawn cell by cell.
 
 Lines that scroll off the top of a full-screen region are copied into a ring of up to 2000 lines (capped at 12 MiB)
-taken from the kernel heap at boot. `corona::scroll_view` moves a view window back through that ring and the renderer
+taken from the kernel heap at boot. `cornea::scroll_view` moves a view window back through that ring and the renderer
 draws from it instead of the live grid, with the cursor hidden. Any output returns the view to the bottom. Helm binds
 PageUp and PageDown to a page and Shift+Up and Shift+Down to a line. The ring does not survive a terminal
 reinitialisation and holds nothing for scrolls inside a smaller region, such as an editor's.
 
 The font is JetBrains Mono (SIL OFL 1.1, notice in `kernel/data/JetBrainsMono-OFL.txt`) baked by
-`tools/bakefont.py` into `kernel/data/corona-fonts.bin` at 9x20, 11x24 and 14x31 (4-bit coverage, regular and
+`tools/bakefont.py` into `kernel/data/cornea-fonts.bin` at 9x20, 11x24 and 14x31 (4-bit coverage, regular and
 bold), picked by screen size. Box drawing, block elements, braille, arrows, geometric shapes, a few mathematical
 symbols and the rupee sign are drawn by the baker rather than taken from the font so that lines join across cells.
 The blob is linked with `incbin`. Regenerate it with
-`python3 tools/bakefont.py <dir of fontsource jetbrains-mono woff files> kernel/data/corona-fonts.bin`
+`python3 tools/bakefont.py <dir of fontsource jetbrains-mono woff files> kernel/data/cornea-fonts.bin`
 (needs `fonttools` and `pillow`).
 
 Unicode scope: Latin (including extended and Vietnamese), Greek, Cyrillic, symbols, box drawing and braille.
 CJK and emoji are treated as two cells wide and draw the replacement glyph. Combining marks are dropped without
 moving the cursor. Indic and Arabic scripts need shaping and are not supported. Invalid UTF-8 prints U+FFFD.
 
-The console lock is an `orbital::Mutex`, taken only after `corona::enable_locking()` (called once the boot core's
+The console lock is an `orbital::Mutex`, taken only after `cornea::enable_locking()` (called once the boot core's
 scheduler is up; before that the boot is single-threaded and the mutex cannot work, see ENGINEERING 40). The panic handler calls `enter_panic()` first, which makes the console
 skip the lock, because the panicking Satellite may be interrupted code that held it.
 

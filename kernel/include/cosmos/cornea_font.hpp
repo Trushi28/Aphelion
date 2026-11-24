@@ -1,7 +1,7 @@
 #pragma once
 #include <cosmos/types.hpp>
 
-namespace corona::font {
+namespace cornea::font {
 
 constexpr u32 FACE_COUNT = 3;
 constexpr u32 NO_GLYPH = 0xFFFFFFFFu;

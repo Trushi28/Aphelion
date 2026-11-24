@@ -1,4 +1,5 @@
 #include <cosmos/userland.hpp>
+#include <cosmos/bootcfg.hpp>
 #include <cosmos/userabi.hpp>
 #include <cosmos/orbital.hpp>
 #include <cosmos/apic.hpp>
@@ -861,6 +862,14 @@ bool run_files() {
         lens::Result<lens::Lens> fuzzdir = lens::open_at(K.domain, root, "h3-selftest/fuzz", lens::Rights::all());
         lens::Result<lens::Lens> scratch = fuzzdir.ok() ? lens::narrow(K.domain, fuzzdir.value(), lens::RIGHTS_READ_WRITE | lens::Right::Delegate) : lens::Result<lens::Lens>::fail(lens::Status::Denied);
         lens::Result<lens::Lens> given = lens::narrow(K.domain, apps, lens::Right::Read | lens::Right::Enumerate | lens::Right::Execute | lens::Right::Delegate);
+        if (fuzzdir.ok() && bootcfg::get().sysfuzz_seed != 0) {
+            char digits[24];
+            u32 n = 0;
+            for (u64 v = bootcfg::get().sysfuzz_seed; v != 0; v /= 10) digits[n++] = static_cast<char>('0' + v % 10);
+            u8 text[24];
+            for (u32 i = 0; i < n; ++i) text[i] = static_cast<u8>(digits[n - 1 - i]);
+            (void)put_blob(K.domain, fuzzdir.value(), "seed", text, text + n);
+        }
         i64 error = -1;
         u64 started = clock::uptime_ms();
         Process* p = f.ok() && scratch.ok() && given.ok() ? launch_file(nullptr, K, f.value(), &K, scratch.value(), &error, given.value()) : nullptr;

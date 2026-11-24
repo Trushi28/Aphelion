@@ -98,7 +98,8 @@ i64 sys_futex_wake(idt::Frame* f) {
     if (!userabi::futex_address_ok(f->rdi)) return userabi::ERR_INVAL;
     if (f->rsi == 0) return 0;
     __atomic_add_fetch(&p->futex_seq, 1u, __ATOMIC_ACQ_REL);
-    return static_cast<i64>(p->futex.wake_all());
+    (void)p->futex.wake_all();
+    return 0;
 }
 
 }

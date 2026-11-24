@@ -1,10 +1,10 @@
 #include <cosmos/framebuffer.hpp>
-#include <cosmos/corona.hpp>
+#include <cosmos/cornea.hpp>
 #include <cosmos/kheap.hpp>
 #include <cosmos/serial.hpp>
 
-extern "C" const u8 corona_font_blob[];
-extern "C" const u8 corona_font_blob_end[];
+extern "C" const u8 cornea_font_blob[];
+extern "C" const u8 cornea_font_blob_end[];
 
 namespace fb {
 
@@ -34,15 +34,15 @@ struct Out {
 }
 
 bool init(const Info& info) {
-    return corona::init(info, corona_font_blob, static_cast<usize>(corona_font_blob_end - corona_font_blob));
+    return cornea::init(info, cornea_font_blob, static_cast<usize>(cornea_font_blob_end - cornea_font_blob));
 }
 
 bool enable_backbuffer() {
-    usize need = corona::backbuffer_bytes_needed();
+    usize need = cornea::backbuffer_bytes_needed();
     if (need == 0 || need > MAX_BACKBUFFER_BYTES || !kheap::ready()) return false;
     void* mem = kheap::alloc(need);
     if (!mem) return false;
-    if (!corona::enable_backbuffer(static_cast<u32*>(mem), need)) {
+    if (!cornea::enable_backbuffer(static_cast<u32*>(mem), need)) {
         kheap::free(mem);
         return false;
     }
@@ -50,40 +50,40 @@ bool enable_backbuffer() {
 }
 
 u32 enable_scrollback() {
-    usize per_line = corona::scrollback_bytes_per_line();
+    usize per_line = cornea::scrollback_bytes_per_line();
     if (per_line == 0 || !kheap::ready()) return 0;
     usize lines = SCROLLBACK_LINES;
     if (lines * per_line > MAX_SCROLLBACK_BYTES) lines = MAX_SCROLLBACK_BYTES / per_line;
     if (lines == 0) return 0;
     void* mem = kheap::alloc(lines * per_line);
     if (!mem) return 0;
-    u32 got = corona::enable_scrollback(static_cast<term::Cell*>(mem), lines * per_line);
+    u32 got = cornea::enable_scrollback(static_cast<term::Cell*>(mem), lines * per_line);
     if (got == 0) kheap::free(mem);
     return got;
 }
 
-bool ready() { return corona::ready(); }
+bool ready() { return cornea::ready(); }
 
-void enter_panic() { corona::enter_panic(); }
+void enter_panic() { cornea::enter_panic(); }
 
-void clear(u32 rgb) { corona::clear(rgb); }
+void clear(u32 rgb) { cornea::clear(rgb); }
 
-void put_pixel(u64 x, u64 y, u32 rgb) { corona::put_pixel(x, y, rgb); }
+void put_pixel(u64 x, u64 y, u32 rgb) { cornea::put_pixel(x, y, rgb); }
 
 void putc(char c, u32 fg, u32 bg) {
     char s[2] = { c, 0 };
-    corona::write_colored(s, fg, bg);
+    cornea::write_colored(s, fg, bg);
 }
 
-void write(const char* s, u32 fg, u32 bg) { corona::write_colored(s, fg, bg); }
+void write(const char* s, u32 fg, u32 bg) { cornea::write_colored(s, fg, bg); }
 
 void writeln(const char* s, u32 fg, u32 bg) {
-    corona::write_colored(s, fg, bg);
-    corona::write_colored("\n", fg, bg);
+    cornea::write_colored(s, fg, bg);
+    cornea::write_colored("\n", fg, bg);
 }
 
 void printf(u32 fg, const char* fmt, ...) {
-    if (!corona::ready()) return;
+    if (!cornea::ready()) return;
     Out o;
     __builtin_va_list ap;
     __builtin_va_start(ap, fmt);
@@ -111,7 +111,7 @@ void printf(u32 fg, const char* fmt, ...) {
     }
     __builtin_va_end(ap);
     o.buf[o.n] = 0;
-    corona::write_colored(o.buf, fg, corona::VOID);
+    cornea::write_colored(o.buf, fg, cornea::VOID);
 }
 
 }

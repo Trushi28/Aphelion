@@ -11,6 +11,7 @@ struct Config {
     Mode mode = Mode::Test;
     Storage storage = Storage::Auto;
     TimerPref timer = TimerPref::Auto;
+    u64 sysfuzz_seed = 0;
     u32 rejected = 0;
 };
 

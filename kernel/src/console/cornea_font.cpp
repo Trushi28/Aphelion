@@ -1,6 +1,6 @@
-#include <cosmos/corona_font.hpp>
+#include <cosmos/cornea_font.hpp>
 
-namespace corona::font {
+namespace cornea::font {
 
 namespace {
 

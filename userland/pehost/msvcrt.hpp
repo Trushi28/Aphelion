@@ -337,6 +337,101 @@ PEHOST_WINAPI inline u64 wcslen(const u16* s) {
     return n;
 }
 
+PEHOST_WINAPI inline u64 wcsnlen(const u16* s, u64 max) {
+    if (!s) return 0;
+    u64 n = 0;
+    while (n < max && s[n]) ++n;
+    return n;
+}
+
+PEHOST_WINAPI inline u64 strcspn(const char* s, const char* reject) {
+    u64 n = 0;
+    for (; s[n]; ++n)
+        for (const char* r = reject; *r; ++r)
+            if (s[n] == *r) return n;
+    return n;
+}
+
+PEHOST_WINAPI inline i32 wcscpy_s(u16* dst, u64 size, const u16* src) {
+    if (!dst || size == 0) {
+        errno_ref() = ERR_INVAL;
+        return ERR_INVAL;
+    }
+    if (!src) {
+        dst[0] = 0;
+        errno_ref() = ERR_INVAL;
+        return ERR_INVAL;
+    }
+    u64 n = 0;
+    while (src[n]) ++n;
+    if (n >= size) {
+        dst[0] = 0;
+        errno_ref() = ERR_RANGE;
+        return ERR_RANGE;
+    }
+    for (u64 i = 0; i <= n; ++i) dst[i] = src[i];
+    return 0;
+}
+
+PEHOST_WINAPI inline i32 islower(i32 c) { return c >= 'a' && c <= 'z'; }
+
+PEHOST_WINAPI inline i32 isupper(i32 c) { return c >= 'A' && c <= 'Z'; }
+
+PEHOST_WINAPI inline i32 isspace(i32 c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+
+PEHOST_WINAPI inline i32 tolower(i32 c) { return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c; }
+
+PEHOST_WINAPI inline double copysign(double x, double y) {
+    u64 a, b;
+    __builtin_memcpy(&a, &x, 8);
+    __builtin_memcpy(&b, &y, 8);
+    a = (a & ~(1ull << 63)) | (b & (1ull << 63));
+    __builtin_memcpy(&x, &a, 8);
+    return x;
+}
+
+PEHOST_WINAPI inline double frexp(double x, i32* exponent) {
+    u64 bits;
+    __builtin_memcpy(&bits, &x, 8);
+    i32 biased = static_cast<i32>((bits >> 52) & 0x7FF);
+    *exponent = 0;
+    if (biased == 0x7FF || (bits << 1) == 0) return x;
+    i32 shift = 0;
+    if (biased == 0) {
+        x *= 18014398509481984.0;
+        __builtin_memcpy(&bits, &x, 8);
+        biased = static_cast<i32>((bits >> 52) & 0x7FF);
+        shift = 54;
+    }
+    *exponent = biased - 1022 - shift;
+    bits = (bits & ~(0x7FFull << 52)) | (1022ull << 52);
+    __builtin_memcpy(&x, &bits, 8);
+    return x;
+}
+
+PEHOST_WINAPI inline char* setlocale(i32 category, const char* locale) {
+    static char name[] = "C";
+    if (category < 0 || category > 5) return nullptr;
+    if (!locale || locale[0] == 0 || (locale[0] == 'C' && locale[1] == 0)) return name;
+    return nullptr;
+}
+
+PEHOST_WINAPI inline u16* _wsetlocale(i32 category, const u16* locale) {
+    static u16 name[] = { 'C', 0 };
+    if (category < 0 || category > 5) return nullptr;
+    if (!locale || locale[0] == 0 || (locale[0] == 'C' && locale[1] == 0)) return name;
+    return nullptr;
+}
+
+PEHOST_WINAPI inline u16* _wcsdup(const u16* s) {
+    if (!s) return nullptr;
+    u64 n = wcslen(s);
+    u16* copy = static_cast<u16*>(malloc((n + 1) * 2));
+    if (!copy) return nullptr;
+    for (u64 i = 0; i <= n; ++i) copy[i] = s[i];
+    return copy;
+}
+
 PEHOST_WINAPI inline i32 strcmp(const char* a, const char* b) {
     while (*a && *a == *b) {
         ++a;

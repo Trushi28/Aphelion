@@ -1,7 +1,7 @@
-#include <cosmos/corona.hpp>
-#include <cosmos/corona_font.hpp>
+#include <cosmos/cornea.hpp>
+#include <cosmos/cornea_font.hpp>
 
-#ifdef CORONA_HOST_TEST
+#ifdef CORNEA_HOST_TEST
 namespace {
 struct Lock {
     void lock() {}
@@ -15,7 +15,7 @@ using Lock = orbital::Mutex;
 }
 #endif
 
-namespace corona {
+namespace cornea {
 
 namespace {
 
@@ -132,7 +132,7 @@ void render_cell(u32* dst, u64 pitch, const term::Cell& c, bool cursor) {
 }
 
 void fill_px(u32* dst, u32 value, u64 count) {
-#ifdef CORONA_HOST_TEST
+#ifdef CORNEA_HOST_TEST
     for (u64 i = 0; i < count; ++i) dst[i] = value;
 #else
     u64 pairs = count >> 1;
@@ -238,7 +238,7 @@ void flush_locked() {
     if (scrolled > 0 && g_back) copy_lines_to_fb(g_origin_y, static_cast<u64>(g_rows) * f.cell_h);
     g_term.clear_dirty();
     asm volatile("" ::: "memory");
-#ifndef CORONA_HOST_TEST
+#ifndef CORNEA_HOST_TEST
     asm volatile("sfence" ::: "memory");
 #endif
 }

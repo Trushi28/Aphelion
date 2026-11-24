@@ -6,7 +6,7 @@
 #include <cosmos/bootcfg.hpp>
 #include <cosmos/stellar.hpp>
 #include <cosmos/diskmap.hpp>
-#include <cosmos/corona.hpp>
+#include <cosmos/cornea.hpp>
 #include <cosmos/input.hpp>
 #include <cosmos/orbital.hpp>
 #include <cosmos/klog.hpp>
@@ -103,7 +103,7 @@ void set_facts(const Facts& f) { g_facts = f; }
 const Facts& facts() { return g_facts; }
 
 void print_about(Writer& w) {
-    corona::Metrics m = corona::metrics();
+    cornea::Metrics m = cornea::metrics();
     Text v[PANEL_ROWS];
     const char* keys[PANEL_ROWS] = {"kernel", "console", "memory", "input", "storage", "nebula", "power"};
 
@@ -111,7 +111,7 @@ void print_about(Writer& w) {
     v[0].num(g_facts.suns);
     v[0].str(g_facts.suns == 1 ? " Sun" : " Suns");
 
-    v[1].str("Corona ");
+    v[1].str("Cornea ");
     v[1].num(m.cols);
     v[1].str("\xC3\x97");
     v[1].num(m.rows);
@@ -214,7 +214,7 @@ int cmd_unicode(Shell&, Io& io, u32, char**) {
 
 int cmd_colors(Shell&, Io& io, u32, char**) {
     Writer& w = io.out;
-    const term::Palette& p = corona::theme();
+    const term::Palette& p = cornea::theme();
     w.str("  ");
     for (u32 i = 0; i < 16; ++i) {
         w.str("\x1b[48;2;");
@@ -766,7 +766,7 @@ constexpr Command COMMANDS[] = {
     {"about", "about", "the info panel again", &cmd_about},
     {"wipe", "wipe", "clear the screen (also Ctrl+L)", &cmd_wipe},
     {"unicode", "unicode", "a glyph coverage sample", &cmd_unicode},
-    {"colors", "colors", "the Corona palette", &cmd_colors},
+    {"colors", "colors", "the Cornea palette", &cmd_colors},
     {"orbit", "orbit", "the Satellites known to Orbital, as rows", &cmd_orbit},
     {"suns", "suns", "per-Sun scheduler state, as rows", &cmd_suns},
     {"memory", "memory", "Universe, kernel heap and ram realm usage, as rows", &cmd_memory},

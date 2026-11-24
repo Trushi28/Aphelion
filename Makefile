@@ -36,7 +36,8 @@ DEFAULT_INDEX := $(if $(filter shell,$(BOOT_DEFAULT)),1,2)
 SHELL_STORAGE_WORD := $(if $(filter usb,$(PROFILE)),usb,auto)
 TEST_STORAGE_WORD := $(if $(filter usb,$(PROFILE)),off,auto)
 SHELL_CMDLINE := mode=shell storage=$(SHELL_STORAGE_WORD)
-TEST_CMDLINE := mode=test storage=$(TEST_STORAGE_WORD)
+TEST_SEED ?=
+TEST_CMDLINE := mode=test storage=$(TEST_STORAGE_WORD)$(if $(TEST_SEED), sysfuzz_seed=$(TEST_SEED))
 
 define LIMINE_CONF_TEXT
 timeout: $(MENU_TIMEOUT)
@@ -133,7 +134,7 @@ $(BUILD)/%.o: %.cpp $(LIMINE)/limine.h $(FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_ASM_DEPS): $(KDIR)/data/corona-fonts.bin
+$(BUILD_ASM_DEPS): $(KDIR)/data/cornea-fonts.bin
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)

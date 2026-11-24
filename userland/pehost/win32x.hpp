@@ -1425,6 +1425,39 @@ PEHOST_WINAPI inline u32 GetTempPathA(u32 size, char* buffer) {
     return 1;
 }
 
+PEHOST_WINAPI inline u32 GetTempPathW(u32 size, u16* buffer) {
+    if (size < 2) return 2;
+    buffer[0] = '\\';
+    buffer[1] = 0;
+    return 1;
+}
+
+PEHOST_WINAPI inline i32 AreFileApisANSI() { return 1; }
+
+PEHOST_WINAPI inline void GetSystemTimePreciseAsFileTime(u32* out) { GetSystemTimeAsFileTime(out); }
+
+PEHOST_WINAPI inline void FlushProcessWriteBuffers() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+
+PEHOST_WINAPI inline u16 RtlCaptureStackBackTrace(u32, u32, void**, u32* hash) {
+    if (hash) *hash = 0;
+    return 0;
+}
+
+PEHOST_WINAPI inline i32 CreateHardLinkW(const u16*, const u16*, void*) {
+    set_last_error(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+
+PEHOST_WINAPI inline u8 CreateSymbolicLinkW(const u16*, const u16*, u32) {
+    set_last_error(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+
+PEHOST_WINAPI inline i32 GetLogicalProcessorInformationEx(u32, void*, u32*) {
+    set_last_error(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+
 PEHOST_WINAPI inline u64 LocalFree(u64 memory) {
     if (memory == 0) return 0;
     if (g_world.heap.free(reinterpret_cast<void*>(memory))) return 0;
@@ -2331,7 +2364,9 @@ inline const ImportTable* kernel32x_table() {
         PEHOST_K(SetCurrentDirectoryW),
         PEHOST_K(GetFullPathNameA),
         PEHOST_K(GetFullPathNameW),
-        PEHOST_K(GetTempPathA),
+        PEHOST_K(GetTempPathA), PEHOST_K(GetTempPathW), PEHOST_K(AreFileApisANSI), PEHOST_K(GetSystemTimePreciseAsFileTime),
+        PEHOST_K(FlushProcessWriteBuffers), PEHOST_K(RtlCaptureStackBackTrace), PEHOST_K(CreateHardLinkW), PEHOST_K(CreateSymbolicLinkW),
+        PEHOST_K(GetLogicalProcessorInformationEx),
         PEHOST_K(LocalFree),
         PEHOST_K(SetEnvironmentVariableA),
         PEHOST_K(SetEnvironmentVariableW),

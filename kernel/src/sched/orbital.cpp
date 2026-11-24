@@ -200,6 +200,48 @@ static u32 pick_idle_core(u32 me) {
     return ~0u;
 }
 
+static u32 pick_preemptible_core(u32 me, int ring) {
+    u32 n = __atomic_load_n(&g_core_count, __ATOMIC_ACQUIRE);
+    if (n == 0) return ~0u;
+    u32 start = __atomic_fetch_add(&g_rotor, 1u, __ATOMIC_RELAXED);
+    u32 best = ~0u;
+    int best_ring = ring;
+    for (u32 k = 0; k < n; ++k) {
+        u32 c = g_core_ids[(start + k) % n];
+        if (c == me) continue;
+        Satellite* cur = g_current[c];
+        if (!cur || cur == &g_idle[c]) continue;
+        if (mlfq::preempts(ring, cur->ring) && cur->ring > best_ring) {
+            best = c;
+            best_ring = cur->ring;
+        }
+    }
+    return best;
+}
+
+static u32 load_of(u32 core) {
+    Satellite* cur = g_current[core];
+    return g_runq[core].size() + ((cur && cur != &g_idle[core]) ? 1u : 0u);
+}
+
+static u32 pick_lighter_core(u32 me) {
+    u32 n = __atomic_load_n(&g_core_count, __ATOMIC_ACQUIRE);
+    if (n < 2) return ~0u;
+    u32 start = __atomic_fetch_add(&g_rotor, 1u, __ATOMIC_RELAXED);
+    u32 best = ~0u;
+    u32 best_load = load_of(me);
+    for (u32 k = 0; k < n; ++k) {
+        u32 c = g_core_ids[(start + k) % n];
+        if (c == me) continue;
+        u32 l = load_of(c);
+        if (l + 2 <= best_load) {
+            best = c;
+            best_load = l;
+        }
+    }
+    return best;
+}
+
 static void kick(u32 core) {
     __atomic_fetch_add(&g_ipis, 1ull, __ATOMIC_RELAXED);
     apic::send_ipi(core, idt::VEC_RESCHED);
@@ -214,11 +256,33 @@ static void place(Satellite* s, u32 me) {
         kick(target);
         return;
     }
+    Satellite* cur = g_current[me];
+    bool local_preempt = cur && cur != &g_idle[me] && mlfq::preempts(s->ring, cur->ring);
+    if (!local_preempt) {
+        u32 remote = pick_preemptible_core(me, s->ring);
+        if (remote != ~0u) {
+            g_lock[remote].lock();
+            g_runq[remote].push(s);
+            g_lock[remote].unlock();
+            __atomic_fetch_add(&g_preemptions, 1ull, __ATOMIC_RELAXED);
+            kick(remote);
+            return;
+        }
+    }
+    if (!local_preempt) {
+        u32 lighter = pick_lighter_core(me);
+        if (lighter != ~0u) {
+            g_lock[lighter].lock();
+            g_runq[lighter].push(s);
+            g_lock[lighter].unlock();
+            kick(lighter);
+            return;
+        }
+    }
     g_lock[me].lock();
     g_runq[me].push(s);
     g_lock[me].unlock();
-    Satellite* cur = g_current[me];
-    if (cur && cur != &g_idle[me] && mlfq::preempts(s->ring, cur->ring)) {
+    if (local_preempt) {
         __atomic_fetch_add(&g_preemptions, 1ull, __ATOMIC_RELAXED);
         kick(me);
     }

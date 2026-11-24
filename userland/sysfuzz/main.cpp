@@ -66,6 +66,7 @@ constexpr u64 RACE_X = WINDOW + 0x1000000;
 constexpr u64 RACE_Y = WINDOW + 0x1100000;
 constexpr u64 EDGE = WINDOW + 0x1200000;
 constexpr u64 SWEEP_PAGES = 256;
+constexpr u64 THREAD_STACKS = WINDOW + 0x2000000;
 constexpr u64 OUT = 0xDEADBEEFCAFEF00Dull;
 constexpr i64 ERR_LOWEST = -19;
 constexpr u32 SWEEP_CALLS = 6000;
@@ -156,6 +157,7 @@ struct Line {
 
 u64 g_seed = 0x9E3779B97F4A7C15ull;
 u64 g_calls;
+u64 g_user_seed;
 u32 g_budget_hit;
 u64 g_register_checks;
 u64 g_anomalies;
@@ -184,6 +186,9 @@ const char* const g_names[] = {
 constexpr u32 NAME_COUNT = sizeof(g_names) / sizeof(g_names[0]);
 
 volatile u32 g_stop;
+volatile u32 g_gate;
+volatile u32 g_started;
+volatile u32 g_passed;
 
 u64 now_ms() {
     userabi::ClockRecord record{};
@@ -1271,6 +1276,92 @@ void process_model() {
     l.flush();
 }
 
+void gate_worker(u64 index) {
+    __atomic_add_fetch(&g_started, 1u, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&g_gate, __ATOMIC_ACQUIRE) == 0) sys::futex_wait(&g_gate, 0, FUTEX_FOREVER);
+    __atomic_add_fetch(&g_passed, 1u, __ATOMIC_ACQ_REL);
+    sys::thread_exit(static_cast<i64>(100 + index));
+}
+
+void quick_worker(u64 index) { sys::thread_exit(static_cast<i64>(200 + index)); }
+
+u64 thread_stack_top(u64 slot) { return THREAD_STACKS + (slot + 1) * 4096 - 8; }
+
+bool wait_for_count(volatile u32* counter, u32 want) {
+    u64 started = now_ms();
+    while (__atomic_load_n(counter, __ATOMIC_ACQUIRE) < want) {
+        if (now_ms() - started > PROCESS_WAIT_MS) return false;
+        sys::yield();
+    }
+    return true;
+}
+
+i32 thread_limits() {
+    u64 vmo = 0;
+    check(sys::vmo_create(16, &vmo) == 0, "a memory object for thread stacks can be created");
+    check(sys::vm_map(vmo, THREAD_STACKS, 0, 16, 3) == static_cast<i64>(THREAD_STACKS), "the thread stacks map");
+    u64 tids[16] = {};
+    u32 made = 0;
+    i64 last = 0;
+    while (made < 16) {
+        last = sys::thread_create(reinterpret_cast<void (*)(u64)>(&gate_worker), thread_stack_top(made), made);
+        if (last <= 0) break;
+        tids[made++] = static_cast<u64>(last);
+    }
+    check(last == ERR_LIMIT && made == MAX_LIVE_THREADS - 1, "threads that stay alive stop at 8 including the first, and the next create says limit");
+    check(wait_for_count(&g_started, made), "every thread that was created starts");
+    check(sys::call(SYS_FUTEX_WAKE, reinterpret_cast<u64>(&g_gate), 0) == 0, "futex_wake of zero waiters returns zero");
+    for (u32 i = 0; i < 200; ++i) sys::yield();
+    check(__atomic_load_n(&g_passed, __ATOMIC_ACQUIRE) == 0, "a wake while the word is unchanged lets nobody through the gate");
+    check(sys::call(SYS_FUTEX_WAKE, reinterpret_cast<u64>(&g_gate), 1) == 0, "a wake of one returns zero");
+    for (u32 i = 0; i < 200; ++i) sys::yield();
+    check(__atomic_load_n(&g_passed, __ATOMIC_ACQUIRE) == 0, "a spurious wake sends every sleeper back to sleep while the word is unchanged");
+    __atomic_store_n(&g_gate, 1u, __ATOMIC_RELEASE);
+    sys::call(SYS_FUTEX_WAKE, reinterpret_cast<u64>(&g_gate), 16);
+    bool statuses = true;
+    for (u32 i = 0; i < made; ++i) statuses = statuses && sys::thread_join(tids[i]) == static_cast<i64>(100 + i);
+    check(statuses, "each joined thread reports the status it ended with");
+    check(__atomic_load_n(&g_passed, __ATOMIC_ACQUIRE) == made, "every sleeper got through once the word changed");
+
+    u32 more = 0;
+    bool quick = true;
+    last = 0;
+    while (made + more < 16) {
+        last = sys::thread_create(reinterpret_cast<void (*)(u64)>(&quick_worker), thread_stack_top(made + more), made + more);
+        if (last <= 0) break;
+        quick = quick && sys::thread_join(static_cast<u64>(last)) == static_cast<i64>(200 + made + more);
+        ++more;
+    }
+    check(made + more == MAX_THREADS_TOTAL - 1 && last == ERR_LIMIT, "with each thread joined before the next, creation stops at 16 over the life of the process");
+    check(quick, "the second batch reports its statuses too");
+    check(sys::thread_create(reinterpret_cast<void (*)(u64)>(&quick_worker), thread_stack_top(0), 0) == ERR_LIMIT, "a finished thread's slot is not reused");
+    sys::vm_unmap(THREAD_STACKS, 16);
+    sys::handle_close(vmo);
+    u64 failed = g_failed_checks + g_anomalies;
+    return static_cast<i32>(failed < 99 ? failed : 99);
+}
+
+void thread_limits_in_child() {
+    if (!g_apps_dir) return;
+    u64 self = 0;
+    check(f_open(g_apps_dir, "sysfuzz", R_READ | R_EXEC, &self) == 0, "the apps directory holds the fuzzer itself");
+    if (!self) return;
+    u64 h = 0;
+    i64 created = ERR_LIMIT;
+    u64 started = now_ms();
+    while (now_ms() - started < PROCESS_WAIT_MS) {
+        h = 0;
+        created = call6(SYS_PROCESS_CREATE, self, 0, reinterpret_cast<u64>(&h), 0);
+        if (created != ERR_LIMIT) break;
+        sys::yield();
+    }
+    check(created == 0 && h != 0, "a second instance of the fuzzer can be started with no handles once the earlier children are reclaimed");
+    i64 st = -1;
+    check(process_exit_status(h, &st) && st == 0, "the second instance, which exercises the thread and futex limits, ends with status 0");
+    sys::handle_close(h);
+    sys::handle_close(self);
+}
+
 u64 parse_number(const char* s) {
     u64 v = 0;
     for (; *s >= '0' && *s <= '9'; ++s) v = v * 10 + static_cast<u64>(*s - '0');
@@ -1279,16 +1370,32 @@ u64 parse_number(const char* s) {
 
 }
 
+void read_seed() {
+    u64 h = 0;
+    if (f_open(g_scratch_dir, "seed", R_READ, &h) != 0) return;
+    char text[32] = {};
+    i64 n = f_read(h, 0, text, 31);
+    sys::handle_close(h);
+    if (n <= 0) return;
+    g_user_seed = parse_number(text);
+    g_seed ^= g_user_seed * 0x9E3779B97F4A7C15ull;
+}
+
 extern "C" i64 aphelion_main(u64 argument, u64 second) {
+    if (argument == 0 && second == 0) return thread_limits();
     if (argument != 0) {
         i64 info = sys::call(SYS_HANDLE_INFO, argument);
         if (info >= 0 && handleabi::info_kind(static_cast<u64>(info)) == NODE_KIND_FOLDER) {
             g_scratch_dir = argument;
             g_apps_dir = second;
+            read_seed();
         } else {
             begin::Start start;
             if (!begin::receive(argument, &start)) return 100;
-            if (start.parsed.argc > 1) g_seed ^= parse_number(start.parsed.argv[1]) * 0x9E3779B97F4A7C15ull;
+            if (start.parsed.argc > 1) {
+                g_user_seed = parse_number(start.parsed.argv[1]);
+                g_seed ^= g_user_seed * 0x9E3779B97F4A7C15ull;
+            }
         }
     }
     if (g_apps_dir) open_programs();
@@ -1304,7 +1411,10 @@ extern "C" i64 aphelion_main(u64 argument, u64 second) {
     race_handles();
     if (g_scratch_dir) files_model();
     pipe_model();
-    if (g_apps_dir) process_model();
+    if (g_apps_dir) {
+        process_model();
+        thread_limits_in_child();
+    }
 
     u32 never = 0;
     for (u32 nr = 0; nr < SYS_COUNT; ++nr)
@@ -1322,7 +1432,8 @@ extern "C" i64 aphelion_main(u64 argument, u64 second) {
     l.add(static_cast<u64>(SYS_COUNT - never));
     l.add(" of ");
     l.add(static_cast<u64>(SYS_COUNT));
-    l.add(" syscalls succeeded at least once");
+    l.add(" syscalls succeeded at least once, seed ");
+    l.add(g_user_seed);
     l.flush();
     if (g_budget_hit) {
         Line budget;

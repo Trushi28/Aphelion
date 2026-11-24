@@ -3,7 +3,7 @@
 #include <cosmos/framebuffer.hpp>
 #include <cosmos/term.hpp>
 
-namespace corona {
+namespace cornea {
 
 constexpr u32 VOID = 0x0A0A14;
 constexpr u32 TEXT = 0xD9DEE8;

@@ -13,6 +13,13 @@ char* strchr(const char*, int);
 char* strrchr(const char*, int);
 void* malloc(unsigned long);
 void free(void*);
+int islower(int);
+int isupper(int);
+int isspace(int);
+int tolower(int);
+unsigned long strcspn(const char*, const char*);
+double copysign(double, double);
+double frexp(double, int*);
 }
 
 namespace {
@@ -1713,6 +1720,73 @@ void msvcrt_tests() {
     expect(same(s1, "xyzw") && crt::strcpy(s1, "") == s1 && crt::strlen(s1) == 0, "strcpy and strcat");
     static const u16 w3[] = { 'a', 'b', 'c', 0 };
     expect(crt::wcslen(w3) == 3 && crt::wcslen(w3 + 3) == 0 && crt::getenv("PATH") == nullptr, "wcslen and getenv");
+    {
+        u32 ctype_bad = 0;
+        for (i32 c = -1; c < 256; ++c) {
+            if ((crt::islower(c) != 0) != (::islower(c) != 0)) ++ctype_bad;
+            if ((crt::isupper(c) != 0) != (::isupper(c) != 0)) ++ctype_bad;
+            if ((crt::isspace(c) != 0) != (::isspace(c) != 0)) ++ctype_bad;
+            if (crt::tolower(c) != ::tolower(c)) ++ctype_bad;
+        }
+        expect(ctype_bad == 0, "islower, isupper, isspace and tolower agree with libc in the C locale for EOF and every byte");
+        expect(!crt::islower(256) && !crt::isupper(-2) && !crt::isspace(1000) && crt::tolower(1000) == 1000 && crt::tolower(-2) == -2, "ctype functions leave values outside EOF and 0 to 255 alone and report them as no class");
+        static const char* const spans[][2] = { { "", "" }, { "abc", "" }, { "", "abc" }, { "abc", "c" }, { "abc", "xyz" }, { "hello world", " \t" }, { "key=value", "=:" }, { "aaaa", "a" }, { "abc", "cba" }, { "a,b;c", ";," } };
+        u32 span_bad = 0;
+        for (const auto& p : spans)
+            if (crt::strcspn(p[0], p[1]) != ::strcspn(p[0], p[1])) ++span_bad;
+        expect(span_bad == 0, "strcspn agrees with libc on empty strings, no match, an early match and a match at the end");
+        static const u16 wide3[] = { 'a', 'b', 'c', 0 };
+        expect(crt::wcsnlen(wide3, 0) == 0 && crt::wcsnlen(wide3, 2) == 2 && crt::wcsnlen(wide3, 3) == 3 && crt::wcsnlen(wide3, 100) == 3 && crt::wcsnlen(nullptr, 5) == 0, "wcsnlen stops at the limit or the terminator and accepts a null string");
+        u16 wdst[4] = { 9, 9, 9, 9 };
+        crt::errno_ref() = 0;
+        expect(crt::wcscpy_s(wdst, 4, wide3) == 0 && wdst[0] == 'a' && wdst[2] == 'c' && wdst[3] == 0 && crt::errno_ref() == 0, "wcscpy_s copies a string that fits with its terminator");
+        for (u32 i = 0; i < 4; ++i) wdst[i] = 9;
+        expect(crt::wcscpy_s(wdst, 3, wide3) == ERR_RANGE && wdst[0] == 0 && crt::errno_ref() == ERR_RANGE, "wcscpy_s refuses a string that does not fit and leaves an empty string");
+        for (u32 i = 0; i < 4; ++i) wdst[i] = 9;
+        expect(crt::wcscpy_s(wdst, 4, nullptr) == ERR_INVAL && wdst[0] == 0 && crt::wcscpy_s(nullptr, 4, wide3) == ERR_INVAL && crt::wcscpy_s(wdst, 0, wide3) == ERR_INVAL, "wcscpy_s refuses a null source, a null destination and a size of zero");
+        u16* dup = crt::_wcsdup(wide3);
+        expect(dup && dup != wide3 && crt::wcslen(dup) == 3 && dup[0] == 'a' && dup[2] == 'c' && crt::_wcsdup(nullptr) == nullptr, "_wcsdup makes a separate copy and accepts a null string");
+        crt::free(dup);
+        u32 fp_bad = 0;
+        static const double specials[] = { 0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, 3.14159, 1e-300, -1e300, 4.9406564584124654e-324, 2.2250738585072009e-308, 2.2250738585072014e-308,
+                                           1.7976931348623157e308, 123456789.0, 1e-310 };
+        for (double x : specials) {
+            for (double y : specials) {
+                double a = crt::copysign(x, y), b = ::copysign(x, y);
+                if (__builtin_memcmp(&a, &b, 8) != 0) ++fp_bad;
+            }
+            i32 e1 = 99, e2 = 99;
+            double a = crt::frexp(x, &e1), b = ::frexp(x, &e2);
+            if (__builtin_memcmp(&a, &b, 8) != 0 || e1 != e2) ++fp_bad;
+        }
+        for (u32 i = 0; i < 20000; ++i) {
+            u64 bits = rnd();
+            if (i % 4 == 0) bits &= ~(0x7FFull << 52);
+            double x;
+            __builtin_memcpy(&x, &bits, 8);
+            if (x != x || x - x != 0) continue;
+            i32 e1 = 99, e2 = 99;
+            double a = crt::frexp(x, &e1), b = ::frexp(x, &e2);
+            if (__builtin_memcmp(&a, &b, 8) != 0 || e1 != e2) ++fp_bad;
+            u64 sign_bits = rnd();
+            double y;
+            __builtin_memcpy(&y, &sign_bits, 8);
+            double c = crt::copysign(x, y), d = ::copysign(x, y);
+            if (__builtin_memcmp(&c, &d, 8) != 0) ++fp_bad;
+        }
+        expect(fp_bad == 0, "copysign and frexp agree with libm bit for bit on special values, subnormals and 20,000 random doubles");
+        double inf = 1.0 / 0.0, nan_value = inf - inf;
+        i32 e = 77;
+        double fi = crt::frexp(inf, &e);
+        bool inf_ok = fi == inf && e == 0;
+        double fn = crt::frexp(nan_value, &e);
+        expect(inf_ok && fn != fn && crt::copysign(nan_value, -1.0) != crt::copysign(nan_value, -1.0) && crt::copysign(inf, -1.0) == -inf, "frexp returns infinity and NaN unchanged and copysign works on them");
+        expect(same(crt::setlocale(0, nullptr), "C") && same(crt::setlocale(2, ""), "C") && same(crt::setlocale(0, "C"), "C") && crt::setlocale(0, "en_US") == nullptr && crt::setlocale(-1, "C") == nullptr && crt::setlocale(6, "C") == nullptr,
+               "setlocale knows only the C locale and a category in range");
+        static const u16 wc[] = { 'C', 0 }, wfr[] = { 'f', 'r', 0 }, wempty[] = { 0 };
+        u16* name = crt::_wsetlocale(0, nullptr);
+        expect(name && name[0] == 'C' && name[1] == 0 && crt::_wsetlocale(0, wempty) == name && crt::_wsetlocale(3, wc) == name && crt::_wsetlocale(0, wfr) == nullptr && crt::_wsetlocale(9, wc) == nullptr, "_wsetlocale knows only the C locale and a category in range");
+    }
     expect(same(crt::strerror(0), "No error") && same(crt::strerror(ERR_INVAL), "Invalid argument") && same(crt::strerror(ERR_BADF), "Bad file descriptor") && same(crt::strerror(ERR_NOMEM), "Not enough space") &&
                same(crt::strerror(ERR_RANGE), "Result too large") && same(crt::strerror(2), "No such file or directory") && same(crt::strerror(1), "Operation not permitted") && same(crt::strerror(9999), "Unknown error") && same(crt::strerror(-1), "Unknown error"),
            "strerror");
@@ -2481,6 +2555,11 @@ void extended_tests() {
     g_fake_clock = pehost::Clock{ 20000000, 10000000, 99, false };
     GetSystemTimeAsFileTime(ft);
     expect(((static_cast<u64>(ft[1]) << 32) | ft[0]) == 2000ull * 10000, "without a wall clock the uptime is used as the time");
+    g_fake_clock = pehost::Clock{ 20000000, 10000000, 86400000, true };
+    u32 precise[2] = { 1, 1 };
+    GetSystemTimePreciseAsFileTime(precise);
+    GetSystemTimeAsFileTime(ft);
+    expect(precise[0] == ft[0] && precise[1] == ft[1], "the precise system time is the system time");
     g_fake_clock_ok = false;
     set_last_error(0);
     expect(QueryPerformanceFrequency(&value) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED && QueryPerformanceCounter(&value) == 0 && GetTickCount64() == 0, "a clock that fails is reported as unsupported");
@@ -2754,6 +2833,20 @@ void extended_tests() {
     expect(GetFullPathNameW(wide("dir\\foo.txt"), 40, wfull, &wpart) == 12 && wide_is(wfull, "\\dir\\foo.txt") && wide_is(wpart, "foo.txt") && GetFullPathNameW(wide("foo"), 3, wfull, &wpart) == 5 && GetFullPathNameW(nullptr, 40, wfull, &wpart) == 0, "the wide full path matches");
     char temp[8];
     expect(GetTempPathA(8, temp) == 1 && same(temp, "\\") && GetTempPathA(1, temp) == 2, "the temporary directory is the root");
+    u16 wtemp[8] = { 7, 7, 7, 7, 7, 7, 7, 7 };
+    expect(GetTempPathW(8, wtemp) == 1 && wtemp[0] == '\\' && wtemp[1] == 0 && GetTempPathW(1, wtemp) == 2, "the wide temporary directory is the root, and a buffer of one is too small");
+    expect(AreFileApisANSI() == 1 && RtlCaptureStackBackTrace(0, 8, nullptr, nullptr) == 0, "the file APIs are ANSI and no stack is captured");
+    u32 stack_hash = 5;
+    void* frames[4];
+    expect(RtlCaptureStackBackTrace(0, 4, frames, &stack_hash) == 0 && stack_hash == 0, "a stack capture reports no frames and a zero hash");
+    FlushProcessWriteBuffers();
+    set_last_error(0);
+    expect(CreateHardLinkW(nullptr, nullptr, nullptr) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED, "hard links are refused as unsupported");
+    set_last_error(0);
+    expect(CreateSymbolicLinkW(nullptr, nullptr, 0) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED, "symbolic links are refused as unsupported");
+    set_last_error(0);
+    u32 info_length = 0;
+    expect(GetLogicalProcessorInformationEx(0xFFFF, nullptr, &info_length) == 0 && last_error() == pehost::ERROR_NOT_SUPPORTED, "the logical processor information is refused as unsupported");
 
     void* block = HeapAlloc(GetProcessHeap(), 0, 32);
     expect(LocalFree(0) == 0 && LocalFree(reinterpret_cast<u64>(block)) == 0 && LocalFree(0x1234) == 0x1234 && last_error() == pehost::ERROR_INVALID_HANDLE, "LocalFree releases heap memory and returns the argument for a foreign pointer");

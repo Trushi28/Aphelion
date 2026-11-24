@@ -43,7 +43,7 @@ built in, described under [Goals](#goals).
 - Stellar FS, a copy-on-write filesystem with a B+tree catalog, CRC32 checksums, O(1) snapshots, B+tree directories,
   extent-table files for fragmented disks, path resolution, atomic rename, typed status codes,
   twin checksummed superblocks, flush-ordered crash-consistent commits and an fsck-style `check()`
-- Corona, a Unicode terminal console on the framebuffer: JetBrains Mono at three sizes, 24-bit colour, box drawing and
+- Cornea, a Unicode terminal console on the framebuffer: JetBrains Mono at three sizes, 24-bit colour, box drawing and
   braille, a RAM backbuffer with pixel scrolling
 - PS/2 keyboard and serial input through one key-event queue, a kernel log ring and ACPI/keyboard-controller reboot
 - Nebula, a non-POSIX namespace: `realm:/path` names over RAM, the Stellar disk, read-only snapshots and live kernel
@@ -194,7 +194,7 @@ disk with someone else's data is refused. `help syntax` lists the option, row, c
 Limits worth knowing: files are capped at 16 MiB and partial writes are buffered in memory until `sync`, close or
 exit; a pipe stage's output is capped at 8 MiB; globs work in the last path component only; variables are never word
 split; `grep` is a plain substring match with ASCII case folding; `touch` only creates; a single `&` is rejected; keys
-typed while a command runs are discarded; the Corona console draws Latin, Greek, Cyrillic, symbols and box drawing but
+typed while a command runs are discarded; the Cornea console draws Latin, Greek, Cyrillic, symbols and box drawing but
 not CJK or Indic scripts, which the editor still stores and writes correctly to a file or the serial line.
 
 ## Tested on
@@ -214,7 +214,7 @@ kernel/
     arch/       GDT, IDT, APIC, ACPI, IOAPIC, PCI
     mm/         physical and virtual memory
     sched/      scheduler and context switching
-    console/    Corona terminal, font and UTF-8
+    console/    Cornea terminal, font and UTF-8
     drivers/    framebuffer, serial, keyboard, input queue, klog, virtio-blk, AHCI, NVMe, xHCI, USB storage
     fs/         Stellar FS, the Nebula namespace and its realms
     shell/      Helm: parser, line editor, commands

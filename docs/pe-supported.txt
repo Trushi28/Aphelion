@@ -1,5 +1,6 @@
 kernel32.dll!AcquireSRWLockExclusive
 kernel32.dll!AcquireSRWLockShared
+kernel32.dll!AreFileApisANSI
 kernel32.dll!CloseHandle
 kernel32.dll!CompareStringEx
 kernel32.dll!CompareStringW
@@ -14,6 +15,7 @@ kernel32.dll!CreateEventExW
 kernel32.dll!CreateEventW
 kernel32.dll!CreateFileA
 kernel32.dll!CreateFileW
+kernel32.dll!CreateHardLinkW
 kernel32.dll!CreateIoCompletionPort stub
 kernel32.dll!CreateMutexA
 kernel32.dll!CreateMutexExA
@@ -26,6 +28,7 @@ kernel32.dll!CreateSemaphoreA
 kernel32.dll!CreateSemaphoreExA
 kernel32.dll!CreateSemaphoreExW
 kernel32.dll!CreateSemaphoreW
+kernel32.dll!CreateSymbolicLinkW
 kernel32.dll!CreateThread
 kernel32.dll!DecodePointer
 kernel32.dll!DeleteCriticalSection
@@ -50,6 +53,7 @@ kernel32.dll!FlsFree
 kernel32.dll!FlsGetValue
 kernel32.dll!FlsSetValue
 kernel32.dll!FlushFileBuffers
+kernel32.dll!FlushProcessWriteBuffers
 kernel32.dll!FormatMessageA
 kernel32.dll!FreeEnvironmentStringsW
 kernel32.dll!FreeLibrary
@@ -89,6 +93,7 @@ kernel32.dll!GetFullPathNameA
 kernel32.dll!GetFullPathNameW
 kernel32.dll!GetLastError
 kernel32.dll!GetLocaleInfoW
+kernel32.dll!GetLogicalProcessorInformationEx
 kernel32.dll!GetModuleFileNameA
 kernel32.dll!GetModuleFileNameW
 kernel32.dll!GetModuleHandleA
@@ -106,8 +111,10 @@ kernel32.dll!GetStdHandle
 kernel32.dll!GetStringTypeW
 kernel32.dll!GetSystemDefaultLCID
 kernel32.dll!GetSystemTimeAsFileTime
+kernel32.dll!GetSystemTimePreciseAsFileTime
 kernel32.dll!GetSystemTimes stub
 kernel32.dll!GetTempPathA
+kernel32.dll!GetTempPathW
 kernel32.dll!GetThreadId
 kernel32.dll!GetThreadPriority
 kernel32.dll!GetTickCount
@@ -172,6 +179,7 @@ kernel32.dll!RemoveDirectoryW
 kernel32.dll!ResetEvent
 kernel32.dll!ResumeThread
 kernel32.dll!RtlCaptureContext
+kernel32.dll!RtlCaptureStackBackTrace
 kernel32.dll!RtlLookupFunctionEntry
 kernel32.dll!RtlPcToFileHeader
 kernel32.dll!RtlUnwind
@@ -337,15 +345,22 @@ ucrtbase.dll!_set_fmode
 ucrtbase.dll!_set_invalid_parameter_handler
 ucrtbase.dll!_set_new_mode
 ucrtbase.dll!_tzset
+ucrtbase.dll!_wcsdup
+ucrtbase.dll!_wsetlocale
 ucrtbase.dll!abort
 ucrtbase.dll!calloc
+ucrtbase.dll!copysign
 ucrtbase.dll!exit
 ucrtbase.dll!fflush
 ucrtbase.dll!fputc
 ucrtbase.dll!fputs
 ucrtbase.dll!free
+ucrtbase.dll!frexp
 ucrtbase.dll!fwrite
 ucrtbase.dll!getenv
+ucrtbase.dll!islower
+ucrtbase.dll!isspace
+ucrtbase.dll!isupper
 ucrtbase.dll!localeconv
 ucrtbase.dll!malloc
 ucrtbase.dll!memcmp
@@ -355,18 +370,23 @@ ucrtbase.dll!memset
 ucrtbase.dll!putchar
 ucrtbase.dll!puts
 ucrtbase.dll!realloc
+ucrtbase.dll!setlocale
 ucrtbase.dll!signal
 ucrtbase.dll!strcat
 ucrtbase.dll!strchr
 ucrtbase.dll!strcmp
 ucrtbase.dll!strcpy
+ucrtbase.dll!strcspn
 ucrtbase.dll!strerror
 ucrtbase.dll!strlen
 ucrtbase.dll!strncmp
 ucrtbase.dll!strncpy
 ucrtbase.dll!strrchr
 ucrtbase.dll!strstr
+ucrtbase.dll!tolower
+ucrtbase.dll!wcscpy_s
 ucrtbase.dll!wcslen
+ucrtbase.dll!wcsnlen
 vcruntime140.dll!_CxxThrowException
 vcruntime140.dll!__C_specific_handler
 vcruntime140.dll!__CxxFrameHandler3

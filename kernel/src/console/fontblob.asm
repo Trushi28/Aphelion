@@ -1,9 +1,9 @@
 section .rodata
 align 16
-global corona_font_blob
-global corona_font_blob_end
-corona_font_blob:
-incbin "corona-fonts.bin"
-corona_font_blob_end:
+global cornea_font_blob
+global cornea_font_blob_end
+cornea_font_blob:
+incbin "cornea-fonts.bin"
+cornea_font_blob_end:
 
 section .note.GNU-stack noalloc noexec nowrite

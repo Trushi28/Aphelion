@@ -23,7 +23,7 @@
 #include <cosmos/nebula_realms.hpp>
 #include <cosmos/lens_text.hpp>
 #include <cosmos/console_stream.hpp>
-#include <cosmos/corona.hpp>
+#include <cosmos/cornea.hpp>
 #include <cosmos/pci.hpp>
 #include <cosmos/virtio_blk.hpp>
 #include <cosmos/ahci.hpp>

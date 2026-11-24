@@ -1,6 +1,6 @@
 #include <cosmos/helm_rows.hpp>
 #include <cosmos/nebula_realms.hpp>
-#include <cosmos/corona.hpp>
+#include <cosmos/cornea.hpp>
 #include <cosmos/input.hpp>
 #include <cosmos/orbital.hpp>
 #include <cosmos/serial.hpp>
@@ -16,7 +16,7 @@ constexpr u32 HISTORY = 64;
 constexpr u32 PROMPT_PATH_CELLS = 28;
 
 void terminal_write(void*, const char* data, u32 n) {
-    corona::write(data, n);
+    cornea::write(data, n);
     serial::console_write(data, n);
 }
 
@@ -263,7 +263,7 @@ void loop(void*) {
         return;
     }
     g_editor = e;
-    corona::Metrics m = corona::metrics();
+    cornea::Metrics m = cornea::metrics();
     const char* start = nebula::disk_is_mounted() ? "disk" : "ram";
     init(*sh, Sink{&terminal_write, nullptr}, true, m.cols, start);
     sh->interrupt_poll = &poll_interrupt;
@@ -293,7 +293,7 @@ void loop(void*) {
             run_line(*sh, text);
             w.flush();
             if (sh->quit) return;
-            m = corona::metrics();
+            m = cornea::metrics();
             sh->cols = m.cols;
             build_prompt(*sh, *e);
             redraw(w, *e, m.cols);
@@ -304,7 +304,7 @@ void loop(void*) {
             const bool back = k.sym == input::Sym::PageUp || k.sym == input::Sym::Up;
             const i32 step = k.sym == input::Sym::PageUp || k.sym == input::Sym::PageDown
                 ? static_cast<i32>(m.rows > 2 ? m.rows - 2 : 1) : 1;
-            corona::scroll_view(back ? step : -step);
+            cornea::scroll_view(back ? step : -step);
             continue;
         }
         if (k.sym == input::Sym::Tab) {
